@@ -147,8 +147,13 @@ async def can_use_integration(
     integration_registry: RuntimeIntegrationRegistry | None = None,
     allow_env_fallback: bool = True,
     for_discovery: bool = False,
+    require_online: bool = True,
 ) -> ToolAccessDecision:
     """Can the acting user use this integration via an agent right now?
+
+    ``require_online=False`` asks whether the connection is set up rather than
+    reachable this moment: a paired Chrome that is closed is still connected.
+    Setup gates use it; a tool call keeps the default.
 
     Resolution order:
       2. An owned or explicitly shared OAuth/account connection selected from
@@ -493,6 +498,7 @@ async def can_use_mcp_server(
     integration_account_id: str | None = None,
     integration_registry: RuntimeIntegrationRegistry | None = None,
     allow_env_fallback: bool = False,
+    require_online: bool = True,
 ) -> ToolAccessDecision:
     """Thin alias — MCP server keys equal integration provider keys.
 
@@ -507,6 +513,7 @@ async def can_use_mcp_server(
         integration_account_id=integration_account_id,
         integration_registry=integration_registry,
         allow_env_fallback=allow_env_fallback,
+        require_online=require_online,
     )
 
 

@@ -186,6 +186,22 @@ OFFICIAL_TOKEN_PRICES: dict[str, TokenModelPrice] = {
         "official",
         note="Text-token rate; image input tokens bill at $8/M and are not represented here.",
     ),
+    "openai/gpt-image-2.6-sunburst": TokenModelPrice(
+        "openai",
+        5.00,
+        30.00,
+        "vercel",
+        cache_read_multiplier=0.25,
+        note="Vercel AI Gateway token rates, verified 2026-11-05.",
+    ),
+    "openai/gpt-image-2.6-flare": TokenModelPrice(
+        "openai",
+        5.00,
+        30.00,
+        "official",
+        cache_read_multiplier=0.25,
+        note="Text input/output token rates; image input is $8/M ($2/M cached).",
+    ),
     "text-embedding-3-small": TokenModelPrice("openai", 0.02, 0.0, "official"),
     "text-embedding-3-large": TokenModelPrice("openai", 0.13, 0.0, "official"),
     "text-embedding-ada-002": TokenModelPrice("openai", 0.10, 0.0, "official"),
@@ -308,6 +324,10 @@ OFFICIAL_IMAGE_PRICES: dict[str, FlatModelPrice] = {
     "openai/gpt-image-1": FlatModelPrice("openai", "image", 0.04, "official"),
     "gpt-image-1": FlatModelPrice("openai", "image", 0.04, "official"),
     "openai/gpt-image-2": FlatModelPrice("openai", "image", 0.08, "official"),
+    "openai/gpt-image-2.6-sunburst": FlatModelPrice(
+        "openai", "image", 0.08, "estimate",
+        note="No-usage fallback estimate using the GPT Image 2 baseline; billed per token by Vercel.",
+    ),
     # $60/M image-output tokens; the default 1024px image is 1120 tokens ≈ $0.067.
     "google/gemini-3.1-flash-image-preview": FlatModelPrice("google", "image", 0.067, "official"),
     "google/gemini-3.1-flash-image": FlatModelPrice("google", "image", 0.067, "official"),
@@ -320,7 +340,6 @@ OFFICIAL_IMAGE_PRICES: dict[str, FlatModelPrice] = {
 
 
 OFFICIAL_AUDIO_PRICES: dict[str, FlatModelPrice] = {
-    "google/gemini-3.1-flash-tts-preview": FlatModelPrice("google", "audio_asset", 0.01, "official"),
     "zyphra/zonos-v0.1-hybrid": FlatModelPrice("zyphra", "audio_asset", 0.01, "official"),
     "zyphra/zonos-v0.1-transformer": FlatModelPrice("zyphra", "audio_asset", 0.01, "official"),
     "sesame/csm-1b": FlatModelPrice("openrouter", "audio_asset", 0.01, "openrouter_fallback"),
@@ -348,6 +367,31 @@ PER_CHARACTER_AUDIO_PRICES: dict[str, FlatModelPrice] = {
     "elevenlabs/eleven-v3": FlatModelPrice("openrouter", "character", 0.00008, "openrouter"),
     "elevenlabs/eleven-multilingual-v2": FlatModelPrice("openrouter", "character", 0.00008, "openrouter"),
     "elevenlabs/eleven-flash-v2.5": FlatModelPrice("openrouter", "character", 0.00004, "openrouter"),
+    # OpenAI list prices: $15 / $30 per 1M characters.
+    "openai/tts-1": FlatModelPrice("openai", "character", 0.000015, "official"),
+    "openai/tts-1-hd": FlatModelPrice("openai", "character", 0.00003, "official"),
+}
+
+
+@dataclass(frozen=True)
+class SpeechTokenPrice:
+    """A speech model billed on text-input and audio-output tokens.
+
+    ``audio_tokens_per_second`` turns a measured clip length into the audio
+    tokens the provider bills when a response carries no token counts.
+    """
+
+    input_per_m: float
+    audio_output_per_m: float
+    audio_tokens_per_second: float
+
+
+SPEECH_TOKEN_PRICES: dict[str, SpeechTokenPrice] = {
+    # $0.60 / 1M text in, $12 / 1M audio out (about $0.015 a minute, so about
+    # 20.8 audio tokens a second).
+    "openai/gpt-4o-mini-tts": SpeechTokenPrice(0.60, 12.00, 20.8),
+    # $1 / 1M text in, $20 / 1M audio out; 25 audio tokens a second.
+    "google/gemini-3.1-flash-tts-preview": SpeechTokenPrice(1.00, 20.00, 25.0),
 }
 # Used when a caller cannot report the synthesized text length.
 _DEFAULT_SPEECH_CHARACTERS = 1000
@@ -355,12 +399,28 @@ _DEFAULT_SPEECH_CHARACTERS = 1000
 _DEFAULT_MUSIC_SECONDS = 180
 
 
+@dataclass(frozen=True)
+class VideoOutputTokenPrice:
+    """A video model billed per output token instead of per second.
+
+    Clip length times the resolution's output-token rate gives the token count;
+    the count times the per-million price gives the cost.
+    """
+
+    usd_per_m_output_tokens: float
+    tokens_per_second: dict[str, int]
+
+
+# One table prices every video model. An entry is either per-second USD by
+# resolution, or a per-token price. A model missing from the table is unpriced:
+# callers must flag it, never record it at zero.
+#
 # Seedance bills per video token: tokens = W×H×fps(24)×seconds / 1024.
 # Per-second rates below derive from BytePlus list prices at 24fps,
 # no-video-input; Seedance 2.5 has its own $10.7/M and $11.7/M tiers.
 # Official tiers stop at 1080p (+4k); "1440p" keeps the 1080p rate so a
 # stale resolution preference can never under-bill.
-VIDEO_COST_PER_SECOND: dict[str, dict[str, float]] = {
+VIDEO_COST_PER_SECOND: dict[str, dict[str, float] | VideoOutputTokenPrice] = {
     # BytePlus Seedance 2.5: $10.7/M tokens at 480p/720p, $11.7/M at 1080p.
     "bytedance/seedance-2.5": {
         "480p": 0.103,
@@ -437,6 +497,13 @@ VIDEO_COST_PER_SECOND: dict[str, dict[str, float]] = {
         "1080p": 0.07,
         "1440p": 0.07,
     },
+    # Gemini Omni 1.2 Flash bills output tokens at $12 per 1M. Per-second
+    # rates by resolution would hard-code a product of two numbers, so the
+    # token rates are the entry. Source: https://aistudio.google.com/docs/pricing
+    "google/gemini-omni-1.2-flash": VideoOutputTokenPrice(
+        usd_per_m_output_tokens=12.0,
+        tokens_per_second={"360p": 1931, "720p": 5792, "1080p": 8688, "4k": 17376},
+    ),
 }
 
 DEFAULT_INPUT_COST_PER_M = 1.50
@@ -461,12 +528,28 @@ def vercel_pricing_cache_path() -> str:
     return str(private_runtime_dir("cache") / "vercel-pricing.json")
 
 
+VERCEL_PRICING_SNAPSHOT_PATH = Path(__file__).parent / "data" / "vercel-pricing-snapshot.json"
+
+
+def _load_vercel_snapshot() -> dict:
+    """The catalog committed with the code, used until the first sync lands."""
+    try:
+        models = json.loads(VERCEL_PRICING_SNAPSHOT_PATH.read_text()).get("models") or {}
+        return models if isinstance(models, dict) else {}
+    except Exception:
+        logger.warning("model pricing: the committed Vercel pricing snapshot is unreadable", exc_info=True)
+        return {}
+
+
 def _load_vercel_cache_if_needed() -> None:
     global _VERCEL_CACHE_MTIME, _VERCEL_CACHE_MODELS
     path = Path(vercel_pricing_cache_path())
     try:
         st = path.stat()
     except Exception:
+        # No sync yet (a fresh deploy, CI): price from the committed snapshot.
+        if not _VERCEL_CACHE_MODELS:
+            _VERCEL_CACHE_MODELS = _load_vercel_snapshot()
         return
     if st.st_mtime <= _VERCEL_CACHE_MTIME:
         return
@@ -566,14 +649,21 @@ def model_pricing_catalog() -> list[dict[str, Any]]:
             "source": price.source,
             "note": price.note,
         })
-    for model, by_resolution in VIDEO_COST_PER_SECOND.items():
-        rows.append({
+    for model, price in VIDEO_COST_PER_SECOND.items():
+        row = {
             "model": model,
             "provider": model.split("/", 1)[0] if "/" in model else "",
-            "unit": "video_second",
-            "usd_by_resolution": dict(by_resolution),
             "source": "official",
-        })
+        }
+        if isinstance(price, VideoOutputTokenPrice):
+            row.update(
+                unit="video_output_token",
+                usd_per_m_output_tokens=price.usd_per_m_output_tokens,
+                tokens_per_second=dict(price.tokens_per_second),
+            )
+        else:
+            row.update(unit="video_second", usd_by_resolution=dict(price))
+        rows.append(row)
     return rows
 
 
@@ -716,56 +806,77 @@ def long_context_threshold(model: str | None) -> int | None:
     return price.long_context_threshold if price else None
 
 
+def resolve_token_unit_prices(
+    model: str | None,
+    *,
+    pricing_source: str | None = None,
+    provider: str | None = None,
+) -> tuple[float, float] | None:
+    """Per-1M token prices that bill a call, or None when no source prices the model.
+
+    A bare model name (as a provider reports it, e.g. ``gpt-6.1-sol``) is first
+    looked up under its provider (``openai/gpt-6.1-sol``), the catalog's id, so
+    the more specific match wins over a bare-name guess.
+    """
+    model_id = str(model or "").strip()
+    if model_id and "/" not in model_id and str(provider or "").strip():
+        qualified = _resolve_exact_token_prices(
+            f"{str(provider).strip().lower()}/{model_id}",
+            pricing_source=pricing_source,
+            provider=provider,
+        )
+        if qualified is not None:
+            return qualified
+    return _resolve_exact_token_prices(model_id, pricing_source=pricing_source, provider=provider)
+
+
+def _resolve_exact_token_prices(
+    model: str | None,
+    *,
+    pricing_source: str | None = None,
+    provider: str | None = None,
+) -> tuple[float, float] | None:
+    """The registry-then-catalog lookup for one exact model id.
+
+    The official registry always wins. A gateway's synced catalog (the route
+    that served the call first, then the other) prices a model the registry
+    does not list; a catalog entry missing either side does not count, so a
+    half-known price never borrows a guessed default.
+    """
+    source = str(pricing_source or "").lower()
+    route_provider = str(provider or "").lower()
+    use_openrouter = source == "openrouter" or route_provider == "openrouter"
+
+    official = _lookup_token_price(model)
+    if official:
+        return official.input_per_m, official.output_per_m
+
+    catalogs = (
+        (_openrouter_cached_price, _vercel_cached_price)
+        if use_openrouter
+        else (_vercel_cached_price, _openrouter_cached_price)
+    )
+    for catalog in catalogs:
+        cached_input, cached_output = catalog(model)
+        if cached_input is not None and cached_output is not None:
+            return cached_input, cached_output
+    return None
+
+
 def token_unit_prices(
     model: str | None,
     *,
     pricing_source: str | None = None,
     provider: str | None = None,
 ) -> tuple[float, float]:
-    """Resolve per-1M token prices for the route that actually served a call.
+    """Per-1M token prices for estimates made before a call (reservations, quotes).
 
-    Route priority (BYOK calls never reach billing — see usage_service):
-      - openrouter  → OpenRouter synced cache → official registry → Vercel cache
-      - vercel      → Vercel synced cache → official registry → OpenRouter cache
-      - official/native → official registry → Vercel cache (list-price mirror)
-        → OpenRouter cache
+    Billing a finished call uses ``resolve_token_unit_prices`` and never these
+    defaults; an estimate still needs a number for a model nobody prices.
     """
-    source = str(pricing_source or "").lower()
-    route_provider = str(provider or "").lower()
-    use_openrouter = source == "openrouter" or route_provider == "openrouter"
-    use_vercel = source == "vercel" or route_provider == "vercel"
-
-    def _resolved(pair: tuple[float | None, float | None]) -> tuple[float, float] | None:
-        cached_input, cached_output = pair
-        if cached_input is None and cached_output is None:
-            return None
-        return (
-            cached_input if cached_input is not None else DEFAULT_INPUT_COST_PER_M,
-            cached_output if cached_output is not None else DEFAULT_OUTPUT_COST_PER_M,
-        )
-
-    if use_openrouter:
-        resolved = _resolved(_openrouter_cached_price(model))
-        if resolved:
-            return resolved
-    elif use_vercel:
-        resolved = _resolved(_vercel_cached_price(model))
-        if resolved:
-            return resolved
-
-    official = _lookup_token_price(model)
-    if official:
-        return official.input_per_m, official.output_per_m
-
-    if not use_vercel:
-        resolved = _resolved(_vercel_cached_price(model))
-        if resolved:
-            return resolved
-    if not use_openrouter:
-        resolved = _resolved(_openrouter_cached_price(model))
-        if resolved:
-            return resolved
-
+    resolved = resolve_token_unit_prices(model, pricing_source=pricing_source, provider=provider)
+    if resolved is not None:
+        return resolved
     return DEFAULT_INPUT_COST_PER_M, DEFAULT_OUTPUT_COST_PER_M
 
 
@@ -783,12 +894,24 @@ def estimate_token_cost_usd(
     audio_input_tokens: int = 0,
     audio_output_tokens: int = 0,
     cached_audio_input_tokens: int = 0,
-) -> float:
-    input_per_m, output_per_m = token_unit_prices(
-        model,
-        pricing_source=pricing_source,
-        provider=provider,
-    )
+    require_price: bool = False,
+) -> float | None:
+    """USD for a call's tokens at the model's price.
+
+    With ``require_price`` a model no source prices returns None instead of
+    the default estimate: a finished call is never billed at a guessed rate.
+    """
+    if require_price:
+        resolved = resolve_token_unit_prices(model, pricing_source=pricing_source, provider=provider)
+        if resolved is None:
+            return None
+        input_per_m, output_per_m = resolved
+    else:
+        input_per_m, output_per_m = token_unit_prices(
+            model,
+            pricing_source=pricing_source,
+            provider=provider,
+        )
     # Per-model cache multipliers from the registry win over the caller's
     # flat defaults (providers differ: Anthropic writes cost 1.25×, OpenAI
     # charges nothing extra for cache writes, etc.).
@@ -877,6 +1000,131 @@ _SEEDANCE_25_1080_VIDEO_INPUT_FACTOR = 7.0 / 11.7
 # Kling charges +50% for native audio generation.
 _KLING_AUDIO_FACTOR = 1.5
 
+# Seedance bills the tokens its output takes: W × H × 24 fps × seconds ÷ 1024.
+# Its per-second rates are those tokens at a per-million price, so the per-token
+# price is the per-second rate over one second of tokens. Pixel counts are the
+# 16:9 frame for each tier; 1440p bills at the 1080p rate, as the table does.
+_SEEDANCE_TOKEN_MODELS = frozenset({
+    "bytedance/seedance-2.5",
+    "bytedance/seedance-2.0",
+    "bytedance/seedance-2.0-fast",
+    "bytedance/seedance-v1.0-pro-fast",
+})
+_SEEDANCE_TOKEN_FRAME = {
+    "480p": (854, 480),
+    "720p": (1280, 720),
+    "1080p": (1920, 1080),
+    "1440p": (1920, 1080),
+}
+_SEEDANCE_TOKEN_FPS = 24
+_SEEDANCE_TOKEN_DIVISOR = 1024
+
+
+def _seedance_video_input_factor(model: str, resolution: str) -> float:
+    lowered = str(model or "").lower()
+    if "seedance-2.5" in lowered:
+        return _SEEDANCE_25_1080_VIDEO_INPUT_FACTOR if resolution in {"1080p", "1440p"} else _SEEDANCE_25_VIDEO_INPUT_FACTOR
+    if "fast" in lowered:
+        return _SEEDANCE_FAST_VIDEO_INPUT_FACTOR
+    return _SEEDANCE_VIDEO_INPUT_FACTOR
+
+
+def video_token_price_per_m(model: str | None, resolution: str = "720p", *, has_video_input: bool = False) -> float | None:
+    """USD per million output tokens for a video model, or None when it is billed per second.
+
+    Gemini bills its output tokens directly. Seedance's per-token price is
+    derived from its per-second rate, so the same clip costs the same either
+    way. Kling, Atlas and Grok bill per second and have no token price here.
+    """
+    key = str(model or "")
+    price = VIDEO_COST_PER_SECOND.get(key)
+    if isinstance(price, VideoOutputTokenPrice):
+        return price.usd_per_m_output_tokens
+    from packages.core.services import catalog_pricing
+
+    catalog_rate = catalog_pricing.video_token_price_per_m(key, resolution, has_video_input=has_video_input)
+    if catalog_rate is not None:
+        return catalog_rate
+    if key not in _SEEDANCE_TOKEN_MODELS or not isinstance(price, dict):
+        return None
+    width, height = _SEEDANCE_TOKEN_FRAME.get(resolution, _SEEDANCE_TOKEN_FRAME["720p"])
+    per_second = float(price.get(resolution, price.get("720p", 0.0)))
+    tokens_per_second = width * height * _SEEDANCE_TOKEN_FPS / _SEEDANCE_TOKEN_DIVISOR
+    rate = per_second / tokens_per_second * 1_000_000
+    if has_video_input:
+        rate *= _seedance_video_input_factor(key, resolution)
+    return rate
+
+
+def video_cost_from_tokens(
+    model: str | None,
+    output_tokens: float | None,
+    resolution: str = "720p",
+    *,
+    has_video_input: bool = False,
+) -> float | None:
+    """USD for a clip's official output tokens, or None when the model has no token price."""
+    if output_tokens is None:
+        return None
+    rate = video_token_price_per_m(model, resolution, has_video_input=has_video_input)
+    if rate is None:
+        return None
+    return max(0.0, float(output_tokens)) * rate / 1_000_000
+
+
+def video_is_priced(model: str | None) -> bool:
+    """Whether the curated table or the gateway catalog has a rate for this video model."""
+    from packages.core.services import catalog_pricing
+
+    model_id = str(model or "")
+    return model_id in VIDEO_COST_PER_SECOND or catalog_pricing.has_video_price(model_id)
+
+
+def video_output_tokens(model: str, duration_seconds: float, resolution: str = "720p") -> int:
+    """Output tokens a clip of this length and resolution is billed for.
+
+    Zero for models priced per second. A resolution without its own rate uses
+    the 720p rate, as the per-second table does.
+    """
+    price = VIDEO_COST_PER_SECOND.get(model)
+    if not isinstance(price, VideoOutputTokenPrice):
+        return 0
+    rate = price.tokens_per_second.get(resolution, price.tokens_per_second["720p"])
+    return round(rate * max(0.0, float(duration_seconds or 0)))
+
+
+def priced_video_cost_usd(
+    model: str,
+    duration_seconds: float,
+    resolution: str = "720p",
+    *,
+    with_audio: bool = False,
+    has_video_input: bool = False,
+) -> float | None:
+    """A clip's list-price cost by length, or None when nothing prices the model.
+
+    The curated table first, then the gateway catalog's per-second rate. Used
+    when the provider reports no tokens, and for quotes before a call.
+    """
+    price = VIDEO_COST_PER_SECOND.get(model)
+    if price is None:
+        from packages.core.services import catalog_pricing
+
+        per_second = catalog_pricing.video_cost_per_second(model, resolution, with_audio=with_audio)
+        if per_second is None:
+            return None
+        return per_second * max(0.0, float(duration_seconds or 0))
+    if isinstance(price, VideoOutputTokenPrice):
+        tokens = video_output_tokens(model, duration_seconds, resolution)
+        return tokens * price.usd_per_m_output_tokens / 1_000_000
+    rate = float(price.get(resolution, price.get("720p", 0.134)))
+    lowered = str(model or "").lower()
+    if has_video_input and "seedance" in lowered:
+        rate *= _seedance_video_input_factor(model, resolution)
+    if with_audio and "kling" in lowered:
+        rate *= _KLING_AUDIO_FACTOR
+    return rate * max(0.0, float(duration_seconds or 0))
+
 
 def estimate_video_cost_usd(
     model: str,
@@ -886,21 +1134,18 @@ def estimate_video_cost_usd(
     with_audio: bool = False,
     has_video_input: bool = False,
 ) -> float:
-    pricing = VIDEO_COST_PER_SECOND.get(model)
-    if not pricing:
+    """Pre-run cost used to reserve credits. Unpriced models get a flat guess.
+
+    A finished job never uses this guess: its cost comes from the gateway or
+    from ``priced_video_cost_usd``, and an unpriced job records no cost.
+    """
+    cost = priced_video_cost_usd(
+        model, duration_seconds, resolution,
+        with_audio=with_audio, has_video_input=has_video_input,
+    )
+    if cost is None:
         return 0.20 * max(0.0, float(duration_seconds or 0))
-    rate = float(pricing.get(resolution, pricing.get("720p", 0.134)))
-    lowered = str(model or "").lower()
-    if has_video_input and "seedance" in lowered:
-        rate *= (
-            _SEEDANCE_25_1080_VIDEO_INPUT_FACTOR if "seedance-2.5" in lowered and resolution in {"1080p", "1440p"} else
-            _SEEDANCE_25_VIDEO_INPUT_FACTOR if "seedance-2.5" in lowered else
-            _SEEDANCE_FAST_VIDEO_INPUT_FACTOR if "fast" in lowered else
-            _SEEDANCE_VIDEO_INPUT_FACTOR
-        )
-    if with_audio and "kling" in lowered:
-        rate *= _KLING_AUDIO_FACTOR
-    return rate * max(0.0, float(duration_seconds or 0))
+    return cost
 
 
 # Gemini image output bills $60/M image tokens; token count scales with
@@ -946,12 +1191,222 @@ def estimate_image_cost_usd(model: str, size: str = "1024x1024") -> float:
     return base * max(1.0, area_ratio)
 
 
+@dataclass(frozen=True)
+class ImageTokenPrice:
+    """An image model's per-1M token rates by token kind.
+
+    Image input and output tokens bill at their own rates, not the text rate.
+    ``cached_input_multiplier`` applies to cached text and image input alike.
+    """
+
+    text_input_per_m: float
+    image_input_per_m: float
+    image_output_per_m: float
+    text_output_per_m: float = 0.0
+    cached_input_multiplier: float = 1.0
+
+
+_GEMINI_FLASH_IMAGE_TOKENS = ImageTokenPrice(0.50, 0.50, 60.00, text_output_per_m=3.00)
+IMAGE_TOKEN_PRICES: dict[str, ImageTokenPrice] = {
+    # OpenAI: text $2 / image in $2.50 / image out $8, cached input 10%.
+    "openai/gpt-image-1-mini": ImageTokenPrice(2.00, 2.50, 8.00, cached_input_multiplier=0.10),
+    # Text $5 ($1.25 cached), image in $8 ($2 cached), image out $30.
+    "openai/gpt-image-2": ImageTokenPrice(5.00, 8.00, 30.00, cached_input_multiplier=0.25),
+    "openai/gpt-image-2.6-flare": ImageTokenPrice(5.00, 8.00, 30.00, cached_input_multiplier=0.25),
+    # Vercel publishes text $5 / out $30 only; image input bills at the text rate.
+    "openai/gpt-image-2.6-sunburst": ImageTokenPrice(5.00, 5.00, 30.00, cached_input_multiplier=0.25),
+    # Google: input $0.50, text out (thinking included) $3, image out $60.
+    "google/gemini-3.1-flash-image": _GEMINI_FLASH_IMAGE_TOKENS,
+    "google/gemini-3.1-flash-image-preview": _GEMINI_FLASH_IMAGE_TOKENS,
+}
+
+
+def _usage_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0)) if not isinstance(value, bool) else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _modality_tokens(details: Any, modality: str) -> int:
+    total = 0
+    for entry in details or []:
+        if isinstance(entry, dict) and str(entry.get("modality") or "").upper() == modality:
+            total += _usage_int(entry.get("tokenCount") or entry.get("token_count") or entry.get("tokens"))
+    return total
+
+
+def _image_usage_buckets(usage: Any) -> dict[str, int] | None:
+    """Token counts by kind from any image response shape, or None without tokens.
+
+    Shapes: OpenAI Images (``input_tokens`` + details), the AI Gateway's
+    camelCase copy of it, OpenRouter chat (``prompt_tokens`` /
+    ``completion_tokens``), and Gemini ``usageMetadata``.
+    """
+    if not isinstance(usage, dict) or not usage:
+        return None
+    if "promptTokenCount" in usage or "candidatesTokenCount" in usage:
+        prompt = _usage_int(usage.get("promptTokenCount"))
+        image_in = min(prompt, _modality_tokens(usage.get("promptTokensDetails"), "IMAGE"))
+        candidates = _usage_int(usage.get("candidatesTokenCount"))
+        image_out = _modality_tokens(usage.get("candidatesTokensDetails"), "IMAGE") or candidates
+        text_out = max(0, candidates - image_out) + _usage_int(usage.get("thoughtsTokenCount"))
+        cached = min(prompt, _usage_int(usage.get("cachedContentTokenCount")))
+        return {"text_in": prompt - image_in, "image_in": image_in, "cached_text_in": min(cached, prompt - image_in),
+                "cached_image_in": 0, "image_out": image_out, "text_out": text_out}
+    input_key = next((k for k in ("input_tokens", "inputTokens") if k in usage), None)
+    if input_key is not None or "output_tokens" in usage or "outputTokens" in usage:
+        input_tokens = _usage_int(usage.get(input_key)) if input_key else 0
+        output_tokens = _usage_int(usage.get("output_tokens", usage.get("outputTokens")))
+        details = usage.get("input_tokens_details") or usage.get("inputTokensDetails") or {}
+        details = details if isinstance(details, dict) else {}
+        image_in = min(input_tokens, _usage_int(details.get("image_tokens", details.get("imageTokens"))))
+        text_in = input_tokens - image_in
+        cached_image = min(image_in, _usage_int(details.get("cached_image_tokens", details.get("cachedImageTokens"))))
+        cached_total = _usage_int(details.get("cached_tokens", details.get("cachedTokens", usage.get("cached_input_tokens"))))
+        cached_text = min(text_in, _usage_int(details.get("cached_text_tokens")) or max(0, cached_total - cached_image))
+        return {"text_in": text_in, "image_in": image_in, "cached_text_in": cached_text,
+                "cached_image_in": cached_image, "image_out": output_tokens, "text_out": 0}
+    if "prompt_tokens" in usage or "completion_tokens" in usage:
+        prompt = _usage_int(usage.get("prompt_tokens"))
+        completion = _usage_int(usage.get("completion_tokens"))
+        prompt_details = usage.get("prompt_tokens_details") or {}
+        completion_details = usage.get("completion_tokens_details") or {}
+        image_in = min(prompt, _usage_int(prompt_details.get("image_tokens")) if isinstance(prompt_details, dict) else 0)
+        image_out = (_usage_int(completion_details.get("image_tokens")) if isinstance(completion_details, dict) else 0) or completion
+        cached = min(prompt - image_in, _usage_int(prompt_details.get("cached_tokens")) if isinstance(prompt_details, dict) else 0)
+        return {"text_in": prompt - image_in, "image_in": image_in, "cached_text_in": cached,
+                "cached_image_in": 0, "image_out": image_out, "text_out": max(0, completion - image_out)}
+    return None
+
+
+def image_call_cost_usd(model: str, usage: Any, size: str = "1024x1024") -> tuple[float | None, str]:
+    """A finished image call's USD cost, and its basis.
+
+    The provider's token counts at the model's per-kind token rates first; a
+    response without tokens falls back to the official per-image list price.
+    ``(None, "unpriced")`` when the model has neither.
+    """
+    model_id = str(model or "").strip()
+    price = IMAGE_TOKEN_PRICES.get(model_id)
+    buckets = _image_usage_buckets(usage) if price else None
+    if price and buckets:
+        cached_rate = price.cached_input_multiplier
+        cost = (
+            (buckets["text_in"] - buckets["cached_text_in"]) * price.text_input_per_m
+            + buckets["cached_text_in"] * price.text_input_per_m * cached_rate
+            + (buckets["image_in"] - buckets["cached_image_in"]) * price.image_input_per_m
+            + buckets["cached_image_in"] * price.image_input_per_m * cached_rate
+            + buckets["image_out"] * price.image_output_per_m
+            + buckets["text_out"] * price.text_output_per_m
+        ) / 1_000_000
+        return cost, "official_tokens"
+    if OFFICIAL_IMAGE_PRICES.get(model_id) or ("/" in model_id and OFFICIAL_IMAGE_PRICES.get(model_id.split("/", 1)[1])):
+        return estimate_image_cost_usd(model_id, size=size), "official_per_image"
+    from packages.core.services import catalog_pricing
+
+    token_prices = catalog_pricing.image_token_prices(model_id)
+    buckets = _image_usage_buckets(usage) if token_prices else None
+    if token_prices and buckets:
+        input_rate, output_rate, cached_rate = token_prices
+        cached_rate = input_rate if cached_rate is None else cached_rate
+        cached = buckets["cached_text_in"] + buckets["cached_image_in"]
+        uncached = buckets["text_in"] + buckets["image_in"] - cached
+        cost = (
+            uncached * input_rate + cached * cached_rate
+            + (buckets["image_out"] + buckets["text_out"]) * output_rate
+        ) / 1_000_000
+        return cost, "catalog_tokens"
+    per_image = catalog_pricing.image_cost_per_image(model_id, size)
+    if per_image is not None:
+        return per_image, "catalog_per_image"
+    return None, "unpriced"
+
+
+_TRANSCRIPTION_USD_PER_MINUTE = (
+    # (id fragment, official USD per minute)
+    ("mini-transcribe", 0.003),
+    ("groq/", 0.111 / 60.0),
+    ("large-v3", 0.111 / 60.0),
+    ("whisper", 0.006),
+)
+
+
+def transcription_usd_per_minute(model: str | None) -> float | None:
+    """A transcription model's USD per audio minute: curated, else the gateway catalog."""
+    lowered = str(model or "").lower()
+    for fragment, rate in _TRANSCRIPTION_USD_PER_MINUTE:
+        if fragment in lowered:
+            return rate
+    from packages.core.services import catalog_pricing
+
+    per_second = catalog_pricing.transcription_cost_per_second(str(model or ""))
+    return per_second * 60.0 if per_second is not None else None
+
+
+def audio_call_cost_usd(
+    model: str,
+    *,
+    characters: int | None = None,
+    seconds: float | None = None,
+    input_tokens: int | None = None,
+    audio_output_tokens: int | None = None,
+) -> tuple[float | None, str]:
+    """A finished audio call's USD cost on the provider's own billing unit, and its basis.
+
+    Per character, per token, per generated second or per asset, as the
+    provider bills that model. ``(None, "unpriced")`` when the model has no
+    price or the unit it bills on was not measured: a guess is never billed.
+    """
+    model_id = str(model or "").strip()
+    per_character = PER_CHARACTER_AUDIO_PRICES.get(model_id)
+    if per_character:
+        if characters is None:
+            return None, "unpriced"
+        return float(per_character.usd) * max(0, int(characters)), "official_characters"
+    speech = SPEECH_TOKEN_PRICES.get(model_id)
+    if speech:
+        in_tokens = max(0, int(input_tokens if input_tokens is not None else (characters or 0) / 4))
+        if audio_output_tokens is not None:
+            out_tokens = max(0, int(audio_output_tokens))
+            basis = "official_tokens"
+        elif seconds is not None:
+            out_tokens = round(max(0.0, float(seconds)) * speech.audio_tokens_per_second)
+            basis = "official_rate_measured_seconds"
+        else:
+            return None, "unpriced"
+        cost = (in_tokens * speech.input_per_m + out_tokens * speech.audio_output_per_m) / 1_000_000
+        return cost, basis
+    price = OFFICIAL_AUDIO_PRICES.get(model_id)
+    if price and price.unit == "second":
+        if seconds is None:
+            return None, "unpriced"
+        return float(price.usd) * max(0.0, float(seconds)), "official_seconds"
+    if price:
+        return float(price.usd), "official_asset"
+    from packages.core.services import catalog_pricing
+
+    return catalog_pricing.speech_cost(
+        model_id,
+        characters=characters,
+        seconds=seconds,
+        input_tokens=input_tokens,
+        audio_output_tokens=audio_output_tokens,
+    )
+
+
 def estimate_audio_cost_usd(model: str, *, purpose: str = "", characters: int | None = None) -> float:
     model_id = str(model or "").strip()
     per_character = PER_CHARACTER_AUDIO_PRICES.get(model_id)
     if per_character:
         count = _DEFAULT_SPEECH_CHARACTERS if characters is None else max(0, int(characters))
         return float(per_character.usd) * count
+    speech = SPEECH_TOKEN_PRICES.get(model_id)
+    if speech:
+        # Quote only: about 15 spoken characters a second.
+        count = _DEFAULT_SPEECH_CHARACTERS if characters is None else max(0, int(characters))
+        cost, _basis = audio_call_cost_usd(model_id, characters=count, seconds=count / 15)
+        return float(cost or 0.0)
     price = OFFICIAL_AUDIO_PRICES.get(model_id)
     if price and price.unit == "second":
         return float(price.usd) * _DEFAULT_MUSIC_SECONDS
@@ -969,5 +1424,12 @@ def estimate_audio_cost_usd(model: str, *, purpose: str = "", characters: int | 
 
 def embedding_cost_usd(model: str, total_tokens: int) -> float:
     price = _lookup_token_price(model)
-    rate = price.input_per_m if price else 0.13
+    if price:
+        rate = price.input_per_m
+    else:
+        from packages.core.services import catalog_pricing
+
+        catalog_rate = catalog_pricing.embedding_price_per_m(model)
+        # 0.13 is only reached by a model nothing prices: a BYOK estimate.
+        rate = catalog_rate if catalog_rate is not None else 0.13
     return max(0, int(total_tokens or 0)) / 1_000_000 * rate

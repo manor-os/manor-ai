@@ -6,8 +6,10 @@ flushes, so the services under test read them through their own queries.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import Iterable, Optional
 
+from packages.core.blueprints.workflow_patterns import schedule_expansion_flows
 from packages.core.models.base import generate_ulid
 from packages.core.models.billing import CreditUsageLog
 from packages.core.models.chat_feedback import ChatMessageFeedback
@@ -16,7 +18,9 @@ from packages.core.models.proposal import ProposalItemRecord
 from packages.core.models.scheduler import ScheduledJob
 from packages.core.models.task import Conversation, Message, Task
 from packages.core.models.user import User
+from packages.core.models.workflow import WorkflowRun
 from packages.core.models.workspace import Workspace
+from packages.core.services.workflow_run_trace import build_definition_snapshot
 
 
 async def _workspace(
@@ -124,6 +128,53 @@ async def _credits(db, ws: Workspace, amounts: Iterable[int], *, at: datetime) -
         for amount in amounts
     ])
     await db.flush()
+
+
+def _worker_steps() -> list[dict]:
+    """The steps of the real every-15-minutes worker a Workflow pattern builds."""
+    expansion = schedule_expansion_flows(
+        slug="posts", item_type="post", item_schema={"type": "object", "properties": {}}, date_field="date",
+        timezone="UTC", lead_minutes=30, waiting_stages=["planned"], scheduled_stage="scheduled",
+        started_stage="started", run_workflow="make_post", run_input="post_id",
+    )
+    return next(flow for flow in expansion["workflows"] if flow["slug"] == "posts_due")["steps"]
+
+
+def _step_result(step_id: str, status: str = "completed", **fields) -> dict:
+    """A result as ``WorkflowRunner._execute_step_safe`` records it."""
+    return {
+        "status": status, "output": "done", "duration_ms": 1.0, "completed_at": "2026-10-27T12:00:00+00:00",
+        "step_id": step_id, "inputs": {}, **fields,
+    }
+
+
+async def _flow_run(
+    db, ws: Workspace, steps: dict[str, str] | list[dict], results: Iterable[str] | dict[str, dict], *,
+    finished_at: Optional[datetime], status: str = "completed", current: Optional[str] = None,
+    error: Optional[str] = None, trigger_data: Optional[dict] = None, cancel_source: Optional[str] = None,
+    attempt: int = 1, lineage_root: Optional[str] = None, parent=None, parent_step: str = "run",
+) -> WorkflowRun:
+    """One run with the ``definition_snapshot`` the service stores. ``steps`` maps
+    step ids to types, or is a real step list; ``results`` are the steps that ran."""
+    run_id = generate_ulid()
+    if isinstance(steps, dict):
+        steps = [{"id": step_id, "type": kind} for step_id, kind in steps.items()]
+    results = results if isinstance(results, dict) else {step_id: _step_result(step_id) for step_id in results}
+    trigger = dict(trigger_data or {})
+    if parent is not None:
+        # What ``_execute_subworkflow_step`` gives a child of a run_workflow start.
+        trigger.update(parent_run_id=parent.id, parent_step_id=parent_step, _workflow_runtime_context={})
+    workflow = SimpleNamespace(id=generate_ulid(), name="Flow", version=1, steps=steps)
+    run = WorkflowRun(
+        id=run_id, workflow_id=workflow.id, entity_id=ws.entity_id, workspace_id=ws.id, status=status,
+        current_step_id=current or next(reversed(results), None), error=error, cancel_source=cancel_source,
+        attempt_number=attempt, lineage_root_run_id=lineage_root or run_id, lineage_is_legacy=False,
+        step_results=results, trigger_data=trigger, definition_snapshot=build_definition_snapshot(workflow),
+        started_at=finished_at - timedelta(seconds=5) if finished_at else None, completed_at=finished_at,
+    )
+    db.add(run)
+    await db.flush()
+    return run
 
 
 async def _job(db, ws: Workspace, enabled: bool, next_run_at: Optional[datetime]) -> ScheduledJob:

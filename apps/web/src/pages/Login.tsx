@@ -7,6 +7,7 @@ import AuthShell, { AuthBrand } from "../components/auth/AuthShell";
 import { navigateAfterAuth, safeAuthRedirect } from "../lib/authNavigation";
 import { t } from "../lib/i18n";
 import { COLLABORATION_ENDED_REASON, collaborationEndedSignIn } from "../lib/persistentSession";
+import LoadingSpinner from "../components/ui/LoadingSpinner";
 
 type Tab = "login" | "register";
 
@@ -29,7 +30,7 @@ export default function Login() {
   const finishAuthNavigation = useCallback(() => {
     navigateAfterAuth(inviteRedirectPath, navigate);
   }, [inviteRedirectPath, navigate]);
-  const defaultTab = searchParams.get("tab") === "register" ? "register" : "login";
+  const defaultTab = searchParams.get("tab") === "register" || window.location.pathname === "/register" ? "register" : "login";
   const [tab, setTab] = useState<Tab>(defaultTab);
   const [email, setEmail] = useState(() => searchParams.get("email") || "");
   const [password, setPassword] = useState("");
@@ -194,7 +195,7 @@ export default function Login() {
         <button
           type="button"
           onClick={() => { setTab(tab === "login" ? "register" : "login"); setError(""); useAuthStore.setState({ pendingVerificationEmail: null }); setVerificationCode(""); setShowForgotPassword(false); }}
-          style={{ fontSize: 13, fontWeight: 600, color: "#4f7d75", background: "transparent", border: "none", cursor: "pointer" }}
+          style={{ fontSize: 13, fontWeight: 400, color: "var(--text-muted)", background: "transparent", border: "none", cursor: "pointer" }}
         >
           {tab === "login" ? t("page.login.create_account") : t("page.login.sign_in")}
         </button>
@@ -202,10 +203,10 @@ export default function Login() {
 
       {/* Form body */}
       <div className="flex-1 flex flex-col justify-center px-8 pb-8" style={{ maxWidth: 420 }}>
-            <h1 style={{ fontSize: 30, fontWeight: 900, color: "#292524", marginBottom: 8 }}>
+            <h1 style={{ fontSize: 26, fontWeight: 600, letterSpacing: "-0.02em", color: "var(--text-strong)", marginBottom: 8 }}>
               {pending2fa ? t("page.login.two_factor_auth") : pendingVerificationEmail ? t("page.login.verify_email") : showForgotPassword ? t("page.login.reset_password") : tab === "login" ? t("page.login.sign_in") : t("page.login.create_account")}
             </h1>
-            <p style={{ fontSize: 14, color: "#78716c", marginBottom: 28 }}>
+            <p style={{ fontSize: 14, color: "var(--text-muted)", marginBottom: 28 }}>
               {pending2fa
                 ? t("page.login.two_factor_desc")
                 : pendingVerificationEmail
@@ -226,7 +227,7 @@ export default function Login() {
                   borderRadius: 12,
                   background: "var(--surface-muted, rgba(245,245,244,0.9))",
                   border: "1px solid var(--border-subtle, rgba(120,113,108,0.2))",
-                  color: "var(--text-default, #44403c)",
+                  color: "var(--text-default, #48484a)",
                   fontSize: 13,
                   display: "flex",
                   alignItems: "center",
@@ -269,7 +270,7 @@ export default function Login() {
                       <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z" />
                     </svg>
                   </div>
-                  <p style={{ fontSize: 14, color: "#78716c" }}>
+                  <p style={{ fontSize: 14, color: "var(--text-muted)" }}>
                     {t("page.login.enter_2fa_code")}
                   </p>
                 </div>
@@ -283,7 +284,7 @@ export default function Login() {
                       value={totpCode}
                       onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, ""))}
                       className="login-input"
-                      style={{ textAlign: "center", fontSize: 24, letterSpacing: 8, fontWeight: 700 }}
+                      style={{ textAlign: "center", fontSize: 24, fontWeight: 700 }}
                       placeholder="000000"
                       autoFocus
                     />
@@ -294,7 +295,7 @@ export default function Login() {
                 </button>
                 <div style={{ textAlign: "center", marginTop: 16 }}>
                   <button type="button" onClick={() => { useAuthStore.setState({ pending2fa: null }); setTotpCode(""); setError(""); }}
-                    style={{ fontSize: 13, fontWeight: 600, color: "#78716c", background: "transparent", border: "none", cursor: "pointer" }}>
+                    style={{ fontSize: 13, fontWeight: 600, color: "var(--text-muted)", background: "transparent", border: "none", cursor: "pointer" }}>
                     {t("page.login.back_to_sign_in")}
                   </button>
                 </div>
@@ -307,8 +308,8 @@ export default function Login() {
                       <path strokeLinecap="round" strokeLinejoin="round" d="M21.75 6.75v10.5a2.25 2.25 0 01-2.25 2.25h-15a2.25 2.25 0 01-2.25-2.25V6.75m19.5 0A2.25 2.25 0 0019.5 4.5h-15a2.25 2.25 0 00-2.25 2.25m19.5 0v.243a2.25 2.25 0 01-1.07 1.916l-7.5 4.615a2.25 2.25 0 01-2.36 0L3.32 8.91a2.25 2.25 0 01-1.07-1.916V6.75" />
                     </svg>
                   </div>
-                  <p style={{ fontSize: 14, color: "#78716c" }}>
-                    {t("page.login.sent_code_to")} <strong style={{ color: "#292524" }}>{pendingVerificationEmail}</strong>
+                  <p style={{ fontSize: 14, color: "var(--text-muted)" }}>
+                    {t("page.login.sent_code_to")} <strong style={{ color: "var(--text-strong)" }}>{pendingVerificationEmail}</strong>
                   </p>
                 </div>
 
@@ -324,7 +325,7 @@ export default function Login() {
                         e.target.value.replace(/[^A-Za-z0-9]/g, "").toUpperCase(),
                       )}
                       className="login-input"
-                      style={{ textAlign: "center", fontSize: 22, letterSpacing: 5, fontWeight: 700 }}
+                      style={{ textAlign: "center", fontSize: 22, fontWeight: 700 }}
                       placeholder="AB12CD34"
                       autoComplete="one-time-code"
                       autoFocus
@@ -343,17 +344,17 @@ export default function Login() {
                     disabled={resendCooldown > 0}
                     style={{
                       fontSize: 13, fontWeight: 600,
-                      color: resendCooldown > 0 ? "#a8a29e" : "#4f7d75",
+                      color: resendCooldown > 0 ? "#aeaeb2" : "#4f7d75",
                       background: "transparent", border: "none", cursor: resendCooldown > 0 ? "default" : "pointer",
                     }}
                   >
                     {resendCooldown > 0 ? `${t("page.login.resend_code_in")} ${resendCooldown}s` : t("page.login.resend_code")}
                   </button>
-                  <span style={{ color: "#d6d3d1", margin: "0 4px" }}>|</span>
+                  <span style={{ color: "var(--text-faint)", margin: "0 4px" }}>|</span>
                   <button
                     type="button"
                     onClick={() => { useAuthStore.setState({ pendingVerificationEmail: null }); setVerificationCode(""); setError(""); }}
-                    style={{ fontSize: 13, fontWeight: 600, color: "#78716c", background: "transparent", border: "none", cursor: "pointer" }}
+                    style={{ fontSize: 13, fontWeight: 600, color: "var(--text-muted)", background: "transparent", border: "none", cursor: "pointer" }}
                   >
                     {t("page.login.back_to_sign_in")}
                   </button>
@@ -368,7 +369,7 @@ export default function Login() {
                       <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 5.25a3 3 0 013 3m3 0a6 6 0 01-7.029 5.912c-.563-.097-1.159.026-1.563.43L10.5 17.25H8.25v2.25H6v2.25H2.25v-2.818c0-.597.237-1.17.659-1.591l6.499-6.499c.404-.404.527-1 .43-1.563A6 6 0 1121.75 8.25z" />
                     </svg>
                   </div>
-                  <p style={{ fontSize: 14, color: "#78716c" }}>
+                  <p style={{ fontSize: 14, color: "var(--text-muted)" }}>
                     {forgotSent ? t("page.login.reset_link_sent") : t("page.login.enter_email_reset_link")}
                   </p>
                 </div>
@@ -394,7 +395,7 @@ export default function Login() {
                   </>
                 )}
                 <div style={{ textAlign: "center", marginTop: 16 }}>
-                  <button type="button" onClick={() => setShowForgotPassword(false)} style={{ fontSize: 13, fontWeight: 600, color: "#4f7d75", background: "transparent", border: "none", cursor: "pointer" }}>
+                  <button type="button" onClick={() => setShowForgotPassword(false)} style={{ fontSize: 13, fontWeight: 400, color: "var(--text-muted)", background: "transparent", border: "none", cursor: "pointer" }}>
                     {t("page.login.back_to_sign_in")}
                   </button>
                 </div>
@@ -474,7 +475,7 @@ export default function Login() {
 
                   {/* Remember me + Forgot password */}
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 22 }}>
-                    <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 13, color: "#57534e", fontWeight: 500 }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 13, color: "var(--text-muted)", fontWeight: 500 }}>
                       <input
                         type="checkbox"
                         checked={rememberMe}
@@ -486,7 +487,7 @@ export default function Login() {
                     <button
                       type="button"
                       onClick={() => { setShowForgotPassword(true); setForgotEmail(email); setForgotSent(false); setError(""); }}
-                      style={{ fontSize: 13, fontWeight: 600, color: "#4f7d75", background: "transparent", border: "none", cursor: "pointer" }}
+                      style={{ fontSize: 13, fontWeight: 400, color: "var(--text-muted)", background: "transparent", border: "none", cursor: "pointer" }}
                     >
                       {t("page.login.forgot_password")}
                     </button>
@@ -512,12 +513,12 @@ export default function Login() {
                           value={invitationCode}
                           onChange={(e) => setInvitationCode(e.target.value.toUpperCase())}
                           className="login-input"
-                          style={{ paddingLeft: 40, textTransform: "uppercase", fontFamily: "ui-monospace, monospace" }}
+                          style={{ paddingLeft: 40, fontFamily: "var(--font-mono)" }}
                           placeholder={t("page.login.enter_invitation_code")}
                           autoComplete="off"
                         />
                       </div>
-                      <p style={{ fontSize: 11, color: "#78716c", margin: "6px 0 0" }}>
+                      <p style={{ fontSize: 11, color: "var(--text-muted)", margin: "6px 0 0" }}>
                         {t("page.login.invite_only")}{" "}
                         <a
                           href="https://app.manorai.xyz"
@@ -534,7 +535,7 @@ export default function Login() {
                   <div style={{ marginBottom: 18 }}>
                     <label className="login-label">
                       {teamInviteToken ? t("page.login.full_name") : t("page.login.company_name")}
-                      <span style={{ fontWeight: 400, textTransform: "none", color: "#a8a29e", marginLeft: 4 }}>({t("page.login.optional")})</span>
+                      <span style={{ fontWeight: 400, textTransform: "none", color: "var(--text-muted)", marginLeft: 4 }}>({t("page.login.optional")})</span>
                     </label>
                     <div className="login-input-wrap">
                       <svg className="login-input-icon" viewBox="0 0 20 20" fill="currentColor">
@@ -610,9 +611,7 @@ export default function Login() {
               >
                 {loading ? (
                   <span style={{ display: "flex", alignItems: "center", gap: 8, opacity: 0.8 }}>
-                    <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none">
-                      <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeDasharray="31.4 31.4" strokeLinecap="round" />
-                    </svg>
+                    <LoadingSpinner size={16} />
                     {t("page.login.please_wait")}
                   </span>
                 ) : (
@@ -629,7 +628,7 @@ export default function Login() {
               {/* Divider */}
               <div style={{ display: "flex", alignItems: "center", gap: 12, margin: "24px 0" }}>
                 <div style={{ flex: 1, height: 1, background: "rgba(214,211,209,0.5)" }} />
-                <span style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase", color: "#a8a29e", letterSpacing: "0.05em" }}>
+                <span style={{ fontSize: 10, fontWeight: 700, color: "var(--text-muted)", }}>
                   {t("page.login.or_continue_with")}
                 </span>
                 <div style={{ flex: 1, height: 1, background: "rgba(214,211,209,0.5)" }} />

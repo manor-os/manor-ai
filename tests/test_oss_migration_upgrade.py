@@ -456,6 +456,19 @@ def test_published_oss_database_with_legacy_data_upgrades_to_current_schema(
             assert "last_assessment" in {
                 column["name"] for column in inspector.get_columns("workspace_stats")
             }
+            assert {"operation_id", "media_job_id", "task_id"} <= {
+                column["name"] for column in inspector.get_columns("token_usage_logs")
+            }
+            assert {"ix_token_usage_operation", "ix_token_usage_media_job", "ix_token_usage_task"} <= {
+                index["name"] for index in inspector.get_indexes("token_usage_logs")
+            }
+            assert "ix_workflow_runs_parent_run_id" in {
+                index["name"] for index in inspector.get_indexes("workflow_runs")
+            }
+            # 20261104_20: content-free failure codes on the daily health rows.
+            assert "error_codes" in {
+                column["name"] for column in inspector.get_columns("metrics_workspace_daily")
+            }
             assert next(
                 column for column in inspector.get_columns("workspace_stat_observations")
                 if column["name"] == "value"
@@ -495,6 +508,7 @@ def test_published_oss_database_with_legacy_data_upgrades_to_current_schema(
                 "ix_document_folders_entity_owner",
                 "uq_document_folders_entity_parent_owner_name",
             } <= {index["name"] for index in inspector.get_indexes("document_folders")}
+            assert "ix_messages_open_cards" in {index["name"] for index in inspector.get_indexes("messages")}
             feedback = connection.execute(
                 sa.text("""
                 SELECT target_kind, target_id, mutation_sequence

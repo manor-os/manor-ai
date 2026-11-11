@@ -408,11 +408,11 @@ function ExecutionMapPanel({
 }) {
   return (
     <section className="workspace-goal-map-panel" style={{
-      border: "1px solid rgba(28,25,23,0.06)",
+      border: "0.5px solid rgba(29, 29, 31,0.06)",
       borderRadius: 18,
       background: "rgba(255,255,255,0.9)",
       overflow: "hidden",
-      boxShadow: "0 16px 42px rgba(28,25,23,0.06)",
+      boxShadow: "0 16px 42px rgba(29, 29, 31,0.06)",
     }}>
       <div className="workspace-goal-map-header" style={{
         display: "flex",
@@ -420,15 +420,15 @@ function ExecutionMapPanel({
         justifyContent: "space-between",
         gap: 16,
         padding: "16px 18px",
-        borderBottom: "1px solid rgba(28,25,23,0.06)",
+        borderBottom: "0.5px solid rgba(29, 29, 31,0.06)",
         background: "linear-gradient(180deg, rgba(250,250,249,0.96), rgba(255,255,255,0.96))",
         flexWrap: "wrap",
       }}>
         <div style={{ minWidth: 220, flex: "1 1 280px" }}>
-          <div className="workspace-goal-map-title" style={{ fontSize: 12, fontWeight: 850, color: "#436b65", letterSpacing: "0.08em", textTransform: "uppercase" }}>
+          <div className="workspace-goal-map-title" style={{ fontSize: 12, fontWeight: 850, color: "#436b65", }}>
             {t("component.workspace_goal_graph.execution_map")}
           </div>
-          <div className="workspace-goal-map-description" style={{ marginTop: 4, fontSize: 12.5, lineHeight: 1.5, color: "#78716c" }}>
+          <div className="workspace-goal-map-description" style={{ marginTop: 4, fontSize: 12.5, lineHeight: 1.5, color: "var(--text-muted)" }}>
             {t("component.workspace_goal_graph.execution_map_desc")}
           </div>
         </div>
@@ -460,10 +460,10 @@ function ExecutionMapPanel({
                 <Legend color="#34d399" label={t("component.status.completed")} />
                 <Legend color="#8aa9d1" label={t("component.status.running")} />
                 <Legend color="#ddbb63" label={t("component.status.waiting")} />
-                <Legend color="#e7e5e4" label={t("component.status.pending")} />
+                <Legend color="#e5e5ea" label={t("component.status.pending")} />
                 <Legend color="#d18b86" label={t("component.status.failed")} />
               </div>
-              <span className="workspace-goal-map-hint" style={{ fontSize: 10.5, color: "#a8a29e" }}>
+              <span className="workspace-goal-map-hint" style={{ fontSize: 10.5, color: "var(--text-muted)" }}>
                 {t("component.workspace_goal_graph.canvas_hint")}
               </span>
             </div>
@@ -505,16 +505,16 @@ function GraphStat({ label, value }: { label: string; value: number | string }) 
   return (
     <div className="workspace-goal-map-stat" style={{
       minWidth: 76,
-      border: "1px solid rgba(28,25,23,0.06)",
+      border: "0.5px solid rgba(29, 29, 31,0.06)",
       borderRadius: 12,
       padding: "7px 10px",
-      background: "#fff",
-      boxShadow: "0 8px 18px rgba(28,25,23,0.04)",
+      background: "var(--surface-panel)",
+      boxShadow: "0 8px 18px rgba(29, 29, 31,0.04)",
     }}>
-      <div className="workspace-goal-map-stat-label" style={{ fontSize: 9.5, fontWeight: 800, color: "#a8a29e", letterSpacing: "0.06em", textTransform: "uppercase" }}>
+      <div className="workspace-goal-map-stat-label" style={{ fontSize: 9.5, fontWeight: 800, color: "var(--text-muted)", }}>
         {label}
       </div>
-      <div className="workspace-goal-map-stat-value" style={{ marginTop: 2, fontSize: 15, fontWeight: 850, color: "#1c1917" }}>
+      <div className="workspace-goal-map-stat-value" style={{ marginTop: 2, fontSize: 15, fontWeight: 850, color: "var(--text-strong)" }}>
         {value}
       </div>
     </div>
@@ -538,11 +538,11 @@ function GoalStatusOverview({
 
   return (
     <section className="workspace-goal-overview" style={{
-      border: "1px solid rgba(28,25,23,0.06)",
+      border: "0.5px solid rgba(29, 29, 31,0.06)",
       borderRadius: 18,
       background: "rgba(255,255,255,0.86)",
       padding: isCompact ? 12 : 14,
-      boxShadow: "0 14px 36px rgba(28,25,23,0.045)",
+      boxShadow: "0 14px 36px rgba(29, 29, 31,0.045)",
     }}>
       <div style={{
         display: "flex",
@@ -551,7 +551,7 @@ function GoalStatusOverview({
         gap: 10,
         marginBottom: 10,
       }}>
-        <div className="workspace-goal-overview-title" style={{ fontSize: 11, fontWeight: 800, color: "#78716c", letterSpacing: "0.08em", textTransform: "uppercase" }}>
+        <div className="workspace-goal-overview-title" style={{ fontSize: 11, fontWeight: 800, color: "var(--text-muted)", }}>
           {t("component.workspace_goal_graph.goal_overview")} · {goals.length}
         </div>
       </div>
@@ -601,7 +601,7 @@ function GoalStatusOverview({
                 background: selected
                   ? "linear-gradient(135deg, rgba(242,246,245,0.96), rgba(255,255,255,0.98))"
                   : "#fff",
-                boxShadow: selected ? "0 12px 30px rgba(67,107,101,0.14)" : "0 8px 20px rgba(28,25,23,0.04)",
+                boxShadow: selected ? "0 12px 30px rgba(67,107,101,0.14)" : "0 8px 20px rgba(29, 29, 31,0.04)",
                 cursor: "pointer",
               }}
             >
@@ -610,7 +610,7 @@ function GoalStatusOverview({
                   minWidth: 0,
                   fontSize: 12,
                   fontWeight: 800,
-                  color: "#1c1917",
+                  color: "var(--text-strong)",
                   overflow: "hidden",
                   textOverflow: "ellipsis",
                   whiteSpace: "nowrap",
@@ -626,45 +626,44 @@ function GoalStatusOverview({
                   border: `1px solid ${tone.border}`,
                   borderRadius: 999,
                   padding: "2px 7px",
-                  textTransform: "uppercase",
                 }}>
                   {goalStatusLabel(goal)}
                 </span>
               </div>
 
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginBottom: 4 }}>
-                <span className="workspace-goal-overview-label" style={{ fontSize: 10, fontWeight: 800, color: "#57534e", textTransform: "uppercase", letterSpacing: "0.04em" }}>
+                <span className="workspace-goal-overview-label" style={{ fontSize: 10, fontWeight: 800, color: "var(--text-muted)", }}>
                   {t("component.workspace_goal_graph.progress")}
                 </span>
-                <span className="workspace-goal-overview-percent" style={{ fontSize: 10.5, fontWeight: 800, color: measured ? tone.fg : "#a8a29e" }}>
+                <span className="workspace-goal-overview-percent" style={{ fontSize: 10.5, fontWeight: 800, color: measured ? tone.fg : "#aeaeb2" }}>
                   {completionPercent}%
                 </span>
               </div>
-              <div className="workspace-goal-overview-track" style={{ height: 5, borderRadius: 999, background: "#e7e5e4", overflow: "hidden", marginBottom: 9 }}>
+              <div className="workspace-goal-overview-track" style={{ height: 5, borderRadius: 999, background: "#e5e5ea", overflow: "hidden", marginBottom: 9 }}>
                 <div style={{
                   width: `${outcomeProgress}%`,
                   height: "100%",
                   borderRadius: 999,
-                  background: measured ? tone.bar : "#d6d3d1",
+                  background: measured ? tone.bar : "#d1d1d6",
                   transition: "width 0.45s ease",
                 }} />
               </div>
-              <div className="workspace-goal-overview-outcome" style={{ fontSize: 10.5, color: "#78716c", marginBottom: 9 }}>
+              <div className="workspace-goal-overview-outcome" style={{ fontSize: 10.5, color: "var(--text-muted)", marginBottom: 9 }}>
                 {goalOutcomeLabel(goal, linkedStat)}
               </div>
 
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginBottom: 4 }}>
-                <span className="workspace-goal-overview-label" style={{ fontSize: 10, fontWeight: 800, color: "#57534e", textTransform: "uppercase", letterSpacing: "0.04em" }}>
+                <span className="workspace-goal-overview-label" style={{ fontSize: 10, fontWeight: 800, color: "var(--text-muted)", }}>
                   {t("component.workspace_goal_graph.execution")}
                 </span>
-                <span className="workspace-goal-overview-execution" style={{ fontSize: 10.5, fontWeight: 700, color: linkedTaskCount > 0 ? "#436b65" : "#a8a29e" }}>
+                <span className="workspace-goal-overview-execution" style={{ fontSize: 10.5, fontWeight: 700, color: linkedTaskCount > 0 ? "#436b65" : "#aeaeb2" }}>
                   {executionLabel}
                 </span>
               </div>
 
               {taskStatusParts.length > 0 && (
                 <div style={{ marginTop: 7, display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
-                  <span className="workspace-goal-overview-status-parts" style={{ fontSize: 10, color: "#a8a29e" }}>
+                  <span className="workspace-goal-overview-status-parts" style={{ fontSize: 10, color: "var(--text-muted)" }}>
                     {taskStatusParts.join(" · ")}
                   </span>
                 </div>
@@ -691,7 +690,7 @@ function NodeDetailPanel({
   compact?: boolean;
 }) {
   const statusColors: Record<string, string> = {
-    completed: "#44895f", running: "#5f84bd", pending: "#a8a29e",
+    completed: "#44895f", running: "#5f84bd", pending: "#aeaeb2",
     failed: "#d65f59", waiting: "#cf9b44",
   };
 
@@ -701,12 +700,12 @@ function NodeDetailPanel({
       minWidth: compact ? 0 : 300,
       flexShrink: 0,
       background: "rgba(255,255,255,0.95)", backdropFilter: "blur(12px)",
-      border: "1px solid rgba(28,25,23,0.06)", borderRadius: 16,
+      border: "0.5px solid rgba(29, 29, 31,0.06)", borderRadius: 16,
       padding: 20, overflowY: "auto", maxHeight: compact ? 360 : 480,
     }}>
       {/* Header */}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
-        <h3 className="workspace-goal-node-detail-heading" style={{ fontSize: 14, fontWeight: 800, color: "#1c1917", margin: 0 }}>
+        <h3 className="workspace-goal-node-detail-heading" style={{ fontSize: 14, fontWeight: 800, color: "var(--text-strong)", margin: 0 }}>
           {node.type === "goal"
             ? t("component.workspace_goal_graph.goal_details")
             : t("component.workspace_goal_graph.task_details")}
@@ -714,7 +713,7 @@ function NodeDetailPanel({
         <button
           onClick={onClose}
           className="workspace-goal-node-detail-close"
-          style={{ background: "none", border: "none", cursor: "pointer", color: "#a8a29e", fontSize: 18, lineHeight: 1 }}
+          style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)", fontSize: 18, lineHeight: 1 }}
         >
           x
         </button>
@@ -722,14 +721,14 @@ function NodeDetailPanel({
 
       {/* Name + Status */}
       <div style={{ marginBottom: 16 }}>
-        <div className="workspace-goal-node-detail-name" style={{ fontSize: 15, fontWeight: 700, color: "#292524", marginBottom: 6 }}>{node.name}</div>
+        <div className="workspace-goal-node-detail-name" style={{ fontSize: 15, fontWeight: 700, color: "var(--text-strong)", marginBottom: 6 }}>{node.name}</div>
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <div style={{ width: 8, height: 8, borderRadius: 4, background: statusColors[node.status] || "#a8a29e" }} />
-          <span style={{ fontSize: 12, fontWeight: 600, color: statusColors[node.status] || "#a8a29e", textTransform: "capitalize" }}>
+          <div style={{ width: 8, height: 8, borderRadius: 4, background: statusColors[node.status] || "#aeaeb2" }} />
+          <span style={{ fontSize: 12, fontWeight: 600, color: statusColors[node.status] || "#aeaeb2", textTransform: "capitalize" }}>
             {node.status}
           </span>
           {node.type && (
-            <span className="workspace-goal-node-detail-type" style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: "#f5f5f4", color: "#78716c", fontWeight: 600 }}>
+            <span className="workspace-goal-node-detail-type" style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: "var(--surface-muted)", color: "var(--text-muted)", fontWeight: 600 }}>
               {node.type}
             </span>
           )}
@@ -795,8 +794,8 @@ function NodeDetailPanel({
 function DetailField({ label, value }: { label: string; value: string }) {
   return (
     <div className="workspace-goal-node-detail-field">
-      <div className="workspace-goal-node-detail-label" style={{ fontSize: 10, fontWeight: 700, color: "#a8a29e", textTransform: "uppercase", letterSpacing: "0.05em" }}>{label}</div>
-      <div className="workspace-goal-node-detail-value" style={{ fontSize: 13, fontWeight: 600, color: "#292524", marginTop: 2 }}>{value}</div>
+      <div className="workspace-goal-node-detail-label" style={{ fontSize: 10, fontWeight: 700, color: "var(--text-muted)", }}>{label}</div>
+      <div className="workspace-goal-node-detail-value" style={{ fontSize: 13, fontWeight: 600, color: "var(--text-strong)", marginTop: 2 }}>{value}</div>
     </div>
   );
 }
@@ -805,7 +804,7 @@ function Legend({ color, label }: { color: string; label: string }) {
   return (
     <div className="workspace-goal-map-legend" style={{ display: "flex", alignItems: "center", gap: 4 }}>
       <div style={{ width: 10, height: 10, borderRadius: 3, background: color }} />
-      <span className="workspace-goal-map-legend-label" style={{ fontSize: 11, color: "#78716c" }}>{label}</span>
+      <span className="workspace-goal-map-legend-label" style={{ fontSize: 11, color: "var(--text-muted)" }}>{label}</span>
     </div>
   );
 }

@@ -22,7 +22,7 @@ const PRIORITY_CONFIG: Record<number, PriorityEntry> = {
   4: { labelKey: "component.priority.high",     color: "#d3873f", Icon: IconArrowUp },
   3: { labelKey: "component.priority.medium",   color: "#c3a63f", Icon: IconArrowRight },
   2: { labelKey: "component.priority.low",      color: "#8aa9d1", Icon: IconArrowDown },
-  1: { labelKey: "component.priority.minimal",  color: "#a8a29e", Icon: IconCircleDot },
+  1: { labelKey: "component.priority.minimal",  color: "var(--text-faint)", Icon: IconCircleDot },
 };
 
 interface PriorityPillProps {
@@ -44,8 +44,8 @@ export default function PriorityPill({ priority, size = "md" }: PriorityPillProp
     <span style={{
       display: "inline-flex", alignItems: "center", gap: 4,
       padding: pad, borderRadius: 20, fontSize: fs, fontWeight: 600,
-      color: isCritical ? cfg.color : "#57534e",
-      background: "#f5f5f4", letterSpacing: "0.01em",
+      color: isCritical ? cfg.color : "#6e6e73",
+      background: "var(--surface-muted)",
     }}>
       <Icon size={iconSize} style={{ color: cfg.color }} />
       {t(cfg.labelKey)}

@@ -25,11 +25,15 @@ from packages.core.models.base import generate_ulid
 from packages.core.models.blueprint import WorkspaceBlueprint
 from packages.core.models.task import Conversation, Message
 from packages.core.models.workspace import AgentSubscription, Workspace
+from packages.core.services.viewer_language import localized
 from packages.core.workspace_chat import service as chat_service
 
 
 SIMULATION_RUN_STATE_KEY = "simulation_run"
 SIMULATION_RUNTIME_VERSION = "1.0"
+# Stage text a person reads besides the shared text keys; resolved in the
+# language of whoever drives the run when its message is written.
+_STAGE_TEXT_KEYS = frozenset({"body", "prompt", "context_summary", "workflow_title"})
 
 
 class SimulationRuntimeError(ValueError):
@@ -195,6 +199,10 @@ def _public_state(
     resolved_experience = experience or _record(settings.get("simulation_experience"))
     stages = resolved_experience.get("stages")
     stage_count = len(stages) if isinstance(stages, list) else 0
+    decision_total = sum(
+        1 for stage in stages or []
+        if isinstance(stage, dict) and _record(stage.get("pending_action")).get("kind")
+    ) if isinstance(stages, list) else 0
     state = _record(settings.get(SIMULATION_RUN_STATE_KEY))
     next_index = max(0, min(int(state.get("next_stage_index") or 0), stage_count))
     return {
@@ -214,6 +222,7 @@ def _public_state(
         "updated_at": state.get("updated_at"),
         "completed_at": state.get("completed_at"),
         "decision_count": len(state.get("decisions") or []),
+        "decision_total": decision_total,
         "runtime_version": state.get("runtime_version") or SIMULATION_RUNTIME_VERSION,
     }
 
@@ -266,6 +275,7 @@ async def start_simulation_run(
     workspace: Workspace,
     user_id: str | None = None,
     restart: bool = False,
+    locale: str | None = None,
 ) -> dict[str, Any]:
     workspace = await _lock_workspace_settings(db, workspace)
     experience = await ensure_simulation_experience(db, workspace=workspace)
@@ -305,6 +315,7 @@ async def start_simulation_run(
         workspace=workspace,
         user_id=user_id,
         experience=experience,
+        locale=locale,
     )
 
 
@@ -314,6 +325,7 @@ async def advance_simulation_run(
     workspace: Workspace,
     user_id: str | None = None,
     experience: dict[str, Any] | None = None,
+    locale: str | None = None,
 ) -> dict[str, Any]:
     workspace = await _lock_workspace_settings(db, workspace)
     resolved_experience = experience or await ensure_simulation_experience(
@@ -348,7 +360,7 @@ async def advance_simulation_run(
         raw_stage = stages[next_index]
         if not isinstance(raw_stage, dict):
             raise SimulationRuntimeError(f"simulation stage {next_index} is invalid")
-        stage = deepcopy(raw_stage)
+        stage = localized(deepcopy(raw_stage), locale, extra_text_keys=_STAGE_TEXT_KEYS)
         stage_id = str(stage.get("id") or f"stage-{next_index + 1}")
         stage_title = str(stage.get("title") or stage_id)
         author = str(stage.get("author") or "agent")
@@ -381,7 +393,7 @@ async def advance_simulation_run(
         artifact_ids = stage.get("artifact_ids")
         if isinstance(artifact_ids, list):
             simulation_artifacts = [
-                deepcopy(artifact_by_id[artifact_id])
+                localized(deepcopy(artifact_by_id[artifact_id]), locale)
                 for artifact_id in artifact_ids
                 if artifact_id in artifact_by_id
             ]
@@ -440,6 +452,7 @@ async def resolve_simulation_action(
     choice: str,
     note: str | None = None,
     payload: dict[str, Any] | None = None,
+    locale: str | None = None,
 ) -> Message:
     workspace = await _lock_workspace_settings(db, workspace)
     action = _record(message.pending_action)
@@ -490,32 +503,8 @@ async def resolve_simulation_action(
     workspace.settings = settings
     await db.flush()
 
-    normalized = str(choice or "").strip().lower().replace("_", " ")
-    if "reject" in normalized or "revise" in normalized or normalized in {"skip", "cancel"}:
-        decision_body = (
-            f"Decision recorded: **{normalized or 'alternate path'}**. "
-            "The simulation will use the safe alternate branch and continue the Blueprint run."
-        )
-    else:
-        decision_body = (
-            f"Decision recorded: **{normalized or 'continue'}**. "
-            "The persisted simulation is continuing from the next stage."
-        )
-    await chat_service.post_message(
-        db,
-        entity_id=workspace.entity_id,
-        workspace_id=workspace.id,
-        body=decision_body,
-        message_kind="system",
-        author_kind="system",
-        meta={
-            "simulation_runtime": True,
-            "simulation_run_id": run_id,
-            "simulation_resolution_receipt": True,
-            "simulation_stage_id": action.get("simulation_stage_id"),
-        },
-    )
-    await advance_simulation_run(db, workspace=workspace, user_id=user_id)
+    # The resolved card already shows the choice; the run simply continues.
+    await advance_simulation_run(db, workspace=workspace, user_id=user_id, locale=locale)
     return resolved
 
 

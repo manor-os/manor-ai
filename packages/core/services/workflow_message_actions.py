@@ -191,7 +191,11 @@ async def _resolve_retry(
 ) -> tuple[WorkflowRun, str | None]:
     from packages.core.services import workflow_service
     from packages.core.services.conversation_messages import add_message
-    from packages.core.services.workflow_chat_projection import workflow_progress_steps
+    from packages.core.services.workflow_chat_projection import (
+        _workflow_business_state,
+        workflow_progress_steps,
+        workflow_retry_from_step_id,
+    )
 
     if choice not in {"retry", "retry_now"}:
         if choice not in {"cancel", "skip"}:
@@ -226,7 +230,9 @@ async def _resolve_retry(
             run_id=run.id,
             entity_id=user.entity_id,
             started_by=user.id,
-            from_step_id=str(pending_action.get("retry_from_step_id") or "") or None,
+            # The card's target was resolved when it was drawn, possibly by an
+            # older resolver; retry from where the run's receipts point now.
+            from_step_id=workflow_retry_from_step_id(run, _workflow_business_state(run)[1]) or None,
             variables=variables,
             definition="current",
         )
@@ -251,6 +257,7 @@ async def _resolve_retry(
             "workflow_business_outcome": "in_progress",
             "workflow_attempt_number": retry.effective_attempt_number,
             "workflow_retry_of_run_id": run.id,
+            "workflow_root_run_id": str(retry.lineage_root_run_id or run.lineage_root_run_id or run.id),
             "workflow_steps": workflow_progress_steps(retry, activity_status="running"),
         },
     )
@@ -325,7 +332,17 @@ async def _resolve_wait(
         if isinstance(current_step, dict) and isinstance(current_step.get("config"), dict)
         else {"options": pending_action.get("options") or []}
     )
+    from packages.core.services.workflow_chat_approvals import (
+        _replace_projected_review,
+        _review_variable,
+        workflow_review_is_revision_choice,
+        workflow_review_matches_original,
+        workflow_review_revision_field,
+        workflow_review_revision_note,
+    )
+
     review_edited = False
+    revising = kind == PendingActionKind.WORKFLOW_APPROVAL.value and workflow_review_is_revision_choice(choice)
     submitted_review = (
         payload.get("review")
         if isinstance(payload, dict) and "review" in payload
@@ -345,18 +362,27 @@ async def _resolve_wait(
         kind == PendingActionKind.WORKFLOW_APPROVAL.value
         and submitted_review is not None
     ):
-        from packages.core.services.workflow_chat_approvals import (
-            _replace_projected_review,
-            _review_matches_original,
-            _review_variable,
-        )
-
         review_variable = _review_variable(current_config)
         if not review_variable:
             _fail(422, "This approval material is not editable")
         original_review = (run.variables or {}).get(review_variable)
-        if not _review_matches_original(original_review, submitted_review):
+        if not workflow_review_matches_original(original_review, submitted_review, current_config):
             _fail(422, "Edited approval material must keep the same packet shape")
+        if revising:
+            note = workflow_review_revision_note(current_config, submitted_review) or note
+    else:
+        review_variable = _review_variable(current_config)
+        original_review = (run.variables or {}).get(review_variable) if review_variable else None
+    review_for_decision = submitted_review if submitted_review is not None else original_review
+    if revising and workflow_review_revision_field(current_config) and not note:
+        _fail(422, "A change request is required before revising this post")
+    if kind == PendingActionKind.WORKFLOW_APPROVAL.value and choice == "approve":
+        if workflow_review_revision_note(current_config, review_for_decision):
+            _fail(422, "Submit the video change request or clear it before approving this post")
+    if (
+        kind == PendingActionKind.WORKFLOW_APPROVAL.value
+        and submitted_review is not None
+    ):
         run.variables = {
             **dict(run.variables or {}),
             review_variable: deepcopy(submitted_review),
@@ -410,6 +436,13 @@ async def _resolve_wait(
             )
         except ValueError as exc:
             _fail(422, {"message": "Invalid workflow input", "errors": {"inputs": str(exc)}})
+        from packages.core.services.workflow_project_select import input_wait_project_selection_errors
+
+        picked_errors = await input_wait_project_selection_errors(
+            db, _input_schema, input_value, entity_id=run.entity_id, workspace_id=run.workspace_id,
+        )
+        if picked_errors:
+            _fail(422, {"message": "Invalid workflow input", "errors": picked_errors})
     variables = dict(run.variables or {})
     variables[response_variable] = input_value if input_value is not None else response_value
     run.variables = variables

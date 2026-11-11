@@ -81,7 +81,9 @@ from packages.core.models.blueprint import (
     BlueprintFavorite,
     WorkspaceBlueprint,
 )
-from packages.core.blueprints.registry import set_draft_payload, set_listing_manifest
+from packages.core.blueprints.export_alignment import align_export_to_release
+from packages.core.blueprints.freshness import installed_blueprint_record
+from packages.core.blueprints.registry import installed_release_payload, set_draft_payload, set_listing_manifest
 from packages.core.models.user import User
 from packages.core.models.workspace import Workspace
 from packages.core.permissions import Permission, check_effective_user_permission
@@ -203,6 +205,10 @@ class ExportBlueprintPayloadRequest(BaseModel):
         None,
         max_length=BLUEPRINT_KNOWLEDGE_MAX_DOCUMENTS,
     )
+    # Lay the export out like the release the Workspace was installed from
+    # (its order, listing copy and unbound channel requirements), so a file
+    # kept in git changes only where the Workspace did.
+    align_to_installed_release: bool = True
     @model_validator(mode="after")
     def validate_knowledge_document_selection(self):
         if self.install_variables is not None:
@@ -664,6 +670,7 @@ class SimulationReportResponse(BaseModel):
 
 class PromoteRequest(BaseModel):
     force: bool = False
+    defer_connections: bool = False
 
 
 class PromoteResponse(BaseModel):
@@ -916,6 +923,12 @@ def _summary(
 ) -> BlueprintSummary:
     is_owner = b.entity_id == viewer_entity_id
     author = _payload_author(b.payload)
+    author_handle = b.author_handle or _string_or_none(author.get("handle"))
+    author_display_name = (
+        b.author_display_name
+        or _string_or_none(author.get("display_name"))
+        or "Manor creator"
+    )
     owner_fields: dict[str, Any] = {}
     return BlueprintSummary(
         id=b.id,
@@ -936,12 +949,8 @@ def _summary(
             tags=list(b.tags or []),
             identity=b.id,
         ),
-        author_handle=b.author_handle or _string_or_none(author.get("handle")),
-        author_display_name=(
-            b.author_display_name
-            or _string_or_none(author.get("display_name"))
-            or "Manor creator"
-        ),
+        author_handle=author_handle,
+        author_display_name=author_display_name,
         author_avatar_url=author_avatar_url,
         remixed_from_id=(
             b.remixed_from_id
@@ -1012,6 +1021,15 @@ def _user_display_name(user: User | None) -> str:
         if part and part.strip()
     )
     return user.display_name or full_name or user.email.split("@", 1)[0]
+
+
+async def _author_name_for_export(db: AsyncSession, user: User, requested: str | None) -> str:
+    """The one name a listing and its manifest carry."""
+    name = requested or _user_display_name(user)
+    # Signup defaults a name to the email's local part. That goes out to everyone
+    # who can read a listing, so an address never stands in for a name.
+    address = user.email.lower()
+    return "Manor creator" if name.strip().lower() in {address, address.split("@", 1)[0]} else name
 
 
 async def _marketplace_signals(
@@ -1176,6 +1194,18 @@ async def _summary_with_signals(
     )
 
 
+
+
+def _without_listing_author(payload: Any) -> Any:
+    """Ignore ``manifest.author``: readers outside the company get a rewritten
+    copy of it, so a file downloaded from a listing differs from the stored row
+    only there."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("manifest"), dict):
+        return payload
+    manifest = {key: value for key, value in payload["manifest"].items() if key != "author"}
+    return {**payload, "manifest": manifest}
+
+
 def _sniff_showcase_file(path: str) -> tuple[str, str, str] | None:
     with open(path, "rb") as handle:
         head = handle.read(64)
@@ -1337,7 +1367,8 @@ async def _paid_purchase_matching_payload(
     payload: dict[str, Any],
     entity_id: str,
 ) -> tuple[Any, WorkspaceBlueprint, str | None] | None:
-    """Return paid provenance for an exact owned snapshot/current release.
+    """Return paid provenance for an owned snapshot/current release, matching
+    all but ``manifest.author``: a copy read from a listing has that rewritten.
 
     This match is provenance metadata only. Cloud raw imports are plan-gated
     independently because client-supplied JSON cannot prove it was not copied
@@ -1351,10 +1382,11 @@ async def _paid_purchase_matching_payload(
     # Prefer the current published release for each Blueprint when it also
     # equals the receipt. Provenance is attached only when the payload resolves
     # to exactly one owned Blueprint identity.
+    received = _without_listing_author(payload)
     for purchase, blueprint in rows:
         if (
             blueprint.status == BlueprintStatus.PUBLISHED
-            and blueprint.payload == payload
+            and _without_listing_author(blueprint.payload) == received
         ):
             matches[blueprint.id] = (
                 purchase,
@@ -1364,7 +1396,7 @@ async def _paid_purchase_matching_payload(
     for purchase, blueprint in rows:
         if (
             blueprint.id not in matches
-            and purchase.payload_snapshot == payload
+            and _without_listing_author(purchase.payload_snapshot) == received
         ):
             matches[blueprint.id] = (
                 purchase,
@@ -1524,7 +1556,9 @@ async def _commit_and_start_installed_workspace(
                     Workspace.deleted_at.is_(None),
                 )
             )).scalar_one()
-            await start_simulation_run(db, workspace=workspace)
+            from packages.core.i18n import get_locale
+
+            await start_simulation_run(db, workspace=workspace, locale=get_locale())
             await db.commit()
             result.notes.append(
                 "Blueprint simulation started in Workspace Chat."
@@ -1543,7 +1577,23 @@ async def _commit_and_start_installed_workspace(
     # Setup can block execution while still requiring an immediate Strategist
     # input request. Its occurrence was staged with the installation transaction.
     from packages.core.models.workspace import Workspace
+    from packages.core.services.workspace_connection_status import ask_to_connect_pending_integrations
     from packages.core.services.workspace_initial_review import dispatch_initial_workspace_review
+
+    # Integrations the Blueprint needs that this account has not connected
+    # are asked about in Workspace chat, as for a Workspace created in chat.
+    try:
+        installed_workspace = await db.get(Workspace, result.workspace_id)
+        if installed_workspace is not None and await ask_to_connect_pending_integrations(
+            db, workspace=installed_workspace, user_id=requested_by,
+        ):
+            await db.commit()
+    except Exception:  # noqa: BLE001
+        await db.rollback()
+        logger.exception(
+            "workspace %s was installed but its connection questions were not posted",
+            result.workspace_id,
+        )
 
     try:
         installed_workspace = await db.get(Workspace, result.workspace_id)
@@ -1714,7 +1764,7 @@ async def _export_workspace_payload(
         install_variables=install_variables,
         file_embedder=file_embedder,
     )
-    author_display_name = req.author_display_name or _user_display_name(user)
+    author_display_name = await _author_name_for_export(db, user, req.author_display_name)
     try:
         return await export_workspace(
             db,
@@ -1873,7 +1923,16 @@ async def _export_authorized_workspace_payload(
         if req.install_variables is not None
         else None
     )
-    return await _export_workspace_payload(
+    release = (
+        await installed_release_payload(db, installed_blueprint_record(workspace.settings))
+        if req.align_to_installed_release else None
+    )
+    if release and req.title is None:
+        # The release's title, not this copy's local name, names the export.
+        released_title = str((release.get("manifest") or {}).get("title") or "").strip()
+        if released_title:
+            req = req.model_copy(update={"title": released_title[:200]})
+    payload = await _export_workspace_payload(
         db,
         workspace_id=workspace_id,
         workspace_name=workspace.name,
@@ -1882,6 +1941,15 @@ async def _export_authorized_workspace_payload(
         install_variables=install_variables,
         file_embedder=file_embedder,
     )
+    payload = align_export_to_release(payload, release)
+    from packages.core.blueprints.team_packages import is_team_package_ref, stamp_package
+
+    # A Workspace on its own package exports under that package's name, so the
+    # file is recognised as its next release in any environment.
+    package_ref = str(installed_blueprint_record(workspace.settings).get("blueprint_id") or "")
+    if is_team_package_ref(package_ref):
+        stamp_package(payload, package_ref.split(":", 2)[2])
+    return payload
 
 
 @workspace_router.post(
@@ -1891,19 +1959,23 @@ async def _export_authorized_workspace_payload(
 async def export_workspace_blueprint_package(
     workspace_id: str,
     req: ExportBlueprintPayloadRequest,
+    layout: Literal["package", "source"] = Query("package"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """The portable configuration plus the files its App and Skills point at
-    (``blueprints.package``), as one ``.manor`` file."""
+    (``blueprints.package``), as one ``.manor`` file. ``layout=source`` lays it
+    out as a source tree — one file per component, long text as .md — for a
+    git repository; every import reads either layout."""
     from fastapi.responses import Response
 
-    from packages.core.blueprints.package import FileEmbedder, PackageError, pack
+    from packages.core.blueprints.package import FileEmbedder, PackageError, pack, pack_source
 
     embedder = FileEmbedder(db, entity_id=user.entity_id, user=user, workspace_id=workspace_id)
     try:
         payload = await _export_authorized_workspace_payload(workspace_id, req, user, db, file_embedder=embedder)
-        data = pack(payload, sorted(embedder.assets.values(), key=lambda asset: asset.sha256))
+        assets = sorted(embedder.assets.values(), key=lambda asset: asset.sha256)
+        data = (pack_source if layout == "source" else pack)(payload, assets)
     except PackageError as exc:
         raise HTTPException(400, str(exc)) from exc
     slug = re.sub(r"[^a-z0-9]+", "-", str(_manifest(payload).get("title") or "blueprint").lower()).strip("-")
@@ -2077,7 +2149,7 @@ async def export_workspace_as_blueprint(
         user=user,
         install_variables=install_variables,
     )
-    author_display_name = req.author_display_name or _user_display_name(user)
+    author_display_name = await _author_name_for_export(db, user, req.author_display_name)
 
     source_blueprint = (
         (ws.settings or {}).get("_blueprint")
@@ -2939,6 +3011,11 @@ async def install_from_payload(
         selected_channel_config_ids=channel_config_ids,
         variable_values=variable_values,
     )
+    # A file that is no listing is the team's own package: record it as a
+    # release so a later file reaches this Workspace as an upgrade.
+    team_release = None
+    if matched is None and workspace_source is None:
+        team_release = await _record_team_package_release(db, payload=payload, user=user)
     try:
         result = await install_blueprint(
             db,
@@ -2947,12 +3024,13 @@ async def install_from_payload(
             mode=mode,
             workspace_name=workspace_name,
             user_id=user.id,
-            blueprint_id=matched.id if matched else None,
+            blueprint_id=matched.id if matched else team_release[0] if team_release else None,
             blueprint_slug=(matched.slug if matched else payload_slug) or None,
             blueprint_version=(
                 paid_source[2]
                 if paid_source is not None
-                else matched.content_version if matched else None
+                else matched.content_version if matched
+                else team_release[1].version if team_release else None
             ),
             create_missing_agents=create_missing_agents,
             agent_ids_by_service_key=agent_ids_by_service_key,
@@ -2968,6 +3046,8 @@ async def install_from_payload(
     except InstallError as exc:
         logger.warning("Blueprint payload install rejected invalid configuration", exc_info=True)
         raise HTTPException(400, _BLUEPRINT_CONFIGURATION_INVALID_DETAIL) from exc
+    if team_release:
+        await _mark_team_package_install(db, result.workspace_id)
     await _commit_and_start_installed_workspace(
         db,
         result=result,
@@ -2975,6 +3055,31 @@ async def install_from_payload(
         requested_by=user.id,
     )
     return _install_response(result)
+
+
+async def _record_team_package_release(db: AsyncSession, *, payload: dict[str, Any], user: User):
+    from packages.core.blueprints.registry import BlueprintVersionConflictError
+    from packages.core.blueprints.team_packages import TeamPackageError, package_scope, release_team_package
+
+    try:
+        return await release_team_package(
+            db, entity_id=user.entity_id, payload=payload,
+            scope=await package_scope(db, payload, user.entity_id), published_by=user.id,
+        )
+    except (TeamPackageError, BlueprintVersionConflictError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+async def _mark_team_package_install(db: AsyncSession, workspace_id: str) -> None:
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from packages.core.blueprints.team_packages import SOURCE_TEAM_PACKAGE
+
+    workspace = await db.get(Workspace, workspace_id)
+    record = dict((workspace.settings or {}).get("_blueprint") or {})
+    workspace.settings = {**dict(workspace.settings or {}), "_blueprint": {**record, "source": SOURCE_TEAM_PACKAGE}}
+    flag_modified(workspace, "settings")
+    await db.flush()
 
 
 class InstallPackageOptions(BaseModel):
@@ -3238,6 +3343,7 @@ async def promote(
     try:
         result = await promote_workspace(
             db, workspace_id, user_id=user.id, force=req.force,
+            defer_connections=req.defer_connections,
         )
     except PromoteError as exc:
         raise HTTPException(400, str(exc))

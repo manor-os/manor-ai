@@ -58,11 +58,17 @@ def _timestamp(value: Any) -> str:
     return value.isoformat() if hasattr(value, "isoformat") else str(value or "")
 
 
+# Bump when a kind's bytes change for the same document: hits extend the TTL, so a
+# file in regular use would otherwise keep its old rendering indefinitely.
+_RENDER_VERSIONS = {"thumbnail": 2}
+
+
 def document_hot_cache_key(document: Any, kind: str) -> str:
     """Return a content-versioned key without exposing paths in Redis."""
     identity = json.dumps(
         {
             "kind": kind,
+            "render": _RENDER_VERSIONS.get(kind, 1),
             "entity_id": str(getattr(document, "entity_id", "") or ""),
             "document_id": str(getattr(document, "id", "") or ""),
             "updated_at": _timestamp(getattr(document, "updated_at", None)),

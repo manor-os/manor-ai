@@ -43,6 +43,40 @@ async def test_create_workspace(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_workspace_list_summary_keeps_only_what_lists_read(client: AsyncClient, db_session):
+    from packages.core.models.workspace import Workspace
+
+    _, headers = await _register(client, "wssummary")
+    settings = {
+        "access_mode": "entity_visible",
+        "sandbox": True,
+        "_blueprint": {"usage_guide": "Read me"},
+    }
+    operating_model = {"app_view": {"open_as": "app", "pages": [{"id": "home"}]}, "rules": ["r"]}
+    created = await client.post(
+        "/api/v1/workspaces", headers=headers, json={"name": "Summary"},
+    )
+    workspace_id = created.json()["id"]
+    workspace = await db_session.get(Workspace, workspace_id)
+    workspace.settings = settings
+    workspace.operating_model = operating_model
+    await db_session.commit()
+
+    full = (await client.get("/api/v1/workspaces", headers=headers)).json()
+    summary = (
+        await client.get("/api/v1/workspaces", headers=headers, params={"view": "summary"})
+    ).json()
+    full_item = next(item for item in full if item["id"] == workspace_id)
+    summary_item = next(item for item in summary if item["id"] == workspace_id)
+
+    assert full_item["settings"]["_blueprint"] == {"usage_guide": "Read me"}
+    assert full_item["operating_model"] == operating_model
+    assert summary_item["settings"] == {"access_mode": "entity_visible", "sandbox": True}
+    assert summary_item["operating_model"] == {"app_view": {"open_as": "app"}}
+    assert summary_item["name"] == "Summary"
+
+
+@pytest.mark.asyncio
 async def test_create_workspace_matches_business_ledgers_and_exposes_overview(
     client: AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -315,6 +349,39 @@ async def test_generic_workspace_update_cannot_forge_blueprint_setup_contract(
     )
     assert still_ready.status_code == 200, still_ready.text
     assert still_ready.json() == ready.json()
+
+
+@pytest.mark.asyncio
+async def test_setup_status_for_a_workflow_ignores_connections_it_never_uses(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.workflow import WorkflowDefinition
+    from packages.core.models.workspace import Workspace
+
+    _, headers = await _register(client, "workflow_scoped_setup")
+    created = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Scoped setup"})
+    workspace_id = created.json()["id"]
+    workspace = await db_session.get(Workspace, workspace_id)
+    workspace.settings = {**(workspace.settings or {}), "blocking_setup": {"checks": [{
+        "key": "youtube", "kind": "integration_provider", "provider": "youtube", "blocking": True,
+    }]}}
+    start = {"id": "start", "type": "trigger", "config": {}}
+    make = WorkflowDefinition(entity_id=workspace.entity_id, workspace_id=workspace_id, name="Make a video", steps=[
+        start, {"id": "make", "type": "tool", "config": {"tool": "generate_video"}}])
+    post = WorkflowDefinition(entity_id=workspace.entity_id, workspace_id=workspace_id, name="Post it", steps=[
+        start, {"id": "post", "type": "tool", "config": {"tool": "youtube_upload_video"}}])
+    db_session.add_all([make, post])
+    await db_session.commit()
+
+    url = f"/api/v1/workspaces/{workspace_id}/setup-status"
+    whole = (await client.get(url, headers=headers)).json()
+    assert whole["ready"] is False and whole["incomplete_checks"][0]["provider"] == "youtube"
+    # Making the video never touches YouTube, so it may start; posting it waits for the connection.
+    assert (await client.get(url, headers=headers, params={"workflow_id": make.id})).json()["ready"] is True
+    assert (await client.get(url, headers=headers, params={"workflow_id": post.id})).json()["ready"] is False
+    # A Workflow that is not this Account's is no reason to start anything.
+    assert (await client.get(url, headers=headers, params={"workflow_id": "01UNKNOWN"})).json()["ready"] is False
 
 
 @pytest.mark.asyncio

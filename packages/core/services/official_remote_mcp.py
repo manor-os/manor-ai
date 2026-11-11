@@ -18,7 +18,6 @@ from packages.core.services.robinhood_oauth import ROBINHOOD_MCP_ENDPOINT
 
 
 class OfficialRemoteMCPProvider(StrEnum):
-    STRIPE = "stripe"
     PAYPAL = "paypal"
     ROBINHOOD = "robinhood"
 
@@ -262,7 +261,6 @@ _ACTION_ENUMS: Mapping[
     type[PayPalMCPAction] | type[StripeMCPAction],
 ] = {
     OfficialRemoteMCPProvider.PAYPAL: PayPalMCPAction,
-    OfficialRemoteMCPProvider.STRIPE: StripeMCPAction,
 }
 
 
@@ -335,38 +333,6 @@ _ACTION_EFFECTS: Mapping[
             PayPalMCPAction.CANCEL_SENT_INVOICE,
             PayPalMCPAction.CANCEL_SUBSCRIPTION,
         ),
-    ),
-    OfficialRemoteMCPProvider.STRIPE: _action_effects(
-        StripeMCPAction,
-        read=(
-            StripeMCPAction.GET_STRIPE_ACCOUNT_INFO,
-            StripeMCPAction.RETRIEVE_BALANCE,
-            StripeMCPAction.LIST_COUPONS,
-            StripeMCPAction.LIST_CUSTOMERS,
-            StripeMCPAction.LIST_DISPUTES,
-            StripeMCPAction.LIST_INVOICES,
-            StripeMCPAction.LIST_PAYMENT_INTENTS,
-            StripeMCPAction.LIST_PRICES,
-            StripeMCPAction.LIST_PRODUCTS,
-            StripeMCPAction.LIST_SUBSCRIPTIONS,
-            StripeMCPAction.SEARCH_STRIPE_RESOURCES,
-            StripeMCPAction.FETCH_STRIPE_RESOURCES,
-            StripeMCPAction.SEARCH_STRIPE_DOCUMENTATION,
-        ),
-        write=(
-            StripeMCPAction.CREATE_COUPON,
-            StripeMCPAction.CREATE_CUSTOMER,
-            StripeMCPAction.UPDATE_DISPUTE,
-            StripeMCPAction.CREATE_INVOICE,
-            StripeMCPAction.CREATE_INVOICE_ITEM,
-            StripeMCPAction.FINALIZE_INVOICE,
-            StripeMCPAction.CREATE_PAYMENT_LINK,
-            StripeMCPAction.CREATE_PRICE,
-            StripeMCPAction.CREATE_PRODUCT,
-            StripeMCPAction.CREATE_REFUND,
-            StripeMCPAction.UPDATE_SUBSCRIPTION,
-        ),
-        destructive=(StripeMCPAction.CANCEL_SUBSCRIPTION,),
     ),
 }
 
@@ -548,99 +514,6 @@ _PAYPAL_SCHEMAS: Mapping[PayPalMCPAction, dict[str, Any]] = {
 }
 
 
-_STRIPE_SCHEMAS: Mapping[StripeMCPAction, dict[str, Any]] = {
-    StripeMCPAction.GET_STRIPE_ACCOUNT_INFO: _object_schema(),
-    StripeMCPAction.RETRIEVE_BALANCE: _object_schema(),
-    StripeMCPAction.CREATE_COUPON: _object_schema(
-        {
-            "percent_off": _property("Percentage discount.", "number"),
-            "duration": _property("Coupon duration."),
-        },
-        ("duration",),
-    ),
-    StripeMCPAction.LIST_COUPONS: _object_schema({"limit": _property("Maximum results.", "integer")}),
-    StripeMCPAction.CREATE_CUSTOMER: _object_schema(
-        {"email": _property("Customer email."), "name": _property("Customer name.")}
-    ),
-    StripeMCPAction.LIST_CUSTOMERS: _object_schema({"email": _property("Optional email filter.")}),
-    StripeMCPAction.LIST_DISPUTES: _object_schema({"payment_intent": _property("PaymentIntent filter.")}),
-    StripeMCPAction.UPDATE_DISPUTE: _object_schema(
-        {
-            "dispute": _property("Dispute ID."),
-            "evidence": _property("Dispute evidence fields.", "object"),
-        },
-        ("dispute", "evidence"),
-    ),
-    StripeMCPAction.CREATE_INVOICE: _object_schema(
-        {"customer": _property("Customer ID."), "collection_method": _property("Collection method.")},
-        ("customer",),
-    ),
-    StripeMCPAction.CREATE_INVOICE_ITEM: _object_schema(
-        {
-            "customer": _property("Customer ID."),
-            "invoice": _property("Invoice ID."),
-            "price": _property("Price ID."),
-            "amount": _property("Amount in the smallest currency unit.", "integer"),
-            "currency": _property("Three-letter currency code."),
-        },
-        ("customer",),
-    ),
-    StripeMCPAction.FINALIZE_INVOICE: _object_schema(
-        {"invoice": _property("Invoice ID.")},
-        ("invoice",),
-    ),
-    StripeMCPAction.LIST_INVOICES: _object_schema({"customer": _property("Customer ID filter.")}),
-    StripeMCPAction.CREATE_PAYMENT_LINK: _object_schema(
-        {"line_items": _property("Price and quantity entries.", "array", items={"type": "object"})},
-        ("line_items",),
-    ),
-    StripeMCPAction.LIST_PAYMENT_INTENTS: _object_schema({"customer": _property("Customer ID filter.")}),
-    StripeMCPAction.CREATE_PRICE: _object_schema(
-        {
-            "product": _property("Product ID."),
-            "currency": _property("Three-letter currency code."),
-            "unit_amount": _property("Amount in the smallest currency unit.", "integer"),
-        },
-        ("product", "currency", "unit_amount"),
-    ),
-    StripeMCPAction.LIST_PRICES: _object_schema({"product": _property("Product ID filter.")}),
-    StripeMCPAction.CREATE_PRODUCT: _object_schema(
-        {"name": _property("Product name.")},
-        ("name",),
-    ),
-    StripeMCPAction.LIST_PRODUCTS: _object_schema({"active": _property("Filter by active status.", "boolean")}),
-    StripeMCPAction.SEARCH_STRIPE_DOCUMENTATION: _object_schema(
-        {"question": _property("Question to search in Stripe documentation.")}, ("question",)
-    ),
-    StripeMCPAction.CREATE_REFUND: _object_schema(
-        {
-            "payment_intent": _property("PaymentIntent ID."),
-            "charge": _property("Charge ID."),
-            "amount": _property("Partial amount; omit for a full refund.", "integer"),
-            "reason": _property("Refund reason."),
-        }
-    ),
-    StripeMCPAction.CANCEL_SUBSCRIPTION: _object_schema(
-        {"subscription": _property("Subscription ID.")},
-        ("subscription",),
-    ),
-    StripeMCPAction.LIST_SUBSCRIPTIONS: _object_schema({"customer": _property("Customer ID filter.")}),
-    StripeMCPAction.UPDATE_SUBSCRIPTION: _object_schema(
-        {
-            "subscription": _property("Subscription ID."),
-            "items": _property("Replacement subscription items.", "array", items={"type": "object"}),
-        },
-        ("subscription",),
-    ),
-    StripeMCPAction.SEARCH_STRIPE_RESOURCES: _object_schema(
-        {"query": _property("Stripe resource search query.")},
-        ("query",),
-    ),
-    StripeMCPAction.FETCH_STRIPE_RESOURCES: _object_schema(
-        {"id": _property("Stripe resource identifier or URI.")},
-        ("id",),
-    ),
-}
 
 
 _FALLBACK_SCHEMAS: Mapping[
@@ -648,7 +521,6 @@ _FALLBACK_SCHEMAS: Mapping[
     Mapping[StrEnum, dict[str, Any]],
 ] = {
     OfficialRemoteMCPProvider.PAYPAL: _PAYPAL_SCHEMAS,
-    OfficialRemoteMCPProvider.STRIPE: _STRIPE_SCHEMAS,
 }
 
 
@@ -726,7 +598,7 @@ class OfficialRemoteMCPFactory:
         paypal_environment: str | None = None,
     ) -> OfficialRemoteMCPDefinition:
         resolved_provider = OfficialRemoteMCPProvider(provider)
-        if resolved_provider is OfficialRemoteMCPProvider.STRIPE:
+        if resolved_provider == "stripe":
             endpoint = "https://mcp.stripe.com"
         elif resolved_provider is OfficialRemoteMCPProvider.ROBINHOOD:
             # No guessed schemas for financial tools. Until this user's

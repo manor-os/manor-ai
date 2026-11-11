@@ -605,8 +605,13 @@ async def run_review(
         ]
 
     # The last review still has unaccepted proposals. What happens next is
-    # decided by the trigger KIND, never by the trigger text.
-    if ctx.open_proposed_tasks or ctx.open_proposed_items:
+    # decided by the trigger KIND, never by the trigger text — and, for an
+    # autonomous review, by how long the cohort has gone undecided: an
+    # unanswered card must not stop the decision layer for good.
+    revise_stale_cohort = False
+    if (ctx.open_proposed_tasks or ctx.open_proposed_items) and trigger.kind.suppressible:
+        revise_stale_cohort = await _stale_cohort_action(db, workspace, ctx)
+    if (ctx.open_proposed_tasks or ctx.open_proposed_items) and not revise_stale_cohort:
         conflict = open_proposal_conflict(
             ctx.open_proposed_tasks,
             open_items=ctx.open_proposed_items,
@@ -701,6 +706,7 @@ async def run_review(
     _enforce_allowlists(proposal, ctx.allowed_service_keys)
     _enforce_proposal_shape(proposal, ctx)
     await _suppress_active_workflow_run_proposals(db, workspace, proposal)
+    await _suppress_tasks_on_active_run_projects(db, workspace, proposal)
 
     # A heartbeat is a liveness hint; this row lock is the fencing boundary.
     # Keep it through Proposal/Task/governance persistence so an expired owner
@@ -797,6 +803,31 @@ async def run_review(
                 "reason": ReviewSkipReason.ACTIVE_WORK_BATCH,
                 **active_batch,
             }
+
+    # Revise mode: a fresh cohort replaces the undecided one; nothing new
+    # leaves the open cohort (and its card) as it was.
+    if revise_stale_cohort:
+        if not _proposal_has_items(proposal):
+            await _finish_strategist_activity(
+                workspace,
+                message_id=activity_message_id,
+                state="skipped",
+            )
+            return {
+                "workspace_id": workspace_id,
+                "skipped": True,
+                "reason": ReviewSkipReason.OPEN_PROPOSALS,
+                "stale_cohort_kept": True,
+            }
+        await close_open_proposals(
+            db,
+            entity_id=workspace.entity_id,
+            open_tasks=ctx.open_proposed_tasks,
+            open_items=ctx.open_proposed_items,
+            reason=STALE_REVISE_REASON,
+            reason_code=SUPERSEDE_REASON_CODE,
+            actor_kind="system",
+        )
 
     automation_origin: dict[str, str] | None = None
     if isinstance(automation_context, dict):
@@ -1270,6 +1301,9 @@ async def _execute_human_request_items(
             "question": proposed_request.question,
             "role_required": proposed_request.role_required,
             "expected_by": expected_by.isoformat() if expected_by else None,
+            "options": list(proposed_request.options),
+            "recommended": proposed_request.recommended,
+            "recommendation_reason": proposed_request.recommendation_reason,
         })
     await db.flush()
     return digests
@@ -2206,32 +2240,119 @@ async def supersede_open_proposals(
     audited — but that code is excluded from the learning loop, because
     "something newer arrived" is not a judgement about the proposal.
     """
-    open_tasks = await list_open_proposals(db, workspace_id)
-    by_review: dict[str, list[str]] = {}
+    from packages.core.strategist.context import _open_proposed_items
+
+    return await close_open_proposals(
+        db,
+        entity_id=entity_id,
+        open_tasks=await list_open_proposals(db, workspace_id),
+        open_items=await _open_proposed_items(db, workspace_id),
+        reason=SUPERSEDE_REASON,
+        reason_code=SUPERSEDE_REASON_CODE,
+        actor_kind="user",
+        actor_id=actor_id,
+    )
+
+
+EXPIRE_REASON_CODE = "EXPIRED"
+EXPIRE_REASON = "Expired: nobody decided on this proposal in time."
+STALE_REVISE_REASON = (
+    "Superseded: the proposal went undecided, so a later review replaced it."
+)
+# An undecided cohort blocks autonomous reviews only this long; after it a
+# scheduled review may run once per window and replace it.
+STALE_COHORT_REVISE_AFTER = timedelta(hours=72)
+
+
+async def close_open_proposals(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    open_tasks: list[Task],
+    open_items: list[dict] | None,
+    reason: str,
+    reason_code: str,
+    actor_kind: str,
+    actor_id: Optional[str] = None,
+) -> dict:
+    """Reject every open cohort (its tasks and non-task items) with one reason."""
+    review_ids: set[str] = set()
     for task in open_tasks:
         details = task.details if isinstance(task.details, dict) else {}
-        review_id = details.get("strategist_review_id")
-        if not review_id:
-            continue
-        by_review.setdefault(str(review_id), []).append(task.id)
+        if details.get("strategist_review_id"):
+            review_ids.add(str(details["strategist_review_id"]))
+    for item in open_items or []:
+        if item.get("review_id"):
+            review_ids.add(str(item["review_id"]))
 
     rejected: list[str] = []
-    for review_id, task_ids in by_review.items():
+    for review_id in sorted(review_ids):
         rejected.extend(await reject_proposal(
             db,
             entity_id=entity_id,
             review_id=review_id,
-            only_task_ids=task_ids,
-            reason=SUPERSEDE_REASON,
-            reason_code=SUPERSEDE_REASON_CODE,
-            actor_kind="user",
+            reason=reason,
+            reason_code=reason_code,
+            actor_kind=actor_kind,
             actor_id=actor_id,
         ))
+    if review_ids and actor_kind == "system":
+        await _close_proposal_cards(
+            db, entity_id=entity_id, review_ids=review_ids, reason_code=reason_code,
+        )
     return {
         "rejected_task_ids": rejected,
-        "review_ids": sorted(by_review),
-        "reason_code": SUPERSEDE_REASON_CODE,
+        "review_ids": sorted(review_ids),
+        "reason_code": reason_code,
     }
+
+
+async def _close_proposal_cards(
+    db: AsyncSession, *, entity_id: str, review_ids: set[str], reason_code: str,
+) -> None:
+    """Close the decision cards of cohorts the system closed.
+
+    Uses the card resolution the chat already shows for an unanswered card
+    (``expired``), so no client change is needed; the reason says why.
+    """
+    from packages.core.workspace_chat.service import resolve_pending_action
+
+    messages = list((await db.execute(
+        select(Message)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .where(
+            Conversation.entity_id == entity_id,
+            Message.resolved_at.is_(None),
+            Message.pending_action["kind"].as_string() == PendingActionKind.APPROVE_PROPOSALS.value,
+            Message.pending_action["review_id"].as_string().in_(sorted(review_ids)),
+        )
+    )).scalars().all())
+    for msg in messages:
+        await resolve_pending_action(
+            db,
+            message_id=msg.id,
+            user_id=None,
+            resolution={"choice": "expired", "reason": reason_code.lower()},
+        )
+
+
+def open_cohort_opened_at(open_tasks: list[Task], open_items: list[dict] | None) -> datetime | None:
+    """When the oldest still-open proposal was made."""
+    stamps = [task.created_at for task in open_tasks if task.created_at] + [
+        item["created_at"] for item in open_items or [] if item.get("created_at")
+    ]
+    if not stamps:
+        return None
+    oldest = min(stamps)
+    return oldest if oldest.tzinfo else oldest.replace(tzinfo=timezone.utc)
+
+
+def _proposal_has_items(proposal) -> bool:
+    return any((
+        proposal.tasks, proposal.human_requests, proposal.experiments,
+        proposal.workflow_runs, proposal.automation_changes,
+        proposal.workflow_changes, proposal.goal_changes,
+    ))
 
 
 async def set_proposal_auto_approval(
@@ -2465,6 +2586,10 @@ async def _sync_proposal_cards_after_starter_cleanup(
             action["task_titles"] = [task.title for task in remaining]
             if isinstance(action.get("tasks"), list):
                 action["tasks"] = _prune_proposal_task_entries(action["tasks"], kept_ids)
+            # The combinations named the removed decisions; rebuild them.
+            for key in ("option_details", "recommendation"):
+                action.pop(key, None)
+            action.update(_proposal_combination_options(action))
             msg.pending_action = action
             msg.meta = _prune_proposal_meta(msg.meta, kept_ids)
             msg.refs = [{"type": "task", "id": task.id} for task in remaining]
@@ -3239,6 +3364,57 @@ async def _suppress_active_workflow_run_proposals(
         )
 
 
+async def _suppress_tasks_on_active_run_projects(
+    db: AsyncSession,
+    workspace: Workspace,
+    proposal: Proposal,
+) -> None:
+    """Drop Tasks that work on a project an open Flow run owns.
+
+    Local eval 2026-11-03: while the article Flow was editing, the review saw
+    its draft in the project folder and proposed its own edit Task, which saved
+    a second Word file there and asked the owner to approve that one too. The
+    run's later steps and its approval own those files; a Task naming the
+    project or its folder is the same work twice. Its dependents go with it.
+    """
+    if not proposal.tasks:
+        return
+    from packages.core.services.workflow_project_service import open_run_project_marks
+
+    owners = await open_run_project_marks(db, entity_id=workspace.entity_id, workspace_id=workspace.id)
+    if not owners:
+        return
+    dropped: dict[int, str] = {}
+    dropped_keys: set[str] = set()
+    for task in proposal.tasks:
+        text = " ".join(filter(None, (task.title, task.description, task.rationale)))
+        run_id = next((run for mark, run in owners.items() if mark in text), None)
+        if run_id:
+            dropped[id(task)] = run_id
+            if task.task_key:
+                dropped_keys.add(task.task_key)
+    while True:
+        dependents = [task for task in proposal.tasks if id(task) not in dropped
+                      and set(task.depends_on_task_keys or ()) & dropped_keys]
+        if not dependents:
+            break
+        for task in dependents:
+            dropped[id(task)] = ""
+            if task.task_key:
+                dropped_keys.add(task.task_key)
+    if not dropped:
+        return
+    titles = [task.title for task in proposal.tasks if id(task) in dropped]
+    proposal.tasks = [task for task in proposal.tasks if id(task) not in dropped]
+    runs = sorted({run for run in dropped.values() if run})
+    logger.info("Strategist: dropped %d task(s) on projects open runs own: %s", len(titles), runs)
+    proposal.notes = _append_note(
+        proposal.notes,
+        "Left to the Flow run already working on it (" + ", ".join(runs) + "), so no separate Task was "
+        "proposed for: " + "; ".join(titles[:3]) + ".",
+    )
+
+
 def _enforce_proposal_shape(proposal: Proposal, ctx) -> None:
     """Apply ``recipe.strategist.proposal_shape`` constraints to a fresh
     proposal cohort.
@@ -3472,6 +3648,54 @@ def _resolve_skip_name(name: str, ctx) -> float | int:
 # ── suppression bookkeeping ───────────────────────────────────────────
 
 _CONFLICT_SAMPLE_LIMIT = 10
+
+async def _stale_cohort_action(db: AsyncSession, workspace: Workspace, ctx) -> bool:
+    """For an autonomous review over an undecided cohort; True = run in revise mode.
+
+    Past the unanswered-authorization window (the same one that expires its
+    card) the cohort is closed as EXPIRED and the review runs normally. Past
+    STALE_COHORT_REVISE_AFTER the review runs, at most once per window, and
+    may replace the cohort. Younger cohorts keep blocking (False).
+    """
+    from packages.core.services.hitl_reminders import UNANSWERED_AUTHORIZATION_HOURS
+
+    opened_at = open_cohort_opened_at(ctx.open_proposed_tasks, ctx.open_proposed_items)
+    if opened_at is None:
+        return False
+    now = datetime.now(timezone.utc)
+    if now - opened_at >= timedelta(hours=UNANSWERED_AUTHORIZATION_HOURS):
+        await close_open_proposals(
+            db,
+            entity_id=workspace.entity_id,
+            open_tasks=ctx.open_proposed_tasks,
+            open_items=ctx.open_proposed_items,
+            reason=EXPIRE_REASON,
+            reason_code=EXPIRE_REASON_CODE,
+            actor_kind="system",
+        )
+        await db.commit()
+        ctx.open_proposed_tasks = []
+        ctx.open_proposed_items = []
+        return False
+    if now - opened_at < STALE_COHORT_REVISE_AFTER:
+        return False
+    settings = dict(workspace.settings or {})
+    strategist_settings = dict(settings.get(_STRATEGIST_SETTINGS_KEY) or {})
+    last = strategist_settings.get("stale_cohort_revised_at")
+    try:
+        last_at = datetime.fromisoformat(last) if isinstance(last, str) else None
+    except ValueError:
+        last_at = None
+    if last_at is not None and now - last_at < STALE_COHORT_REVISE_AFTER:
+        return False
+    # Recorded before the model call, so an empty result still counts and a
+    # stale cohort costs at most one review per window.
+    strategist_settings["stale_cohort_revised_at"] = now.isoformat()
+    settings[_STRATEGIST_SETTINGS_KEY] = strategist_settings
+    workspace.settings = settings
+    await db.commit()
+    return True
+
 
 def open_proposal_conflict(
     open_tasks: list[Task],
@@ -4207,6 +4431,26 @@ async def _goal_target_direction(db: AsyncSession, payload: dict) -> str:
 
 # ── Chat surfacing ────────────────────────────────────────────────────
 
+def _human_request_choices(entry: dict) -> dict:
+    """A human request's answers as card options, the recommended one first."""
+    from packages.core.services.decision_recommendation import recommendation
+
+    options = [str(item) for item in entry.get("options") or [] if str(item).strip()]
+    recommended = str(entry.get("recommended") or "").strip()
+    if not recommended:
+        return {"options": options} if options else {}
+    if recommended not in options:
+        options.insert(0, recommended)
+    reason = " ".join(str(entry.get("recommendation_reason") or "").split())[:280]
+    return {
+        "options": options,
+        "recommendation": (
+            recommendation(recommended, reason=reason) if reason
+            else recommendation(recommended, reason_code="most_likely")
+        ),
+    }
+
+
 async def _post_human_request_chat(
     workspace: Workspace,
     human_requests: list[dict],
@@ -4247,6 +4491,9 @@ async def _post_human_request_chat(
                         "hitl_type": "input",
                         "commitment_id": entry.get("commitment_id"),
                         "prompt": question,
+                        # The card shows the deadline; the body above is the text-only copy.
+                        **({"expected_by": entry["expected_by"]} if entry.get("expected_by") else {}),
+                        **_human_request_choices(entry),
                     },
                 )
             await db.commit()
@@ -4386,6 +4633,50 @@ def _proposal_basis_display(pt: ProposedTask, reports: list) -> Optional[dict]:
     return {"report_domains": report_domains, "signals": signals}
 
 
+def _proposal_combination_options(action: dict) -> dict:
+    """The card's choices as whole combinations, one of them recommended.
+
+    A person decides the cohort in one tap — all of it, only the first
+    decision, or not now — instead of ticking rows. The resolve endpoint's
+    ``approve_selected`` already takes explicit task/item picks, so "only the
+    first" is that choice with its payload fixed here. The recommended
+    combination is everything; its reason is the Strategist's own rationale
+    for the first decision when it gave one.
+    """
+    from packages.core.services.decision_recommendation import recommendation
+
+    tasks = [entry for entry in action.get("tasks") or [] if isinstance(entry, dict)]
+    items = [item for item in action.get("items") or [] if isinstance(item, dict)]
+    decisions = [("task", entry.get("task_id"), entry.get("title")) for entry in tasks if entry.get("task_id")]
+    decisions += [("item", item.get("item_id"), item.get("summary")) for item in items if item.get("item_id")]
+    rationale = next((
+        " ".join(str(entry.get("rationale") or "").split())
+        for entry in tasks if str(entry.get("rationale") or "").strip()
+    ), "")
+    if rationale:
+        first_sentence = re.split(r"(?<=[.!?。！？])\s*", rationale, maxsplit=1)[0]
+        rec = recommendation("approve", reason=first_sentence[:280])
+    else:
+        rec = recommendation("approve", reason_code="proposal_all" if len(decisions) > 1 else "approve_once")
+    count = len(decisions)
+    details: dict = {
+        "approve": {"label": f"Do all {count}" if count > 1 else "Do it", "label_code": "proposal.all", "label_params": {"count": count}},
+        "reject": {"label": "Not now", "label_code": "proposal.none"},
+    }
+    if count < 2:
+        return {"options": ["approve", "reject"], "option_details": details, "recommendation": rec}
+    kind, first_id, first_title = decisions[0]
+    details["approve_selected"] = {
+        "label": f"Only the first: {first_title}" if first_title else "Only the first",
+        "label_code": "proposal.first", "label_params": {"title": str(first_title or "")},
+        "payload": {
+            "selected_task_ids": [first_id] if kind == "task" else [],
+            "selected_item_ids": [first_id] if kind == "item" else [],
+        },
+    }
+    return {"options": ["approve", "approve_selected", "reject"], "option_details": details, "recommendation": rec}
+
+
 def _proposal_task_entries(
     proposal: Proposal,
     task_ids: list[str],
@@ -4487,7 +4778,7 @@ async def _notify_proposal_users(
         from packages.core.database import async_session
         from packages.core.models.user import User
         from packages.core.permissions import resolve_effective_user_role_name
-        from packages.core.services.notification_service import create_notification
+        from packages.core.services.notify import notify
         from packages.core.services.workspace_access import (
             user_can_read_workspace_by_identity,
         )
@@ -4557,12 +4848,13 @@ async def _notify_proposal_users(
                     role=role,
                 ):
                     continue
-                await create_notification(
-                    notification_db,
+                # Routed like every catalogued kind, so the person's own
+                # setting for "Strategist proposal" applies (default: bell).
+                await notify(
                     workspace.entity_id,
                     user.id,
-                    type="proposal",
-                    title=notif_title,
+                    "proposal",
+                    notif_title,
                     body=notif_body,
                     link=f"/workspaces/{workspace.id}?tab=chat",
                     workspace_id=workspace.id,
@@ -4579,7 +4871,6 @@ async def _notify_proposal_users(
                         "task_count": task_count,
                     },
                 )
-            await notification_db.commit()
     except Exception:  # noqa: BLE001 — notification is not the Proposal receipt
         logger.debug(
             "Strategist: notification creation failed (non-blocking)",
@@ -4712,6 +5003,8 @@ async def _post_proposal_chat(
         pending_action["task_ids"] = []
         pending_action["task_titles"] = []
         pending_action["tasks"] = []
+    if pending_action is not None:
+        pending_action.update(_proposal_combination_options(pending_action))
 
     if pending_action is not None:
         approval = {

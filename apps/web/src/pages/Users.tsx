@@ -124,9 +124,9 @@ export default function Users() {
 
   if (isLoading) {
     return (
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", gap: 12, color: "#a8a29e" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", gap: 12, color: "var(--text-muted)" }}>
         <LoadingSpinner size={20} />
-        <span style={{ fontSize: 14 }}>{t("page.users.loading")}</span>
+        <span className="sr-only">{t("page.users.loading")}</span>
       </div>
     );
   }
@@ -240,7 +240,7 @@ export default function Users() {
                       <td>
                         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
                           <UserAvatar name={u.display_name || u.email || "U"} size={36} />
-                          <span style={{ fontSize: 14, fontWeight: 600, color: "#292524" }}>
+                          <span style={{ fontSize: 14, fontWeight: 600, color: "var(--text-strong)" }}>
                             {u.display_name || u.email}
                           </span>
                         </div>
@@ -257,9 +257,9 @@ export default function Users() {
                               borderRadius: 8,
                               fontSize: 12,
                               fontWeight: 500,
-                              color: "#57534e",
-                              background: "#fafaf9",
-                              border: "1px solid rgba(28,25,23,0.06)",
+                              color: "var(--text-muted)",
+                              background: "var(--surface-muted)",
+                              border: "0.5px solid rgba(29, 29, 31,0.06)",
                               cursor: "pointer",
                               outline: "none",
                               transition: "border-color 0.15s",
@@ -308,7 +308,7 @@ export default function Users() {
         ) : (
           <EmptyState
             icon={
-              <svg style={{ width: 32, height: 32, color: "#d6d3d1" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+              <svg style={{ width: 32, height: 32, color: "var(--text-faint)" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M15 19.128a9.38 9.38 0 002.625.372 9.337 9.337 0 004.121-.952 4.125 4.125 0 00-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 018.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0111.964-3.07M12 6.375a3.375 3.375 0 11-6.75 0 3.375 3.375 0 016.75 0zm8.25 2.25a2.625 2.625 0 11-5.25 0 2.625 2.625 0 015.25 0z" />
               </svg>
             }

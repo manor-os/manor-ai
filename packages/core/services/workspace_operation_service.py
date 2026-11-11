@@ -10,6 +10,7 @@ import copy
 import difflib
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -22,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.ai.runtime.capability_bindings import (
     apply_runtime_binding_owner_scope_default,
     normalize_runtime_capability_binding,
+    runtime_binding_service_key,
     runtime_capability_binding_identity,
     validate_runtime_capability_binding,
 )
@@ -50,10 +52,13 @@ from packages.core.services.reusable_resource_locks import (
 from packages.core.services.provider_keys import canonical_provider_key
 from packages.core.services.workspace_app_view import _ACTION_KEY
 from packages.core.services.workspace_operation_validation import (
+    INTEGRATION_PENDING_CONNECTION,
     partition_new_validation_errors,
     validate_operation_channel_references,
     validate_operation_domain_values,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class OperationConflictError(ValueError):
@@ -844,6 +849,35 @@ def _validated_integration_scope(raw: Any) -> dict[str, Any]:
     return scope
 
 
+def _keep_live_mappings_for_echoed_designs(live_rows: Any, incoming_rows: Any) -> list[Any]:
+    """A whole-model write keeps a deployed service's live Agent.
+
+    Clients that save the whole operating model echo whatever ``agent_mappings``
+    they read, which can still be the creation draft's ``create_custom`` design
+    for a service that is already deployed. That design names no Agent, so it is
+    not a request to redeploy the service; re-provisioning would rewire it to a
+    new Agent and strand the Tasks running on the old one. Choosing another
+    Agent stays the explicit ``agent_mapping.upsert`` operation.
+    """
+    live = {
+        str(row.get("service_key") or "").strip(): row
+        for row in _as_list(live_rows)
+        if isinstance(row, dict) and row.get("agent_id") and str(row.get("service_key") or "").strip()
+    }
+    kept: list[Any] = []
+    for row in _as_list(incoming_rows):
+        key = str(row.get("service_key") or "").strip() if isinstance(row, dict) else ""
+        if (
+            key in live
+            and row.get("strategy") == "create_custom"
+            and not (row.get("agent_id") or row.get("recommended_agent_id"))
+        ):
+            kept.append(_copy_json(live[key]))
+        else:
+            kept.append(row)
+    return kept
+
+
 @_patch_op(
     "operating_model.replace",
     "workspace_model.replace",
@@ -856,6 +890,10 @@ def _op_operating_model_replace(state, payload, raw_patch):
     if not isinstance(raw_model, dict):
         raise ValueError("operating_model must be an object")
     om = _as_dict(raw_model)
+    if "agent_mappings" in om:
+        om["agent_mappings"] = _keep_live_mappings_for_echoed_designs(
+            state.get("agent_mappings"), om["agent_mappings"],
+        )
     if "integration_scope" in om:
         om["integration_scope"] = _validated_integration_scope(om["integration_scope"])
     state["operating_model"] = om
@@ -881,6 +919,10 @@ def _op_operating_model_update(state, payload, raw_patch):
     if not isinstance(raw_model, dict):
         raise ValueError("operating_model must be an object")
     om_update = _as_dict(raw_model)
+    if "agent_mappings" in om_update:
+        om_update["agent_mappings"] = _keep_live_mappings_for_echoed_designs(
+            state.get("agent_mappings"), om_update["agent_mappings"],
+        )
     if "integration_scope" in om_update:
         om_update["integration_scope"] = _validated_integration_scope(om_update["integration_scope"])
     om = _as_dict(state.get("operating_model"))
@@ -2017,6 +2059,48 @@ def operation_review_diff(draft_data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+class OperationRebaseConflictError(OperationConflictError):
+    """Someone else changed the same settings after the draft was made."""
+
+    def __init__(self, conflicts: list[str]):
+        self.conflicts = conflicts
+        shown = ", ".join(conflicts[:8]) + (f" and {len(conflicts) - 8} more" if len(conflicts) > 8 else "")
+        super().__init__(
+            "the Workspace changed after this draft was made, and these settings were changed both "
+            f"there and in the draft: {shown}. Create a new draft from the current Workspace and "
+            "make the change again."
+        )
+
+
+def _operation_draft_can_rebase(draft: WorkspaceOperationDraft) -> bool:
+    """Whether a stale draft can be merged onto the newer Workspace.
+
+    It needs the base it started from (older drafts have none), and only
+    field-level operations: a ``*.replace`` says "this section is exactly
+    this", which merging someone else's newer change into would contradict.
+    """
+    base = getattr(draft, "base_state", None)
+    if not isinstance(base, dict) or not base:
+        return False
+    return not any(_normalise_patch(patch)[0].endswith(".replace") for patch in _as_list(draft.patches))
+
+
+def _rebase_operation_draft(draft: WorkspaceOperationDraft, live: dict[str, Any], revision: int) -> None:
+    """Lay the draft's own changes over a Workspace that moved since it was made.
+
+    Raises ``OperationRebaseConflictError`` when someone else changed a field
+    the draft also changed.
+    """
+    from packages.core.services.operation_draft_rebase import rebase_operation_state
+
+    merged, conflicts = rebase_operation_state(draft.base_state, live, _as_dict(draft.current_state))
+    if conflicts:
+        raise OperationRebaseConflictError(conflicts)
+    draft.current_state = _json_safe(_sync_operating_model_from_state(merged))
+    draft.base_state = _json_safe(live)
+    draft.base_revision = revision
+
+
 def operation_draft_review_fingerprint(
     draft: WorkspaceOperationDraft | dict[str, Any],
 ) -> str:
@@ -2114,6 +2198,9 @@ def operation_review_hitl_payload(
             ]
             if replaced:
                 reason += f" Replace Agents for services: {', '.join(replaced)}."
+    self_check = _as_dict(_as_dict(draft_data.get("validation")).get("app_self_check"))
+    if self_check.get("summary"):
+        reason += f" {self_check['summary']}"
 
     return validate_hitl_payload(
         HitlType.REVIEW.value,
@@ -2176,6 +2263,7 @@ async def create_operation_draft(
         base_revision=int(workspace.operation_revision or 0),
         status=WorkspaceOperationDraftStatus.OPEN,
         current_state=_json_safe(state),
+        base_state=_json_safe(current),
         patches=patches,
     )
     db.add(draft)
@@ -2396,6 +2484,9 @@ async def validate_operation_draft(
         "budget_impact": _budget_impact(current or {}, _as_dict(draft.current_state)),
         "checked_at": _utcnow().isoformat(),
     }
+    from packages.core.services.workspace_app_selfcheck import carry_app_self_check
+
+    carry_app_self_check(getattr(draft, "validation", None), draft.current_state, validation)
     draft.validation = _json_safe(validation)
     return draft.validation
 
@@ -2704,37 +2795,22 @@ async def _collect_operation_draft_issues(
         errors,
         prefix="skill_bindings",
     )
-    # A Workspace Chat request may grant MCP tools only through an integration
-    # already usable by this actor. Recheck at approval/apply time as well as
-    # at draft creation, since connections can be removed while a card is open.
-    def mcp_binding_provider(binding: Any) -> str:
-        if not isinstance(binding, dict):
-            return ""
-        from packages.core.services.workspace_integration_scope import integration_provider_for_tool
-
-        tool_provider = integration_provider_for_tool(
-            binding.get("tool_name") or binding.get("capability") or binding.get("capability_id")
-        )
-        if tool_provider:
-            return tool_provider
-        if binding.get("capability_type") not in {"mcp", "integration"}:
-            return ""
-        return canonical_provider_key(
-            binding.get("mcp_server_key") or binding.get("integration_key")
-            or binding.get("capability_id") or binding.get("capability")
-        )
-
+    # An integration this actor has not connected yet is a pending
+    # requirement, not a blocker: the binding (and every rule about it) is
+    # kept, and once applied the Workspace asks in its chat to connect it.
+    # Rechecked at approval/apply time, since connections change while a card
+    # is open.
     current_bindings = {
         str(row.get("binding_key") or ""): row
         for row in _as_list((current or {}).get("capability_bindings"))
         if isinstance(row, dict)
     }
     requested_integrations = {
-        mcp_binding_provider(row)
+        _binding_integration_provider(row)
         for row in _as_list(state.get("capability_bindings"))
         if isinstance(row, dict)
         and row != current_bindings.get(str(row.get("binding_key") or ""))
-        and mcp_binding_provider(row)
+        and _binding_integration_provider(row)
     }
     before_disabled = {
         canonical_provider_key(value)
@@ -2746,8 +2822,9 @@ async def _collect_operation_draft_issues(
         for value in _as_list(_as_dict(state.get("integration_scope")).get("disabled_providers"))
         if isinstance(value, str) and canonical_provider_key(value)
     }
-    # Internal Blueprint restore may intentionally reinstate a live setup
-    # requirement before the account exists. User-authored Chat changes may not.
+    # Restoring a disabled provider brings back its inherited requirements;
+    # say when that one is not connected either. Internal Blueprint restores
+    # have no person to ask.
     if user_id or draft.created_by_user_id:
         requested_integrations.update(before_disabled - after_disabled)
     if requested_integrations:
@@ -2761,10 +2838,15 @@ async def _collect_operation_draft_issues(
         )
         for provider in sorted(requested_integrations):
             if not readiness.get(provider) or not readiness[provider].ready:
-                errors.append({
+                warnings.append({
                     "path": "capability_bindings" if provider not in before_disabled else "integration_scope",
-                    "code": "integration_not_connected",
-                    "message": f"Integration {provider!r} is not an existing connection available to this user.",
+                    "code": INTEGRATION_PENDING_CONNECTION,
+                    "provider": provider,
+                    "message": (
+                        f"Integration {provider!r} is not connected yet. The change still applies; "
+                        "the Workspace then asks in its chat to connect it, and that work starts "
+                        "once it is connected. Its rules apply as written."
+                    ),
                 })
     scope_candidates = [("integration_scope", state)]
     if isinstance(state.get("operating_model"), dict):
@@ -2914,6 +2996,25 @@ async def _collaborator_reference_errors(
             db, entity_id=draft.entity_id, workspace_id=draft.workspace_id, state=state,
         )
     ]
+
+
+def _binding_integration_provider(binding: Any) -> str:
+    """The integration a capability binding needs, or "" for none."""
+    if not isinstance(binding, dict):
+        return ""
+    from packages.core.services.workspace_integration_scope import integration_provider_for_tool
+
+    tool_provider = integration_provider_for_tool(
+        binding.get("tool_name") or binding.get("capability") or binding.get("capability_id")
+    )
+    if tool_provider:
+        return tool_provider
+    if binding.get("capability_type") not in {"mcp", "integration"}:
+        return ""
+    return canonical_provider_key(
+        binding.get("mcp_server_key") or binding.get("integration_key")
+        or binding.get("capability_id") or binding.get("capability")
+    )
 
 
 def _validate_capability_bindings(
@@ -3848,6 +3949,73 @@ async def _materialize_workflow_attachments(db, workspace, attachments, *, user_
     return bindings
 
 
+#: ``flagged_integrations`` source for an integration an operation bound
+#: before it was connected. Owned here: dropped once nothing binds it.
+_OPERATION_PENDING_FLAG_SOURCE = "workspace_operation"
+
+
+async def _wait_for_pending_integrations(
+    db: AsyncSession,
+    workspace: Workspace,
+    state: dict[str, Any],
+    validation: dict[str, Any],
+    *,
+    user_id: str | None,
+) -> list[str]:
+    """Keep each integration this change needs but is not connected as a
+    pending requirement, and ask in Workspace chat to connect it.
+
+    The bindings and rules apply as written; the work waits only for the
+    connection. The flag lets connection status declare a binding that lives
+    in the operating model rather than on an Agent row. Returns the
+    integrations still waiting.
+    """
+    bound: dict[str, set[str]] = {}
+    for binding in _as_list(state.get("capability_bindings")):
+        provider = _binding_integration_provider(binding)
+        if provider and binding.get("enabled") is not False:
+            service_key = runtime_binding_service_key(binding)
+            bound.setdefault(provider, set()).update([service_key] if service_key else [])
+    settings = dict(getattr(workspace, "settings", None) or {})
+    flags = [flag for flag in _as_list(settings.get("flagged_integrations")) if isinstance(flag, dict)]
+    kept = [
+        flag for flag in flags
+        if flag.get("source") != _OPERATION_PENDING_FLAG_SOURCE
+        or canonical_provider_key(flag.get("provider")) in bound
+    ]
+    flagged = {
+        canonical_provider_key(flag.get("provider"))
+        for flag in kept if flag.get("source") == _OPERATION_PENDING_FLAG_SOURCE
+    }
+    pending = sorted({
+        canonical_provider_key(warning.get("provider"))
+        for warning in _as_list(validation.get("warnings"))
+        if isinstance(warning, dict) and warning.get("code") == INTEGRATION_PENDING_CONNECTION
+    } - {""})
+    kept.extend(
+        {
+            "provider": provider, "required": True, "source": _OPERATION_PENDING_FLAG_SOURCE,
+            "linked_service_keys": sorted(bound[provider]), "blocks_creation": False,
+        }
+        for provider in pending if provider in bound and provider not in flagged
+    )
+    if kept != flags:
+        settings["flagged_integrations"] = kept
+        workspace.settings = settings
+    if not pending:
+        return []
+    await db.flush()
+    try:
+        from packages.core.services.workspace_connection_status import ask_to_connect_pending_integrations
+
+        async with db.begin_nested():
+            await ask_to_connect_pending_integrations(db, workspace=workspace, user_id=user_id)
+    except Exception:
+        # The change is applied either way; connection status still lists it.
+        logger.exception("Failed to ask to connect pending integrations for %s", workspace.id)
+    return pending
+
+
 async def apply_operation_draft(
     db: AsyncSession,
     draft_id: str,
@@ -3883,7 +4051,15 @@ async def apply_operation_draft(
     if draft.status != WorkspaceOperationDraftStatus.OPEN:
         raise OperationConflictError(f"cannot apply {draft.status} operation draft")
     _require_allowed_patch_operations(_as_list(draft.patches), allowed_patch_operations)
-    if int(draft.base_revision or 0) != int(workspace.operation_revision or 0):
+    # The review is of the draft as it was shown, so it is checked before a
+    # rebase rewrites the draft's state around the same changes.
+    if (
+        expected_review_fingerprint is not None
+        and expected_review_fingerprint != operation_draft_review_fingerprint(draft)
+    ):
+        raise OperationConflictError("workspace operation draft changed; review the updated draft before applying")
+    stale = int(draft.base_revision or 0) != int(workspace.operation_revision or 0)
+    if stale and not _operation_draft_can_rebase(draft):
         raise OperationConflictError(
             "workspace operation draft is stale; create a new draft before applying"
         )
@@ -3892,14 +4068,20 @@ async def apply_operation_draft(
     # reuse it for validation + diff so neither path re-loads workspace,
     # budget, governance, and agent mappings independently.
     current_state = await _snapshot_workspace_state(db, workspace, lock_governance=True)
+    if stale:
+        _rebase_operation_draft(draft, current_state, int(workspace.operation_revision or 0))
+
     validation = await validate_operation_draft(db, draft, current_state=current_state, user_id=user_id)
     if validation.get("errors"):
         raise OperationValidationError(validation)
     applied_diff = await preview_operation_diff(db, draft, current_state=current_state)
-    # Governance has its own revision. Compare the reviewed effects only after
-    # reloading that live policy under its lock and recomputing the actual diff.
+    # Governance has its own revision, so a policy change since the review
+    # leaves the draft's revision current but changes what it would do. The
+    # effects recomputed against the live policy must still be the reviewed
+    # ones. (A rebased draft was already checked as reviewed, above.)
     if (
-        expected_review_fingerprint is not None
+        not stale
+        and expected_review_fingerprint is not None
         and expected_review_fingerprint != operation_draft_review_fingerprint(draft)
     ):
         raise OperationConflictError("workspace operation draft changed; review the updated draft before applying")
@@ -4074,6 +4256,9 @@ async def apply_operation_draft(
         user_id=user_id,
     )
     await db.flush()
+    pending_connections = await _wait_for_pending_integrations(
+        db, workspace, state, validation, user_id=user_id or draft.created_by_user_id,
+    )
     # Its App page and Flows read in each viewer's language (workspace_translation).
     from packages.core.services.workspace_translation import schedule_workspace_translation
 
@@ -4081,6 +4266,7 @@ async def apply_operation_draft(
     result = {
         "draft": draft_to_dict(draft),
         "workspace_revision": workspace.operation_revision,
+        "pending_connections": pending_connections,
         "pre_existing_issues": _pre_existing_issue_summary(validation),
         "tasks_created": task_result["tasks_created"],
         "goals": goal_result,
@@ -4699,7 +4885,8 @@ async def resolve_workspace_operation_review(
                     "llm_message": (
                         "[Workspace operation not applied]\n"
                         f"{exc}\n"
-                        "Tell the user this draft is stale and ask whether to create a fresh operation draft."
+                        "Tell the user which settings someone else changed in the meantime and ask whether "
+                        "to create a fresh operation draft from the current Workspace."
                     ),
                 }
             except OperationValidationError as exc:

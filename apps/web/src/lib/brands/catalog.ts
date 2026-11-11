@@ -64,6 +64,7 @@ const ALIASES: Readonly<Record<string, string>> = {
   wechatpersonal: "wechat", wechatofficial: "wechat",
   feishu: "lark",
   twitter: "x", twitterx: "x", tiktokshop: "tiktok", rednote: "xiaohongshu",
+  小红书: "xiaohongshu", 抖音: "tiktok", 微信: "wechat", 视频号: "wechat", 公众号: "wechat", 微信公众号: "wechat", 油管: "youtube", 推特: "x", 领英: "linkedin", 脸书: "facebook",
   chrome: "googlechrome", localbrowser: "googlechrome",
   claudecode: "claude", codex: "openai", codexcli: "openai",
   geminicli: "googlegemini", gemini: "googlegemini", cursorcli: "cursor",

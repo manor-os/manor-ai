@@ -236,14 +236,9 @@ async def gather_context(
     # Provider readiness is scoped to this workspace's declared provider needs;
     # entity-level integrations such as a connected LinkedIn account must not
     # make an X-only workspace propose LinkedIn work.
-    declared_provider_keys = _workspace_declared_provider_keys(workspace, goals)
-    active_provider_keys = (
-        await _active_provider_keys(db, workspace.entity_id)
-    ) - disabled_workspace_providers(workspace.operating_model)
-    if declared_provider_keys:
-        configured_integrations = sorted(declared_provider_keys & active_provider_keys)
-    else:
-        configured_integrations = sorted(active_provider_keys)
+    declared_provider_keys, active_provider_keys, configured_integrations = (
+        await _workspace_provider_scope(db, workspace, goals)
+    )
 
     knowledge_nets = await _knowledge_nets(db, workspace)
     governance_policy = await _governance_policy(db, workspace)
@@ -398,6 +393,29 @@ async def _agents_by_id(
         select(Agent).where(Agent.id.in_(ids))
     )).scalars().all())
     return {a.id: a for a in rows}
+
+
+async def _workspace_provider_scope(
+    db: AsyncSession, workspace: Workspace, goals: list[Goal],
+) -> tuple[set[str], set[str], list[str]]:
+    """(declared, active, configured) provider keys for one Workspace.
+
+    Declared providers narrow the entity's active ones; with none declared,
+    every active provider the Workspace has not disabled is in scope.
+    """
+    declared = _workspace_declared_provider_keys(workspace, goals)
+    active = (
+        await _active_provider_keys(db, workspace.entity_id)
+    ) - disabled_workspace_providers(workspace.operating_model)
+    configured = sorted(declared & active) if declared else sorted(active)
+    return declared, active, configured
+
+
+async def workspace_configured_provider_keys(
+    db: AsyncSession, workspace: Workspace, goals: list[Goal],
+) -> list[str]:
+    """The providers this Workspace actually works with (same scope as review)."""
+    return (await _workspace_provider_scope(db, workspace, goals))[2]
 
 
 async def _active_provider_keys(db: AsyncSession, entity_id: str) -> set[str]:
@@ -739,8 +757,14 @@ async def _recent_proposal_outcomes(
         "completed": [], "rejected": [], "abandoned": [], "pending": [],
         "blocked": [], "in_progress": [],
     }
+    from packages.core.proposals.constants import LEARNING_EXCLUDED_REASON_CODES
+
     for t in rows:
         details = t.details or {}
+        if details.get("rejection_reason_code") in LEARNING_EXCLUDED_REASON_CODES:
+            # Replaced by a newer review or left unanswered: no verdict on
+            # the proposal, so it is no evidence either way.
+            continue
         if t.status == TaskStatus.COMPLETED:
             buckets["completed"].append(t)
         elif t.status == TaskStatus.CANCELLED:
@@ -854,15 +878,24 @@ async def _calibration_stats(
 async def _approval_counts(
     db: AsyncSession, workspace_id: str,
 ) -> tuple[int, int]:
-    """(approved, proposed) over the last 30d."""
+    """(approved, proposed) over the last 30d.
+
+    Proposals replaced by a newer review or left to expire were never judged,
+    so they count neither way.
+    """
+    from packages.core.proposals.constants import LEARNING_EXCLUDED_REASON_CODES
+
     cutoff = datetime.now(timezone.utc) - timedelta(days=30)
-    rows = list((await db.execute(
-        select(Task.status).where(
-            Task.workspace_id == workspace_id,
-            Task.details["strategist_review_id"].astext.isnot(None),
-            Task.created_at >= cutoff,
-        )
-    )).scalars().all())
+    rows = [
+        status for status, reason_code in (await db.execute(
+            select(Task.status, Task.details["rejection_reason_code"].astext).where(
+                Task.workspace_id == workspace_id,
+                Task.details["strategist_review_id"].astext.isnot(None),
+                Task.created_at >= cutoff,
+            )
+        )).all()
+        if reason_code not in LEARNING_EXCLUDED_REASON_CODES
+    ]
     proposed = len(rows)
     approved = sum(1 for s in rows if s not in ("proposed", "cancelled"))
     return approved, proposed
@@ -968,11 +1001,15 @@ async def _gather_operating_memory(db: AsyncSession, workspace: Workspace) -> st
             workspace_name=workspace.name,
             workspace_kind=workspace.kind,
         )
-        return load_workspace_operating_memory(
+        from packages.core.memory.layers import MemoryLayerFile, org_memory_path, render_layer_file
+
+        org = render_layer_file(workspace.entity_id, MemoryLayerFile("org", org_memory_path(workspace.entity_id)))
+        workspace_memory = load_workspace_operating_memory(
             workspace.entity_id,
             workspace.id,
             max_chars=7_200,
         )
+        return "\n\n".join(part for part in ((org or {}).get("content"), workspace_memory) if part)
     except Exception:
         return ""
 

@@ -325,6 +325,7 @@ VERCEL_ROLE_MODEL_TYPES: dict[str, str] = {
 # Other product-catalog entries retain their native or OpenRouter routes.
 VERCEL_CATALOG_MEDIA_MODEL_TYPES: dict[tuple[str, str], str] = {
     ("image", "openai/gpt-image-2"): "image",
+    ("image", "openai/gpt-image-2.6-sunburst"): "image",
     ("image", "openai/gpt-5-image-mini"): "image",
     ("voice", "openai/tts-1-hd"): "speech",
     ("voice", "openai/tts-1"): "speech",

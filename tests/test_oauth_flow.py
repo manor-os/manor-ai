@@ -1893,3 +1893,50 @@ async def test_callback_rejects_bad_state(client: AsyncClient):
         follow_redirects=False,
     )
     assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_cancelled_connect_goes_back_to_the_page_that_asked_for_it(monkeypatch):
+    """Cancelling a provider's consent returns to the chat (or popup landing)
+    that started it, for every provider; without a return path the readable
+    error page stays."""
+    from unittest.mock import AsyncMock
+    from urllib.parse import parse_qs, urlsplit
+
+    import packages.core.services.oauth_flow as flow
+    from apps.api.routers import integrations as router
+    from packages.core.services.oauth_provider_config import _PROVIDER_OAUTH_META, OAuthProviderConfig
+
+    monkeypatch.setattr(flow, "_redis_client", AsyncMock(return_value=None))
+    monkeypatch.setattr(flow, "_shared_state_store_required", lambda: False)
+    monkeypatch.setattr(flow, "_pending_oauth_states", {})
+    monkeypatch.setenv("APP_URL", "https://app.example.test")
+    config = OAuthProviderConfig(
+        server_key="gmail", client_id="fixture-client", client_secret="fixture-secret",
+        authorize_url=_PROVIDER_OAUTH_META["gmail"]["authorize_url"],
+        token_url=_PROVIDER_OAUTH_META["gmail"]["token_url"], scopes="openid",
+        redirect_path="/api/v1/integrations/oauth/gmail/callback", source="env",
+    )
+    redirect = "https://app.example.test" + config.redirect_path
+
+    asked = await flow.begin_authorization(
+        config=config, user_id="owner", entity_id="entity", redirect_uri=redirect,
+        return_to="/chat?workspace=ws1",
+    )
+    response = await router.oauth_callback(
+        "gmail", code=None, state=asked.state, error="access_denied",
+        error_description=None, realm_id=None, db=None,
+    )
+    location = urlsplit(response.headers["location"])
+    assert response.status_code == 302
+    assert location.path == "/chat"
+    assert parse_qs(location.query) == {"workspace": ["ws1"], "oauth_cancelled": ["gmail"]}
+
+    plain = await flow.begin_authorization(
+        config=config, user_id="owner", entity_id="entity", redirect_uri=redirect,
+    )
+    page = await router.oauth_callback(
+        "gmail", code=None, state=plain.state, error="access_denied",
+        error_description=None, realm_id=None, db=None,
+    )
+    assert page.status_code != 302 and "location" not in page.headers

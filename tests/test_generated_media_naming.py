@@ -230,6 +230,53 @@ def test_new_workflow_archive_uses_stable_lineage_instead_of_task():
     assert first == retry == f"{base}/workflow/RUN1"
 
 
+def test_workflow_project_run_saves_into_the_project_folder():
+    """A file a WorkflowProject run saves lands where the project's folder view finds it."""
+    from packages.core.services.generated_media_naming import workspace_execution_artifact_dir
+
+    base = "Workspaces/_by_id/FOLDER1"
+    archive = workspace_execution_artifact_dir(
+        base, workflow_run_id="RUN2", workflow_lineage_root_run_id="RUN1",
+        workflow_project_root="projects/onboarding-article",
+    )
+    assert archive == f"{base}/projects/onboarding-article"
+    assert scope_workspace_artifact_path("final.docx", archive, default_subdir="artifacts") == (
+        f"{base}/projects/onboarding-article/final.docx"
+    )
+    # Only a runtime-assigned project folder counts, and only for a Workflow run.
+    assert workspace_execution_artifact_dir(
+        base, workflow_run_id="RUN1", workflow_project_root="briefs/a",
+    ) == f"{base}/workflow/RUN1"
+    assert workspace_execution_artifact_dir(
+        base, task_id="TASK1", workflow_project_root="projects/onboarding-article",
+    ) == f"{base}/tasks/TASK1"
+
+
+def test_a_project_run_keeps_a_file_it_shares_in_the_project_folder():
+    """"Make the handoff note available" (storage_scope workspace) inside a
+    WorkflowProject run still lands where the project's App and reviews look."""
+    from packages.core.ai.runtime.tool_context import RuntimeToolCallContext
+    from packages.core.ai.runtime.tool_execution import _output_scope, _runtime_project_storage_scope
+    from packages.core.services.generated_media_naming import workspace_execution_artifact_dir
+
+    arguments = {"kind": "document", "name": "handoff-note.md", "storage_scope": "workspace"}
+    in_project = RuntimeToolCallContext(
+        entity_id="ENT", workspace_id="WS", workflow_run_id="RUN1",
+        workflow_lineage_root_run_id="RUN1", workflow_project_root="projects/onboarding-article",
+    )
+    scope = _output_scope(in_project, "generate_file", _runtime_project_storage_scope(arguments, in_project))
+    assert scope.workspace_shared is False
+    assert workspace_execution_artifact_dir(
+        "Workspaces/_by_id/FOLDER1", workflow_run_id=scope.workflow_run_id,
+        workflow_project_root=scope.workflow_project_root,
+    ) == "Workspaces/_by_id/FOLDER1/projects/onboarding-article"
+    # Without a project the Workspace still shares it from its home; a named asset stays shared.
+    plain = RuntimeToolCallContext(entity_id="ENT", workspace_id="WS", workflow_run_id="RUN1")
+    assert _output_scope(plain, "generate_file", _runtime_project_storage_scope(arguments, plain)).workspace_shared
+    asset = {"kind": "image", "prompt": "logo", "storage_scope": "workspace", "params": {"workspace_asset_key": "logo"}}
+    assert _runtime_project_storage_scope(asset, in_project) == asset
+
+
 def test_unscoped_task_does_not_create_an_entity_root_task_archive():
     from packages.core.services.generated_media_naming import workspace_execution_artifact_dir
 

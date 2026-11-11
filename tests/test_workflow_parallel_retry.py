@@ -166,6 +166,48 @@ async def test_failed_then_retried_graph_never_repeats_successful_producers(monk
     assert all(calls.index(f"check_{key}") < calls.index("join") for key in ("a", "b", "c"))
 
 
+def test_retry_after_a_stop_redoes_the_work_that_came_up_short_not_the_stop():
+    from packages.core.services.workflow_retry import retry_target
+
+    steps = [
+        {"id": "start", "type": "trigger", "next": ["export"]},
+        {"id": "export", "type": "tool", "next": ["measure"]},
+        {"id": "measure", "type": "code", "next": ["usable"]},
+        {"id": "usable", "type": "condition", "true_next": ["done"], "false_next": ["blocked"]},
+        {"id": "done", "type": "end"},
+        {"id": "blocked", "type": "stop"},
+    ]
+    results = {
+        "start": {"status": "completed"},
+        "export": {"status": "completed"},
+        "measure": {"status": "completed"},
+        "usable": {"status": "completed", "condition_result": False},
+        "blocked": {"status": "failed", "error": "The export came out empty."},
+    }
+    prior = SimpleNamespace(step_results=results, current_step_id="blocked")
+    # The stop only reports the outcome; the condition and code before it would decide the same again.
+    assert retry_target(steps, prior, {}, None) == "export"
+    # A card drawn before this rule still names the stop; it does not override the work before it.
+    assert retry_target(steps, prior, {}, "blocked") == "export"
+    # An end that fails the run (production_blocked) is a terminal like a stop.
+    failing_end = [*steps[:-1], {"id": "blocked", "type": "end", "config": {"fail_when": "true"}}]
+    assert retry_target(failing_end, prior, {}, "blocked") == "export"
+    # The Retry the person is offered points at the same work, also on a run that was already retried from the stop.
+    from packages.core.services.workflow_chat_projection import workflow_retry_from_step_id
+    for retry_of, retried_from in (("", ""), ("earlier-run", "blocked")):
+        run = SimpleNamespace(status="failed", current_step_id="blocked", step_results=results,
+                              execution_snapshot={"steps": steps}, effective_retry_of_run_id=retry_of,
+                              effective_retry_from_step_id=retried_from)
+        assert workflow_retry_from_step_id(run, {}) == "export"
+    # A Flow that names its own recovery point keeps it.
+    steps[-1]["config"] = {"retry_from_step_id": "measure"}
+    assert retry_target(steps, prior, {}, None) == "measure"
+    # With no work before it, the stop is all there is to retry.
+    bare = [{"id": "start", "type": "trigger", "next": ["blocked"]}, {"id": "blocked", "type": "stop"}]
+    alone = SimpleNamespace(step_results={"start": {"status": "completed"}, "blocked": {"status": "failed"}}, current_step_id="blocked")
+    assert retry_target(bare, alone, {}, None) == "blocked"
+
+
 def test_default_retry_uses_failed_receipt_not_stale_success_pointer():
     from packages.core.services.workflow_retry import retry_target
 
@@ -176,6 +218,42 @@ def test_default_retry_uses_failed_receipt_not_stale_success_pointer():
     steps = graph()
     steps[3]["config"]["retry_from_step_id"] = "start"
     assert retry_target(steps, prior, {}, None) == "start"
+
+
+def test_default_retry_of_a_failed_error_route_resumes_at_the_failed_step_not_its_handler():
+    from packages.core.services.workflow_chat_projection import workflow_retry_from_step_id
+    from packages.core.services.workflow_retry import retry_target
+
+    # A continue_error sub-flow fails and is handled: the run takes its error route to read, then hold, which fails too.
+    steps = [
+        {"id": "start", "type": "trigger", "next": ["load"]},
+        {"id": "load", "type": "workflow_project", "next": ["make"]},
+        {"id": "make", "type": "subworkflow", "next": ["probe"],
+         "config": {"on_error": "continue_error", "error_next": ["read"]}},
+        {"id": "probe", "type": "tool", "next": ["done"]},
+        {"id": "read", "type": "workflow_project", "next": ["hold"]},
+        {"id": "hold", "type": "workflow_project", "next": ["held"]},
+        {"id": "done", "type": "end"},
+        {"id": "held", "type": "stop"},
+    ]
+    results = {
+        "start": {"status": "completed"},
+        "load": {"status": "completed"},
+        "make": {"status": "failed", "continued": True, "next_override": ["read"], "subrun_id": "child"},
+        "read": {"status": "completed"},
+        "hold": {"status": "failed", "error": "another run changed this project"},
+    }
+    prior = SimpleNamespace(step_results=results, current_step_id="hold")
+    # The retry redoes the sub-flow that failed; the handler's own conflict is only its consequence.
+    assert retry_target(steps, prior, {}, None) == "make"
+    run = SimpleNamespace(status="failed", current_step_id="hold", step_results=results,
+                          execution_snapshot={"steps": steps}, effective_retry_of_run_id="earlier-run",
+                          effective_retry_from_step_id="hold")
+    assert workflow_retry_from_step_id(run, {}) == "make"
+    # When the normal path also reaches the failing step, that step is not just the handler's consequence.
+    shared = [dict(step) for step in steps]
+    shared[2] = {**steps[2], "next": ["probe", "hold"]}
+    assert retry_target(shared, prior, {}, None) == "hold"
 
 
 def test_legacy_retry_recovers_missing_sibling_from_lineage_without_reviving_stale_downstream():
@@ -344,3 +422,46 @@ def test_retry_dag_checkpoint_does_not_execute_unrelated_unreached_ancestors():
              {"id": "target", "type": "agent", "depends_on": ["gate"]}]
     with pytest.raises(ValueError, match="checkpoint.*gate"):
         recovered_run(steps, {"root": {"status": "completed"}}, "target", explicit_checkpoint=True)
+
+
+@pytest.mark.asyncio
+async def test_retry_refuses_a_second_attempt_while_the_first_retry_runs(client, db_session):
+    from sqlalchemy import select
+
+    from test_workflows import _auth, _simple_steps
+
+    headers = await _auth(client, "retryrunningguard")
+    workflow = (await client.post(
+        "/api/v1/workflows", headers=headers,
+        json={"name": "Guarded retry", "steps": _simple_steps(["work"])},
+    )).json()
+    failed = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run", headers=headers, json={"execute": False},
+    )).json()
+    original = await db_session.get(WorkflowRun, failed["id"])
+    original.status = "failed"
+    original.current_step_id = "work"
+    original.error = "work timed out"
+    await db_session.commit()
+    original_id = original.id
+
+    first = await client.post(
+        f"/api/v1/workflows/runs/{original_id}/retry", headers=headers,
+        json={"from_step_id": "work", "execute": False},
+    )
+    assert first.status_code == 201, first.text
+    retry_id = first.json()["id"]
+
+    # Both the original run (a double click) and the running retry itself are refused.
+    for clicked in (original_id, retry_id):
+        second = await client.post(
+            f"/api/v1/workflows/runs/{clicked}/retry", headers=headers,
+            json={"from_step_id": "work", "execute": False},
+        )
+        assert second.status_code == 409, second.text
+        assert retry_id in second.json()["detail"]
+
+    attempts = (await db_session.scalars(
+        select(WorkflowRun.id).where(WorkflowRun.retry_of_run_id == original_id)
+    )).all()
+    assert attempts == [retry_id]

@@ -64,7 +64,7 @@ export default function Input({
   return (
     <div className={className}>
       {label && (
-        <label htmlFor={inputId} className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-1.5">
+        <label htmlFor={inputId} className="block text-xs font-semibold text-stone-500 mb-1.5">
           {label}
         </label>
       )}

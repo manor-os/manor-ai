@@ -1,3 +1,4 @@
+import { displayReadInterval } from "../lib/readRefreshPolicy";
 import { useEffect, useState, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
@@ -7,7 +8,6 @@ import { crmMoney } from "../lib/crmMoney";
 import { cacheCrmProfile, crmQueryOptions, invalidateCrmQueries, seedCrmClient, type CrmChange } from "../lib/crmQueries";
 import { useAuthStore } from "../stores/auth";
 import PageHeader, { PageHeaderAddButton } from "../components/ui/PageHeader";
-import PeopleNavigation from "../components/PeopleNavigation";
 import { IconArrowLeft, IconEdit, IconTrash, IconUser, IconChat, IconBriefcase, IconCalendar, IconCheckCircle, IconExternalLink } from "../components/icons";
 import IconTile from "../components/ui/IconTile";
 import StatusPill from "../components/ui/StatusPill";
@@ -34,7 +34,7 @@ const message = (e:unknown)=>e instanceof Error ? e.message : t("status.error");
 const dateTime = (value:string)=>new Date(value).toLocaleString(undefined, { timeZone: getPreferredTimeZone() });
 const money = (amount:string,currency:string)=>crmMoney([amount],currency);
 function FilterSelect({title,value,onChange,options:entries}:{title:string;value:string;onChange:(v:string)=>void;options:{value:string;label:string}[]}) {
-  return <div className="space-y-1.5"><p className="text-xs font-semibold uppercase tracking-wide text-stone-500">{title}</p><Select ariaLabel={title} value={value} onChange={onChange} options={entries} /></div>;
+  return <div className="space-y-1.5"><p className="text-xs font-semibold text-stone-500">{title}</p><Select ariaLabel={title} value={value} onChange={onChange} options={entries} /></div>;
 }
 function Pager({offset,total,onChange}:{offset:number;total:number;onChange:(n:number)=>void}) {
   return total > pageSize ? <div className="flex items-center justify-between gap-3 text-sm"><span>{offset+1}–{Math.min(offset+pageSize,total)} / {total}</span><div className="flex gap-2"><Button size="sm" variant="outline" disabled={!offset} onClick={()=>onChange(Math.max(0,offset-pageSize))}>{label("previous")}</Button><Button size="sm" variant="outline" disabled={offset+pageSize>=total} onClick={()=>onChange(offset+pageSize)}>{label("next")}</Button></div></div> : null;
@@ -66,7 +66,11 @@ export default function Clients() {
   const owners = useQuery({...crmQueryOptions(["crm-owners",identity],signal=>api.people.directory(signal))});
   const ownerOptions = (owners.data || []).map(u=>({value:u.id,label:u.display_name || u.email}));
   const ownerName = (id:string|null|undefined)=>ownerOptions.find(o=>o.value===id)?.label || label(id ? "inactive_owner" : "unassigned");
-  const overview = useQuery({...crmQueryOptions(["crm-overview",identity],signal=>api.crm.overview(signal)),refetchInterval:60000,enabled:!clientId});
+  const overview = useQuery({...crmQueryOptions(["crm-overview",identity],signal=>api.crm.overview(signal)),refetchInterval: (query) => displayReadInterval(query.state, 60000),enabled:!clientId});
+  // Anything to sum or narrow yet? Until then the page is just its empty state.
+  const crmHasRecords = !overview.data
+    || Object.values(overview.data.clients).some((count) => (count || 0) > 0)
+    || overview.data.pipeline.length > 0 || overview.data.overdue > 0 || overview.data.followups.length > 0;
   const filters = new URLSearchParams({search:appliedText.search,status,owner_id:owner||"",tag:appliedText.tag,limit:String(pageSize),offset:String(offset)});
   if(lifecycle)filters.set("lifecycle",lifecycle);
   const clients = useQuery({...crmQueryOptions(["crm-clients",identity,filters.toString()],signal=>api.crm.clients(filters.toString(),signal)),enabled:!clientId && view==="clients"});
@@ -74,11 +78,11 @@ export default function Clients() {
   const pipelineFilters = new URLSearchParams({search:appliedText.search,owner_id:owner||"",limit:String(pageSize),offset:String(offset)});if(stage)pipelineFilters.set("stage",stage);
   const pipeline = useQuery({...crmQueryOptions(["crm-pipeline",identity,pipelineFilters.toString()],signal=>api.crm.pipeline(pipelineFilters.toString(),signal)),enabled:!clientId && view==="pipeline"});
   const queueFilters = new URLSearchParams({status:queueStatus,owner_id:owner||"",overdue:String(overdue),limit:String(pageSize),offset:String(offset)});
-  const queue = useQuery({...crmQueryOptions(["crm-queue",identity,queueFilters.toString()],signal=>api.crm.queue(queueFilters.toString(),signal)),refetchInterval:60000,enabled:!clientId && view==="queue"});
+  const queue = useQuery({...crmQueryOptions(["crm-queue",identity,queueFilters.toString()],signal=>api.crm.queue(queueFilters.toString(),signal)),refetchInterval: (query) => displayReadInterval(query.state, 60000),enabled:!clientId && view==="queue"});
   const contacts = useQuery({...crmQueryOptions(["client-contacts",identity,clientId],signal=>api.clients.contacts(clientId,signal)),enabled:!!clientId && section==="contacts"});
   const activities = useQuery({...crmQueryOptions(["crm-activities",identity,clientId,offset],signal=>api.crm.activities(clientId,offset,signal)),enabled:!!clientId && section==="activities"});
   const opportunities = useQuery({...crmQueryOptions(["crm-opportunities",identity,clientId,offset],signal=>api.crm.opportunities(clientId,offset,signal)),enabled:!!clientId && section==="opportunities"});
-  const followups = useQuery({...crmQueryOptions(["crm-followups",identity,clientId,offset],signal=>api.crm.followups(clientId,offset,signal)),refetchInterval:60000,enabled:!!clientId && section==="followups"});
+  const followups = useQuery({...crmQueryOptions(["crm-followups",identity,clientId,offset],signal=>api.crm.followups(clientId,offset,signal)),refetchInterval: (query) => displayReadInterval(query.state, 60000),enabled:!!clientId && section==="followups"});
   const active = selected.data?.status==="active";
   function route(changes:Record<string,string|null>) {const next=new URLSearchParams(params);for(const [key,value] of Object.entries(changes)){if(value===null)next.delete(key);else next.set(key,value);}setParams(next);setOffset(0);setError("");}
   function openClient(id:string,s="profile"){
@@ -143,13 +147,14 @@ export default function Clients() {
   const revalidating=clientId?selected.isFetching&&!selected.isPending:listQuery.isFetching&&!listQuery.isPending;
   return <div className="h-full flex flex-col min-w-0">
     <PageHeader
-      title={t("nav.people")}
+      title={t("page.settings.tab_clients")}
       subtitle={selected.data?.name}
       breadcrumb={clientId&&<Button variant="ghost" onClick={()=>route({client:null,section:null})}>
         <span aria-hidden="true"><IconArrowLeft size={16} /></span>
         {t("page.people.back_clients")}
       </Button>}
-      tabs={<PeopleNavigation />}
+      // The list views are the page's main switch: on the title row.
+      tabs={!clientId ? <TabSwitcher ariaLabel={label("crm_views")} tabs={options(["clients","pipeline","queue"]).map(o=>({key:o.value,label:o.label}))} value={view} onChange={v=>route({view:v})} /> : undefined}
       toolbar={!clientId&&view!=="queue" ? <SmartToolbar searchValue={search} onSearchChange={setSearch} searchPlaceholder={label(view==="clients"?"search_clients_hint":"search_opportunities_hint")} className="w-full sm:w-64" /> : undefined}
       actions={<>
         {(textPending||revalidating)&&<LoadingSpinner size={16} ariaLabel={t("status.loading")} />}
@@ -161,27 +166,27 @@ export default function Clients() {
         </>}
       </>}
     />
-    <div className="mb-4 min-w-0 shrink-0">
-      {clientId
-        ? <TabSwitcher appearance="minimal" size="sm" ariaLabel={label("client_sections")} wrap tabs={sections.map(key=>({key,label:label(key)}))} value={section} onChange={v=>route({section:v})} />
-        : <TabSwitcher appearance="minimal" size="sm" ariaLabel={label("crm_views")} wrap tabs={options(["clients","pipeline","queue"]).map(o=>({key:o.value,label:o.label}))} value={view} onChange={v=>route({view:v})} />}
-    </div>
+    {/* A client's sections are a second level: quiet text tabs under the header. */}
+    {clientId && <div className="mb-4 min-w-0 shrink-0">
+      <TabSwitcher appearance="minimal" size="sm" ariaLabel={label("client_sections")} wrap tabs={sections.map(key=>({key,label:label(key)}))} value={section} onChange={v=>route({section:v})} />
+    </div>}
     <div className="flex-1 overflow-auto min-w-0 space-y-5 pb-6" aria-busy={busy||textPending||revalidating}>
       {error&&!profileOpen&&!contactOpen&&!editor&&!confirmation&&<p role="alert" className="text-sm text-red-700">{error}</p>}
       {owners.isError&&retry(owners.error,()=>void owners.refetch())}
       {!clientId ? <>
-        {overview.isPending ? <LoadingSpinner ariaLabel={t("status.loading")} /> : overview.isError ? retry(overview.error,()=>void overview.refetch()) : <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        {/* Before the first client there is nothing to sum or narrow: only the empty state shows. */}
+        {overview.isPending ? <LoadingSpinner ariaLabel={t("status.loading")} /> : overview.isError ? retry(overview.error,()=>void overview.refetch()) : crmHasRecords && <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <Card minHeight={0} title={label("active_clients")} hoverable={false}><p className="text-2xl font-semibold mt-2">{Object.values(overview.data.clients).reduce((a,b)=>a+(b||0),0)}</p><p className="text-xs text-stone-500 mt-1">{lifecycles.map(l=>`${label(l)} ${overview.data.clients[l]||0}`).join(" · ")}</p></Card>
           <Card minHeight={0} title={label("open_pipeline")} hoverable={false}><div className="mt-2 space-y-2">{Array.from(new Set(overview.data.pipeline.filter(d=>!["won","lost"].includes(d.stage)).map(d=>d.currency))).map(c=>{const entries=overview.data.pipeline.filter(d=>d.currency===c&&!["won","lost"].includes(d.stage));return <div key={c}><p className="font-semibold">{crmMoney(entries.map(d=>d.amount),c)}</p><p className="text-xs text-stone-500">{label("weighted")}: {crmMoney(entries.map(d=>d.weighted),c)}</p></div>;})}{!overview.data.pipeline.some(d=>!["won","lost"].includes(d.stage))&&<p className="text-sm text-stone-500">{label("no_opportunities")}</p>}</div></Card>
           <Card minHeight={0} title={label("overdue_followups")} hoverable={false}><p className="text-2xl font-semibold mt-2">{overview.data.overdue}</p><Button size="sm" variant="ghost" onClick={()=>{setOverdue(true);setQueueStatus("open");route({view:"queue"});}}>{label("view_followups")}</Button></Card>
         </div>}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+        {crmHasRecords && <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
           <OwnerField emptyLabel={label("all_owners")} value={owner} onChange={v=>resetFilter(()=>setOwner(v))} owners={ownerOptions} />
           {view==="clients"&&<><FilterSelect title={label("lifecycle")} value={lifecycle} onChange={v=>resetFilter(()=>setLifecycle(v))} options={[{value:"",label:label("all_lifecycles")},...options(lifecycles)]} /><FilterSelect title={label("client_status")} value={status} onChange={v=>resetFilter(()=>setStatus(v))} options={options(["active","inactive"])} /><Input label={label("tag_filter")} ariaLabel={label("tag_filter")} placeholder={label("tag_filter")} value={tag} onChange={e=>setTag(e.target.value)} /></>}
           {view==="pipeline"&&<FilterSelect title={label("stage")} value={stage} onChange={v=>resetFilter(()=>setStage(v))} options={[{value:"",label:label("all_stages")},...options(stages)]} />}
           {view==="queue"&&<><FilterSelect title={label("followup_status")} value={queueStatus} onChange={v=>resetFilter(()=>{setQueueStatus(v);if(v==="done")setOverdue(false);})} options={options(["open","done"])} /><label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={overdue} disabled={queueStatus==="done"} onChange={e=>resetFilter(()=>setOverdue(e.target.checked))} />{label("overdue_only")}</label></>}
-        </div>
-        {view==="clients"&&(clients.isPending?<LoadingSpinner ariaLabel={t("status.loading")} />:clients.isError?retry(clients.error,()=>void clients.refetch()):<><p className="text-xs text-stone-500">{label("records")}: {clients.data.total}</p>{!clients.data.items.length?<EmptyState title={label("no_clients")} description={label("empty_clients_hint")} />:<div className="space-y-2">{clients.data.items.map(c=><CompactCard key={c.id} title={c.name} subtitle={[c.email,c.metadata?.crm?.industry].filter(Boolean).join(" · ")||label("no_details")} meta={`${label(c.metadata?.crm?.lifecycle||"lead")} · ${ownerName(c.metadata?.crm?.owner_id)}`} onClick={()=>openClient(c.id)} />)}</div>}<Pager offset={offset} total={clients.data.total} onChange={setOffset} /></>)}
+        </div>}
+        {view==="clients"&&(clients.isPending?<LoadingSpinner ariaLabel={t("status.loading")} />:clients.isError?retry(clients.error,()=>void clients.refetch()):<>{clients.data.total>0&&<p className="text-xs text-stone-500">{label("records")}: {clients.data.total}</p>}{!clients.data.items.length?<EmptyState title={crmHasRecords ? label("no_clients") : t("page.clients.empty")} description={crmHasRecords ? label("empty_clients_hint") : t("page.clients.optional")} />:<div className="space-y-2">{clients.data.items.map(c=><CompactCard key={c.id} title={c.name} subtitle={[c.email,c.metadata?.crm?.industry].filter(Boolean).join(" · ")||label("no_details")} meta={`${label(c.metadata?.crm?.lifecycle||"lead")} · ${ownerName(c.metadata?.crm?.owner_id)}`} onClick={()=>openClient(c.id)} />)}</div>}<Pager offset={offset} total={clients.data.total} onChange={setOffset} /></>)}
         {view==="pipeline"&&(pipeline.isPending?<LoadingSpinner ariaLabel={t("status.loading")} />:pipeline.isError?retry(pipeline.error,()=>void pipeline.refetch()):<>{!pipeline.data.items.length?<EmptyState title={label("no_opportunities")} description={label("root_record_hint")} />:<div className="space-y-2">{pipeline.data.items.map(d=>dealRow(d))}</div>}<Pager offset={offset} total={pipeline.data.total} onChange={setOffset} /></>)}
         {view==="queue"&&<>{queue.isPending?<LoadingSpinner ariaLabel={t("status.loading")} />:queue.isError?retry(queue.error,()=>void queue.refetch()):<>{!queue.data.items.length?<EmptyState title={label("no_followups")} description={label("root_record_hint")} />:<div className="space-y-2">{queue.data.items.map(d=>taskRow(d))}</div>}<Pager offset={offset} total={queue.data.total} onChange={setOffset} /></>}</>}
       </> : selected.isPending ? <LoadingSpinner ariaLabel={t("status.loading")} /> : selected.isError ? retry(selected.error,()=>void selected.refetch()) : selected.data&&p&&<>

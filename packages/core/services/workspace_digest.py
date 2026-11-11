@@ -15,9 +15,12 @@ from typing import Any
 from sqlalchemy import Text, func, literal, select, update
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 
+from packages.core.attention import delivery as attention_delivery
 from packages.core.constants.approvals import APPROVAL_OPEN_STATUSES
+from packages.core.constants.attention import AttentionKind, AttentionState
 from packages.core.database import async_session
 from packages.core.ledger import event_types as et
+from packages.core.models.attention import AttentionItem
 from packages.core.models.document import Integration
 from packages.core.models.goal import Goal
 from packages.core.models.hitl_request import HitlRequest
@@ -257,8 +260,14 @@ async def _waiting(
     now: datetime,
     recipients: dict[RecipientKey, frozenset[str]],
     links: dict[str, str],
+    prepared: dict[str, Any],
 ) -> tuple[list[DigestItem], int, bool]:
-    """(oldest cards waiting on the person, how many more, whether that count is a lower bound)."""
+    """(oldest things waiting on the person, how many more, whether that count is a lower bound).
+
+    Open cards, and what has no card: a Workflow paused at its approval and a
+    Strategist proposal. Staging 2026-11-03: the digest named one of the four
+    things waiting because it read only the cards.
+    """
     requests = (await db.execute(
         select(HitlRequest).where(
             HitlRequest.entity_id == user.entity_id,
@@ -274,12 +283,42 @@ async def _waiting(
             recipients[key] = frozenset(await hitl_reminders.reminder_recipients(db, request))
         if str(user.id) in recipients[key]:
             mine.append(request)
+    others = (await db.execute(
+        select(AttentionItem).where(
+            AttentionItem.entity_id == user.entity_id,
+            AttentionItem.workspace_id.in_(list(names)),
+            AttentionItem.state == AttentionState.OPEN.value,
+            AttentionItem.kind.in_([AttentionKind.NEEDS_INPUT.value, AttentionKind.DECISION_PENDING.value]),
+            AttentionItem.subject_type != "hitl_request",
+            AttentionItem.opened_at < now,
+        ).order_by(AttentionItem.opened_at.asc(), AttentionItem.id.asc()).limit(WAITING_SCAN)
+    )).scalars().all()
+    waiting: list[tuple[datetime, HitlRequest | AttentionItem]] = [(request.created_at, request) for request in mine]
+    for other in others:
+        if other.id not in prepared:
+            prepared[other.id] = await attention_delivery.prepare_told(db, other, stage=other.stage, now=now)
+        told = prepared[other.id]
+        if told is not None and str(user.id) in told.recipients:
+            waiting.append((other.opened_at, other))
+    # A decision a run or proposal is held on comes first; on staging 2026-11-04, months-old
+    # open questions filled the list and pushed an article's approval out of it.
+    waiting.sort(key=lambda row: (
+        isinstance(row[1], AttentionItem) and row[1].subject_type == "human_commitment", _utc(row[0]),
+    ))
     items: list[DigestItem] = []
-    for request in mine[:WAITING_LIMIT]:
-        if request.id not in links:
-            links[request.id] = await hitl_reminders.card_link(db, request)
-        items.append(DigestItem(names[request.workspace_id], hitl_reminders.summary(request), links[request.id]))
-    return items, len(mine) - len(items), len(requests) >= WAITING_SCAN
+    for _at, row in waiting[:WAITING_LIMIT]:
+        if isinstance(row, AttentionItem):
+            items.append(DigestItem(names[row.workspace_id], row.title, prepared[row.id].link))
+            continue
+        if row.id not in links:
+            links[row.id] = await hitl_reminders.card_link(db, row)
+        items.append(DigestItem(names[row.workspace_id], hitl_reminders.summary(row), links[row.id]))
+    lower_bound = len(requests) >= WAITING_SCAN or len(others) >= WAITING_SCAN
+    return items, len(waiting) - len(items), lower_bound
+
+
+def _utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
 
 
 def _open_incident(state: Any) -> bool:
@@ -326,7 +365,7 @@ async def _accounts(
                     db, user.entity_id, now,
                 )
             owned_providers = set()
-            for _name, owners, providers in scans[user.entity_id]:
+            for _workspace_id, _name, owners, providers in scans[user.entity_id]:
                 if str(user.id) in owners:
                     owned_providers |= providers
         if canonical_provider_key(integration.provider) in owned_providers:
@@ -343,11 +382,13 @@ async def build_user_digest(
     scans: dict[str, account_incident_delivery.WorkspaceScan] | None = None,
     recipients: dict[RecipientKey, frozenset[str]] | None = None,
     links: dict[str, str] | None = None,
+    prepared: dict[str, Any] | None = None,
 ) -> Digest:
     """Build one person's digest for ``(since, now]``.
 
     ``scans`` caches each entity's Workspace owner/provider scan,
-    ``recipients`` each card's recipients by ``RecipientKey`` and ``links``
+    ``recipients`` each card's recipients by ``RecipientKey``, ``prepared``
+    each attention item's recipients and link by id, and ``links``
     each card's link by id. Pass one dict of each across the people of a run
     so each is computed once per run.
     """
@@ -358,6 +399,7 @@ async def build_user_digest(
             db, user, names, now=now,
             recipients=recipients if recipients is not None else {},
             links=links if links is not None else {},
+            prepared=prepared if prepared is not None else {},
         )
     else:
         changed = {key: [] for key in CHANGED_KEYS}
@@ -487,6 +529,7 @@ async def run_workspace_digest_sweep(*, now: datetime | None = None, batch: int 
     scans: dict[str, account_incident_delivery.WorkspaceScan] = {}
     recipients: dict[RecipientKey, frozenset[str]] = {}
     links: dict[str, str] = {}
+    prepared: dict[str, Any] = {}
     sent = 0
     after = ""
     while True:
@@ -509,7 +552,7 @@ async def run_workspace_digest_sweep(*, now: datetime | None = None, batch: int 
                         if since is None:
                             continue  # already sent today
                         digest = await build_user_digest(
-                            db, user, since=since, now=now, scans=scans, recipients=recipients, links=links,
+                            db, user, since=since, now=now, scans=scans, recipients=recipients, links=links, prepared=prepared,
                         )
                     if digest.is_empty():
                         continue

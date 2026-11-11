@@ -1227,3 +1227,40 @@ async def test_nonrecoverable_runtime_abort_still_stops_agent_loop() -> None:
     executor.assert_awaited_once()
     text_completion.assert_not_awaited()
     tool_completion.assert_not_awaited()
+
+
+def _tool_schemas_declaring_context_keys():
+    import importlib
+    import pkgutil
+
+    import packages.core.ai.tools as tools_package
+    from packages.core.ai.runtime.tool_context import RUNTIME_TOOL_CONTEXT_KEYS
+
+    found = {}
+    for module_info in pkgutil.iter_modules(tools_package.__path__):
+        module = importlib.import_module(f"packages.core.ai.tools.{module_info.name}")
+        for value in vars(module).values():
+            function = value.get("function") if isinstance(value, dict) else None
+            if not isinstance(function, dict):
+                continue
+            properties = (function.get("parameters") or {}).get("properties") or {}
+            keys = [key for key in properties if key in RUNTIME_TOOL_CONTEXT_KEYS]
+            if keys:
+                found[function["name"]] = (value, keys)
+    return found
+
+
+def test_a_tool_that_declares_a_context_key_receives_it():
+    """task_id/workspace_id are host context keys and were stripped before validation, so
+    get_task_details, update_task and others always failed as "missing task_id"."""
+    from packages.core.ai.runtime.tool_input_validation import validate_runtime_tool_arguments
+
+    declared = _tool_schemas_declaring_context_keys()
+    assert "get_task_details" in declared  # the scan sees the live failure
+    for name, (schema, keys) in declared.items():
+        required = set((schema["function"].get("parameters") or {}).get("required") or [])
+        arguments = {key: "01ABCDEFGHJKMNPQRSTVWXYZ00" for key in keys}
+        for key in required - set(arguments):
+            arguments[key] = "x"
+        failure = validate_runtime_tool_arguments(arguments=arguments, tool_schema=schema)
+        assert failure is None or failure.expected not in keys, (name, failure)

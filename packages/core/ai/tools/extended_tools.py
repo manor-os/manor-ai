@@ -7,6 +7,7 @@ Ported from manor-multi-agent's runtime/extended_tools.py.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import hashlib
 import logging
@@ -607,6 +608,23 @@ async def _resolve_primary_byok_media_credentials(
         return "", "", False
 
 
+def _unbillable_platform_model_error(model: str, role: str) -> str:
+    """Why a platform call may not run ``model``, or "" when it may.
+
+    Manor credits only pay for a model Manor can bill. The user's own key
+    (BYOK) is never gated here; callers check this for platform calls only.
+    """
+    from packages.core.constants.models import platform_model_billable
+
+    if platform_model_billable(role, model):
+        return ""
+    logger.warning("Refusing platform %s call to unpriced model %s", role, model)
+    return (
+        f"The model {model} has no Manor price, so it cannot run on Manor credits. "
+        "Choose another model, or add your own API key for it in Settings → AI Models."
+    )
+
+
 def _selectable_media_model(model: str, kind: str) -> bool:
     """Whether ``model`` is a model the Account can select for ``kind``.
 
@@ -756,6 +774,8 @@ def _media_key_provider_mismatch(api_key: str, provider: str) -> str:
 
 def _image_mime_to_ext(mime: str) -> str:
     lowered = (mime or "").lower()
+    if "gif" in lowered:
+        return ".gif"
     if "jpeg" in lowered or "jpg" in lowered:
         return ".jpg"
     if "webp" in lowered:
@@ -1468,6 +1488,23 @@ async def _deliver_image_to_sandbox(
     return outcome
 
 
+def _usage_token_count(value: Any) -> int:
+    try:
+        if isinstance(value, bool):
+            return 0
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _native_image_usage_cost_usd(usage: dict | None, model: str) -> float | None:
+    """USD for an image call's reported tokens at the model's per-kind token rates."""
+    from packages.core.services.model_pricing_gateway import image_call_cost_usd
+
+    cost, basis = image_call_cost_usd(model, usage)
+    return cost if basis == "official_tokens" else None
+
+
 async def _save_generated_image_bytes(
     *,
     entity_id: str,
@@ -1557,18 +1594,17 @@ async def _save_generated_image_bytes(
                 image_bytes=image_bytes,
             )
 
-    prompt_toks = int((usage or {}).get("prompt_tokens") or 0)
-    completion_toks = int((usage or {}).get("completion_tokens") or 0)
-    cost_usd = 0.0
-    if prompt_toks or completion_toks:
-        try:
-            from packages.core.services.billing_service import estimate_provider_cost
+    # The provider's image tokens at per-kind token rates; without tokens, the
+    # official per-image list price. Flare publishes no per-image price, so a
+    # response that omits usage is recorded unpriced rather than guessed.
+    from packages.core.services.model_pricing_gateway import image_call_cost_usd
 
-            cost_usd = float(estimate_provider_cost(prompt_toks, completion_toks, model))
-        except Exception:
-            cost_usd = 0.0
-    if cost_usd <= 0:
-        cost_usd = _estimate_image_cost(model, size=size)
+    cost_usd, image_cost_basis = image_call_cost_usd(model, usage, size=size)
+    if cost_usd is None or (model == "openai/gpt-image-2.6-flare" and image_cost_basis != "official_tokens"):
+        logger.warning("Image model %s returned no billable usage and has no list price", model)
+        cost_usd, image_cost_basis = None, "unpriced"
+    if is_byok and cost_usd is None:
+        cost_usd = 0.0
 
     await _bill_media(
         entity_id=entity_id,
@@ -1581,6 +1617,10 @@ async def _save_generated_image_bytes(
         agent_id=agent_id,
         conversation_id=conversation_id,
         byok=is_byok,
+        # Provider-reported tokens (gpt-image) for the BYOK token row.
+        prompt_tokens=_usage_token_count((usage or {}).get("prompt_tokens")),
+        completion_tokens=_usage_token_count((usage or {}).get("completion_tokens")),
+        pricing_source=image_cost_basis,
     )
 
     if group_scope is not None:
@@ -2426,10 +2466,35 @@ async def _save_generated_audio_bytes(
 ) -> str:
     """Persist generated audio and register it as a Knowledge document.
 
-    ``provider_cost_usd`` is the gateway-reported cost of this generation; it
-    replaces the catalog estimate when present (BYOK calls are never charged).
+    ``provider_cost_usd`` is the gateway-reported cost of this generation; it is
+    billed only when nothing prices the model (BYOK calls are never charged).
     """
     import base64
+
+    # The provider has billed us once it returned audio, so charge before any
+    # validation or storage that could still fail.
+    if bill_media and entity_id:
+        audio_cost, audio_basis = _generated_audio_cost_usd(
+            model,
+            purpose=purpose,
+            prompt=prompt,
+            provider_cost_usd=provider_cost_usd,
+            audio_bytes=audio_bytes,
+            audio_format=audio_format,
+        )
+        await _bill_media(
+            entity_id=entity_id,
+            user_id=user_id,
+            kind="audio",
+            model=model,
+            cost_usd=0.0 if is_byok and audio_cost is None else audio_cost,
+            units=1,
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            byok=is_byok,
+            pricing_source=audio_basis,
+        )
 
     # Name and MIME follow the bytes: a caller that skipped conversion must not
     # store one container under another's label (MP3 bytes as ``.wav``).
@@ -2499,25 +2564,6 @@ async def _save_generated_audio_bytes(
 
         audio_url = entity_fs_open_url(entity_id, target.rel_path)
         logger.info("Generated audio saved: %s (%d bytes)", filepath, len(audio_bytes))
-
-    if bill_media:
-        await _bill_media(
-            entity_id=entity_id,
-            user_id=user_id,
-            kind="audio",
-            model=model,
-            cost_usd=_generated_audio_cost_usd(
-                model,
-                purpose=purpose,
-                prompt=prompt,
-                provider_cost_usd=provider_cost_usd,
-            ),
-            units=1,
-            workspace_id=workspace_id,
-            agent_id=agent_id,
-            conversation_id=conversation_id,
-            byok=is_byok,
-        )
 
     if group_scope is not None:
         return audio_url
@@ -3856,6 +3902,9 @@ async def _generate_audio_handler(
         return result
     if not isinstance(payload, dict) or payload.get("status") != "error":
         return result
+    # A refused description is the person's to change; stock music would hide it.
+    if payload.get("code") == AudioGenerationErrorCode.PROMPT_DECLINED:
+        return result
     library = await _music_from_library(entity_id, user_id, payload, **kwargs)
     if library:
         return library
@@ -4387,6 +4436,16 @@ async def _generate_live_audio(
         # provider in the artifact metadata for compatibility with native routes.
         generation_provider = AudioGenerationProvider.coerce(provider)
     if entity_id and not is_byok:
+        unbillable = _unbillable_platform_model_error(model, role)
+        if unbillable:
+            return json.dumps(
+                _audio_error_payload(
+                    code=AudioGenerationErrorCode.MODEL_NOT_BILLABLE,
+                    error=unbillable,
+                    purpose=purpose,
+                    model=model,
+                )
+            )
         await runtime_assert_credit_available(
             entity_id,
             source=RUNTIME_GENERATE_AUDIO_TOOL_SOURCE,
@@ -4574,6 +4633,7 @@ async def _generate_live_audio(
                 task_id=runtime_context.task_id,
                 workflow_run_id=runtime_context.workflow_run_id,
                 workflow_lineage_root_run_id=runtime_context.workflow_lineage_root_run_id,
+                workflow_project_root=runtime_context.workflow_project_root,
             )
             from packages.core.services.generated_media_naming import voice_folder_applies
 
@@ -4686,6 +4746,21 @@ async def _generate_live_audio(
             )
         )
     except Exception as exc:  # noqa: BLE001 - tool should return structured errors
+        from packages.core.services.media_prompt_declined import declined_message, provider_declined_prompt
+
+        if provider_declined_prompt(str(exc)):
+            logger.info("Audio provider declined the description: %s", exc)
+            kind = "music" if purpose == AudioGenerationPurpose.MUSIC else "audio"
+            return json.dumps(
+                _audio_error_payload(
+                    code=AudioGenerationErrorCode.PROMPT_DECLINED,
+                    error=declined_message(kind, str(exc)),
+                    purpose=purpose,
+                    provider=generation_provider,
+                    model=model,
+                ),
+                ensure_ascii=False,
+            )
         logger.exception("Audio generation failed")
         return json.dumps(
             _audio_error_payload(
@@ -4825,6 +4900,27 @@ async def _transcribe_audio_handler(
     except Exception as exc:  # noqa: BLE001 - tool returns structured errors
         return json.dumps({"error": f"Could not load audio: {exc}"})
 
+    from packages.core.services.voice.whisper import WHISPER_MAX_UPLOAD_BYTES
+
+    try:
+        start_seconds = max(0.0, float(kwargs.get("start_seconds") or 0.0))
+        end_seconds = float(kwargs["end_seconds"]) if kwargs.get("end_seconds") not in (None, "") else None
+    except (TypeError, ValueError):
+        return json.dumps({"error": "start_seconds and end_seconds must be numbers of seconds"})
+    if end_seconds is not None and end_seconds <= start_seconds:
+        return json.dumps({"error": "end_seconds must be after start_seconds"})
+    windowed = bool(start_seconds) or end_seconds is not None
+    if windowed or len(audio_bytes) > WHISPER_MAX_UPLOAD_BYTES:
+        # Send only the span asked for, as compact speech audio: a whole studio WAV
+        # is over the STT upload limit even when the words fit in seconds of it.
+        from packages.core.services.audio_conversion import AudioConversionError, speech_audio_bytes
+
+        try:
+            audio_bytes = await speech_audio_bytes(audio_bytes, start_seconds=start_seconds, end_seconds=end_seconds)
+        except AudioConversionError as exc:
+            return json.dumps({"error": str(exc)})
+        mime, filename = "audio/mpeg", f"{os.path.splitext(filename or 'audio')[0]}.mp3"
+
     # Resolve the STT model + optional BYOK key the same way chat audio
     # attachments do (file_context.py), so BYOK / self-hosted keys are honoured.
     stt_model = None
@@ -4846,28 +4942,84 @@ async def _transcribe_audio_handler(
             user_key = (metadata or {}).get("llm_api_key")
     except Exception:
         logger.debug("STT model/key resolution failed", exc_info=True)
-    if kwargs.get("model"):
-        stt_model = str(kwargs["model"]).strip()
+    explicit_model = str(kwargs.get("model") or "").strip()
+    if explicit_model:
+        stt_model = explicit_model
+        # A model named at call time skips the Account picker, so it is gated
+        # here: Manor credits only run a model Manor can bill.
+        if not user_key:
+            unbillable = _unbillable_platform_model_error(explicit_model, "stt")
+            if unbillable:
+                return json.dumps({"error": unbillable, "code": "model_not_billable"})
     language = str(kwargs.get("language") or "").strip() or None
 
-    from packages.core.services.voice.whisper import WhisperError, transcribe_blob
+    from packages.core.constants.models import timestamped_stt_model
+    from packages.core.services.voice.whisper import WhisperError, WhisperTimestampError, transcribe_blob
 
-    try:
-        result = await transcribe_blob(
-            audio_bytes,
-            mime=mime or "audio/mpeg",
-            filename=filename or "audio.mp3",
-            language=language,
-            user_api_key=user_key,
-            resolved_model=stt_model,
+    request = {
+        "mime": mime or "audio/mpeg",
+        "filename": filename or "audio.mp3",
+        "language": language,
+        "user_api_key": user_key,
+    }
+    if not user_key:
+        # A platform call is charged, so the account must have credit before it is made.
+        from packages.core.ai.runtime import RUNTIME_AUDIO_TRANSCRIBE_SOURCE, runtime_assert_credit_available
+
+        await runtime_assert_credit_available(
+            entity_id, source=RUNTIME_AUDIO_TRANSCRIBE_SOURCE, workspace_id=runtime_context.workspace_id,
         )
+    try:
+        try:
+            # Timings come first: the default chat-audio model only transcribes text,
+            # so ask the timestamp-capable model and route that align_subtitles uses.
+            result = await transcribe_blob(
+                audio_bytes,
+                **request,
+                resolved_model=stt_model if explicit_model else timestamped_stt_model(stt_model),
+                require_timestamps=True,
+            )
+        except WhisperTimestampError:
+            # No route can time speech here; text alone is still a transcript.
+            result = await transcribe_blob(audio_bytes, **request, resolved_model=stt_model)
     except WhisperError as exc:
         return json.dumps({"error": str(exc)})
     except Exception as exc:  # noqa: BLE001 - tool returns structured errors
         logger.exception("transcribe_audio failed")
         return json.dumps({"error": str(exc)})
+    # Billed like the other transcription paths: a platform call is charged, a BYOK call is logged only.
+    try:
+        from packages.core.ai.runtime import RUNTIME_AUDIO_TRANSCRIBE_SOURCE
+        from packages.core.database import async_session
+        from packages.core.services.usage_service import record_media_usage
+        from packages.core.services.voice.whisper import whisper_cost_usd
 
-    segments = result.segments
+        async with async_session() as db:
+            await record_media_usage(
+                db,
+                entity_id=entity_id,
+                kind="whisper",
+                model=result.model,
+                cost_usd=whisper_cost_usd(result.duration_seconds, result.model, getattr(result, "usage", None)),
+                units=int(result.duration_seconds or 0),
+                workspace_id=runtime_context.workspace_id,
+                user_id=user_id or None,
+                agent_id=runtime_context.agent_id,
+                conversation_id=runtime_context.conversation_id,
+                source=RUNTIME_AUDIO_TRANSCRIBE_SOURCE,
+                byok=bool(user_key),
+            )
+            await db.commit()
+    except Exception:  # noqa: BLE001 - the transcript is already made; billing is best-effort here
+        logger.debug("transcribe_audio usage billing failed (best-effort)", exc_info=True)
+
+    # A window's segments are timed from its start; report them in the file's own time.
+    segments = [
+        {**segment, "start": round(float(segment["start"]) + start_seconds, 3),
+         "end": round(float(segment["end"]) + start_seconds, 3)}
+        for segment in result.segments or []
+    ]
+    window = {"start_seconds": start_seconds, "end_seconds": end_seconds} if windowed else {}
     if segments:
         payload = {
             "text": result.text,
@@ -4876,6 +5028,7 @@ async def _transcribe_audio_handler(
             "segments": segments,
             "srt": _srt_from_segments(segments),
             "timestamps_available": True,
+            **window,
         }
     else:
         payload = {
@@ -4886,10 +5039,10 @@ async def _transcribe_audio_handler(
             "srt": "",
             "timestamps_available": False,
             "note": (
-                "Timestamped segments require a native Whisper/OpenAI (or Groq) "
-                "speech-to-text key. This transcription used the OpenRouter "
-                "chat-audio fallback, which returns text only."
+                "No timestamp-capable speech-to-text route is available, so this "
+                "transcription returns text only."
             ),
+            **window,
         }
     return json.dumps(payload, ensure_ascii=False)
 
@@ -4903,8 +5056,10 @@ TRANSCRIBE_AUDIO_SCHEMA = {
             "timestamped segments plus a ready-to-use SRT subtitle string. Use it to build "
             "accurate subtitles or to time video scene-cuts against spoken narration. Returns "
             "the transcript text, duration, per-segment start/end/text timings, and an SRT "
-            "document. Timestamps require a native Whisper/OpenAI (or Groq) STT key; the "
-            "OpenRouter chat-audio fallback returns text only (timestamps_available=false)."
+            "document. Uses a timestamp-capable STT route when one is available; otherwise it "
+            "returns text only (timestamps_available=false). Give start_seconds/end_seconds to "
+            "transcribe only that part (for example the excerpt a video uses); its segment times "
+            "stay in the file's own time. Long or large files are sent as compact speech audio."
         ),
         "parameters": {
             "type": "object",
@@ -4923,6 +5078,16 @@ TRANSCRIBE_AUDIO_SCHEMA = {
                 "language": {
                     "type": "string",
                     "description": "Optional ISO language hint (e.g. en, zh) to improve accuracy.",
+                },
+                "start_seconds": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Optional: transcribe from this second of the file.",
+                },
+                "end_seconds": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Optional: transcribe up to this second of the file (after start_seconds).",
                 },
             },
             "required": ["audio_path"],
@@ -5115,14 +5280,15 @@ GENERATE_IMAGE_SCHEMA = {
             "properties": {
                 "prompt": {"type": "string", "description": "Detailed description of the image to generate"},
                 "expected_model": {"type": "string", "description": "Model returned by generate_file(kind=search, params.media_kind=image); fail if Account selection changed."},
+                "model": {"type": "string", "description": "Optional explicit catalog image model. GIF requires GPT Image 2.6 Sunburst or Flare."},
                 "name": {
                     "type": "string",
                     "description": "Optional user-visible filename or Knowledge-relative path, e.g. cafe-scene.png or 猫咪打工人动漫/images/场景.png.",
                 },
                 "size": {
                     "type": "string",
-                    "enum": ["1024x1024", "1536x1024", "1024x1536"],
-                    "description": "Image size (default 1024x1024). 1536x1024 for landscape, 1024x1536 for portrait.",
+                    "pattern": "^(auto|[1-9][0-9]*x[1-9][0-9]*)$",
+                    "description": "Image size (default 1024x1024). GIF accepts auto or dimensions that are multiples of 16; each provider enforces its own supported sizes.",
                 },
                 "aspect_ratio": {
                     "type": "string",
@@ -5136,6 +5302,24 @@ GENERATE_IMAGE_SCHEMA = {
                     "type": "string",
                     "enum": ["low", "medium", "high"],
                     "description": "Image quality (default medium). Higher quality takes longer.",
+                },
+                "output_format": {
+                    "type": "string",
+                    "enum": ["png", "gif"],
+                    "description": "Output format (default png). GIF requires GPT Image 2.6 Sunburst or Flare.",
+                },
+                "frame_count": {
+                    "type": "integer",
+                    "minimum": 2,
+                    "maximum": 16,
+                    "description": "GIF frames (default 9).",
+                },
+                "frame_duration_ms": {
+                    "type": "integer",
+                    "minimum": 20,
+                    "maximum": 2000,
+                    "multipleOf": 10,
+                    "description": "GIF milliseconds per frame, in 10 ms increments (default 200).",
                 },
                 "reference_url": {
                     "type": "string",
@@ -5324,6 +5508,93 @@ def _normalize_image_bytes_for_aspect_ratio(
         return image_bytes, mime, ""
 
 
+_GIF_IMAGE_MODELS = frozenset({"openai/gpt-image-2.6-sunburst", "openai/gpt-image-2.6-flare"})
+# The /images/edits contract takes up to 16 reference images, for GIF output too.
+_GIF_MAX_REFERENCES = 16
+
+
+def _gif_generation_options(
+    *, output_format: Any, frame_count: Any, frame_duration_ms: Any, size: str,
+    model: str, input_fidelity: str, unsupported_options: dict[str, Any],
+) -> tuple[dict[str, int] | None, str]:
+    """Validate the documented GIF-only Image API contract before dispatch."""
+    selected_format = str(output_format or "png").strip().lower()
+    if selected_format not in {"png", "gif"}:
+        return None, "output_format must be png or gif."
+    gif_fields_present = frame_count is not None or frame_duration_ms is not None
+    if selected_format != "gif":
+        if gif_fields_present:
+            return None, "frame_count and frame_duration_ms are supported only with output_format=gif."
+        return None, ""
+    if model not in _GIF_IMAGE_MODELS:
+        return None, "output_format=gif requires GPT Image 2.6 Sunburst or Flare."
+    # GPT Image 2.6 takes reference images for GIF output (the same /images/edits
+    # contract as PNG); input_fidelity is for gpt-image-1.5 and earlier only.
+    if input_fidelity:
+        return None, "GIF generation does not support input_fidelity; use reference images to guide the look."
+    forbidden = [key for key, value in unsupported_options.items() if value is not None]
+    if forbidden:
+        return None, f"GIF generation does not support {', '.join(forbidden)}."
+    try:
+        if isinstance(frame_count, float) and not frame_count.is_integer():
+            raise ValueError
+        if isinstance(frame_duration_ms, float) and not frame_duration_ms.is_integer():
+            raise ValueError
+        count = 9 if frame_count is None else int(frame_count)
+        duration = 200 if frame_duration_ms is None else int(frame_duration_ms)
+    except (TypeError, ValueError):
+        return None, "frame_count and frame_duration_ms must be integers."
+    if isinstance(frame_count, bool) or isinstance(frame_duration_ms, bool):
+        return None, "frame_count and frame_duration_ms must be integers."
+    if not 2 <= count <= 16:
+        return None, "frame_count must be between 2 and 16 for GIF output."
+    if not 20 <= duration <= 2000 or duration % 10:
+        return None, "frame_duration_ms must be 20-2000 and a multiple of 10 for GIF output."
+    if size != "auto":
+        try:
+            width, height = (int(value) for value in size.lower().split("x", 1))
+        except (TypeError, ValueError):
+            return None, "GIF size must be auto or WIDTHxHEIGHT with positive dimensions that are multiples of 16."
+        if width <= 0 or height <= 0 or width % 16 or height % 16:
+            return None, "GIF size must be auto or WIDTHxHEIGHT with positive dimensions that are multiples of 16."
+    return {"frame_count": count, "frame_duration_ms": duration}, ""
+
+
+def _gif_request_fields(gif_options: dict[str, int]) -> dict[str, Any]:
+    """The GIF fields both provider routes send: the same snake_case names on native and Vercel requests."""
+    return {"output_format": "gif", **gif_options}
+
+
+def _validated_gif_details(image_bytes: bytes) -> tuple[dict[str, Any] | None, str]:
+    """Inspect provider bytes without re-encoding them or flattening their frames."""
+    try:
+        import io
+        from PIL import Image
+
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            frame_count = getattr(image, "n_frames", 1)
+            if image.format != "GIF" or not 2 <= frame_count <= 64:
+                return None, "OpenAI GIF response was not an animated GIF."
+            durations: list[int] = []
+            for index in range(frame_count):
+                image.seek(index)
+                image.load()
+                duration = image.info.get("duration")
+                if not isinstance(duration, int) or not 20 <= duration <= 2000 or duration % 10:
+                    return None, "OpenAI GIF response has an invalid frame duration."
+                durations.append(duration)
+            details: dict[str, Any] = {
+                "output_format": "gif", "frame_count": frame_count,
+                "size": f"{image.width}x{image.height}",
+            }
+            if len(set(durations)) == 1:
+                details["frame_duration_ms"] = durations[0]
+            else:
+                details["frame_durations_ms"] = durations
+            return details, ""
+    except Exception:
+        return None, "OpenAI GIF response could not be decoded as an animated GIF."
+
 
 def _image_response_json(resp, *, provider: str) -> tuple[dict, str]:
     """Parse a provider image response defensively.
@@ -5495,7 +5766,14 @@ async def _generate_image_handler(
             entity_id=entity_id, workspace_id=str(runtime_context.workspace_id),
             project_id=project_id, asset_key=workspace_asset_key,
         )
-        if reuse_if_exists:
+        # Reusing a static asset needs no current model/provider. GIF and
+        # invalid animation requests must still reach validation below.
+        if (
+            reuse_if_exists
+            and str(kwargs.get("output_format") or "png").strip().lower() == "png"
+            and kwargs.get("frame_count") is None
+            and kwargs.get("frame_duration_ms") is None
+        ):
             existing = (await _project_named_images(
                 entity_id=entity_id, workspace_id=str(runtime_context.workspace_id), project_id=project_id,
             )).get(workspace_asset_key)
@@ -5524,6 +5802,48 @@ async def _generate_image_handler(
                     asset_reference=existing_reference,
                 )
                 return json.dumps(payload)
+    account_model = await _resolve_user_image_model(user_id, entity_id, False)
+    explicit_model = str(kwargs.get("model") or "").strip()
+    expected_model = str(kwargs.get("expected_model") or "").strip()
+    if explicit_model:
+        if not _selectable_media_model(explicit_model, "image"):
+            return json.dumps({"error": "model must be an image model in the Account catalog."})
+        model = explicit_model
+        if expected_model and expected_model != model:
+            return json.dumps({"error": "model override conflicts with expected_model", "error_code": "image_model_changed_reinspect_required", "expected_model": expected_model, "model": model})
+    else:
+        model = account_model
+        if expected_model and model != expected_model and not _selectable_media_model(expected_model, "image"):
+            # A non-image model is a caller guess, not an Account selection that changed.
+            expected_model = ""
+        if expected_model and model != expected_model:
+            return json.dumps({
+                "error": (
+                    f"The Account-selected image model changed from {expected_model} to {model}. "
+                    f"Retry with expected_model={model} (or without expected_model) to use it."
+                ),
+                "error_code": "image_model_changed_reinspect_required",
+                "expected_model": expected_model,
+                "model": model,
+            })
+    gif_options, gif_error = _gif_generation_options(
+        output_format=kwargs.get("output_format"),
+        frame_count=kwargs.get("frame_count"),
+        frame_duration_ms=kwargs.get("frame_duration_ms"),
+        size=size,
+        model=model,
+        input_fidelity=input_fidelity,
+        unsupported_options={
+            key: kwargs.get(key)
+            for key in ("stream", "partial_images", "output_compression", "prompt_rewriter")
+        },
+    )
+    if gif_error:
+        return json.dumps({"error": gif_error})
+    output_format = "gif" if gif_options else "png"
+    if output_format == "gif" and reuse_if_exists:
+        return json.dumps({"error": "GIF generation does not support reuse_if_exists; generate a new verified animation."})
+
     # Named reference assets are the exact files a project or Workspace keeps.
     try:
         asset_urls, asset_receipts = await _reference_asset_urls(
@@ -5533,28 +5853,12 @@ async def _generate_image_handler(
     except _UnknownReferenceAssets as exc:
         return json.dumps({"error": str(exc), "error_code": "reference_asset_not_found"})
     reference_urls = list(dict.fromkeys([*asset_urls, *reference_urls]))
+    if output_format == "gif" and len(reference_urls) > _GIF_MAX_REFERENCES:
+        return json.dumps({"error": f"GIF generation accepts at most {_GIF_MAX_REFERENCES} reference images."})
 
-    model = await _resolve_user_image_model(user_id, entity_id, False)
-    expected_model = str(kwargs.get("expected_model") or "").strip()
-    if expected_model and model != expected_model and not _selectable_media_model(expected_model, "image"):
-        # Not an image model the Account could have selected: a guess, or
-        # another media kind's model, never a changed selection.
-        expected_model = ""
-    if expected_model and model != expected_model:
-        return json.dumps({
-            "error": (
-                f"The Account-selected image model changed from {expected_model} to {model}. "
-                f"Retry with expected_model={model} (or without expected_model) to use it."
-            ),
-            "error_code": "image_model_changed_reinspect_required",
-            "expected_model": expected_model,
-            "model": model,
-        })
     api_key, base_url_override, is_byok = await _resolve_user_media_credentials(user_id, entity_id, role="image")
-    if kwargs.get("model"):
-        model = str(kwargs["model"]).strip()
-    if expected_model and model != expected_model:
-        return json.dumps({"error": "model override conflicts with expected_model", "error_code": "image_model_changed_reinspect_required", "expected_model": expected_model, "model": model})
+    if output_format == "gif" and is_byok and _is_openrouter_credential(api_key, base_url_override):
+        return json.dumps({"error": "GIF generation cannot use an OpenRouter key. Use a native OpenAI API key or the platform's managed GIF route."})
     provider = _catalog_provider(model)
     if provider == "xai":
         if reference_urls and model.split("/", 1)[1] not in _XAI_IMAGE_EDIT_MODELS:
@@ -5633,14 +5937,19 @@ async def _generate_image_handler(
         is_byok = False
     if not api_key:
         return json.dumps({"error": "No image generation API key configured"})
+    if output_format == "gif" and _is_openrouter_credential(api_key, base_url_override):
+        return json.dumps({"error": "GIF generation cannot use an OpenRouter key. Use a native OpenAI API key or the platform's managed GIF route."})
     if entity_id and not is_byok:
+        unbillable = _unbillable_platform_model_error(model, "image")
+        if unbillable:
+            return json.dumps({"error": unbillable, "code": "model_not_billable"})
         await runtime_assert_credit_available(
             entity_id,
             source=RUNTIME_GENERATE_IMAGE_TOOL_SOURCE,
             workspace_id=runtime_context.workspace_id or None,
         )
 
-    is_openrouter = api_key.startswith("sk-or-")
+    is_openrouter = _is_openrouter_credential(api_key, base_url_override)
     if not managed_vercel_image and not is_openrouter and provider in {"openai", "google"}:
         from packages.core.services.model_resolver import detect_llm_provider_from_key
 
@@ -5661,7 +5970,15 @@ async def _generate_image_handler(
             from packages.core.services.vercel_ai_gateway import vercel_gateway_post
 
             request: dict[str, Any] = {"prompt": prompt, "n": 1}
-            if aspect_ratio:
+            if gif_options:
+                request["size"] = size
+                request["providerOptions"] = {"openai": {
+                    "outputFormat": "gif",
+                    "frameCount": gif_options["frame_count"],
+                    "frameDurationMs": gif_options["frame_duration_ms"],
+                    "quality": quality,
+                }}
+            elif aspect_ratio:
                 request["aspectRatio"] = aspect_ratio
             elif size:
                 request["size"] = size
@@ -5695,15 +6012,29 @@ async def _generate_image_handler(
                 return json.dumps(
                     {"error": "Vercel AI Gateway returned invalid base64 image data."}
                 )
-            # Most gateway models return PNG; Grok returns JPEG.
-            mime = "image/jpeg" if image_bytes[:3] == b"\xff\xd8\xff" else "image/png"
-            image_bytes, mime, actual_size = _normalize_image_bytes_for_aspect_ratio(
-                image_bytes,
-                mime,
-                aspect_ratio,
-            )
-            if actual_size:
-                size = actual_size
+            gif_details: dict[str, Any] = {}
+            if gif_options:
+                gif_details, gif_response_error = _validated_gif_details(image_bytes)
+                if gif_response_error:
+                    return json.dumps({"error": gif_response_error})
+                mime = "image/gif"
+                size = str(gif_details["size"])
+            else:
+                # Most gateway models return PNG; Grok returns JPEG.
+                mime = "image/jpeg" if image_bytes[:3] == b"\xff\xd8\xff" else "image/png"
+                image_bytes, mime, actual_size = _normalize_image_bytes_for_aspect_ratio(
+                    image_bytes, mime, aspect_ratio,
+                )
+                if actual_size:
+                    size = actual_size
+            usage = data.get("usage") or {}
+            if gif_options:
+                # AI SDK's v4 image usage uses camelCase token fields.
+                usage = {**usage, **{
+                    native: usage[gateway]
+                    for native, gateway in (("input_tokens", "inputTokens"), ("output_tokens", "outputTokens"))
+                    if gateway in usage
+                }}
             image_url = await _save_generated_image_bytes(
                 entity_id=entity_id,
                 user_id=user_id,
@@ -5714,7 +6045,7 @@ async def _generate_image_handler(
                 image_bytes=image_bytes,
                 mime=mime,
                 is_byok=False,
-                usage=data.get("usage") or {},
+                usage=usage,
                 workspace_id=runtime_context.workspace_id,
                 task_id=runtime_context.task_id,
                 agent_id=runtime_context.agent_id,
@@ -5724,21 +6055,21 @@ async def _generate_image_handler(
                 sandbox_path=sandbox_path,
                 workspace_shared=bool(workspace_asset_key) or bool(kwargs.get("_workspace_shared_from_context")),
             )
-            return json.dumps(
-                await _generated_image_result_payload(
-                    image_url=image_url,
-                    prompt=prompt,
-                    size=size,
-                    model=model,
-                    entity_id=entity_id,
-                    workspace_id=runtime_context.workspace_id,
-                    workspace_asset_key=workspace_asset_key,
-                    include_fs_path=bool(kwargs.get("workspace_id")),
-                    image_holder=image_holder,
-                    asset_receipts=asset_receipts,
-                    saved_to_knowledge=save_to_knowledge,
-                )
+            payload = await _generated_image_result_payload(
+                image_url=image_url,
+                prompt=prompt,
+                size=size,
+                model=model,
+                entity_id=entity_id,
+                workspace_id=runtime_context.workspace_id,
+                workspace_asset_key=workspace_asset_key,
+                include_fs_path=bool(kwargs.get("workspace_id")),
+                image_holder=image_holder,
+                asset_receipts=asset_receipts,
+                saved_to_knowledge=save_to_knowledge,
             )
+            payload.update(gif_details)
+            return json.dumps(payload)
 
         if is_openrouter:
             message_content: Any = prompt
@@ -5864,6 +6195,9 @@ async def _generate_image_handler(
                 }
                 if input_fidelity:
                     form_data["input_fidelity"] = input_fidelity
+                if gif_options:
+                    # Multipart fields are strings; the GIF fields match the JSON generation request.
+                    form_data.update({key: str(value) for key, value in _gif_request_fields(gif_options).items()})
                 async with httpx.AsyncClient(timeout=180.0) as client:
                     resp = await client.post(
                         f"{native_base_url}/images/edits",
@@ -5875,6 +6209,15 @@ async def _generate_image_handler(
                 if parse_err:
                     return json.dumps({"error": f"Image edit failed: {parse_err}"})
             else:
+                request_body: dict[str, Any] = {
+                    "model": native_model,
+                    "prompt": prompt,
+                    "size": size,
+                    "quality": quality,
+                    "n": 1,
+                }
+                if gif_options:
+                    request_body.update(_gif_request_fields(gif_options))
                 async with httpx.AsyncClient(timeout=180.0) as client:
                     resp = await client.post(
                         f"{native_base_url}/images/generations",
@@ -5882,13 +6225,7 @@ async def _generate_image_handler(
                             "Authorization": f"Bearer {api_key}",
                             "Content-Type": "application/json",
                         },
-                        json={
-                            "model": native_model,
-                            "prompt": prompt,
-                            "size": size,
-                            "quality": quality,
-                            "n": 1,
-                        },
+                        json=request_body,
                     )
                     data, parse_err = _image_response_json(resp, provider="OpenAI")
                 if parse_err:
@@ -5903,18 +6240,26 @@ async def _generate_image_handler(
             b64_data = first.get("b64_json") or ""
             if b64_data:
                 image_bytes = base64.b64decode(b64_data)
-                mime = "image/png"
+                mime = "image/gif" if output_format == "gif" else "image/png"
             elif first.get("url"):
                 image_bytes, mime = await _download_image_bytes(first["url"])
             else:
                 return json.dumps({"error": "OpenAI image response did not include image data."})
-            image_bytes, mime, actual_size = _normalize_image_bytes_for_aspect_ratio(
-                image_bytes,
-                mime,
-                aspect_ratio,
-            )
-            if actual_size:
-                size = actual_size
+            gif_details: dict[str, Any] = {}
+            if output_format == "gif":
+                gif_details, gif_response_error = _validated_gif_details(image_bytes)
+                if gif_response_error:
+                    return json.dumps({"error": gif_response_error})
+                mime = "image/gif"
+                size = str(gif_details["size"])
+            else:
+                image_bytes, mime, actual_size = _normalize_image_bytes_for_aspect_ratio(
+                    image_bytes,
+                    mime,
+                    aspect_ratio,
+                )
+                if actual_size:
+                    size = actual_size
 
             image_url = await _save_generated_image_bytes(
                 entity_id=entity_id,
@@ -5936,8 +6281,7 @@ async def _generate_image_handler(
                 sandbox_path=sandbox_path,
                 workspace_shared=bool(workspace_asset_key) or bool(kwargs.get("_workspace_shared_from_context")),
             )
-            return json.dumps(
-                await _generated_image_result_payload(
+            payload = await _generated_image_result_payload(
                     image_url=image_url,
                     prompt=prompt,
                     size=size,
@@ -5950,7 +6294,9 @@ async def _generate_image_handler(
                     asset_receipts=asset_receipts,
                     saved_to_knowledge=save_to_knowledge,
                 )
-            )
+            if output_format == "gif":
+                payload.update(gif_details)
+            return json.dumps(payload)
 
         if provider == "google":
             native_model = _native_media_model(model, kind="image", provider=provider)
@@ -6016,7 +6362,7 @@ async def _generate_image_handler(
                     image_bytes=image_bytes,
                     mime=mime,
                     is_byok=is_byok,
-                    usage={},
+                    usage=data.get("usageMetadata") or {},
                     workspace_id=runtime_context.workspace_id,
                     task_id=runtime_context.task_id,
                     agent_id=runtime_context.agent_id,
@@ -7679,6 +8025,9 @@ async def _generate_video_handler(
     if not api_key:
         return _video_error_result("No video generation API key configured", prompt=raw_prompt, model=model)
     if entity_id and not is_byok:
+        unbillable = _unbillable_platform_model_error(model, "video")
+        if unbillable:
+            return _video_error_result(unbillable, prompt=raw_prompt, model=model)
         await runtime_assert_credit_available(
             entity_id,
             source=RUNTIME_GENERATE_VIDEO_TOOL_SOURCE,
@@ -7838,8 +8187,26 @@ async def _generate_video_handler(
     except Exception:
         pass
 
-    # Create the job
+    # A full store is known before the provider is paid, not when the clip is saved.
     from packages.core.database import async_session
+    from packages.core.services.storage_capacity import (
+        ensure_storage_capacity,
+        estimate_media_bytes,
+        storage_blocked_result,
+    )
+
+    if entity_id:
+        try:
+            async with async_session() as db:
+                await ensure_storage_capacity(
+                    db, entity_id,
+                    estimate_media_bytes("video", duration_seconds=duration, resolution=resolution),
+                    what="This video",
+                )
+        except StorageLimitExceeded as exc:
+            return storage_blocked_result(exc, kind="video", prompt=raw_prompt, model=model)
+
+    # Create the job
     from packages.core.models.media_job import MediaJob
     from packages.core.models.base import generate_ulid
     from packages.core.ai.runtime.authorization_receipts import (
@@ -8105,13 +8472,24 @@ async def _generate_video_handler(
 # ── Registration ─────────────────────────────────────────────────────────────
 
 
+def _declined_aware(handler: Callable[..., Awaitable[str]], kind: str) -> Callable[..., Awaitable[str]]:
+    """The handler, with a provider's refusal of the description typed ``prompt_declined``."""
+    from packages.core.services.media_prompt_declined import mark_declined_result
+
+    @functools.wraps(handler)
+    async def wrapped(*args: Any, **kwargs: Any) -> str:
+        return mark_declined_result(await handler(*args, **kwargs), kind)
+
+    return wrapped
+
+
 def get_tools():
     return [
         (WEB_FETCH_SCHEMA, _web_fetch_handler),
         (EXTRACT_DATA_SCHEMA, _extract_data_handler),
-        (GENERATE_IMAGE_SCHEMA, _generate_image_handler),
+        (GENERATE_IMAGE_SCHEMA, _declined_aware(_generate_image_handler, "image")),
         (PLAN_VIDEO_SEGMENTS_SCHEMA, _plan_video_segments_handler),
-        (GENERATE_VIDEO_SCHEMA, _generate_video_handler),
+        (GENERATE_VIDEO_SCHEMA, _declined_aware(_generate_video_handler, "video")),
         (TRANSCRIBE_AUDIO_SCHEMA, _transcribe_audio_handler),
     ]
 
@@ -8137,21 +8515,63 @@ def _estimate_audio_cost(model: str, *, purpose: str = "", characters: int | Non
     return estimate_audio_cost_usd(model, purpose=purpose, characters=characters)
 
 
+def _audio_bytes_duration_seconds(audio_bytes: bytes, audio_format: str) -> float | None:
+    """Length of generated audio, read from the bytes; None when it cannot be read.
+
+    Raw PCM is 24 kHz 16-bit mono (Gemini speech); anything else is probed.
+    """
+    if not audio_bytes:
+        return None
+    if _normalize_audio_format(audio_format) == "pcm":
+        return len(audio_bytes) / 48_000
+    import shutil
+    import subprocess
+
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        probed = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", "-i", "pipe:0"],
+            input=audio_bytes, capture_output=True, timeout=20, check=False,
+        )
+        duration = float((probed.stdout or b"").decode().strip() or 0)
+    except Exception:
+        logger.debug("audio duration probe failed", exc_info=True)
+        return None
+    return duration if duration > 0 else None
+
+
 def _generated_audio_cost_usd(
     model: str,
     *,
     purpose: str,
     prompt: str,
     provider_cost_usd: float | None = None,
-) -> float:
-    """USD charged for one generated audio file on a managed route.
+    audio_bytes: bytes = b"",
+    audio_format: str = "",
+) -> tuple[float | None, str]:
+    """USD charged for one generated audio file on a managed route, and its basis.
 
-    The gateway-reported cost wins; otherwise the catalog estimate, counting
-    the synthesized text for per-character speech models.
+    Priced on the provider's own billing unit: characters for character-priced
+    speech, tokens (or the official token rate over the measured length) for
+    token-priced speech, measured seconds for per-second music, the official
+    price per asset otherwise. The gateway's reported cost is billed only when
+    nothing prices the model; with neither, the call is recorded unpriced.
     """
+    from packages.core.services.model_pricing_gateway import audio_call_cost_usd
+
+    cost, basis = audio_call_cost_usd(
+        model,
+        characters=len(prompt or ""),
+        seconds=_audio_bytes_duration_seconds(audio_bytes, audio_format),
+    )
+    if cost is not None:
+        return cost, basis
     if provider_cost_usd is not None and provider_cost_usd > 0:
-        return float(provider_cost_usd)
-    return _estimate_audio_cost(model, purpose=purpose, characters=len(prompt or ""))
+        logger.warning("Audio model %s has no price; billing the gateway's reported cost", model)
+        return float(provider_cost_usd), "gateway_cost_fallback"
+    return None, "unpriced"
 
 
 async def _bill_media(
@@ -8160,39 +8580,66 @@ async def _bill_media(
     user_id: str,
     kind: str,
     model: str,
-    cost_usd: float,
+    cost_usd: float | None,
     units: int,
     workspace_id: str | None = None,
     agent_id: str | None = None,
     conversation_id: str | None = None,
     byok: bool = False,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    pricing_source: str | None = None,
 ) -> None:
-    """Record a media-generation call (image / video) against the
-    entity. Unlike embedding/TTS this path doesn't depend on the LLM
-    billing context — the tool already has ``entity_id`` from the Runtime
-    Harness tool execution context.
+    """Record a media-generation call (image / audio) against the entity.
+
+    Unlike embedding/TTS this path doesn't depend on the LLM billing context —
+    the tool already has ``entity_id`` from the Runtime Harness tool execution
+    context. A BYOK call is passed through even at zero cost:
+    ``record_media_usage`` writes its token-log row, its only record. A
+    platform call with no known cost (``cost_usd`` None) still leaves a
+    flagged, uncharged row instead of nothing.
     """
-    if not entity_id or cost_usd <= 0:
+    if not entity_id:
         return
     try:
         from packages.core.database import async_session
-        from packages.core.services.usage_service import record_media_usage
+        from packages.core.services.usage_service import (
+            record_media_call_unknown_cost,
+            record_media_usage,
+        )
 
         async with async_session() as db:
-            await record_media_usage(
-                db,
-                entity_id=entity_id,
-                kind=kind,
-                model=model,
-                cost_usd=float(cost_usd),
-                units=units,
-                workspace_id=workspace_id,
-                user_id=user_id or None,
-                agent_id=agent_id,
-                conversation_id=conversation_id,
-                source=f"tool:{kind}",
-                byok=byok,
-            )
+            if cost_usd is None and not byok:
+                await record_media_call_unknown_cost(
+                    db,
+                    entity_id,
+                    kind=kind,
+                    model=model,
+                    workspace_id=workspace_id,
+                    user_id=user_id or None,
+                    agent_id=agent_id,
+                    conversation_id=conversation_id,
+                    units=units,
+                    pricing_source=pricing_source or "unpriced",
+                )
+            elif byok or (cost_usd or 0) > 0:
+                await record_media_usage(
+                    db,
+                    entity_id=entity_id,
+                    kind=kind,
+                    model=model,
+                    cost_usd=float(cost_usd or 0),
+                    units=units,
+                    workspace_id=workspace_id,
+                    user_id=user_id or None,
+                    agent_id=agent_id,
+                    conversation_id=conversation_id,
+                    source=f"tool:{kind}",
+                    byok=byok,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    pricing_source=pricing_source,
+                )
             await db.commit()
     except Exception:
-        logger.debug("media billing failed (best-effort)", exc_info=True)
+        logger.warning("media billing failed kind=%s model=%s", kind, model, exc_info=True)

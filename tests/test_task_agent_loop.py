@@ -202,10 +202,11 @@ def _install_host(monkeypatch, db_session, selection, *, conversation_hook=None)
 
         keys = (
             "system_prompt", "user_message", "tools", "max_rounds",
-            "on_round_end_strict", "on_llm_call_before", "runtime_cancel_checker",
+            "on_round_end_strict", "on_llm_call_before", "on_llm_usage_settled",
+            "runtime_cancel_checker",
             "terminal_tool_result_policy", "initial_messages", "initial_usage",
             "initial_rounds", "initial_tool_calls_made", "on_tool_end",
-            "human_input_suspension", "hitl_resume_checkpoint",
+            "human_input_suspension", "hitl_resume_checkpoint", "incoming_updates",
         )
         resume = {"resume_checkpoint": kwargs["runtime_checkpoint"]} if kwargs.get("runtime_checkpoint") else {}
         # The harness restores the checkpointed ledger into the host's live one.
@@ -418,6 +419,73 @@ async def test_consumer_dispatches_the_wake_to_the_agent_loop(db_session, monkey
 
 
 @pytest.mark.asyncio
+async def test_a_task_nobody_can_run_is_blocked_instead_of_woken_forever(db_session, monkeypatch):
+    """Staging 2026-11-03: its Agent had left, and 122 wakes in two days all deferred while it read as in progress."""
+    task, run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
+    _install_host(monkeypatch, db_session, selection)
+
+    monkeypatch.setattr(task_run_host, "resolve_task_execution", AsyncMock(return_value=SimpleNamespace(
+        runtime_kind=TaskRuntimeKind.COORDINATED_PLAN, coordinator=None,
+    )))
+    event = await _fresh(db_session, RuntimeOutboxEvent, event_id)
+    assert task.status == "in_progress"
+
+    # The Agent may be restored soon: early wakes stay retryable.
+    event.attempt_count = 1
+    await db_session.commit()
+    outcome = await worker.run_task_agent_loop_once(event_id=event_id, task_id=task.id, wake_generation=generation)
+    assert outcome == {"status": "deferred", "reason": "factory_selection_unavailable"}
+    assert (await _fresh(db_session, Task, task.id)).status == "in_progress"
+    assert (await _fresh(db_session, RuntimeOutboxEvent, event_id)).delivered_at is None
+    assert (await _fresh(db_session, TaskCoordinatorRun, run.id)).claim_token is None
+
+    event = await _fresh(db_session, RuntimeOutboxEvent, event_id)
+    event.attempt_count = worker._NO_RUNNER_WAKE_ATTEMPTS
+    await db_session.commit()
+    await worker.run_task_agent_loop_once(event_id=event_id, task_id=task.id, wake_generation=generation)
+    assert (await _fresh(db_session, Task, task.id)).status == "blocked"
+    assert (await _fresh(db_session, TaskCoordinatorRun, run.id)).phase == "failed"
+    assert (await _fresh(db_session, RuntimeOutboxEvent, event_id)).delivered_at is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["stale_wake", "live_claim", "stale_lifecycle", "restored_factory"])
+async def test_no_runner_recovery_cannot_stop_a_newer_or_runnable_task(db_session, monkeypatch, boundary):
+    task, run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
+    _install_host(monkeypatch, db_session, selection)
+    monkeypatch.setattr(task_run_host, "resolve_task_execution", AsyncMock(return_value=SimpleNamespace(
+        runtime_kind=TaskRuntimeKind.COORDINATED_PLAN,
+        coordinator=selection if boundary == "restored_factory" else None,
+    )))
+    if boundary == "stale_wake":
+        wake = await stage_task_coordinator_wake(db_session, task_id=task.id, reason="new_work")
+        assert wake.wake_generation != generation
+    elif boundary == "live_claim":
+        run.claim_token = "current-worker"
+        run.claim_generation = generation
+        run.claim_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+    elif boundary == "stale_lifecycle":
+        run.lifecycle_generation = "previous-task-lifecycle"
+    event = await _fresh(db_session, RuntimeOutboxEvent, event_id)
+    event.attempt_count = worker._NO_RUNNER_WAKE_ATTEMPTS
+    await db_session.commit()
+
+    claim, _reason = await worker._admit_and_claim(
+        event_id=event_id, task_id=task.id, wake_generation=generation,
+    )
+    assert (claim is not None) == (boundary == "restored_factory")
+    assert (await _fresh(db_session, Task, task.id)).status == "in_progress"
+    assert (await _fresh(db_session, RuntimeOutboxEvent, event_id)).delivered_at is None
+    current = await _fresh(db_session, TaskCoordinatorRun, run.id)
+    assert current.phase != "failed"
+    if boundary == "live_claim":
+        assert current.claim_token == "current-worker"
+        assert current.claim_generation == generation
+    elif boundary == "stale_wake":
+        assert current.wake_generation == wake.wake_generation
+
+
+@pytest.mark.asyncio
 async def test_plan_work_and_complete_task_finishes_the_task(db_session, monkeypatch):
     task, run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
     host = _install_host(monkeypatch, db_session, selection)
@@ -513,6 +581,50 @@ async def test_plan_work_and_complete_task_finishes_the_task(db_session, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_every_task_model_round_reserves_then_settles_once_on_the_task(db_session, monkeypatch):
+    """The Task's own rounds bill like chat: reserve before the call, settle once after it."""
+    from packages.core.ai.runtime.billing import runtime_current_billing_context
+    from packages.core.services import usage_service
+
+    task, _run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
+    _install_host(monkeypatch, db_session, selection)
+    builders: list[dict] = []
+    calls: list[tuple[str, int]] = []
+
+    def billing(**kwargs):
+        builders.append(kwargs)
+
+        async def reserve(round_num, *_args, **_kw):
+            context = runtime_current_billing_context()
+            # Only the round's call settles through the callback.
+            assert context.durable_per_call and context.operation_id == context.task_id == task.id
+            calls.append(("reserve", round_num))
+
+        async def settle(round_num, *_args, **_kw):
+            calls.append(("settle", round_num))
+
+        return reserve, settle
+
+    monkeypatch.setattr(usage_service, "build_durable_llm_billing_callbacks", billing)
+    _model(monkeypatch, [
+        ("", [_call("note", "record_note", {"text": "Launch on 2026-10-10"})]),
+        ("", [_call("done", "complete_task", COMPLETE_ARGS)]),
+    ])
+
+    outcome = await worker.run_task_agent_loop_once(
+        event_id=event_id, task_id=task.id, wake_generation=generation,
+    )
+
+    assert outcome == {"status": "completed", "task_id": task.id}
+    assert calls == [("reserve", 1), ("settle", 1), ("reserve", 2), ("settle", 2)]
+    [built] = builders
+    assert built["source_prefix"].startswith(f"task:{task.id}:")
+    assert built["operation_id"] == built["task_id"] == task.id
+    assert built["source"] == worker.RUNTIME_PLAN_AND_RUN_TASK_SOURCE
+    assert built["entity_id"] == task.entity_id and built["workspace_id"] == task.workspace_id
+
+
+@pytest.mark.asyncio
 async def test_invalid_completion_is_returned_to_the_loop(db_session, monkeypatch):
     task, run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
     _install_host(monkeypatch, db_session, selection)
@@ -531,6 +643,72 @@ async def test_invalid_completion_is_returned_to_the_loop(db_session, monkeypatc
         event_id=event_id, task_id=task.id, wake_generation=generation,
     )
     assert outcome["status"] == "completed" and len(seen) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_change_made_during_the_last_step_is_applied_before_completion(db_session, monkeypatch):
+    """Live: the budget changed 17 s before stage 1 completed, and it delivered the old budget."""
+    from datetime import datetime, timedelta, timezone
+
+    task, run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
+    host = _install_host(monkeypatch, db_session, selection)
+
+    async def change_then_complete(_messages, _tools):
+        async with host.session_factory() as db:
+            row = await db.get(Task, task.id)
+            at = (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat()
+            row.details = {**(row.details or {}), "changes": [{"at": at, "text": "预算改为740元。"}]}
+            await db.commit()
+        return "", [_call("done", "complete_task", COMPLETE_ARGS)]
+
+    def redone(messages, _tools):
+        refusal = json.loads(messages[-1]["content"])
+        assert refusal["error"] == "changed_during_run" and "预算改为740元。" in refusal["message"]
+        return "", [_call("again", "complete_task", COMPLETE_ARGS)]
+
+    seen = _model(monkeypatch, [change_then_complete, redone])
+    outcome = await worker.run_task_agent_loop_once(
+        event_id=event_id, task_id=task.id, wake_generation=generation,
+    )
+    assert outcome["status"] == "completed" and len(seen) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_rules_change_during_a_run_reaches_its_next_round_once(db_session, monkeypatch):
+    """A rule saved while a Task runs is followed for the rest of that run, not
+    only from its next wake, and it does not refuse the run's completion."""
+    from packages.core.models.governance import GovernancePolicy
+    from packages.core.workspace_chat import context as workspace_context
+
+    task, run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
+    db_session.add(GovernancePolicy(
+        workspace_id=task.workspace_id, entity_id=task.entity_id, policy={}, revision=1,
+    ))
+    await db_session.commit()
+    host = _install_host(monkeypatch, db_session, selection)
+    rule = "- Cite sources: every figure names its source"
+    monkeypatch.setattr(workspace_context, "rules_text", AsyncMock(return_value=f"Operating rules (1):\n{rule}"))
+
+    async def save_rule_then_work(_messages, _tools):
+        async with host.session_factory() as db:
+            row = await db.get(GovernancePolicy, task.workspace_id)
+            row.revision = 2
+            await db.commit()
+        return "", [_call("n1", "record_note", {"text": "draft"})]
+
+    seen = _model(monkeypatch, [
+        save_rule_then_work,
+        ("", [_call("n2", "record_note", {"text": "draft with sources"})]),
+        ("", [_call("done", "complete_task", COMPLETE_ARGS)]),
+    ])
+    outcome = await worker.run_task_agent_loop_once(
+        event_id=event_id, task_id=task.id, wake_generation=generation,
+    )
+    assert outcome["status"] == "completed" and len(seen) == 3
+    assert not any(rule in str(m.get("content")) for m in seen[0])
+    notices = [m for m in seen[1] if m.get("role") == "user" and rule in str(m.get("content"))]
+    assert len(notices) == 1 and "rules changed" in notices[0]["content"]
+    assert sum(rule in str(m.get("content")) for m in seen[2]) == 1
 
 
 @pytest.mark.asyncio
@@ -685,6 +863,43 @@ async def test_missing_completion_continues_then_blocks(db_session, monkeypatch)
     assert outcome["error"] == "agent_loop_completion_missing"
     assert outcome["details"]["continuation_attempts"] == worker._NON_SUBMIT_RETRIES
     assert (await _event(db_session, task.id)).delivered_at is not None
+
+
+@pytest.mark.asyncio
+async def test_initiative_run_that_cannot_finish_fails_and_settles_its_occurrence(db_session, monkeypatch):
+    """Nobody resumes an Initiative run's Task; Blocked would leave its occurrence open forever."""
+    from packages.core.services.agent_initiative_decision import (
+        INITIATIVE_TASK_MARKER_KEY,
+        INITIATIVE_TASK_MARKER_VERSION,
+    )
+    from packages.core.services.scheduled_task_terminal_delivery import (
+        scheduled_task_terminal_dedupe_key,
+    )
+
+    task, run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
+    scheduled_run_id = generate_ulid()
+    task.details = {
+        "scheduled_run_id": scheduled_run_id,
+        "scheduled_job_id": "initiative:watch",
+        INITIATIVE_TASK_MARKER_KEY: {"version": INITIATIVE_TASK_MARKER_VERSION},
+    }
+    await db_session.commit()
+    _install_host(monkeypatch, db_session, selection)
+    monkeypatch.setattr(worker, "_NON_SUBMIT_RETRIES", 0)
+    _model(monkeypatch, [('{"version":"1","decision":"silent"}', [])])
+
+    outcome = await worker.run_task_agent_loop_once(
+        event_id=event_id, task_id=task.id, wake_generation=generation,
+    )
+
+    assert outcome == {"status": "failed", "task_id": task.id, "code": "agent_loop_completion_missing"}
+    assert (await _fresh(db_session, Task, task.id)).status == "failed"
+    settlement = (await db_session.execute(
+        select(RuntimeOutboxEvent).where(
+            RuntimeOutboxEvent.dedupe_key == scheduled_task_terminal_dedupe_key(scheduled_run_id, task.id)
+        )
+    )).scalar_one()
+    assert settlement.payload["scheduled_run_id"] == scheduled_run_id
 
 
 @pytest.mark.asyncio
@@ -2303,9 +2518,7 @@ async def test_existing_file_must_be_inspected_before_completion(db_session, mon
 
     def refused(messages, _tools):
         message = _tool_error(messages)["message"]
-        assert message.startswith(
-            "Inspect Reports/launch-note.md before completing (e.g. read_file/probe_media)"
-        ), message
+        assert message.startswith("Inspect Reports/launch-note.md before completing"), message
         # Read by path, deliver by Document id: the same verified file.
         return "", [_call("read", "read_file", {"path": f"/api/v1/fs/{task.entity_id}/{file.fs_path}"})]
 
@@ -2318,6 +2531,41 @@ async def test_existing_file_must_be_inspected_before_completion(db_session, mon
         event_id=event_id, task_id=task.id, wake_generation=generation,
     ))["status"] == "completed"
     assert len(seen) == 3
+
+
+@pytest.mark.asyncio
+async def test_an_agent_that_cannot_read_still_delivers_the_file_it_saved(
+    db_session, monkeypatch, workspace_files,
+):
+    task, run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
+    host = _install_host(monkeypatch, db_session, selection)
+    document_id = (await workspace_files(db_session, task, "Reports/plan.md", "# Plan\n")).document_id
+
+    async def generate_file(args):
+        return json.dumps({"document": {
+            "document_id": document_id, "fs_path": "Reports/plan.md", "name": "plan.md",
+        }})
+
+    host.extra_tools["generate_file"] = generate_file
+    deliverable = {"title": "Plan", "reference": "r1"}
+    refusals = []
+
+    def refused(messages, _tools):
+        refusals.append(_tool_error(messages)["error"])
+        return "", [_call("done", "complete_task", _completion(deliverables=[deliverable]))]
+
+    _model(monkeypatch, [
+        ("", [_call("gen", "generate_file", {"kind": "document"})]),
+        ("", [_call("early", "complete_task", _completion(deliverables=[deliverable]))]),
+        refused,
+    ])
+    outcome = await worker.run_task_agent_loop_once(
+        event_id=event_id, task_id=task.id, wake_generation=generation,
+    )
+    assert outcome == {"status": "completed", "task_id": task.id}
+    assert refusals == ["completion_check_failed"]
+    files = (await _fresh(db_session, Task, task.id)).actual_output["files"]
+    assert [file["document_id"] for file in files] == [document_id]
 
 
 @pytest.mark.asyncio
@@ -2606,6 +2854,24 @@ def test_inspection_tracker_orders_reads_after_writes_and_covers_review_director
     assert restored.inspected_after_write(other)
 
 
+def test_inspection_is_refused_once_per_written_revision():
+    from packages.core.workers.task_agent_loop_completion import InspectionTracker, inspection_problems
+
+    tracker = InspectionTracker({"seq": 1, "written": {"doc:d1": 1}})
+    resolved = [{"index": 1, "reference": "Reports/plan.md", "keys": ["doc:d1"]}]
+
+    first = inspection_problems(resolved, tracker)
+    assert len(first) == 1 and first[0].startswith("Inspect Reports/plan.md before completing")
+    assert "read_file" not in first[0], "the Agent may not have this tool"
+    assert inspection_problems(resolved, tracker) == []
+    # Survives the round's checkpoint.
+    assert inspection_problems(resolved, InspectionTracker(tracker.state())) == []
+
+    # A new write is a new file to look at.
+    tracker.written["doc:d1"] = 5
+    assert len(inspection_problems(resolved, tracker)) == 1
+
+
 @pytest.mark.asyncio
 async def test_a_display_path_read_satisfies_the_inspection_rule(db_session, monkeypatch, workspace_files):
     task, run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
@@ -2728,6 +2994,42 @@ async def test_failed_write_then_completed_claim_is_refused_in_the_lane(db_sessi
     assert outcome == {"status": "blocked", "task_id": task.id, "code": "agent_loop_completed_non_success"}
     assert refusals == ["unconfirmed_effects"] and len(seen) == 3
     assert (await _fresh(db_session, TaskCoordinatorRun, run.id)).checkpoint["non_submit_retries"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_report_that_is_not_a_delivery_still_shows_what_the_run_saved(
+    db_session, monkeypatch, workspace_files,
+):
+    task, run, selection, event_id, generation = await _agent_loop_run(db_session, monkeypatch)
+    host = _install_host(monkeypatch, db_session, selection)
+    document_id = (await workspace_files(db_session, task, "Reports/plan.md", "# Plan\n")).document_id
+
+    async def generate_file(args):
+        return json.dumps({"document": {
+            "document_id": document_id, "fs_path": "Reports/plan.md", "name": "plan.md",
+        }})
+
+    async def publish(args):
+        return json.dumps({"error": "gateway timeout after upload started"})
+
+    host.extra_tools["generate_file"] = generate_file
+    host.extra_tools["publish_post"] = publish
+
+    def insist(_messages, _tools):
+        return "", [_call("again", "complete_task", _completion())]
+
+    _model(monkeypatch, [
+        ("", [_call("gen", "generate_file", {"kind": "document"})]),
+        ("", [_call("pub", "publish_post", {"text": "Launch!"})]),
+        ("", [_call("early", "complete_task", _completion())]),
+        insist,
+    ])
+    outcome = await worker.run_task_agent_loop_once(
+        event_id=event_id, task_id=task.id, wake_generation=generation,
+    )
+    assert outcome["code"] == "agent_loop_completed_non_success"
+    files = (await _fresh(db_session, Task, task.id)).actual_output["files"]
+    assert [(file["document_id"], file["origin"]) for file in files] == [(document_id, "created")]
 
 
 @pytest.mark.asyncio

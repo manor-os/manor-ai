@@ -118,6 +118,7 @@ celery_app.conf.include = [
     "packages.core.tasks.embedding_tasks",
     "packages.core.tasks.media_analysis_tasks",
     "packages.core.tasks.workspace_translation_tasks",
+    "packages.core.tasks.workspace_recommendation_tasks",
     "packages.core.tasks.monitor_tasks",
     "packages.core.tasks.scheduler_tasks",
     "packages.core.tasks.oauth_refresh",
@@ -130,6 +131,7 @@ celery_app.conf.include = [
     "packages.core.tasks.apify_tasks",
     "packages.core.tasks.runtime_tasks",
     "packages.core.tasks.room_agent_tasks",
+    "packages.core.tasks.workspace_draft_tasks",
 ]
 
 # Beat schedule — periodic jobs
@@ -143,6 +145,12 @@ celery_app.conf.beat_schedule = {
     "room-agent-pending-recovery": {
         "task": "room_agent.recover_pending",
         "schedule": 15.0,
+    },
+    # Architect turns whose process died (a release restarted the pod) are
+    # run again once their claim expires.
+    "workspace-draft-turn-recovery": {
+        "task": "workspace_draft.recover_turns",
+        "schedule": 30.0,
     },
     "apify-collection-recovery": {
         "task": "apify.reconcile_collections",
@@ -192,15 +200,16 @@ celery_app.conf.beat_schedule = {
         "task": "workflow.redispatch_unclaimed_runs",
         "schedule": 60.0,
     },
-    "daily-health-briefing": {
-        "task": "monitor.daily_health_briefing",
-        "schedule": crontab(hour=8, minute=0),
-    },
     "media-reference-cleanup": {
         # Provider input snapshots (uploads/media-references/<job id>/), not
         # deliverables. Daily sweep, 30-day retention by default.
         "task": "media.cleanup_media_references",
         "schedule": crontab(hour=4, minute=30),
+    },
+    "media-display-variant-backfill": {
+        # Files older than display variants, a small batch at a time until none are left.
+        "task": "media.backfill_display_variants",
+        "schedule": 300.0,
     },
     "ai-edit-session-cleanup": {
         # AI Edit sessions keep multi-turn context while their editor is open.
@@ -222,6 +231,12 @@ celery_app.conf.beat_schedule = {
         "task": "memory.entity_chat_extraction_sweep",
         "schedule": 6 * 3600.0,  # every 6h, matching workspace extraction
     },
+    "memory-layer-migration": {
+        # Earlier memory moves into the layer files a few entities at a time;
+        # once every entity is marked complete it is one indexed query.
+        "task": "memory.migrate_layers",
+        "schedule": 1800.0,
+    },
     "teams-subscription-renewal": {
         "task": "channel.ms_teams_subscription_tick",
         "schedule": 6 * 3600.0,
@@ -230,13 +245,8 @@ celery_app.conf.beat_schedule = {
         "task": "channel.outlook_subscription_tick",
         "schedule": 6 * 3600.0,
     },
-    "heartbeat-check": {
-        "task": "monitor.heartbeat_check",
-        "schedule": 1800.0,  # every 30 minutes
-    },
     "hitl-waiting-reminder": {
-        # Dedicated HITL nudge: daily briefing counts waiting steps,
-        # this one actively reminds task owners while a plan is paused.
+        # Reminds the people a waiting card is for (24h, then once more).
         "task": "monitor.hitl_waiting_reminder",
         "schedule": 900.0,  # every 15 minutes
     },
@@ -282,6 +292,12 @@ celery_app.conf.beat_schedule = {
         "task": "workspace.digest_sweep",
         "schedule": 900.0,
         "options": {"expires": 600.0},
+    },
+    "workspace-attention-sweep": {
+        # Watch layer: keep attention items in step with platform state.
+        "task": "workspace.attention_sweep",
+        "schedule": 300.0,
+        "options": {"expires": 240.0},
     },
     "sync-openrouter-pricing": {
         # Keep runtime pricing aligned with OpenRouter changes.

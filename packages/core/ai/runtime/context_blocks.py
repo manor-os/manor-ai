@@ -11,6 +11,7 @@ from packages.core.ai.runtime.envelope import RuntimeEnvelope
 from packages.core.ai.runtime.file_context import (
     editor_current_document_content,
     editor_context_without_inline_document_content,
+    EDITOR_DOCUMENT_SNAPSHOT_KEY,
     editor_file_identity_from_context,
     FILE_CONTEXT_METADATA_KEY,
     RUNTIME_ATTACHMENT_CONTEXT_METADATA_KEY,
@@ -36,6 +37,7 @@ ContextBlockKind = Literal[
     "runtime_mounts",
     "workspace_code_projects",
     "published_website",
+    "workflow_project_folder",
 ]
 
 
@@ -100,6 +102,10 @@ async def resolve_runtime_context_blocks(
     if workspace_scope_context:
         blocks.append(workspace_scope_context)
 
+    project_folder_context = _workflow_project_folder_block(request, envelope)
+    if project_folder_context:
+        blocks.append(project_folder_context)
+
     manual_skill_context = _manual_skill_selection_context_block(request, manual_skill_refs)
     if manual_skill_context:
         blocks.append(manual_skill_context)
@@ -134,7 +140,7 @@ async def resolve_runtime_context_blocks(
         except Exception:
             logger.debug("Runtime workspace context block failed", exc_info=True)
         try:
-            projects_block = await _workspace_code_projects_block(request)
+            projects_block = await _workspace_code_projects_block(request, envelope)
             if projects_block:
                 blocks.append(projects_block)
         except Exception:
@@ -170,35 +176,77 @@ async def resolve_runtime_context_blocks(
 _MAX_CONTEXT_CODE_PROJECTS = 10
 
 
+def _workflow_project_folder_block(
+    request: AIRuntimeRequest,
+    envelope: RuntimeEnvelope,
+) -> RuntimeContextBlock | None:
+    """Name the folder a Workflow step's run keeps its files in."""
+    folder = request.workflow_project_folder
+    if not folder:
+        return None
+    lines = [
+        f"This step's Workflow run works on the project in `{folder}/`. Save every file "
+        "this step makes there: `generate_file` with a plain file name (for example "
+        "`research-memo.md` or `final-article.docx`) saves into this folder, and earlier "
+        "steps' files are there to read. Save somewhere else only when the step names "
+        "another destination.",
+    ]
+    if "code_project" in envelope.effective_allowed_tool_names():
+        lines.append(
+            "Use `code_project` only for code (a website, app or script); a project it "
+            "creates is made inside this folder."
+        )
+    return RuntimeContextBlock(
+        kind="workflow_project_folder",
+        title="Project Folder",
+        content="\n".join(lines),
+        source="workflow_runner.workflow_project_root",
+        key=folder,
+    )
+
+
 async def _workspace_code_projects_block(
     request: AIRuntimeRequest,
+    envelope: RuntimeEnvelope | None = None,
 ) -> RuntimeContextBlock | None:
-    """Name the Workspace's code projects so follow-up edits reuse them."""
+    """Name the Workspace's code projects so follow-up edits reuse them.
+
+    A Workflow step whose run works on a WorkflowProject sees only the code
+    projects inside that project's folder, and none when it has no
+    ``code_project``: continuing another folder would leave the run's files
+    outside its project.
+    """
     if request.surface in {ChatSurface.EXTERNAL_CHANNEL_CHAT, ChatSurface.PUBLIC_CUSTOMER_CHAT}:
         return None
-    from sqlalchemy import or_, select
+    folder = request.workflow_project_folder
+    if folder and envelope is not None and "code_project" not in envelope.effective_allowed_tool_names():
+        return None
+    from sqlalchemy import false, or_, select
 
-    from packages.core.config import get_settings
     from packages.core.database import async_session
     from packages.core.models.code_project import CodeProject
     from packages.core.models.site import Site
 
+    project_filters = [
+        CodeProject.entity_id == request.entity_id,
+        CodeProject.workspace_id == request.workspace_id,
+        CodeProject.archived_at.is_(None),
+    ]
+    if folder:
+        project_filters.append(CodeProject.root_path.startswith(f"{folder}/", autoescape=True))
     # Own session: a failed lookup must not abort the caller's transaction.
     async with async_session() as db:
         projects = (await db.scalars(
             select(CodeProject)
-            .where(
-                CodeProject.entity_id == request.entity_id,
-                CodeProject.workspace_id == request.workspace_id,
-                CodeProject.archived_at.is_(None),
-            )
+            .where(*project_filters)
             .order_by(CodeProject.updated_at.desc())
             .limit(_MAX_CONTEXT_CODE_PROJECTS)
         )).all()
         project_ids = [project.id for project in projects]
         # Sites built here, plus sites built elsewhere whose chat, forms and
-        # analytics are connected to this Workspace.
-        site_filter = Site.workspace_id == request.workspace_id
+        # analytics are connected to this Workspace (in a project run, only
+        # the sites of its own code projects).
+        site_filter = false() if folder else Site.workspace_id == request.workspace_id
         if project_ids:
             site_filter = or_(site_filter, Site.project_id.in_(project_ids))
         sites = (await db.scalars(
@@ -214,10 +262,7 @@ async def _workspace_code_projects_block(
             for site in sites
             if site.status == "active"
         }
-    domain = (get_settings().MANOR_SITES_DOMAIN or "").strip().lower()
-
-    def site_url(site) -> str:
-        return f"https://{site.slug}.{domain}" if domain else ""
+    from packages.core.services.site_publisher import site_public_url as site_url
 
     sites_by_project = {site.project_id: site for site in sites if site.project_id in project_ids}
     lines = [
@@ -405,7 +450,8 @@ def _file_editor_current_document_context_block(
         return None
     editor_context = request.editor_context or {}
     content = editor_current_document_content(editor_context)
-    if content is None:
+    snapshot = editor_context.get(EDITOR_DOCUMENT_SNAPSHOT_KEY)
+    if content is None and not snapshot:
         return None
     key = editor_file_identity_from_context(
         editor_context,
@@ -419,7 +465,7 @@ def _file_editor_current_document_context_block(
         key=str(key) if key else None,
         include_in_prompt=False,
         metadata={
-            "content_chars": len(content),
+            "content_chars": len(content) if content is not None else snapshot.get("chars"),
             "editor_type": editor_context.get("editor_type") or editor_context.get("editorType"),
             "file_type": editor_context.get("file_type") or editor_context.get("fileType"),
         },

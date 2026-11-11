@@ -3,9 +3,8 @@ from __future__ import annotations
 
 from hashlib import sha256
 
-from sqlalchemy import and_, cast, exists, func, or_, select
-from sqlalchemy.dialects.postgresql import JSONPATH
-from sqlalchemy.orm import aliased, load_only
+from sqlalchemy import and_, case, exists, func, or_, select, text
+from sqlalchemy.orm import aliased
 
 from packages.core.constants.approvals import ApprovalStatus
 from packages.core.constants.pending_actions import PendingActionKind
@@ -16,16 +15,24 @@ from packages.core.models.execution import ExecutionStep
 from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.participant import HumanCommitment
 from packages.core.models.proposal import ProposalRecord
-from packages.core.models.task import Conversation, Message
+from packages.core.models.task import MESSAGE_OPEN_CARD_CONDITION, Conversation, Message
 from packages.core.models.workflow import WorkflowRun
 from packages.core.models.workspace import WorkspaceOperationDraft
 from packages.core.services.workflow_chat_projection import _workflow_business_state
 
 
 def _sources(message: Message):
-    action = message.pending_action if isinstance(message.pending_action, dict) else {}
     meta = message.meta if isinstance(message.meta, dict) else {}
-    raw_requests = meta.get("hitl_requests")
+    yield from _card_sources(
+        message.id, message.pending_action, meta.get("hitl_requests"), message.resolved_at,
+    )
+
+
+def _card_sources(message_id, pending_action, raw_requests, resolved_at):
+    action = pending_action if isinstance(pending_action, dict) else {}
+    if action.get("simulation_runtime") is True:
+        # A simulation's decisions wait on their chat card only, not as Needs-you or badges.
+        return
     requests = [
         request for request in raw_requests if isinstance(request, dict) and request.get("id")
     ] if isinstance(raw_requests, list) else []
@@ -36,11 +43,11 @@ def _sources(message: Message):
         # independent requests carried by the same message.
         mirror_ids = {
             str(action[key]) for key in ("approval_request_id", "approval_token") if action.get(key)
-        } or {str(message.id)}
+        } or {str(message_id)}
         mirror_resolved = any(
             str(request["id"]) in mirror_ids and request.get("resolved") for request in requests
         )
-        if message.resolved_at is None and not mirror_resolved:
+        if resolved_at is None and not mirror_resolved:
             yield action, str(action.get("approval_request_id") or action.get("approval_token") or "")
     for request in requests:
         if str(request["id"]) not in mirror_ids and not request.get("resolved"):
@@ -68,25 +75,22 @@ async def pending_actions_by_workspace(
     counts: dict[str, dict[str, dict]] = {wid: {} for wid in workspace_ids}
     if not workspace_ids:
         return counts
+    # Only the card fields: the rest of a message's metadata (a Workflow card's
+    # steps, for one) can be far larger and is not read here.
     messages = (await db.execute(
-        select(Message, Conversation.workspace_id).options(load_only(
-            Message.id, Message.pending_action, Message.meta, Message.resolved_at,
-        )).join(Conversation, Conversation.id == Message.conversation_id).where(
+        select(
+            Message.id, Message.pending_action, Message.meta["hitl_requests"],
+            Message.resolved_at, Conversation.workspace_id,
+        ).join(Conversation, Conversation.id == Message.conversation_id).where(
             Conversation.entity_id == entity_id,
             Conversation.workspace_id.in_(workspace_ids),
-            or_(
-                and_(Message.resolved_at.is_(None), Message.pending_action["kind"].as_string().isnot(None)),
-                func.jsonb_path_exists(
-                    Message.meta,
-                    cast('$.hitl_requests[*] ? (exists(@.id) && (!exists(@.resolved) || @.resolved == false))', JSONPATH),
-                ),
-            ),
+            text(MESSAGE_OPEN_CARD_CONDITION),
         )
     )).all()
     candidates = [
-        (message.id, wid, action, request_id)
-        for message, wid in messages
-        for action, request_id in _sources(message)
+        (message_id, wid, action, request_id)
+        for message_id, pending_action, hitl_requests, resolved_at, wid in messages
+        for action, request_id in _card_sources(message_id, pending_action, hitl_requests, resolved_at)
     ]
     request_ids = {entry[3] for entry in candidates if entry[3]}
     requests = {
@@ -179,7 +183,6 @@ async def pending_actions_by_workspace(
         ("review_id", ProposalRecord, ProposalRecord.review_id),
         ("draft_id", WorkspaceOperationDraft, WorkspaceOperationDraft.id),
         ("commitment_id", HumanCommitment, HumanCommitment.id),
-        ("workflow_run_id", WorkflowRun, WorkflowRun.id),
     ):
         ids = {action[key] for _, _, action, _ in candidates if action.get(key)}
         owners[key] = {
@@ -188,6 +191,9 @@ async def pending_actions_by_workspace(
                 model.entity_id == entity_id, column.in_(ids),
             ))).scalars()
         } if ids else {}
+    owners["workflow_run_id"] = await _workflow_run_owners(db, entity_id, {
+        action["workflow_run_id"] for _, _, action, _ in candidates if action.get("workflow_run_id")
+    })
     run_ids = set(owners["workflow_run_id"])
     retry_parent = func.coalesce(
         WorkflowRun.retry_of_run_id, WorkflowRun.trigger_data["retry_of_run_id"].as_string(),
@@ -271,6 +277,21 @@ def ended_run_replaced(run):
         newer.binding_id.is_not_distinct_from(run.binding_id),
         or_(newer.created_at > run.created_at, and_(newer.created_at == run.created_at, newer.id > run.id)),
     ))
+
+
+async def _workflow_run_owners(db, entity_id: str, ids: set[str]) -> dict:
+    """Read the fields behind Workflow cards from one run snapshot."""
+    if not ids:
+        return {}
+    rows = (await db.execute(select(
+        WorkflowRun.id,
+        WorkflowRun.workspace_id,
+        WorkflowRun.status,
+        WorkflowRun.current_step_id,
+        case((WorkflowRun.status == "completed", WorkflowRun.variables)).label("variables"),
+        case((WorkflowRun.status.in_(("completed", "paused")), WorkflowRun.step_results)).label("step_results"),
+    ).where(WorkflowRun.entity_id == entity_id, WorkflowRun.id.in_(ids)))).all()
+    return {row.id: row for row in rows}
 
 
 def _owner_is_actionable(action: dict, workspace_id: str, owners: dict) -> bool:

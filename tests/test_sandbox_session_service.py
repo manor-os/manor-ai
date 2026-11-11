@@ -2348,9 +2348,13 @@ async def test_task_requester_failed_ticket_is_retryable_capacity(
     )
 
     _external_runner_settings(local_sandbox_settings, monkeypatch)
+    last_error = (
+        "sandbox_allocation_failed: last runner answer: egress_unverified: "
+        "The exit proxy could not be verified: it did not answer. (reason proxy_unreachable; gateway exit 3)"
+    )
     fake_queue.statuses = [
         _ticket("queued"),
-        _ticket("failed", last_error="sandbox_allocation_failed"),
+        _ticket("failed", last_error=last_error),
     ]
     clock = FakeClock()
     owner = SandboxOwner(entity_id="ent_1", user_id="user_1")
@@ -2370,6 +2374,9 @@ async def test_task_requester_failed_ticket_is_retryable_capacity(
     # The ticket's recorded code is the caller's to read (a runner refusal
     # reaches its user by name).
     assert result.cause == "sandbox_allocation_failed"
+    # ... and so is the runner answer the retries ended on.
+    assert result.runner_code == "egress_unverified"
+    assert result.detail == last_error
     assert fake_queue.consumed == []
     assert fake_queue.cancelled == []
     assert recorded_contexts == []

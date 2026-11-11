@@ -51,6 +51,32 @@ def test_publication_receipt_computes_payload_hash_and_default_evidence():
     assert receipt["verified_at"] == "2026-08-03T12:00:00Z"
 
 
+def test_publication_receipt_keeps_unknown_platform_time_distinct_from_verification_time():
+    receipt = normalize_publication_receipt(
+        _verified_receipt(published_at=None),
+        payload={"text": "hello"},
+        observed_at=NOW,
+    )
+
+    assert receipt["published_at"] is None
+    assert receipt["verified_at"] == "2026-08-03T12:00:00Z"
+
+
+def test_publication_receipt_rejects_invalid_unknown_or_known_timestamp_values():
+    with pytest.raises(PublicationReceiptError, match="published_at must be an ISO 8601"):
+        normalize_publication_receipt(
+            _verified_receipt(published_at="not-a-time"),
+            payload={"text": "hello"},
+            observed_at=NOW,
+        )
+    with pytest.raises(PublicationReceiptError, match="verified_at must be an ISO 8601"):
+        normalize_publication_receipt(
+            _verified_receipt(verified_at="not-a-time"),
+            payload={"text": "hello"},
+            observed_at=NOW,
+        )
+
+
 def test_publication_receipt_does_not_promote_unverified_provider_success():
     with pytest.raises(PublicationReceiptError, match="not verified"):
         normalize_publication_receipt(

@@ -18,7 +18,7 @@ from sqlalchemy.orm.attributes import set_committed_value
 from starlette.requests import Request
 
 from apps.api.deps import get_current_user
-from packages.core.models.oauth_provider import OAuthAuthorizationCode, OAuthClientApp
+from packages.core.models.oauth_provider import OAuthAuthorizationCode, OAuthClientApp, OAuthRefreshToken
 from packages.core.models.staff import Department, Staff, StaffRole
 from packages.core.models.user import Entity, User, UserMembership
 from packages.core.services import auth_service
@@ -44,7 +44,8 @@ async def oauth_db(tmp_path, monkeypatch, client_secret_hash):
     monkeypatch.setattr(auth_service.settings, "JWT_SECRET_KEY", "isolated-oauth-test-signing-key-1234567890")
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'oauth.sqlite'}")
     metadata = MetaData()
-    for model in (Entity, User, UserMembership, Department, StaffRole, Staff, OAuthClientApp, OAuthAuthorizationCode):
+    for model in (Entity, User, UserMembership, Department, StaffRole, Staff,
+                  OAuthClientApp, OAuthAuthorizationCode, OAuthRefreshToken):
         table = model.__table__.to_metadata(metadata)
         for column in table.columns:
             if isinstance(column.type, (JSONB, ARRAY)):

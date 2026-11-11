@@ -1,3 +1,4 @@
+import { displayReadInterval } from "../lib/readRefreshPolicy";
 import { useCallback, useState, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Navigate, useNavigate, useParams } from "react-router-dom";
@@ -11,7 +12,7 @@ import Input from "../components/ui/Input";
 import Textarea from "../components/ui/Textarea";
 import Select from "../components/ui/Select";
 import Modal from "../components/ui/Modal";
-import Card from "../components/ui/Card";
+import { ConfigAddRow, ConfigBlock, ConfigGroup, ConfigPage, ConfigRow } from "../components/ui/GroupedList";
 import RadioCard from "../components/ui/RadioCard";
 import CompactCard from "../components/ui/CompactCard";
 import EmptyState from "../components/ui/EmptyState";
@@ -127,6 +128,12 @@ function GroupCommunication({ value }: { value: CollaborationCommunication }) {
       : <p role="status" className="text-sm text-stone-500">{c(value.linked ? "group_unavailable" : "no_group")}</p>}
   </div>;
 }
+function GroupCommunicationRows({ value }: { value: CollaborationCommunication }) {
+  const navigate = useNavigate();
+  return value.group
+    ? <ConfigRow label={value.group.title} note={c("open_group")} chevron onClick={() => navigate(value.group!.path)} />
+    : <ConfigBlock><p role="status" className="config-empty">{c(value.linked ? "group_unavailable" : "no_group")}</p></ConfigBlock>;
+}
 /**
  * Everyone of the provider company who works in this Workspace for the
  * delivery. The customer decides on them as one team: during the trial they
@@ -160,20 +167,19 @@ function ProviderTeamCard({ team, grants, workspaceId, refresh }: {
     }
   }
   return <>
-    <Card minHeight={0} hoverable={false} title={t("page.collaboration.provider_team", { count: team.members.length })}
-      headerAction={kept ? <div className="flex gap-2">
-        <Button variant="outline" size="sm" onClick={() => {
-          setError("");
-          setValue({ email: anchor.email, role: "maintainer", days: anchorGrant?.expires_at ? 14 : null, share_configuration: !!anchorGrant?.share_configuration });
-          setDialog("update");
-        }}>{t("action.update")}</Button>
-        <Button variant="danger" size="sm" onClick={() => { setError(""); setDialog("remove"); }}>{c("remove_provider_team")}</Button>
-      </div> : undefined}>
-      <ul aria-label={c("provider_team_members")} className="mt-2 space-y-1 text-sm">
-        {team.members.map(member => <li key={member.grant_id} className="truncate">{member.email}</li>)}
-      </ul>
-      {!kept && <p className="mt-2 text-sm text-stone-500">{c("provider_trial_note")}</p>}
-    </Card>
+    <ConfigGroup title={t("page.collaboration.provider_team", { count: team.members.length })} note={kept ? undefined : c("provider_trial_note")}>
+      <ConfigBlock>
+        <ul aria-label={c("provider_team_members")} className="config-plain-list">
+          {team.members.map(member => <li key={member.grant_id}>{member.email}</li>)}
+        </ul>
+      </ConfigBlock>
+      {kept && <ConfigRow label={t("action.update")} chevron onClick={() => {
+        setError("");
+        setValue({ email: anchor.email, role: "maintainer", days: anchorGrant?.expires_at ? 14 : null, share_configuration: !!anchorGrant?.share_configuration });
+        setDialog("update");
+      }} />}
+      {kept && <ConfigRow label={c("remove_provider_team")} danger onClick={() => { setError(""); setDialog("remove"); }} />}
+    </ConfigGroup>
     <Modal open={dialog === "update"} onClose={() => { if (!busy) setDialog(null); }} title={c("update_authorization")}>
       <div className="space-y-4">
         <InvitationFields value={value} change={setValue} locked busy={busy} allowNoExpiry={!anchorGrant?.expires_at} />
@@ -202,7 +208,7 @@ export function WorkspaceCollaborationManagement({
   const key = ["workspace-collaboration-management", identity, workspaceId];
   const query = useQuery({
     ...crmQueryOptions(key, signal => api.collaboration.management(workspaceId, signal)),
-    refetchInterval: query => query.state.data?.grants.some(grant => grant.status === "requested") ? 15000 : 60000
+    refetchInterval: query => displayReadInterval(query.state, query.state.data?.grants.some(grant => grant.status === "requested") ? 15000 : 60000)
   });
   const [groupDialog, setGroupDialog] = useState(false);
   const [groupId, setGroupId] = useState("");
@@ -245,28 +251,28 @@ export function WorkspaceCollaborationManagement({
   function openPhase(next: "request_acceptance" | "accept") {
     setNote(""); setProvider(null); setPhase(next);
   }
-  return <div className="space-y-4">
+  return <ConfigPage title={c("tab")}>
     {query.isPending ? <LoadingSpinner /> : query.isError ? <EmptyState title={query.error.message} action={<Button onClick={() => void query.refetch()}>{c("retry")}</Button>} /> : data && <>
       {!data.phase && deliverCard}
-      {data.phase && <Card minHeight={0} hoverable={false} title={`${c("delivery")}: ${c(`phase_${data.phase}`)}`}
-        footer={["trial", "awaiting_acceptance"].includes(data.phase) ? <div className="flex gap-2 flex-wrap">
-          {data.phase === "trial" && <Button variant="outline" onClick={() => openPhase("request_acceptance")}>{c("request_acceptance")}</Button>}
-          <Button onClick={() => openPhase("accept")}>{c("acceptance")}</Button>
-        </div> : undefined}>
-        {!!data.acceptance?.confirmed_at && <p className="text-sm text-stone-500">{[`${c("accepted_on")}: ${new Date(String(data.acceptance.confirmed_at)).toLocaleString(undefined, { timeZone: getPreferredTimeZone() })}`, String(data.acceptance.note || "").trim()].filter(Boolean).join(" · ")}</p>}
-      </Card>}
+      {data.phase && <ConfigGroup title={`${c("delivery")}: ${c(`phase_${data.phase}`)}`}>
+        {!!data.acceptance?.confirmed_at && <ConfigBlock><p className="config-empty">{[`${c("accepted_on")}: ${new Date(String(data.acceptance.confirmed_at)).toLocaleString(undefined, { timeZone: getPreferredTimeZone() })}`, String(data.acceptance.note || "").trim()].filter(Boolean).join(" · ")}</p></ConfigBlock>}
+        {data.phase === "trial" && <ConfigRow label={c("request_acceptance")} chevron onClick={() => openPhase("request_acceptance")} />}
+        {["trial", "awaiting_acceptance"].includes(data.phase) && <ConfigRow label={c("acceptance")} chevron onClick={() => openPhase("accept")} />}
+      </ConfigGroup>}
       {!!team?.members.length && <ProviderTeamCard team={team} grants={data.grants} workspaceId={workspaceId} refresh={refresh} />}
-      <Card minHeight={0} hoverable={false} title={c("people")} description={c("policy")} headerAction={<Button onClick={() => {
-        setError(""); setValue({ email: "", role: "tester", days: 14, share_configuration: false }); setInvite(true);
-      }}>{c("invite")}</Button>}>
-        <div className="mt-3 space-y-3">{!people.length ? <EmptyState compact title={c("no_people")} /> : people.map(grant => <CompactCard key={grant.id} title={grant.email} subtitle={`${c(grant.role)} · ${c("expires")}: ${expiryText(grant)}`} meta={c(`status_${grant.status}`)} onClick={() => openDetail({ title: grant.email, body: <GrantDetails grant={grant} workspaceId={workspaceId} refresh={refresh} /> })} />)}</div>
-      </Card>
-      <Card minHeight={0} hoverable={false}>
-        <GroupCommunication value={data.communication} />
-        <div className="mt-3"><Button variant="outline" onClick={() => {
+      <ConfigGroup title={c("people")} note={c("policy")}>
+        {!people.length && <ConfigBlock><p className="config-empty">{c("no_people")}</p></ConfigBlock>}
+        {people.map(grant => <ConfigRow key={grant.id} label={grant.email} note={`${c(grant.role)} · ${c("expires")}: ${expiryText(grant)}`} meta={c(`status_${grant.status}`)} chevron onClick={() => openDetail({ title: grant.email, body: <GrantDetails grant={grant} workspaceId={workspaceId} refresh={refresh} /> })} />)}
+        <ConfigAddRow label={c("invite")} onClick={() => {
+          setError(""); setValue({ email: "", role: "tester", days: 14, share_configuration: false }); setInvite(true);
+        }} />
+      </ConfigGroup>
+      <ConfigGroup title={c("group_communication")}>
+        <GroupCommunicationRows value={data.communication} />
+        <ConfigRow label={c(data.communication.linked ? "change_group" : "link_group")} chevron onClick={() => {
           setError(""); setGroupId(data.communication.group?.id || ""); setGroupDialog(true);
-        }}>{c(data.communication.linked ? "change_group" : "link_group")}</Button></div>
-      </Card>
+        }} />
+      </ConfigGroup>
     </>}
     {error && !invite && !phase && !groupDialog && <p role="alert">{error}</p>}
     <Modal open={groupDialog} onClose={() => { if (!busy) setGroupDialog(false); }} title={c("link_group")}>
@@ -315,7 +321,7 @@ export function WorkspaceCollaborationManagement({
             setPhase(null);
             await refresh();
           })}>{c("confirm")}</Button></div></Modal>
-  </div>;
+  </ConfigPage>;
 }
 function Portal({
   grantId,
@@ -329,7 +335,7 @@ function Portal({
   const query = useQuery({
     ...crmQueryOptions(["workspace-collaboration-portal", identity, grantId, verified], signal => api.collaboration.portal(grantId, signal)),
     enabled: verified,
-    refetchInterval: query => query.state.data?.grant.status === "requested" ? 15000 : 60000
+    refetchInterval: query => displayReadInterval(query.state, query.state.data?.grant.status === "requested" ? 15000 : 60000)
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");

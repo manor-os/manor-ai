@@ -340,6 +340,8 @@ test("a workspace App retries a safe failed course delivery through the native r
   await page.addInitScript(() => localStorage.setItem("manor_locale", "en"));
   await page.goto(`${fixture}?schedule&recovery=safe`);
   const delivery = page.getByRole("region", { name: "Lesson execution", exact: true });
+  // Recovery authority is loaded when its row enters the viewport.
+  await delivery.scrollIntoViewIfNeeded();
   const headingStatus = delivery.locator("li", { hasText: "Lesson three review" }).locator(".workspace-app-data__progress-heading em");
   await expect(headingStatus).toHaveText("Run failed");
   await expect(delivery.getByRole("button", { name: "Retry", exact: true })).toBeVisible();
@@ -358,6 +360,7 @@ test("a workspace App retries a cancelled delivery when the server still grants 
   await page.addInitScript(() => localStorage.setItem("manor_locale", "en"));
   await page.goto(`${fixture}?schedule&recovery=cancelled`);
   const delivery = page.getByRole("region", { name: "Lesson execution", exact: true });
+  await delivery.scrollIntoViewIfNeeded();
   await expect(delivery.locator("li", { hasText: "Lesson three review" }).locator(".workspace-app-data__progress-heading em")).toHaveText("Cancelled");
   await expect(delivery).toContainText("Execution Cancelled");
   await expect(delivery.getByRole("button", { name: "Retry", exact: true })).toBeVisible();
@@ -370,6 +373,7 @@ test("a workspace App retries a cancelled delivery when the server still grants 
 test("a workspace App can reconcile an unconfirmed lesson delivery through native retry", async ({ page }) => {
   await page.goto(`${fixture}?schedule&recovery=reconcile`);
   const delivery = page.getByRole("region", { name: "Lesson execution", exact: true });
+  await delivery.scrollIntoViewIfNeeded();
   await delivery.getByRole("button", { name: "Review & retry", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Review & retry" });
   const submit = dialog.getByRole("button", { name: "Confirm & retry" });
@@ -389,6 +393,7 @@ test("a workspace App discloses failure details and never retries unknown outcom
   await page.addInitScript(() => localStorage.setItem("manor_locale", "en"));
   await page.goto(`${fixture}?schedule&recovery=review`);
   const reviewDelivery = page.getByRole("region", { name: "Lesson execution", exact: true });
+  await reviewDelivery.scrollIntoViewIfNeeded();
   await reviewDelivery.getByRole("button", { name: "Retry", exact: true }).click();
   const unavailable = page.getByRole("dialog", { name: "Retry", exact: true });
   await expect(unavailable.getByRole("alert")).toContainText("Retry is no longer available here.");
@@ -413,6 +418,7 @@ test("a workspace App discloses failure details and never retries unknown outcom
 
   await page.goto(`${fixture}?schedule&recovery=blocked`);
   const blockedDelivery = page.getByRole("region", { name: "Lesson execution", exact: true });
+  await blockedDelivery.scrollIntoViewIfNeeded();
   await blockedDelivery.getByRole("button", { name: "Retry", exact: true }).click();
   const blocked = page.getByRole("dialog", { name: "Retry", exact: true });
   await expect(blocked.getByRole("alert")).toContainText("Retry is no longer available here.");
@@ -425,6 +431,7 @@ test("a workspace App discloses failure details and never retries unknown outcom
 
   await page.goto(`${fixture}?schedule&recovery=readonly`);
   const readonlyDelivery = page.getByRole("region", { name: "Lesson execution", exact: true });
+  await readonlyDelivery.scrollIntoViewIfNeeded();
   await expect(readonlyDelivery.getByRole("button", { name: "Retry", exact: true })).toHaveCount(0);
   await expect(readonlyDelivery.getByRole("link", { name: "Open run", exact: true })).toHaveAttribute("href", "/flows/lesson-flow/runs/course-recovery-readonly");
   await expect(page.getByTestId("fixture-retry-requests")).toHaveText("Retry requests: 0");
@@ -435,6 +442,7 @@ test("a workspace App revalidates retry authorization before retrying", async ({
   await page.addInitScript(() => localStorage.setItem("manor_locale", "en"));
   await page.goto(`${fixture}?schedule&recovery=stale`);
   const delivery = page.getByRole("region", { name: "Lesson execution", exact: true });
+  await delivery.scrollIntoViewIfNeeded();
   await expect(delivery.getByRole("button", { name: "Retry", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Expire retry authorization", exact: true }).click();
   await delivery.getByRole("button", { name: "Retry", exact: true }).click();
@@ -451,6 +459,7 @@ test("a workspace App reviews a native TikTok approval, retains its draft after 
   await page.addInitScript(() => localStorage.setItem("manor_locale", "en"));
   await page.goto(`${fixture}?schedule&recovery=tiktok`);
   const delivery = page.getByRole("region", { name: "Lesson execution", exact: true });
+  await delivery.scrollIntoViewIfNeeded();
   await delivery.getByRole("button", { name: "Review request", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Review before continuing", exact: true });
   await expect(dialog).toBeVisible();
@@ -483,6 +492,7 @@ test("a workspace App keeps ordinary approvals generic and leaves read-only or b
   await page.addInitScript(() => localStorage.setItem("manor_locale", "en"));
   await page.goto(`${fixture}?schedule&recovery=ordinary-paused`);
   const delivery = page.getByRole("region", { name: "Lesson execution", exact: true });
+  await delivery.scrollIntoViewIfNeeded();
   await delivery.getByRole("button", { name: "Review request", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Review before continuing", exact: true });
   await expect(dialog.getByRole("button", { name: "Approve", exact: true })).toBeVisible();
@@ -491,6 +501,7 @@ test("a workspace App keeps ordinary approvals generic and leaves read-only or b
 
   for (const recovery of ["paused-readonly", "background-wait"]) {
     await page.goto(`${fixture}?schedule&recovery=${recovery}`);
+    await page.getByRole("region", { name: "Lesson execution", exact: true }).scrollIntoViewIfNeeded();
     await expect(page.getByRole("region", { name: "Lesson execution", exact: true }).getByRole("button", { name: "Review request", exact: true })).toHaveCount(0);
     await expect(page.getByTestId("fixture-runtime-approval-requests")).toHaveText("Runtime approval requests: 0");
   }

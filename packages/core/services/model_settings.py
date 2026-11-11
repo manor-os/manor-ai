@@ -118,13 +118,24 @@ def get_model_settings_sync() -> dict[str, Any]:
     return _cache or _normalize(None)
 
 
-def effective_catalog(settings: dict[str, Any]) -> dict[str, list[dict]]:
-    """CATALOG with admin-disabled models removed."""
+def effective_catalog(settings: dict[str, Any], *, billable_only: bool = True) -> dict[str, list[dict]]:
+    """CATALOG with admin-disabled models removed.
+
+    ``billable_only`` also removes models the platform cannot bill, so they
+    can be neither offered nor saved for the platform key. Saving a model with
+    the user's own key (BYOK) passes ``False``: BYOK is not gated.
+    """
+    from packages.core.constants.models import platform_model_billable
+
     disabled = settings.get("disabled_models") or {}
     out: dict[str, list[dict]] = {}
     for role, items in CATALOG.items():
         blocked = set(disabled.get(role) or [])
-        out[role] = [dict(item) for item in items if str(item.get("id")) not in blocked]
+        out[role] = [
+            dict(item) for item in items
+            if str(item.get("id")) not in blocked
+            and (not billable_only or platform_model_billable(role, item.get("id"), catalog_item=item))
+        ]
     return out
 
 

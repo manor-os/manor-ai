@@ -125,10 +125,10 @@ export default function DocumentPropertiesDialog({
     >
       {/* Visibility */}
       <fieldset style={{ border: "none", padding: 0, margin: "0 0 14px" }}>
-        <legend style={{ fontSize: 11, fontWeight: 700, color: "#57534e", textTransform: "uppercase", letterSpacing: 0.4, marginBottom: 6 }}>
+        <legend style={{ fontSize: 11, fontWeight: 700, color: "var(--text-muted)", marginBottom: 6 }}>
           {t("permissions.doc.section.visibility")}
         </legend>
-        <p style={{ fontSize: 11, color: "#a8a29e", margin: "0 0 8px" }}>
+        <p style={{ fontSize: 11, color: "var(--text-muted)", margin: "0 0 8px" }}>
           {t("permissions.doc.visibility_hint")}
         </p>
         <div style={{ display: "flex", flexDirection: "column", gap: 4 }} role="radiogroup" aria-label={t("permissions.doc.section.visibility")}>
@@ -141,7 +141,7 @@ export default function DocumentPropertiesDialog({
             >
               <VisibilityIcon visibility={opt.value} size={13} />
               <span style={{ fontSize: 13 }}>{opt.label}</span>
-              <span style={{ fontSize: 11, color: "#a8a29e", marginLeft: "auto" }}>{opt.hint}</span>
+              <span style={{ fontSize: 11, color: "var(--text-muted)", marginLeft: "auto" }}>{opt.hint}</span>
             </RadioCard>
           ))}
         </div>
@@ -149,10 +149,10 @@ export default function DocumentPropertiesDialog({
 
       {/* Classification */}
       <fieldset style={{ border: "none", padding: 0, margin: "0 0 14px" }}>
-        <legend style={{ fontSize: 11, fontWeight: 700, color: "#57534e", textTransform: "uppercase", letterSpacing: 0.4, marginBottom: 6 }}>
+        <legend style={{ fontSize: 11, fontWeight: 700, color: "var(--text-muted)", marginBottom: 6 }}>
           {t("permissions.doc.section.classification")}
         </legend>
-        <p style={{ fontSize: 11, color: "#a8a29e", margin: "0 0 8px" }}>
+        <p style={{ fontSize: 11, color: "var(--text-muted)", margin: "0 0 8px" }}>
           {t("permissions.doc.classification_hint")}
         </p>
         <div style={{ display: "flex", flexDirection: "column", gap: 4 }} role="radiogroup" aria-label={t("permissions.doc.section.classification")}>
@@ -164,7 +164,7 @@ export default function DocumentPropertiesDialog({
               ariaLabel={opt.label}
             >
               <ClassificationBadge level={opt.value} size="sm" />
-              <span style={{ fontSize: 11, color: "#a8a29e", marginLeft: "auto" }}>{opt.hint}</span>
+              <span style={{ fontSize: 11, color: "var(--text-muted)", marginLeft: "auto" }}>{opt.hint}</span>
             </RadioCard>
           ))}
         </div>
@@ -190,7 +190,7 @@ export default function DocumentPropertiesDialog({
               size="sm"
               aria-label={t("permissions.doc.client_visible_label")}
             />
-            <span style={{ fontSize: 13, color: "#292524" }}>
+            <span style={{ fontSize: 13, color: "var(--text-strong)" }}>
               {t("permissions.doc.client_visible_label")}
             </span>
           </div>

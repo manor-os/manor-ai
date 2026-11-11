@@ -95,3 +95,36 @@ def test_recompaction_with_an_explicit_budget_is_not_a_first_delivery():
     handoff = json.dumps({"status": loop._SKILL_HANDOFF_STATUS, "content": skill})
     assert len(loop._compact_tool_result_for_context("invoke_skill", handoff, 4_000)) <= 4_000
     assert len(loop._compact_tool_result_for_context("invoke_skill", handoff, 4_000, first_delivery=True)) > 4_000
+
+
+def test_a_designer_reads_its_whole_context(monkeypatch):
+    # Staging restaurant App: catalog, Workflows and the 24k page it must keep came to
+    # ~40k; cut to 12k, the designer refused to rewrite a page it could not see.
+    from dataclasses import replace
+
+    from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.services.workspace_app_designer import APP_DESIGNER
+    from packages.core.services.workspace_part_designers import run_part_designer
+
+    context = {"current_app_view": {"components": [{"id": f"view_{i}", "note": "x" * 90} for i in range(400)]}}
+    result = json.dumps(context)
+    assert len(result) > 30_000
+    sent: list[list[dict]] = []
+
+    async def complete(messages, tools, **kwargs):
+        sent.append(list(messages))
+        if len(sent) == 1:
+            return "", [{"id": "call_1", "name": "app_read_context", "arguments": {}}], {"total": 1}
+        return "done", [], {"total": 1}
+
+    async def read(name, args):
+        return result
+
+    monkeypatch.setattr(loop, "runtime_execute_agentic_round_tool_completion", complete)
+    designer = replace(APP_DESIGNER, executor=lambda _context, _state: read, revise_note=lambda _context: None)
+    asyncio.run(run_part_designer(
+        designer, None, brief="Show the dishes by name", feedback=None, entity_id="entity",
+        user_id=None, workspace_id="workspace", surface=ChatSurface.WORKSPACE_CHAT,
+    ))
+
+    assert next(m["content"] for m in sent[1] if m.get("role") == "tool") == result

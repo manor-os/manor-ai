@@ -33,10 +33,6 @@ WHISPER_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 # OpenAI whisper-1: $0.006 per minute of audio.
 _WHISPER_USD_PER_MINUTE = 0.006
-# Groq whisper-large-v3: $0.111 per audio hour ≈ $0.00185/min.
-_GROQ_WHISPER_USD_PER_MINUTE = 0.111 / 60.0
-# OpenAI gpt-4o-mini-transcribe: $0.003 per minute (half of whisper-1).
-_MINI_TRANSCRIBE_USD_PER_MINUTE = 0.003
 
 
 class WhisperError(Exception):
@@ -65,6 +61,8 @@ class WhisperResult:
     # Word-level timing from native verbose transcription responses.
     words: list[dict] | None = None
     cost_usd: float | None = None
+    # The provider's token usage, from token-billed (chat-audio) transcription.
+    usage: dict | None = None
 
 
 async def transcribe_blob(
@@ -327,7 +325,7 @@ async def transcribe_blob(
         if duration <= 0 and segments:
             duration = max(float(segment["end"]) for segment in segments)
         if duration <= 0:
-            duration = max(1.0, len(blob) / 4096)
+            duration = _blob_duration_seconds(blob)
         if require_timestamps and not segments:
             raise WhisperTimestampError(
                 "The selected Vercel transcription model did not return segment timestamps."
@@ -449,12 +447,13 @@ async def transcribe_blob(
                 reference_transcript=str(reference_transcript or "").strip(),
                 model=reported_model or model,
             )
-        # Estimate duration from blob size (chat API doesn't return duration)
-        duration = max(1.0, len(blob) / 4096)
+        # The chat API reports no duration; it is probed from the audio.
+        duration = _blob_duration_seconds(blob)
         return WhisperResult(
             text=text,
             duration_seconds=duration,
             model=reported_model or model,
+            usage=payload.get("usage") if isinstance(payload.get("usage"), dict) else None,
         )
 
     # Standard Whisper path: multipart file upload to /audio/transcriptions
@@ -504,7 +503,7 @@ async def transcribe_blob(
     text = (payload.get("text") or "").strip()
     duration = float(payload.get("duration") or 0.0)
     if duration <= 0:
-        duration = max(1.0, len(blob) / 4096)
+        duration = _blob_duration_seconds(blob)
 
     # ``verbose_json`` includes a per-segment array with start/end timings.
     # Map it to a compact shape callers can turn into subtitle cues.
@@ -628,14 +627,56 @@ def _reference_aligned_chat_result(
     )
 
 
-def whisper_cost_usd(duration_seconds: float, model: str = "") -> float:
+def _blob_duration_seconds(blob: bytes) -> float:
+    """The audio's real length when the provider reports none.
+
+    Probed from the bytes; only an unreadable blob falls back to a size guess,
+    since bytes per second differ by an order of magnitude between formats.
+    """
+    import shutil
+    import subprocess
+
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe and blob:
+        try:
+            probed = subprocess.run(
+                [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", "-i", "pipe:0"],
+                input=blob, capture_output=True, timeout=20, check=False,
+            )
+            duration = float((probed.stdout or b"").decode().strip() or 0)
+            if duration > 0:
+                return duration
+        except Exception:
+            logger.debug("transcription audio probe failed", exc_info=True)
+    return max(1.0, len(blob) / 4096)
+
+
+def whisper_cost_usd(duration_seconds: float, model: str = "", usage: dict | None = None) -> float:
     """Convert audio duration to provider USD cost. Caller multiplies
-    through the standard margin via ``record_media_usage``."""
-    lowered = str(model or "").lower()
-    if "groq/" in lowered or "large-v3" in lowered:
-        per_minute = _GROQ_WHISPER_USD_PER_MINUTE
-    elif "mini-transcribe" in lowered:
-        per_minute = _MINI_TRANSCRIBE_USD_PER_MINUTE
-    else:
+    through the standard margin via ``record_media_usage``.
+
+    The model's official per-minute rate (curated, else the gateway catalog).
+    Only a model nothing prices, which the platform never offers, falls back
+    to the whisper-1 rate as a BYOK estimate.
+    """
+    from packages.core.services.model_pricing import (
+        estimate_token_cost_usd,
+        transcription_usd_per_minute,
+    )
+
+    if isinstance(usage, dict) and (usage.get("prompt_tokens") or usage.get("completion_tokens")):
+        # Chat-audio models bill their audio and text tokens, not minutes.
+        details = usage.get("prompt_tokens_details") or {}
+        token_cost = estimate_token_cost_usd(
+            int(usage.get("prompt_tokens") or 0),
+            int(usage.get("completion_tokens") or 0),
+            model,
+            audio_input_tokens=int((details if isinstance(details, dict) else {}).get("audio_tokens") or 0),
+            require_price=True,
+        )
+        if token_cost is not None:
+            return float(token_cost)
+    per_minute = transcription_usd_per_minute(model)
+    if per_minute is None:
         per_minute = _WHISPER_USD_PER_MINUTE
     return max(0.0, duration_seconds) / 60.0 * per_minute

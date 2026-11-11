@@ -88,7 +88,11 @@ def parse_file_reference(
         text = text[1:-1].strip()
     if not text or is_internal_file_target(text):
         return None
-    parsed = urlsplit(text)
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        # Text that is no URL (``[x]`` reads as a bad IPv6 host) is no address.
+        return None
     if parsed.scheme and parsed.scheme not in {"http", "https"}:
         return None
     path = parsed.path or ""
@@ -192,7 +196,10 @@ def _is_file_link_target(target: str) -> bool:
 
 
 def _basename(target: str) -> str:
-    path = urlsplit(target).path if "://" in target else target
+    try:
+        path = urlsplit(target).path if "://" in target else target
+    except ValueError:
+        path = target
     name = os.path.basename(unquote(path).rstrip("/"))
     return name or target
 

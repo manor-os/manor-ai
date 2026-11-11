@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.ai.runtime.tool_context import RUNTIME_TOOL_CONTEXT_KEYS
 from packages.core.ai.tools import workspace_arch_tools
 from packages.core.models.base import generate_ulid
 from packages.core.models.workspace_draft import WorkspaceDraft
@@ -138,9 +139,7 @@ async def test_architect_runtime_rejects_legacy_binding_arguments(monkeypatch, l
     design = {
         "service_key": "email", "agent_name": "Email Agent",
         "system_prompt": "Read email and prepare unsent drafts. " * 4,
-        "_runtime_run_id_from_context": "run",
-        "_runtime_tool_call_id_from_context": "call",
-        "_runtime_tool_attempt_from_context": 1,
+        **dict.fromkeys(RUNTIME_TOOL_CONTEXT_KEYS, "from-runtime"),
     }
     result = json.loads(await executor("ws_request_custom_agent", {**design, **legacy}))
     assert result["ok"] is False
@@ -148,6 +147,73 @@ async def test_architect_runtime_rejects_legacy_binding_arguments(monkeypatch, l
     # Internal Runtime provenance must not make a valid design invalid.
     assert json.loads(await executor("ws_request_custom_agent", design))["ok"] is True
     handler.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_custom_agent_design_reaches_its_tool_through_a_real_architect_loop(monkeypatch):
+    """The loop adds its own run identity to every call; none of it may fail the design."""
+    import importlib
+
+    from packages.core.ai.runtime import billing, completions, runtime_execute_workspace_architect_loop
+    from packages.core.ai.runtime.workspace_drafts import runtime_workspace_architect_tool_executor
+
+    loop_module = importlib.import_module("packages.core.ai.agentic_loop")
+    design = {
+        "draft_id": "draft", "service_key": "care", "agent_name": "Customer Care",
+        "system_prompt": "Answer guests about the menu, hours and policies, and hand over what needs a person. " * 2,
+    }
+    replies = iter([("", [{"id": "call_1", "name": "ws_request_custom_agent", "arguments": design}]),
+                    ("done", None)])
+    seen_results = []
+
+    async def completion(messages, tools=None, **_):
+        seen_results.extend(m["content"] for m in messages if m.get("role") == "tool")
+        text, calls = next(replies)
+        return text, calls, {"prompt": 1, "completion": 1, "total": 2}
+
+    async def text(_messages, **_):
+        return "done", {"prompt": 1, "completion": 1, "total": 2}
+
+    async def route(**_):
+        return None, {}, None
+
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_tool_completion", completion)
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_text_completion", text)
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_final_completion", text)
+    monkeypatch.setattr(completions, "runtime_resolve_text_completion_route", route)
+    monkeypatch.setattr(billing, "runtime_ensure_billing_context", lambda *_a, **_k: None)
+    handler = AsyncMock(return_value='{"ok": true}')
+    monkeypatch.setitem(workspace_arch_tools.HANDLERS, "ws_request_custom_agent", handler)
+
+    await runtime_execute_workspace_architect_loop(
+        runtime_envelope=None, system_prompt="s", user_message="u",
+        tools=[workspace_arch_tools.REQUEST_CUSTOM_AGENT_SCHEMA],
+        entity_id="entity", agent_id=None, max_rounds=3,
+        tool_executor=runtime_workspace_architect_tool_executor(
+            AsyncMock(), draft_id="draft", entity_id="entity", user_id="user",
+        ),
+    )
+
+    handler.assert_awaited_once()
+    assert handler.await_args.kwargs["agent_name"] == "Customer Care"
+    assert handler.await_args.kwargs["_performance_run_id_from_context"]
+    assert seen_results == ['{"ok": true}']
+
+
+@pytest.mark.asyncio
+async def test_a_crashed_architect_tool_keeps_its_cause_from_the_model(monkeypatch):
+    from packages.core.ai.runtime.workspace_drafts import runtime_workspace_architect_tool_executor
+
+    handler = AsyncMock(side_effect=RuntimeError("connection to 10.0.0.5 refused"))
+    monkeypatch.setitem(workspace_arch_tools.HANDLERS, "ws_get_draft", handler)
+    executor = runtime_workspace_architect_tool_executor(
+        AsyncMock(), draft_id="draft", entity_id="entity", user_id="user",
+    )
+
+    result = await executor("ws_get_draft", {})
+
+    assert json.loads(result)["ok"] is False
+    assert "10.0.0.5" not in result
 
 
 async def _seed_draft(db_session, monkeypatch):
@@ -229,7 +295,8 @@ async def test_concurrent_draft_change_aborts_old_turn_before_later_tools(
     lint.assert_not_awaited()
     await db_session.refresh(draft)
     assert "agent_capability_plans" not in draft.fields
-    assert not any(message.get("content") == "old turn" for message in draft.messages)
+    # The user's message stays for the turn to be run again; the stale turn records no reply.
+    assert not any(message.get("role") == "assistant" for message in draft.messages)
 
 
 @pytest.mark.asyncio
@@ -270,3 +337,136 @@ async def test_capability_search_reacquires_turn_lock_until_caller_finishes(
             select(WorkspaceDraft).where(WorkspaceDraft.id == draft_id)
             .with_for_update(nowait=True)
         )
+
+
+@pytest.mark.asyncio
+async def test_capability_search_reuses_the_stored_plan_for_an_unchanged_request(
+    db_session, monkeypatch,
+):
+    """Regression (2026-11-01): a later Architect turn searched an unchanged
+    service again and paid for a second full catalog match."""
+    draft, catalog = await _seed_draft(db_session, monkeypatch)
+    match = AsyncMock(return_value=catalog.resolve(["tool:test_0"]))
+    monkeypatch.setattr(agent_generator, "match_agent_capabilities", match)
+
+    async def search(**kwargs):
+        result = json.loads(await workspace_arch_tools._search_capabilities(
+            db_session, draft_id=draft.id, entity_id=draft.entity_id,
+            user_id=draft.user_id, service_key="email", **kwargs,
+        ))
+        await db_session.commit()
+        return result
+
+    first = await search(intent="Read the inbox")
+    again = await search(intent="Read the inbox")
+
+    assert match.await_count == 1
+    assert (first["plan_reused"], again["plan_reused"]) == (False, True)
+    assert again["agent_capability_plan"] == first["agent_capability_plan"]
+
+    match.return_value = catalog.resolve(["tool:test_1"])
+    changed = await search(intent="Read and label the inbox")
+
+    assert match.await_count == 2
+    assert changed["plan_reused"] is False
+    await db_session.refresh(draft)
+    [stored] = draft.fields["agent_capability_plans"]
+    assert stored["capability_ids"] == ["tool:test_1"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_architect_turns_finish_when_the_capability_provider_stalls(
+    db_session, monkeypatch,
+):
+    """Regression (2026-10-27): three Create Workspace drafts started together
+    stopped inside ws_search_capabilities. Capability selection had no overall
+    deadline, so turns waiting on an unresponsive provider never ended and
+    kept their chat stream slots. Each turn must get the selection error back
+    as a tool result, finish, and release its claim on the draft."""
+    import packages.core.ai.agentic_loop as loop_module
+    from packages.core.ai.runtime.workspace_drafts import (
+        runtime_workspace_architect_tool_executor,
+    )
+    from packages.core.services import workspace_draft_service
+
+    monkeypatch.setattr(
+        AgentCapabilityCatalogFactory, "create", AsyncMock(return_value=_catalog()),
+    )
+    monkeypatch.setattr(workspace_arch_tools, "_list_nango_aggregator", AsyncMock(return_value=None))
+    provider_calls = 0
+
+    async def unresponsive_provider(*_args, **_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(agent_generator, "runtime_execute_text_completion", unresponsive_provider)
+    monkeypatch.delenv("AGENT_CAPABILITY_MATCH_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.setattr(agent_generator, "_CAPABILITY_MATCH_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(loop_module, "_preflight_credit_check", AsyncMock())
+    monkeypatch.setattr(
+        loop_module, "runtime_execute_agentic_final_completion",
+        AsyncMock(return_value=("Capability matching is unavailable right now.", {})),
+    )
+    monkeypatch.setattr(workspace_draft_service, "_refresh_missing_from_lint", AsyncMock())
+    search_results: dict[str, dict] = {}
+
+    async def architect(db, *, draft, turn, **_kwargs):
+        executor = runtime_workspace_architect_tool_executor(
+            db, draft_id=draft.id, entity_id=draft.entity_id, user_id=draft.user_id, turn=turn,
+        )
+
+        async def recording_executor(name, args):
+            result = await executor(name, args)
+            search_results[draft.id] = json.loads(result)
+            return result
+
+        result = await loop_module.agentic_loop(
+            system_prompt="system", user_message="build", tools=[], max_rounds=1,
+            tool_executor=recording_executor,
+            forced_tool_calls=[
+                {"name": "ws_search_capabilities", "arguments": {"service_key": "email"}},
+            ],
+        )
+        return result.content
+
+    monkeypatch.setattr(workspace_draft_service, "_architect_turn", architect)
+    entity_id, user_id = generate_ulid(), generate_ulid()
+    drafts = [
+        WorkspaceDraft(
+            entity_id=entity_id, user_id=user_id, status="active",
+            fields={"services": [{"service_key": "email", "name": "Email"}]},
+            messages=[], missing=[], ready=False,
+        )
+        for _ in range(3)
+    ]
+    db_session.add_all(drafts)
+    await db_session.commit()
+    draft_ids = [draft.id for draft in drafts]
+
+    async def turn(draft_id):
+        async with AsyncSession(db_session.bind, expire_on_commit=False) as db:
+            reply, _ = await workspace_draft_service.process_draft_message(
+                db, draft_id=draft_id, entity_id=entity_id,
+                user_id=user_id, user_message="Answer customer email",
+            )
+            await db.commit()
+            return reply
+
+    replies = await asyncio.wait_for(
+        asyncio.gather(*(turn(draft_id) for draft_id in draft_ids)), timeout=15,
+    )
+
+    assert replies == ["Capability matching is unavailable right now."] * 3
+    assert provider_calls == 3
+    for draft_id in draft_ids:
+        assert search_results[draft_id]["ok"] is False
+        assert "did not finish within" in search_results[draft_id]["error"]
+    async with AsyncSession(db_session.bind) as other:
+        rows = (await other.execute(
+            select(WorkspaceDraft).where(WorkspaceDraft.id.in_(draft_ids))
+        )).scalars().all()
+    for row in rows:
+        assert "_architect_turn" not in row.fields
+        assert not row.fields.get("agent_capability_plans")
+        assert row.messages[-1]["role"] == "assistant"

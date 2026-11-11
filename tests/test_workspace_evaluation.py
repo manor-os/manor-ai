@@ -8,11 +8,13 @@ import pytest
 from sqlalchemy import select
 
 from packages.core.models.base import generate_ulid
+from packages.core.models.billing import CreditUsageLog
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.goal import Goal, GoalMeasurement, GoalTaskLink
 from packages.core.models.runtime_learning import AgentLearningCandidate, RuntimeEvidence
 from packages.core.models.task import Task
 from packages.core.models.usage import TokenUsageLog, ToolCallLog
+from packages.core.models.workflow import WorkflowRun
 from packages.core.models.workspace import Workspace
 from packages.core.ai.runtime import runtime_strategist_user_prompt
 from packages.core.constants.execution import (
@@ -355,6 +357,23 @@ async def test_workspace_evaluation_rolls_up_runtime_dimensions(db_session) -> N
         cost_usd=Decimal("0.03"),
         source="strategist",
     )
+    # Charged credits, including a media charge with no token log: the cost
+    # dimension reads the ledger, not the estimated provider USD above.
+    charges = [
+        CreditUsageLog(
+            entity_id=entity_id, workspace_id=workspace_id, model="test-model",
+            total_credit=credits, business_type=kind,
+        )
+        for credits, kind in ((30, "strategist"), (480, "image"))
+    ]
+    # Workflow runs keep their steps in the run row, not in execution_steps.
+    runs = [
+        WorkflowRun(
+            workflow_id=generate_ulid(), entity_id=entity_id, workspace_id=workspace_id,
+            status=status, started_at=now - timedelta(hours=3),
+        )
+        for status in ("completed", "completed", "failed")
+    ]
     tool = ToolCallLog(
         entity_id=entity_id,
         workspace_id=workspace_id,
@@ -379,6 +398,8 @@ async def test_workspace_evaluation_rolls_up_runtime_dimensions(db_session) -> N
             candidate,
             usage,
             tool,
+            *charges,
+            *runs,
         ]
     )
     await db_session.commit()
@@ -397,7 +418,11 @@ async def test_workspace_evaluation_rolls_up_runtime_dimensions(db_session) -> N
     assert snapshot["dimensions"]["output_quality"]["approval_count"] == 2
     assert snapshot["dimensions"]["output_quality"]["approval_rate"] == 1.0
     assert snapshot["dimensions"]["user_feedback"]["positive_signal_count"] == 2
-    assert snapshot["dimensions"]["cost_efficiency"]["window_credits"] > 0
+    assert snapshot["dimensions"]["cost_efficiency"]["window_credits"] == 510
+    execution = snapshot["dimensions"]["execution_health"]
+    assert (execution["workflow_run_count"], execution["completed_workflow_run_count"], execution["failed_workflow_run_count"]) == (3, 2, 1)
+    assert "fix_failures" in snapshot["recommendation_codes"]
+    assert len(snapshot["recommendation_codes"]) == len(snapshot["recommendations"])
     assert snapshot["dimensions"]["learning"]["candidate_status_counts"]["applied"] == 1
     assert snapshot["history"] == []
     assert snapshot["trend"]["direction"] == "unknown"

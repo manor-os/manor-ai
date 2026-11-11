@@ -193,9 +193,9 @@ export default function CustomFields() {
         <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>
           {Object.entries(grouped).map(([resourceType, fields]) => (
             <div key={resourceType}>
-              <h3 style={{ fontSize: 13, fontWeight: 700, color: "#1c1917", textTransform: "capitalize", marginBottom: 8, paddingLeft: 4 }}>
+              <h3 style={{ fontSize: 13, fontWeight: 700, color: "var(--text-strong)", textTransform: "capitalize", marginBottom: 8, paddingLeft: 4 }}>
                 {resourceType}
-                <span style={{ fontSize: 11, fontWeight: 500, color: "#a8a29e", marginLeft: 8 }}>{fields.length} {fields.length === 1 ? t("page.custom_fields.field_singular") : t("page.custom_fields.field_plural")}</span>
+                <span style={{ fontSize: 11, fontWeight: 500, color: "var(--text-muted)", marginLeft: 8 }}>{fields.length} {fields.length === 1 ? t("page.custom_fields.field_singular") : t("page.custom_fields.field_plural")}</span>
               </h3>
               <div className="glass-card" style={{ overflow: "hidden", padding: 0 }}>
                 <div style={{ overflowX: "auto" }}>
@@ -211,10 +211,10 @@ export default function CustomFields() {
                     </thead>
                     <tbody>
                       {fields.map((field) => {
-                        const typeColor = FIELD_TYPE_COLORS[field.field_type] || { bg: "#f5f5f4", color: "#57534e" };
+                        const typeColor = FIELD_TYPE_COLORS[field.field_type] || { bg: "#f5f5f7", color: "var(--text-muted)" };
                         return (
                           <tr key={field.id}>
-                            <td style={{ padding: "12px 16px", fontWeight: 600, color: "#292524" }}>{field.name}</td>
+                            <td style={{ padding: "12px 16px", fontWeight: 600, color: "var(--text-strong)" }}>{field.name}</td>
                             <td style={{ padding: "12px 16px" }}>
                               <span style={{
                                 padding: "2px 8px",
@@ -231,22 +231,22 @@ export default function CustomFields() {
                               {field.required ? (
                                 <StatusBadge type="warning">{t("page.custom_fields.required")}</StatusBadge>
                               ) : (
-                                <span style={{ color: "#a8a29e", fontSize: 12 }}>{t("page.custom_fields.optional")}</span>
+                                <span style={{ color: "var(--text-muted)", fontSize: 12 }}>{t("page.custom_fields.optional")}</span>
                               )}
                             </td>
-                            <td style={{ padding: "12px 16px", color: "#78716c", fontSize: 12 }}>{field.sort_order}</td>
+                            <td style={{ padding: "12px 16px", color: "var(--text-muted)", fontSize: 12 }}>{field.sort_order}</td>
                             <td style={{ padding: "12px 16px", textAlign: "right" }}>
                               <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 4 }}>
                                 <button
                                   onClick={() => openEdit(field)}
-                                  style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "#a8a29e" }}
+                                  style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "var(--text-muted)" }}
                                   title={t("action.edit")}
                                 >
                                   <IconEdit size={16} />
                                 </button>
                                 <button
                                   onClick={() => setDeleteTarget(field.id)}
-                                  style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "#a8a29e" }}
+                                  style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "var(--text-muted)" }}
                                   title={t("action.delete")}
                                 >
                                   <IconTrash size={16} />
@@ -297,7 +297,7 @@ export default function CustomFields() {
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
           <Input label={t("page.custom_fields.name")} value={formName} onChange={(e) => setFormName(e.target.value)} placeholder={t("page.custom_fields.name_placeholder")} />
           <div>
-            <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: "#78716c", marginBottom: 4 }}>{t("page.custom_fields.field_type")}</label>
+            <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: "var(--text-muted)", marginBottom: 4 }}>{t("page.custom_fields.field_type")}</label>
             <select value={formFieldType} onChange={(e) => setFormFieldType(e.target.value)} className="manor-input">
               {FIELD_TYPES.map((t) => (
                 <option key={t} value={t}>{t.charAt(0).toUpperCase() + t.slice(1)}</option>
@@ -305,7 +305,7 @@ export default function CustomFields() {
             </select>
           </div>
           <div>
-            <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: "#78716c", marginBottom: 4 }}>{t("page.custom_fields.resource_type")}</label>
+            <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: "var(--text-muted)", marginBottom: 4 }}>{t("page.custom_fields.resource_type")}</label>
             <select value={formResourceType} onChange={(e) => setFormResourceType(e.target.value)} className="manor-input">
               {RESOURCE_TYPES.map((r) => (
                 <option key={r} value={r}>{r.charAt(0).toUpperCase() + r.slice(1)}</option>
@@ -329,7 +329,7 @@ export default function CustomFields() {
               id="field-required"
               style={{ accentColor: "#4f7d75" }}
             />
-            <label htmlFor="field-required" style={{ fontSize: 13, fontWeight: 500, color: "#57534e", cursor: "pointer" }}>{t("page.custom_fields.required_field")}</label>
+            <label htmlFor="field-required" style={{ fontSize: 13, fontWeight: 500, color: "var(--text-muted)", cursor: "pointer" }}>{t("page.custom_fields.required_field")}</label>
           </div>
           <Input
             label={t("page.custom_fields.sort_order")}

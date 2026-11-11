@@ -59,10 +59,11 @@ async def test_workspace_purge_batch_commits_each_success(monkeypatch):
             raise RuntimeError("isolated candidate failure")
         return True
 
-    async def fake_drain(_db):
+    async def fake_drain(_db, **_kwargs):
         nonlocal drain_calls
         drain_calls += 1
-        return 2, 1
+        # The first pass cleans two jobs; the next pass finds nothing left.
+        return (2, 1) if drain_calls == 1 else (0, 0)
 
     monkeypatch.setattr(database, "create_worker_session", lambda: lambda: fake_db)
     monkeypatch.setattr(entity_service, "list_workspaces_due_for_purge", fake_list)
@@ -80,7 +81,8 @@ async def test_workspace_purge_batch_commits_each_success(monkeypatch):
     ]
     assert fake_db.commits == 2
     assert fake_db.rollbacks == 1
-    assert drain_calls == 1
+    # One pass cleans jobs; a second pass confirms nothing is left.
+    assert drain_calls == 2
 
 
 @pytest.mark.asyncio

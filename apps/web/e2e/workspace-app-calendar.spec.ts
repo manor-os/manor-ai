@@ -13,6 +13,26 @@ test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => localStorage.setItem("manor_locale", "en"));
 });
 
+test("a calendar deletion refreshes the collection before returning from its result", async ({ page }) => {
+  page.on("pageerror", (error) => { throw error; });
+  await page.goto(`${fixture}?delete-post`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("button", { name: "Raise That Flag · v2", exact: true }).click();
+  await page.getByTestId("calendar-more-2026-10-22").click();
+  await page.getByTestId("calendar-day-2026-10-22").click();
+  const post = page.getByTestId("calendar-day-panel").getByTestId("calendar-entry-behind-the-song");
+  await post.getByRole("button").click();
+  await post.getByRole("button", { name: "Cancel this post", exact: true }).click();
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await page.getByRole("button", { name: "Run", exact: true }).click();
+  await expect(page.getByText("The post is deleted.", { exact: true })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => (window as any).__collectionReadAfterDelete === true)).toBe(true);
+  await page.getByRole("button", { name: "All actions", exact: true }).click();
+  await expect(page.getByTestId("calendar-collection")).toBeVisible();
+  await page.getByRole("button", { name: "Raise That Flag · v2", exact: true }).click();
+  await expect(page.getByTestId("calendar-day-2026-10-22")).toHaveAccessibleName(/5 scheduled items/);
+  await expect(page.getByTestId("calendar-entry-behind-the-song")).toHaveCount(0);
+});
+
 for (const [name, width, suffix] of [["desktop", 1440, ""], ["mobile", 320, ""], ["narrow container", 1440, "?narrow"]] as const) {
   test(`campaign calendar keeps its overview and day details usable on ${name}`, async ({ page }, testInfo) => {
     const missingLikes = name === "desktop";
@@ -41,6 +61,9 @@ for (const [name, width, suffix] of [["desktop", 1440, ""], ["mobile", 320, ""],
     const back = page.getByRole("button", { name: "All actions", exact: true });
     await expect(back).toBeInViewport();
     await expect(back).toBeFocused();
+    const campaignAction = calendar.getByRole("button", { name: "End campaign", exact: true });
+    await expect(campaignAction).toHaveCount(0);
+    await expect(calendar.getByText("Details", { exact: true })).toHaveCount(0);
     await expect(page.getByRole("button", { name: /^Launch a Music Marketing Campaign/ })).toHaveCount(0);
     await expect(calendar.locator("summary").filter({ hasText: /^(Published content|Publishing progress)$/ })).toHaveCount(0);
     const selectedDay = page.getByTestId("calendar-day-2026-10-22");
@@ -184,6 +207,36 @@ for (const [name, width, suffix] of [["desktop", 1440, ""], ["mobile", 320, ""],
   });
 }
 
+test("a published post's counts refresh in place from the icon beside them", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 950 });
+  await page.goto(`${fixture}?refresh`);
+  await page.getByTestId("calendar-collection").getByRole("button", { name: "Raise That Flag · v2", exact: true }).click();
+  await page.getByTestId("calendar-day-2026-10-22").click();
+  const dayPanel = page.getByTestId("calendar-day-panel");
+  const post = dayPanel.getByTestId("calendar-entry-morning-teaser");
+  const metrics = dayPanel.getByTestId("calendar-metrics-morning-teaser");
+  const icon = metrics.getByRole("button", { name: "Refresh data", exact: true });
+  await expect(icon).toBeVisible();
+  // Only published posts offer it, and an expanded post does not repeat it as a button.
+  await expect(dayPanel.locator("[data-testid^='item-results-action-']")).toHaveCount(
+    await dayPanel.locator("[data-testid^='calendar-metrics-']").count());
+  await page.screenshot({ path: test.info().outputPath("published-post-refresh-icon.png"), animations: "disabled" });
+  await post.locator(".workspace-app-calendar__item-heading").click();
+  await expect(post.locator(".workspace-app-calendar__item-details").getByRole("button", { name: "Refresh data" })).toHaveCount(0);
+  await icon.click();
+  // It starts the entry here, with this post as its input, and stays on the calendar.
+  await expect(page.getByTestId("campaign-calendar")).toBeVisible();
+  expect(await page.evaluate(() => (window as any).refreshStarts)).toEqual([{
+    variables: { slot_project_id: "morning-teaser" },
+    trigger_data: { workspace_manual: true, _workspace_app_action: "action:refresh-post-metrics" },
+    execute: false,
+  }]);
+  await expect(metrics.getByRole("button", { name: "Refresh data: running" })).toHaveAttribute("aria-busy", "true");
+  // When the run ends the icon is ready again.
+  await expect(icon).toHaveAttribute("aria-busy", "false", { timeout: 15_000 });
+  await expect(icon).toBeEnabled();
+});
+
 test("a post waiting for review is reviewed and answered from its own row", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 950 });
   await page.goto(fixture);
@@ -212,6 +265,29 @@ test("a post waiting for review is reviewed and answered from its own row", asyn
     variables: { owner_review_decision: { choice: "request_changes", note: "Shorten the opening and keep the chorus." } },
   }]);
   await expect(post.getByRole("button", { name: "Review", exact: true })).toHaveCount(0);
+});
+
+test("a campaign is ended from its header and a post cancelled from its row, not from tiles", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 950 });
+  await page.goto(fixture);
+  await expect(page.getByRole("button", { name: /End a Campaign|Cancel a Post/ })).toHaveCount(0);
+  await page.getByTestId("calendar-collection").getByRole("button", { name: "Raise That Flag · v2", exact: true }).click();
+  await page.getByTestId("campaign-calendar").getByTestId("calendar-day-2026-10-22").click();
+  // Only a post nothing is publishing yet can be cancelled.
+  const publishing = page.getByTestId("calendar-entry-chorus-preview");
+  await publishing.locator(".workspace-app-calendar__item-heading").click();
+  await expect(publishing.locator(".workspace-app-calendar__item-heading")).toHaveAttribute("aria-expanded", "true");
+  await expect(publishing.getByRole("button", { name: "Cancel this post", exact: true })).toHaveCount(0);
+  const waiting = page.getByTestId("calendar-entry-night-teaser");
+  await waiting.locator(".workspace-app-calendar__item-heading").click();
+  await waiting.getByRole("button", { name: "Cancel this post", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Cancel a Post" })).toBeVisible();
+
+  // The open campaign's header ends that campaign.
+  await page.goto(fixture);
+  await page.getByTestId("calendar-collection").getByRole("button", { name: "Midnight Drive · v1", exact: true }).click();
+  await page.getByTestId("campaign-calendar").getByRole("button", { name: "End campaign", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "End a Campaign" })).toBeVisible();
 });
 
 test("campaign calendar exposes a failed calendar load without presenting it as an empty plan", async ({ page }) => {

@@ -275,9 +275,10 @@ class RuntimeAgentCheckpoint:
     disable_followup_tools: bool = False
     tool_continuations: dict[str, dict[str, Any]] = field(default_factory=dict)
     #: ``{"id": <pending tool call id>, "content": <tool result text>}`` — a
-    #: result that arrived while the turn was parked (a human's answer to
-    #: ``request_input``). On resume the loop appends it as the pending call's
-    #: result instead of re-executing the tool.
+    #: result that arrived while the turn was parked (a human's answer or an
+    #: exhausted resource allocation). On resume the loop appends it instead
+    #: of re-executing the tool. A host-only ``terminal_failure`` reason for
+    #: resource failure restricts the resumed loop to its final model reply.
     pending_tool_result: dict[str, Any] | None = None
     final_response_evidence: dict[str, Any] = field(default_factory=dict)
     tool_evidence: dict[str, Any] = field(default_factory=dict)

@@ -121,6 +121,23 @@ async def test_active_runtime_outside_message_page_remains_visible(
 
 
 @pytest.mark.integration
+async def test_a_run_waiting_on_an_approval_does_not_lock_the_chat(client, db_session, monkeypatch):
+    """It waits for a person's decision, not for this chat: the composer stays
+    usable and the next message supersedes it."""
+    headers, entity_id, workspace_id, conversation_id = await _workspace_chat(client, db_session)
+    _mode(monkeypatch)
+    placeholder = _message(conversation_id, meta={"stream_status": "streaming"})
+    run = _run(conversation_id, entity_id, status="waiting_resource", assistant_message_id=placeholder.id)
+    run.status_reason = "capability_approval"
+    db_session.add_all([placeholder, run])
+    await db_session.commit()
+    assert (await _page(client, headers, workspace_id))["has_active_runtime_run"] is False
+    run.status_reason = "sandbox_queue"
+    await db_session.commit()
+    assert (await _page(client, headers, workspace_id))["has_active_runtime_run"] is True
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("execution,coordination,expected", [
     ("durable", "external-runner", False),
     ("inline", "external-runner", None),

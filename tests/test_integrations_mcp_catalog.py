@@ -82,7 +82,9 @@ async def test_mcp_catalog_exposes_youtube_and_tiktok(client: AsyncClient):
     assert tk["name"] == "TikTok"
     assert "video.publish" in (tk.get("scopes") or "")
 
-    for remote_key in ("stripe", "paypal"):
+    for remote_key in (
+        "paypal",
+    ):
         assert catalog[remote_key]["server_kind"] == "managed"
         assert catalog[remote_key]["supports_multi_account"] is True
 

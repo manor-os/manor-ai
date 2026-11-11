@@ -61,7 +61,7 @@ export default function ForgotPassword() {
             >
               <IconCheckCircle size={24} />
             </div>
-            <h1 style={{ fontSize: 30, fontWeight: 900, color: "var(--text-strong)", marginBottom: 8 }}>
+            <h1 style={{ fontSize: 26, fontWeight: 600, letterSpacing: "-0.02em", color: "var(--text-strong)", marginBottom: 8 }}>
               {t("page.forgot_password.check_inbox")}
             </h1>
             <p style={{ fontSize: 14, color: "var(--text-muted)", lineHeight: 1.6, marginBottom: 28 }}>
@@ -77,7 +77,7 @@ export default function ForgotPassword() {
           </div>
         ) : (
           <>
-            <h1 style={{ fontSize: 30, fontWeight: 900, color: "var(--text-strong)", marginBottom: 8 }}>
+            <h1 style={{ fontSize: 26, fontWeight: 600, letterSpacing: "-0.02em", color: "var(--text-strong)", marginBottom: 8 }}>
               {t("page.forgot_password.title")}
             </h1>
             <p style={{ fontSize: 14, color: "var(--text-muted)", lineHeight: 1.6, marginBottom: 28 }}>

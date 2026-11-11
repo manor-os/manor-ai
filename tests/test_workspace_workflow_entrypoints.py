@@ -2532,6 +2532,12 @@ def test_pending_action_reply_detection_does_not_block_new_work() -> None:
         include_workflow_free_text=True,
     ) is True
     assert pending_action_reply_matches("respond", [workflow_input]) is True
+    # "Continue / finish it" in Chinese answers a failed run's Retry card instead of starting new work.
+    retry_card = {"kind": "workflow_retry", "options": ["retry", "cancel"]}
+    assert pending_action_reply_matches("继续完成", [retry_card]) is True
+    assert pending_action_reply_matches("继续完成这个视频", [retry_card]) is True
+    assert pending_action_reply_matches("帮我规划下一首歌的宣传", [retry_card]) is False
+    assert pending_action_reply_matches("继续写一首新歌", [retry_card]) is False
     assert pending_action_reply_matches("cancel", [workflow_input]) is True
     assert pending_action_reply_matches(
         "Go ahead and create another video about healthy habits.",
@@ -2930,6 +2936,14 @@ async def test_agent_workflow_listing_prefers_current_workspace_binding(
 
     assert [item["binding_id"] for item in workspace_result["workflows"]] == [bindings[1]["id"]]
     assert [item["binding_id"] for item in entity_result["workflows"]] == [bindings[0]["id"]]
+
+    # A folder id taken from a file path is not a Workspace: say so instead of listing nothing.
+    folder_result = json.loads(await workflow_tools._list_workflows(
+        entity_id=registration["entity_id"],
+        target_workspace_id="01M651V7T648QADFX5G38AZEHP",
+    ))
+    assert folder_result["ok"] is False
+    assert "not a Workspace id" in folder_result["error"]
 
 
 @pytest.mark.asyncio
@@ -5779,6 +5793,18 @@ def test_completed_message_carries_the_whole_result_and_the_card_a_short_one():
     assert len(reference["summary"]) == 280 and reference["summary"].endswith("…")
 
 
+def test_completed_message_does_not_repeat_the_summary_the_person_just_approved():
+    summary = "Created one original synth pop clip and saved the MP3 to your Workspace."
+    run = SimpleNamespace(id="run-song-1", workflow_id="workflow-song-1", status="completed",
+                          definition_snapshot={"name": "Create a Song"},
+                          step_results={"listen": {"status": "completed", "review": {"summary": summary}}})
+    content, reference = workflow_result_chat_projection(run, {"status": "completed", "summary": summary})
+
+    assert content == "Create a Song completed."
+    # The run card still carries it for surfaces that show no review.
+    assert reference["summary"]
+
+
 def test_a_finished_run_is_announced_under_the_flow_name_it_was_started_as():
     run = SimpleNamespace(id="run-named-1", workflow_id="workflow-named-1", status="completed",
                           definition_snapshot={"name": "opc create social from brief v1"},
@@ -6050,6 +6076,10 @@ async def test_retryable_business_outcome_projects_editable_retry_attempt(
     assert activity["meta"]["workflow_status"] == "completed"
     assert activity["meta"]["workflow_business_outcome"] == "needs_input"
     assert activity["meta"]["workflow_attempt_number"] == 1
+    # Chat keeps every attempt of this run, and the message that started it, on one row.
+    assert activity["meta"]["workflow_root_run_id"] == run["id"]
+    request = next(message for message in messages if message.get("body") == "Run the recoverable workflow.")
+    assert activity["meta"]["workflow_origin_message_id"] == request["id"]
     retry_action = activity["pending_action"]
     assert retry_action["kind"] == "workflow_retry"
     assert retry_action["retry_from_step_id"] == "handoff"
@@ -6097,7 +6127,16 @@ async def test_retryable_business_outcome_projects_editable_retry_attempt(
     assert resolved_without_attempt["intervention"] is None
     stored_activity.resolved_at = None
     stored_activity.resolution = None
+    # A card drawn by an older resolver keeps the target it was drawn with; the
+    # page and the Retry both follow the run's receipts instead.
+    stored_activity.pending_action = {**stored_activity.pending_action, "retry_from_step_id": "stale_target"}
     await db_session.commit()
+    stale_card = (await client.get(
+        f"/api/v1/workflows/runs/{run['id']}?detail=false",
+        headers=headers,
+    )).json()
+    assert stale_card["intervention"]["message_id"] == activity["id"]
+    assert stale_card["intervention"]["retry_from_step_id"] == "handoff"
 
     queued.clear()
     response = await client.post(
@@ -6561,6 +6600,175 @@ async def test_workflow_approval_card_resumes_same_run(
     )
     assert approval_step["status"] == "completed"
     assert queued == [run["id"]]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_run_waiting_for_review_posts_its_card_in_workspace_chat(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+) -> None:
+    """Production: scheduled preparation runs stopped at final review with no
+    chat card. A scheduled run now brings its decision to the Workspace chat
+    when it stops for a person, and quiet scheduled runs post nothing."""
+    from datetime import datetime, timezone
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.scheduler import ScheduledJob
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.tasks import scheduler_tasks
+
+    monkeypatch.setattr(
+        "packages.core.ai.workflow_runner.WorkflowRunner.enqueue",
+        staticmethod(lambda *args, **kwargs: None),
+    )
+    steps = [
+        {"id": "trigger", "type": "trigger", "name": "Start", "config": {}, "next": ["review"]},
+        {
+            "id": "review", "type": "wait", "name": "Review the finished post",
+            "config": {
+                "wait_type": "approval", "message": "Review the finished post before publishing.",
+                "options": ["approve", "request_changes"], "response_variable": "decision",
+            },
+            "next": ["end"],
+        },
+        {"id": "end", "type": "end", "name": "Done", "next": [], "config": {
+            "completion_message": "Post approved; it publishes at its scheduled time.",
+        }},
+    ]
+    registration, headers, workspace, binding = await _seed_workspace_entrypoint(
+        client, "scheduledreview", steps=steps, variables={"decision": None},
+    )
+    now = datetime(2030, 2, 1, 22, 0, tzinfo=timezone.utc)
+    job = ScheduledJob(
+        id=generate_ulid(), job_id=f"prepare:{generate_ulid()}", entity_id=registration["entity_id"],
+        workspace_id=workspace["id"], user_id=registration["user_id"],
+        name="Prepare scheduled content", execution_type="workflow",
+        execution_target={"workflow_id": binding["workflow_id"]},
+        schedule_kind="cron", cron_expr="*/15 * * * *", next_run_at=now, enabled=True,
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    async def allow_credits(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(scheduler_tasks, "_preflight_scheduled_job_credits", allow_credits)
+    monkeypatch.setattr(scheduler_tasks, "_publish_scheduled_dispatch", lambda dispatch: None)
+    parent_dispatch, _ = await scheduler_tasks._prepare_scheduler_parent_dispatch(job.id, now)
+    await scheduler_tasks._async_dispatch_single(
+        job.id, now.isoformat(), occurrence_key=parent_dispatch["kwargs"]["occurrence_key"],
+    )
+    run_id = (await db_session.execute(
+        select(WorkflowRun.id).where(WorkflowRun.workflow_id == binding["workflow_id"])
+    )).scalar_one()
+
+    def cards(messages):
+        return [message for message in messages if message.get("pending_action")]
+
+    before = (await client.get(f"/api/v1/workspaces/{workspace['id']}/chat/messages", headers=headers)).json()
+    assert not [m for m in before if (m.get("meta") or {}).get("workflow_run_id") == run_id]
+
+    import packages.core.ai.workflow_runner as workflow_runner_module
+    import packages.core.database as db_module
+
+    monkeypatch.setattr(workflow_runner_module, "async_session", db_module.async_session)
+    await workflow_runner_module.WorkflowRunner().run(run_id)
+
+    messages = (await client.get(f"/api/v1/workspaces/{workspace['id']}/chat/messages", headers=headers)).json()
+    card = next(m for m in cards(messages) if m["pending_action"].get("workflow_run_id") == run_id)
+    assert card["pending_action"]["kind"] == "workflow_approval"
+    assert card["pending_action"]["options"] == ["approve", "request_changes"]
+    resolved = await client.post(
+        f"/api/v1/workspaces/{workspace['id']}/chat/messages/{card['id']}/resolve",
+        headers=headers, json={"choice": "approve"},
+    )
+    assert resolved.status_code == 200, resolved.text
+    resumed = (await client.get(f"/api/v1/workflows/runs/{run_id}", headers=headers)).json()
+    assert resumed["status"] == "running"
+    assert resumed["variables"]["decision"]["choice"] == "approve"
+    # The row says what finishing means for this Flow, not a bare "completed".
+    await workflow_runner_module.WorkflowRunner().run(run_id)
+    messages = (await client.get(f"/api/v1/workspaces/{workspace['id']}/chat/messages", headers=headers)).json()
+    activity = next(
+        m for m in messages
+        if m["message_kind"] == "workflow_activity" and (m.get("meta") or {}).get("workflow_run_id") == run_id
+    )
+    assert activity["body"].endswith("Post approved; it publishes at its scheduled time.")
+
+
+@pytest.mark.asyncio
+async def test_chat_continue_retries_the_failed_run_with_its_own_brief(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+) -> None:
+    """Production: "继续完成" was planned as new strategy work and a remade video
+    lost the original karaoke-lyrics brief. The agent can now relay it to the
+    failed run's Retry card, which retries that run with its own inputs."""
+    from datetime import datetime, timedelta, timezone
+
+    from packages.core.ai.runtime.workspace_operation_actions import runtime_workspace_resolve_hitl_action
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.task import Message
+    from packages.core.models.workflow import WorkflowRun
+
+    monkeypatch.setattr(
+        "packages.core.ai.workflow_runner.WorkflowRunner.enqueue",
+        staticmethod(lambda *args, **kwargs: None),
+    )
+    steps = [
+        {"id": "start", "type": "trigger", "next": ["make"]},
+        {"id": "make", "type": "transform", "name": "Make the video", "config": {"set": {"made": True}}, "next": ["blocked"]},
+        {"id": "blocked", "type": "stop", "name": "Video blocked", "config": {
+            "message": "The video came out short.", "retry_from_step_id": "make",
+        }},
+    ]
+    registration, headers, workspace, binding = await _seed_workspace_entrypoint(
+        client, "chat-continue", steps=steps,
+        variables={"request": "", "attachments": [], "brief": "Karaoke lyrics on screen"},
+    )
+    await client.post(
+        f"/api/v1/workspaces/{workspace['id']}/chat/entrypoints/{binding['id']}/stream",
+        headers=headers, data={"message": "Make the lyric video."},
+    )
+    run = (await client.get(f"/api/v1/workflows/runs?workspace_id={workspace['id']}", headers=headers)).json()[0]
+    import packages.core.ai.workflow_runner as workflow_runner_module
+    import packages.core.database as db_module
+
+    monkeypatch.setattr(workflow_runner_module, "async_session", db_module.async_session)
+    await workflow_runner_module.WorkflowRunner().run(run["id"])
+    messages = (await client.get(f"/api/v1/workspaces/{workspace['id']}/chat/messages", headers=headers)).json()
+    card = next(m for m in messages if (m.get("pending_action") or {}).get("kind") == "workflow_retry")
+    assert card["pending_action"]["retry_from_step_id"] == "make"
+
+    async def relay():
+        return json.loads(await runtime_workspace_resolve_hitl_action(
+            entity_id=registration["entity_id"], workspace_id=workspace["id"],
+            conversation_id=card["conversation_id"], user_id=registration["user_id"],
+            params={"message_id": card["id"], "action": "approve"},
+        ))
+
+    # Not before the person has answered the card.
+    assert (await relay())["reason"] == "retry_not_seen_by_user"
+    # A later message about new work is not a decision to spend credits on this run.
+    db_session.add(Message(
+        id=generate_ulid(), conversation_id=card["conversation_id"], role="user", author_kind="user",
+        content="继续写一首新歌", created_at=datetime.now(timezone.utc) + timedelta(seconds=1),
+    ))
+    await db_session.commit()
+    assert (await relay())["reason"] == "latest_message_is_not_a_reply_to_this_card"
+    db_session.add(Message(
+        id=generate_ulid(), conversation_id=card["conversation_id"], role="user", author_kind="user",
+        content="继续完成", created_at=datetime.now(timezone.utc) + timedelta(seconds=2),
+    ))
+    await db_session.commit()
+    relayed = await relay()
+    assert relayed["resolved"] is True and relayed["choice"] == "retry"
+    retried = await db_session.get(WorkflowRun, relayed["workflow_run_id"])
+    assert retried.id != run["id"] and retried.retry_of_run_id == run["id"]
+    assert retried.retry_from_step_id == "make"
+    assert retried.variables["brief"] == "Karaoke lyrics on screen"
 
 
 @pytest.mark.asyncio

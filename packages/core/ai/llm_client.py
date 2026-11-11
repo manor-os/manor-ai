@@ -12,7 +12,7 @@ external config module dependency).
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 import contextlib
 import contextvars
 from dataclasses import dataclass
@@ -290,6 +290,17 @@ def _platform_model_routing_enabled() -> bool:
     """
 
     return os.getenv("DEPLOYMENT_MODE", "oss").strip().lower() == "cloud"
+
+
+def _unroutable_detail(routing: Any, model: str | None) -> tuple[str, str]:
+    """(message, error code) for a call that resolved no usable key."""
+    if getattr(routing, "source", "") == "unpriced":
+        return (
+            f"The model {model} has no Manor price, so it cannot run on Manor credits. "
+            "Choose another model, or add your own API key for it.",
+            "model_not_billable",
+        )
+    return _missing_llm_key_detail(), "llm_configuration_missing"
 
 
 def _missing_llm_key_detail() -> str:
@@ -852,6 +863,19 @@ async def resolve_llm_routing_for_model(
         )
 
     if model_provider:
+        from packages.core.services.catalog_pricing import is_priceable
+
+        if not is_priceable(model_id, "text"):
+            # Manor credits only pay for a model Manor can bill; the user's own
+            # key (handled above) may still run it.
+            logger.warning("Refusing platform call to unpriced model %s", model_id)
+            _is_byok_call.set(False)
+            return ResolvedLLMRouting(
+                api_key="",
+                base_url=get_llm_base_url(),
+                provider=model_provider,
+                source="unpriced",
+            )
         try:
             route = await resolve_official_model_route(
                 model_id,
@@ -1333,6 +1357,12 @@ class LLMBillingContext:
     durable_per_call: bool = False
     """True when the caller settles each call through a durable callback."""
     byok: bool = False  # True = user's own API key; log usage for analytics but charge 0 credits
+    operation_id: Optional[str] = None
+    """The run these calls belong to (a Workflow run id). Written to the
+    token and credit rows so usage can be tied back to the run."""
+    task_id: Optional[str] = None
+    """The Task whose execution makes these calls. Written to the token and
+    credit rows so spend can be tied back to the Task."""
     in_flight_credits: int = 0
     """Credits consumed in this request but not necessarily visible in the
     ledger yet. Non-durable automatic billing uses this local counter while
@@ -1347,7 +1377,29 @@ class LLMBillingContext:
 _billing_ctx_var: contextvars.ContextVar[Optional[LLMBillingContext]] = contextvars.ContextVar(
     "llm_billing_ctx", default=None,
 )
+# Set while a loop round's provider call is in flight. The loop's durable settle
+# callback writes that call's usage, so the automatic record must not write it
+# again. Calls outside a round keep their automatic record.
+_llm_round_settled_by_callback: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "llm_round_settled_by_callback", default=False,
+)
 _entity_in_flight_credits: dict[str, int] = {}
+
+
+@contextmanager
+def llm_round_settled_by_callback_scope(active: bool = True):
+    """Mark the provider call inside this scope as settled by the loop's callback.
+
+    The mark is restored on every exit, an exception or cancellation included,
+    so no later call in the same context loses its automatic record.
+    """
+    token = _llm_round_settled_by_callback.set(bool(active))
+    try:
+        yield
+    finally:
+        _llm_round_settled_by_callback.reset(token)
+
+
 # Whether the provider call being gated was routed to a native BYOK key, set
 # around the preflight of a routed call. In a sponsored trial the route, not
 # the context's byok flag, decides whether the provider's credits are gated.
@@ -1371,6 +1423,31 @@ def llm_context_attribution_scope(attribution: Optional[dict]):
         yield
     finally:
         _context_attribution_var.reset(token)
+
+
+# A sub-agent working inside its caller's billing context shares that
+# context's payer, BYOK and credits; its calls are only recorded apart.
+_usage_subsource_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "llm_usage_subsource", default=None,
+)
+_USAGE_SOURCE_MAX_CHARS = 50  # token_usage_logs.source / credit_usage_logs.business_type
+
+
+@contextlib.contextmanager
+def llm_usage_subsource_scope(name: Optional[str]):
+    """Record usage in this scope as ``<context source>.<name>``."""
+    token = _usage_subsource_var.set(str(name or "").strip() or None)
+    try:
+        yield
+    finally:
+        _usage_subsource_var.reset(token)
+
+
+def usage_record_source(billing: LLMBillingContext) -> str:
+    """The source an automatically recorded call is logged under."""
+    subsource = _usage_subsource_var.get()
+    source = f"{billing.source}.{subsource}" if subsource else billing.source
+    return source[:_USAGE_SOURCE_MAX_CHARS]
 
 
 _prompt_cache_key_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
@@ -1447,6 +1524,21 @@ def _is_prompt_cache_key_rejection(exc: httpx.HTTPStatusError) -> bool:
     return "prompt_cache_key" in (body or "")
 
 
+def inherited_billing_task_id(entity_id: str, task_id: Optional[str] = None) -> Optional[str]:
+    """The Task a new billing context bills to: ``task_id``, else the bound one's.
+
+    Work nested inside a Task's execution (a delegated child, a tool's own
+    completion) binds its own context; it still belongs to that Task when the
+    outer context is for the same entity.
+    """
+    if task_id:
+        return task_id
+    outer = _billing_ctx_var.get()
+    if outer is not None and outer.entity_id == entity_id:
+        return outer.task_id
+    return None
+
+
 @contextlib.asynccontextmanager
 async def llm_billing_context(
     entity_id: str,
@@ -1458,11 +1550,14 @@ async def llm_billing_context(
     source: str = "system",
     byok: bool = False,
     payer_entity_id: Optional[str] = None,
+    task_id: Optional[str] = None,
+    operation_id: Optional[str] = None,
 ):
     """Context manager: every LLM call within this scope auto-records usage.
 
     ``payer_entity_id`` is an already resolved payer; without it the payer
-    is resolved and pinned at the first credit check.
+    is resolved and pinned at the first credit check. ``operation_id`` and
+    ``task_id`` name the run and Task the calls' usage rows are tied to.
 
     Usage:
         async with llm_billing_context("entity_123", source="strategist"):
@@ -1473,6 +1568,8 @@ async def llm_billing_context(
         entity_id=entity_id, user_id=user_id, agent_id=agent_id,
         workspace_id=workspace_id, conversation_id=conversation_id,
         source=source, byok=byok, payer_entity_id=payer_entity_id,
+        task_id=inherited_billing_task_id(entity_id, task_id),
+        operation_id=operation_id,
     )
     # Restore the *previous* value on exit via set(prev) rather than
     # reset(token). A ContextVar Token is bound to the context that called
@@ -2275,12 +2372,15 @@ def _cache_read_tokens_from_usage(usage: Dict[str, Any]) -> int:
 
 
 def _cache_creation_tokens_from_usage(usage: Dict[str, Any]) -> int:
+    prompt_details = usage.get("prompt_tokens_details") or {}
     input_details = usage.get("input_tokens_details") or usage.get("input_token_details") or {}
     return _first_int_usage_value(
         usage.get("cache_creation_input_tokens"),
         usage.get("cache_creation_tokens"),
         usage.get("cache_write_input_tokens"),
         usage.get("cache_write_tokens"),
+        # OpenRouter reports cache writes here.
+        prompt_details.get("cache_write_tokens"),
         input_details.get("cache_creation"),
         input_details.get("cache_write"),
     )
@@ -2323,21 +2423,31 @@ def _usage_from_response(data: Dict[str, Any], model: Optional[str] = None) -> D
     cache_read = _cache_read_tokens_from_usage(usage)
     cache_creation = _cache_creation_tokens_from_usage(usage)
     audio_in, audio_out = _audio_tokens_from_usage(usage)
-    reported_cost = (
+    # A gateway's own cost figure is kept for reconciliation only: the bill is
+    # the official tokens at the model's price (``usage_service.llm_call_cost_usd``).
+    gateway_cost = (
         usage.get("cost_usd")
         if usage.get("cost_usd") is not None
         else usage.get("cost")
     )
+    prompt = int(usage.get("prompt_tokens") or 0)
+    completion = int(usage.get("completion_tokens") or 0)
+    total = int(usage.get("total_tokens") or 0)
+    # Some routes leave reasoning out of completion_tokens but count it in the
+    # total; the provider bills it as output, so the gap is output too.
+    if total > prompt + completion:
+        completion = total - prompt
     return {
-        "prompt": usage.get("prompt_tokens", 0),
-        "completion": usage.get("completion_tokens", 0),
-        "total": usage.get("total_tokens", 0),
+        "prompt": prompt,
+        "completion": completion,
+        "total": total or prompt + completion,
         "cache_read": cache_read,
         "cache_creation": cache_creation,
         "audio_in": audio_in,
         "audio_out": audio_out,
         "model": model or usage.get("model"),
-        "cost_usd": reported_cost,
+        "cost_usd": None,
+        "gateway_cost_usd": gateway_cost,
     }
 
 
@@ -3069,10 +3179,12 @@ def _anthropic_max_tokens(model: str, requested: Optional[int]) -> int:
 
 def _usage_from_anthropic_response(data: Dict[str, Any], model: Optional[str]) -> Dict[str, Any]:
     raw = data.get("usage") or {}
-    prompt = int(raw.get("input_tokens") or 0)
-    completion = int(raw.get("output_tokens") or 0)
     cache_read = _cache_read_tokens_from_usage(raw)
     cache_creation = _cache_creation_tokens_from_usage(raw)
+    # Anthropic's input_tokens excludes cached tokens; the rest of billing
+    # treats prompt as the whole input and carves the cache buckets out of it.
+    prompt = int(raw.get("input_tokens") or 0) + cache_read + cache_creation
+    completion = int(raw.get("output_tokens") or 0)
     return {
         "prompt": prompt,
         "completion": completion,
@@ -3553,7 +3665,7 @@ def _record_llm_call(
                 model,
                 byok=is_byok,
             )
-        if not billing.suppress:
+        if not billing.suppress and not _llm_round_settled_by_callback.get():
             _schedule_billing_record(
                 billing,
                 billing_payload,
@@ -3641,10 +3753,9 @@ def _usage_to_credit_estimate(usage: dict, model: str | None) -> int:
         reported_cost = 0.0
     if reported_cost > 0:
         try:
-            import math
-            from packages.core.services.billing_service import AI_MARGIN, CREDITS_PER_USD
+            from packages.core.services.billing_service import usd_to_credits
 
-            return max(1, math.ceil(reported_cost * (1 + AI_MARGIN) * CREDITS_PER_USD))
+            return max(1, usd_to_credits(reported_cost))
         except Exception:
             logger.debug("Failed to convert reported LLM cost to credits", exc_info=True)
 
@@ -3759,13 +3870,11 @@ async def _preflight_credit_check(*, session_factory: Any | None = None) -> None
 
     from packages.core.constants.plans import ai_credit_limits_enabled, is_cloud
     routed_byok = _routed_call_byok_var.get()
-    pinned_payer = getattr(billing, "payer_entity_id", None)
-    sponsored_context = bool(pinned_payer) and pinned_payer != billing.entity_id
     byok_call = (
         routed_byok
-        # A sponsored trial follows the route: the provider's byok flag must
-        # not exempt a call that fell back to the platform at its expense.
-        if routed_byok is not None and sponsored_context
+        # The actual route wins over a context established before failover,
+        # for both ordinary tenants and sponsored trials.
+        if routed_byok is not None
         else getattr(billing, "byok", False) or _is_byok_call.get(False)
     )
     tenant_credit_check = (
@@ -4281,6 +4390,9 @@ def fire_and_forget(coro_factory: Callable[[], Awaitable[Any]], *, label: str = 
         warnings if no event loop is running.
       label: short tag used in the failure log line.
     Returns True when the task was scheduled, False when no event loop exists.
+
+    The task is held until it finishes, and ``drain_fire_and_forget_writes``
+    lets a per-task worker loop finish pending writes before it closes.
     """
     async def _wrapped():
         try:
@@ -4290,10 +4402,49 @@ def fire_and_forget(coro_factory: Callable[[], Awaitable[Any]], *, label: str = 
 
     try:
         loop = asyncio.get_running_loop()
-        loop.create_task(_wrapped())
-        return True
     except RuntimeError:
         return False  # No running loop — drop the write (sync context)
+    task = loop.create_task(_wrapped())
+    _FIRE_AND_FORGET_TASKS.add(task)
+    task.add_done_callback(_FIRE_AND_FORGET_TASKS.discard)
+    return True
+
+
+# Strong references keep pending writes from being garbage-collected.
+_FIRE_AND_FORGET_TASKS: set[asyncio.Task[None]] = set()
+_FIRE_AND_FORGET_DRAIN_TIMEOUT_SECONDS = 30.0
+
+
+async def drain_fire_and_forget_writes(
+    *, timeout_seconds: float = _FIRE_AND_FORGET_DRAIN_TIMEOUT_SECONDS,
+) -> None:
+    """Finish this loop's pending fire-and-forget writes (billing, tool logs).
+
+    ``asyncio.run`` cancels unfinished tasks when it closes its loop, so a
+    Celery task that returns right after its last model call would otherwise
+    drop that call's usage row and credit charge.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _pending() -> tuple[asyncio.Task[None], ...]:
+        return tuple(
+            task for task in _FIRE_AND_FORGET_TASKS
+            if task.get_loop() is loop and not task.done()
+        )
+
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            while pending := _pending():
+                await asyncio.gather(*pending, return_exceptions=True)
+    except TimeoutError:
+        pending = _pending()
+        logger.warning(
+            "Timed out draining fire-and-forget writes (%d task(s)); their usage may be lost",
+            len(pending),
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 def _schedule_billing_record(
@@ -4316,6 +4467,7 @@ def _schedule_billing_record(
             )
             _release_entity_in_flight_credits(in_flight_entity_id, reserved_credits)
 
+    source = usage_record_source(billing)
     attribution = _context_attribution_var.get()
     if attribution and not any(
         key in usage for key in ("context_attribution", "context_attribution_total", "context_breakdown")
@@ -4339,9 +4491,11 @@ def _schedule_billing_record(
                     user_id=billing.user_id, agent_id=billing.agent_id,
                     workspace_id=billing.workspace_id,
                     conversation_id=billing.conversation_id,
-                    usage=usage, duration_ms=duration_ms, source=billing.source,
+                    usage=usage, duration_ms=duration_ms, source=source,
                     # None resolves the Workspace's payer at write time.
                     payer_entity_id=billing.payer_entity_id,
+                    operation_id=billing.operation_id,
+                    task_id=billing.task_id,
                 )
                 await db.commit()
         finally:
@@ -4760,6 +4914,23 @@ def _byok_provider_error_code() -> str:
 # chat_completion (plain text)
 # ---------------------------------------------------------------------------
 
+class UnattributedLLMCallError(RuntimeError):
+    """A cloud provider call made with no billing context.
+
+    Such a call would spend platform credit with no preflight and no usage row.
+    """
+
+
+def _require_billing_context(call_type: str) -> None:
+    from packages.core.constants.plans import is_cloud
+
+    if _billing_ctx_var.get() is None and is_cloud():
+        raise UnattributedLLMCallError(
+            f"{call_type} needs a billing context in cloud mode: bind one with "
+            "llm_billing_context or runtime_ensure_billing_context before calling it."
+        )
+
+
 async def chat_completion(
     messages: List[Dict[str, str]],
     *,
@@ -4780,6 +4951,7 @@ async def chat_completion(
     "finish_reason" key alongside token counts. If metadata is provided,
     user-level API key and base URL take priority.
     """
+    _require_billing_context("chat_completion")
     return await _call_with_provider_retry(
         lambda: _chat_completion_attempt(
             messages,
@@ -4814,11 +4986,9 @@ async def _chat_completion_attempt(
     api_key = routing.api_key
     base_url = routing.base_url
     if not api_key:
-        detail = _missing_llm_key_detail()
+        detail, error_code = _unroutable_detail(routing, resolved_model)
         logger.warning(detail)
-        return "", _failure_usage(
-            resolved_model, detail, error_code="llm_configuration_missing",
-        )
+        return "", _failure_usage(resolved_model, detail, error_code=error_code)
 
     # Pre-flight after key resolution so native-provider BYOK can bypass
     # Manor credit gates while platform OpenRouter calls remain gated.
@@ -5113,6 +5283,7 @@ async def chat_completion_with_tools(
     See :func:`_chat_completion_with_tools_attempt` for the result contract
     and :func:`_call_with_provider_retry` for the retry policy.
     """
+    _require_billing_context("chat_completion_with_tools")
     return await _call_with_provider_retry(
         lambda: _chat_completion_with_tools_attempt(
             messages,
@@ -5163,11 +5334,9 @@ async def _chat_completion_with_tools_attempt(
     base_url = routing.base_url
 
     if not api_key:
-        detail = _missing_llm_key_detail()
+        detail, error_code = _unroutable_detail(routing, model)
         logger.warning("%s Tool calling unavailable.", detail)
-        return "", None, _failure_usage(
-            model, detail, error_code="llm_configuration_missing",
-        )
+        return "", None, _failure_usage(model, detail, error_code=error_code)
 
     # Pre-flight after key resolution so native-provider BYOK can bypass
     # Manor credit gates while platform OpenRouter calls remain gated.

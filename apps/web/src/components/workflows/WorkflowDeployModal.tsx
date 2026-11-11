@@ -1,3 +1,4 @@
+import { t } from "../../lib/i18n";
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, translateApiError } from "../../lib/api";
@@ -9,20 +10,20 @@ import Select from "../ui/Select";
 import { workflowRunInputs } from "../../lib/workflowRunInputs";
 
 const TRIGGER_OPTIONS = [
-  { value: "manual", label: "Manual — run on demand / API" },
-  { value: "schedule", label: "Schedule — run on a cron" },
-  { value: "event", label: "Event — a named app event" },
-  { value: "workspace_event", label: "Workspace event — a workspace activity" },
-  { value: "webhook", label: "Webhook — inbound URL" },
-  { value: "error", label: "Error — run when a workflow fails" },
-  { value: "mcp", label: "Tool — callable by AI agents (MCP)" },
+  { value: "manual", label: t("ui.manual_run_on_demand_api") },
+  { value: "schedule", label: t("ui.schedule_run_on_a_cron") },
+  { value: "event", label: t("ui.event_a_named_app_event") },
+  { value: "workspace_event", label: t("ui.workspace_event_a_workspace_activity") },
+  { value: "webhook", label: t("ui.webhook_inbound_url") },
+  { value: "error", label: t("ui.error_run_when_a_workflow_fails") },
+  { value: "mcp", label: t("ui.tool_callable_by_ai_agents_mcp") },
 ];
 
 const CRON_PRESETS = [
-  { label: "Every hour", cron: "0 * * * *" },
-  { label: "Daily 9am", cron: "0 9 * * *" },
-  { label: "Weekdays 8am", cron: "0 8 * * 1-5" },
-  { label: "Mondays 8am", cron: "0 8 * * 1" },
+  { label: t("ui.every_hour"), cron: "0 * * * *" },
+  { label: t("ui.daily_9am"), cron: "0 9 * * *" },
+  { label: t("ui.weekdays_8am"), cron: "0 8 * * 1-5" },
+  { label: t("ui.mondays_8am"), cron: "0 8 * * 1" },
 ];
 
 /** Deploy a workflow into a workspace / business line as a triggered binding. */
@@ -133,10 +134,10 @@ export default function WorkflowDeployModal({
       footer={
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
           <Button variant="ghost" onClick={() => { reset(); onClose(); }}>
-            Cancel
+            {t("ui.cancel")}
           </Button>
           <Button onClick={() => deployMut.mutate()} loading={deployMut.isPending} disabled={!canDeploy}>
-            Deploy
+            {t("ui.deploy")}
           </Button>
         </div>
       }
@@ -149,13 +150,13 @@ export default function WorkflowDeployModal({
         </p>
 
         {(bindings as any[]).length > 0 && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 7, padding: "10px 0 14px", borderBottom: "1px solid rgba(28,25,23,0.08)" }}>
-            <span style={{ fontSize: 11, fontWeight: 600, color: "var(--text-faint)" }}>Existing deployments</span>
+          <div style={{ display: "flex", flexDirection: "column", gap: 7, padding: "10px 0 14px", borderBottom: "0.5px solid rgba(29, 29, 31,0.08)" }}>
+            <span style={{ fontSize: 11, fontWeight: 600, color: "var(--text-faint)" }}>{t("ui.existing_deployments")}</span>
             {(bindings as any[]).map((binding) => {
               const workspace = (workspaces as { id: string; name: string }[]).find((w) => w.id === binding.workspace_id);
               return (
                 <div key={binding.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 9, background: "var(--surface-muted)" }}>
-                  <span style={{ width: 7, height: 7, borderRadius: "50%", background: binding.enabled ? "#4f9c84" : "#a8a29e", flexShrink: 0 }} />
+                  <span style={{ width: 7, height: 7, borderRadius: "50%", background: binding.enabled ? "#4f9c84" : "#aeaeb2", flexShrink: 0 }} />
                   <div style={{ minWidth: 0, flex: 1 }}>
                     <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text-strong)" }}>{binding.name || binding.trigger_type}</div>
                     <div style={{ fontSize: 11, color: "var(--text-faint)" }}>
@@ -185,11 +186,11 @@ export default function WorkflowDeployModal({
           </div>
         )}
 
-        <Field label="Workspace">
+        <Field label={t("ui.workspace")}>
           <Select
             value={workspaceId}
             onChange={setWorkspaceId}
-            placeholder="Entity-level (no workspace)"
+            placeholder={t("ui.entity_level_no_workspace")}
             options={(workspaces as { id: string; name: string }[]).map((w) => ({
               value: w.id,
               label: w.name,
@@ -197,7 +198,7 @@ export default function WorkflowDeployModal({
           />
         </Field>
 
-        <Field label="Business line">
+        <Field label={t("ui.business_line")}>
           <Input
             placeholder="e.g. leasing, maintenance, billing (optional)"
             value={businessLine}
@@ -205,12 +206,12 @@ export default function WorkflowDeployModal({
           />
         </Field>
 
-        <Field label="Trigger">
+        <Field label={t("ui.trigger")}>
           <Select value={triggerType} onChange={setTriggerType} options={TRIGGER_OPTIONS} />
         </Field>
 
         {triggerType === "schedule" && (
-          <Field label="Cron schedule">
+          <Field label={t("ui.cron_schedule")}>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
               {CRON_PRESETS.map((p) => {
                 const active = cron.trim() === p.cron;
@@ -249,7 +250,7 @@ export default function WorkflowDeployModal({
         )}
 
         {needsEvent && (
-          <Field label="Event name">
+          <Field label={t("ui.event_name")}>
             <Input
               placeholder="e.g. lead.created"
               value={eventName}
@@ -272,9 +273,9 @@ export default function WorkflowDeployModal({
         )}
 
         {triggerType === "mcp" && (
-          <Field label="Tool description">
+          <Field label={t("ui.tool_description")}>
             <Input
-              placeholder="What this workflow does (shown to the agent)"
+              placeholder={t("ui.what_this_workflow_does_shown_to_the_agent")}
               value={toolDesc}
               onChange={(e) => setToolDesc(e.target.value)}
             />
@@ -292,7 +293,7 @@ export default function WorkflowDeployModal({
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-      <span style={{ fontSize: 11, fontWeight: 500, letterSpacing: 0.2, color: "var(--text-faint)" }}>
+      <span style={{ fontSize: 11, fontWeight: 500, color: "var(--text-faint)" }}>
         {label}
       </span>
       {children}

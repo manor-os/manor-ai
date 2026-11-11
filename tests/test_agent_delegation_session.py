@@ -12,7 +12,7 @@ from sqlalchemy import delete, select
 from packages.core.models.agent_delegation_session import AgentDelegationSession
 from packages.core.models.base import generate_ulid
 from packages.core.models.task import Conversation, Message
-from packages.core.models.workspace import Agent, AgentSubscription
+from packages.core.models.workspace import Agent, AgentSubscription, AgentToolBinding, ToolDefinition
 
 
 async def _workspace(client: AsyncClient) -> tuple[dict, dict]:
@@ -33,6 +33,159 @@ async def _workspace(client: AsyncClient) -> tuple[dict, dict]:
     )
     assert response.status_code == 201
     return headers, response.json()
+
+
+_CHILD_FILE = {"kind": "document", "name": "child.md", "content": "From the child"}
+
+
+async def _main_chat_child(client, db_session, monkeypatch, tmp_path, tool, arguments, *, before_seed=None):
+    """A Workspace main chat whose child runs for real; only its model is scripted.
+
+    The result delegates to the child: the real child loop, tool gate and tool.
+    """
+    from packages.core.ai import agentic_loop as loop_module
+    from packages.core.ai.runtime import billing, completions
+    from packages.core.ai.tools.workspace_agent_tools import _workspace_agent_handler
+    from packages.core.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    headers, workspace = await _workspace(client)
+    if before_seed is not None:
+        await before_seed(headers, workspace)
+    user_id = (await client.get("/api/v1/auth/me", headers=headers)).json()["id"]
+    agent_id, subscription_id, conversation_id = generate_ulid(), generate_ulid(), generate_ulid()
+    db_session.add_all([
+        Agent(id=agent_id, entity_id=workspace["entity_id"], name="Writer", status="active"),
+        AgentSubscription(
+            id=subscription_id, entity_id=workspace["entity_id"], workspace_id=workspace["id"],
+            agent_id=agent_id, service_key="writer", status="active",
+        ),
+        Conversation(
+            id=conversation_id, entity_id=workspace["entity_id"],
+            workspace_id=workspace["id"], scope="workspace_main",
+        ),
+    ])
+    if tool == "generate_file":
+        definition = ToolDefinition(id=generate_ulid(), name=tool, display_name=tool, category="file")
+        db_session.add(definition)
+        await db_session.flush()
+        db_session.add(AgentToolBinding(agent_id=agent_id, tool_id=definition.id))
+    await db_session.commit()
+
+    rounds = {"seen": 0}
+
+    async def completion(_messages, tools=None, **_kwargs):
+        rounds["seen"] += 1
+        usage = {"prompt": 1, "completion": 1, "total": 2}
+        if rounds["seen"] == 1:
+            return "", [{"id": "call_1", "name": tool, "arguments": arguments}], usage
+        return "done", None, usage
+
+    async def text(_messages, **_kwargs):
+        return "done", {"prompt": 1, "completion": 1, "total": 2}
+
+    async def route(**_kwargs):
+        return None, {}, None
+
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_tool_completion", completion)
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_text_completion", text)
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_final_completion", text)
+    monkeypatch.setattr(completions, "runtime_resolve_text_completion_route", route)
+    monkeypatch.setattr(billing, "runtime_ensure_billing_context", lambda *_a, **_k: None)
+
+    async def delegate(**params):
+        return json.loads(await _workspace_agent_handler(
+            entity_id=workspace["entity_id"], workspace_id=workspace["id"], conversation_id=conversation_id,
+            user_id=user_id, action="delegate_service", params={"service_key": "writer", **params},
+        ))
+
+    return SimpleNamespace(
+        delegate=delegate, agent_id=agent_id, conversation_id=conversation_id, user_id=user_id,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("tool", "arguments", "error"), [
+    # Past the gate: only the scripted sandbox id, which no one created, is refused.
+    ("sandbox", {"action": "exec", "params": {"sandbox_id": "sbx-1", "command": "ls"}}, "sandbox_access_denied"),
+    # File tools have a second identity check behind the tool gate.
+    ("generate_file", _CHILD_FILE, None),
+])
+async def test_main_chat_child_write_passes_the_identity_gate_and_is_logged(
+    client: AsyncClient, db_session, monkeypatch, tmp_path, tool, arguments, error,
+) -> None:
+    """Prod 2026-11: a child delegated from a Workspace main chat had no run
+    identity, so every gated call it made was refused and it logged nothing.
+    """
+    from packages.core.ai.chat_logger import DELEGATION_TOOL_CALL_SOURCE
+    from packages.core.models.usage import ToolCallLog
+
+    child = await _main_chat_child(client, db_session, monkeypatch, tmp_path, tool, arguments)
+    result = await child.delegate(prompt="Do the write.")
+
+    for _ in range(50):
+        rows = (await db_session.execute(
+            select(ToolCallLog).where(ToolCallLog.conversation_id == child.conversation_id)
+        )).scalars().all()
+        if rows:
+            break
+        await asyncio.sleep(0.05)
+
+    assert [row.tool_name for row in rows] == [tool], result
+    assert rows[0].source == DELEGATION_TOOL_CALL_SOURCE
+    assert rows[0].agent_id == child.agent_id
+    if error:
+        assert error in rows[0].error
+    else:
+        assert rows[0].error is None
+        assert result["status"] == "completed"
+        assert [path.read_text() for path in tmp_path.rglob("child.md")] == ["From the child"]
+
+
+@pytest.mark.asyncio
+async def test_main_chat_child_approval_holds_the_write_until_granted_and_once(
+    client: AsyncClient, db_session, monkeypatch, tmp_path,
+) -> None:
+    from packages.core.governance.approvals import grant_approval
+    from packages.core.models.hitl_request import HitlRequest
+
+    async def ask_before_file_writes(headers, workspace):
+        draft = await client.post(
+            f"/api/v1/workspaces/{workspace['id']}/operation/drafts", headers=headers,
+            json={"patches": [{"op": "rule.add", "payload": {"rule": {
+                "rule_key": "review_files", "description": "Review new files",
+                "rule_type": "approval_required", "action_patterns": ["workspace.file.create"],
+            }}}]},
+        )
+        applied = await client.post(
+            f"/api/v1/workspaces/{workspace['id']}/operation/drafts/{draft.json()['id']}/apply",
+            headers=headers, json={"user_confirmation": True},
+        )
+        assert applied.status_code == 200, applied.text
+
+    child = await _main_chat_child(
+        client, db_session, monkeypatch, tmp_path, "generate_file", _CHILD_FILE,
+        before_seed=ask_before_file_writes,
+    )
+
+    paused = await child.delegate(prompt="Do the write.")
+    assert paused["error"] == "approval_required", paused
+    assert not list(tmp_path.rglob("child.md")), paused
+    token = paused["approval_token"]
+
+    request = await db_session.get(HitlRequest, token)
+    await grant_approval(db_session, request, by_user_id=child.user_id, via="chat")
+    await db_session.commit()
+
+    resumed = await child.delegate(approval_token=token)
+    assert resumed["status"] == "completed", resumed
+    assert [path.read_text() for path in tmp_path.rglob("child.md")] == ["From the child"]
+
+    replayed = await child.delegate(approval_token=token)
+    assert replayed["error"] == "delegated_approval_resume_rejected", replayed
+    assert len(list(tmp_path.rglob("child.md"))) == 1
 
 
 @pytest.mark.asyncio

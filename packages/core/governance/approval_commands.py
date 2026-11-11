@@ -1,14 +1,16 @@
 """Atomic one-time approval plus a server-derived local policy rule.
 
 Only ordinary Task-runtime requests a Task agent loop parked on (its signed
-park tag) expose this command. Other origins keep their existing one-time
-decision transport.
+park tag) expose the atomic command. Other tool-call authorizations ("Always
+allow" on a chat or Workflow approval) expose ``save_rule``: the same
+server-derived rule is saved, and the card's own one-time decision transport
+then approves the request — saving the rule never approves anything itself.
 """
 from __future__ import annotations
 
 import hashlib
 import json
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
@@ -93,8 +95,18 @@ def _stored_targets(request: HitlRequest) -> list[ApprovalTarget]:
     return targets
 
 
+def _standing_request(request: HitlRequest) -> bool:
+    """A tool-call authorization whose next occurrence an allow rule admits."""
+    context = request.context or {}
+    decision = context.get('decision') if isinstance(context.get('decision'), dict) else {}
+    return bool(request.origin_kind == 'tool_call' and request.hitl_type == 'authorize'
+        and request.action_key and context.get('kind') != 'provider'
+        and decision.get('standing', True) is not False
+        and not any('coordinator' in key for key in context))
+
+
 def _rule_options(request: HitlRequest) -> list[dict]:
-    if not _ordinary_task_request(request):
+    if not (_ordinary_task_request(request) or _standing_request(request)):
         return []
     try:
         selectors = [ActionSelector(action_key=request.action_key)]
@@ -147,8 +159,10 @@ async def project_approval_command(db: AsyncSession, *, request_id: str, actor: 
         'available_decisions': ['approve_once', 'reject'] if request.status == 'pending' else [],
         'grant_options': [], 'rule_options': [], 'policy_versions': [],
         'capabilities': {'can_approve_once': request.status == 'pending', 'can_save_rule': False, 'can_grant_run': False}}
-    if request.status != 'pending' or not _ordinary_task_request(request):
+    if request.status != 'pending':
         return result
+    if not _ordinary_task_request(request):
+        return await _project_save_rule(db, request, actor, result)
     scope = await _local_scope(db, request, actor)
     snapshot = await policies.read_approval_settings(db, scope, actor)
     result.update(scope=scope.model_dump(), policy_versions=snapshot['policy_versions'], policy_version=snapshot['version'])
@@ -168,9 +182,90 @@ async def project_approval_command(db: AsyncSession, *, request_id: str, actor: 
     return result
 
 
-def _command_fingerprint(command: ApproveAndSaveRuleCommand) -> str:
+class SaveRuleCommand(BaseModel):
+    """Save the offered allow rule for a pending request without deciding it."""
+
+    model_config = ConfigDict(extra='forbid', populate_by_name=True)
+    request: HitlRequestRef
+    choice: Literal['save_rule']
+    expected_digest: str = Field(alias='expectedDigest', min_length=1, max_length=128)
+    idempotency_key: str = Field(alias='idempotencyKey', min_length=8, max_length=128)
+    expected_policy_version: str = Field(alias='expectedPolicyVersion', min_length=1, max_length=128)
+    option_id: str = Field(alias='optionId', min_length=1, max_length=128)
+
+
+ApprovalCommand = Annotated[ApproveAndSaveRuleCommand | SaveRuleCommand, Field(discriminator='choice')]
+
+
+def _command_fingerprint(command: ApproveAndSaveRuleCommand | SaveRuleCommand) -> str:
     payload = command.model_dump(exclude={'idempotency_key'})
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+async def _project_save_rule(db: AsyncSession, request: HitlRequest, actor: User, result: dict) -> dict:
+    if not _standing_request(request):
+        return result
+    scope = await _local_scope(db, request, actor)
+    snapshot = await policies.read_approval_settings(db, scope, actor)
+    result.update(scope=scope.model_dump(), policy_versions=snapshot['policy_versions'], policy_version=snapshot['version'])
+    if not snapshot['capabilities']['can_save_rule']:
+        return result
+    authority = await authorize_hitl_resolution(db, request=request, by_user_id=actor.id, standing=True)
+    if not authority.allowed:
+        return result
+    options = _rule_options(request)
+    if options:
+        result['available_decisions'].append('save_rule')
+        result['rule_options'] = options
+        result['capabilities']['can_save_rule'] = True
+    return result
+
+
+async def save_rule(db: AsyncSession, *, command: SaveRuleCommand, actor: User) -> dict:
+    """Save the allow rule a pending tool-call authorization offered.
+
+    The request stays pending: the card's one-time approval follows through
+    its own transport. Idempotent per request and key, like the atomic
+    command; a different rule for the same request is a conflict.
+    """
+    initial = await _request(db, command.request.id, actor)
+    scope = await _local_scope(db, initial, actor)
+    async with db.begin_nested():
+        await policies._load(db, scope, lock=True)
+        request = await _request(db, command.request.id, actor, lock=True)
+        fingerprint = _command_fingerprint(command)
+        previous = (request.context or {}).get('rule_command')
+        if previous:
+            if previous.get('idempotency_key') != command.idempotency_key or previous.get('fingerprint') != fingerprint or previous.get('actor_id') != actor.id:
+                raise ApprovalCommandConflict('A different rule was already saved from this approval')
+            return {**previous['result'], 'policy': await policies.read_approval_settings(db, scope, actor), 'idempotent': True}
+        if request.status != 'pending' or request_digest(request) != command.expected_digest:
+            raise ApprovalCommandConflict('The approval changed; review it again')
+        if not _standing_request(request):
+            raise ApprovalCommandError('This approval has no standing version to save')
+        authority = await authorize_hitl_resolution(db, request=request, by_user_id=actor.id, standing=True)
+        if not authority.allowed:
+            raise policies.ApprovalPolicyAccessError(authority.reason or 'You cannot save a standing approval rule')
+        option = next((item for item in _rule_options(request) if item['id'] == command.option_id), None)
+        if option is None:
+            raise ApprovalCommandConflict('The offered approval rule changed')
+        current = await policies.read_approval_settings(db, scope, actor)
+        rules = [RuleDraft(id=rule['id'], effect=rule['effect'], selector=rule['selector'])
+            for rule in current['policy']['rules'] if rule['source_kind'] == 'user']
+        selected = RuleDraft.model_validate(option['rule'])
+        if not any(rule.effect == selected.effect and rule.selector == selected.selector for rule in rules):
+            rules.append(selected)
+        saved = await policies.update_approval_policy(db, scope, PolicyDraft(mode=current['policy']['mode'], user_rules=rules), command.expected_policy_version, actor)
+        result = {'request_ref': {'kind': 'hitl', 'id': request.id}, 'status': request.status,
+            'digest': command.expected_digest, 'changed_scope': scope.model_dump(),
+            'policy_versions': saved['policy_versions'], 'policy_version': saved['version']}
+        request.context = {**request.context, 'rule_command': {'idempotency_key': command.idempotency_key,
+            'fingerprint': fingerprint, 'actor_id': actor.id, 'result': result}}
+        db.add(AuditLog(entity_id=scope.entity_id, user_id=actor.id, action='approval.rule_saved',
+            resource_type='hitl_request', resource_id=request.id, details={'scope': scope.model_dump(),
+                'request_digest': command.expected_digest, 'option_id': command.option_id, 'idempotency_key': command.idempotency_key}))
+        await db.flush()
+        return {**result, 'policy': saved, 'idempotent': False}
 
 
 async def approve_and_save_rule(db: AsyncSession, *, command: ApproveAndSaveRuleCommand, actor: User) -> dict:

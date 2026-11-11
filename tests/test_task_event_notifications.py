@@ -411,3 +411,108 @@ async def test_hitl_requested_event_falls_back_to_entity_admins_for_ai_tasks():
         assert "waiting for your input" in (notif.content or "")
         assert notif.meta["event_type"] == "task.hitl_requested"
         assert notif.meta["link"] == f"/tasks/{task_id}"
+
+
+@pytest.mark.asyncio
+async def test_initiative_task_outcome_events_do_not_notify_the_owner(monkeypatch):
+    """An Initiative run's Task outcome is internal; its owner still gets input requests."""
+    import packages.core.database as dbmod
+    from packages.core.models.notification import Notification
+    from packages.core.models.task import Task
+    from packages.core.models.user import Entity, User
+    from packages.core.services import task_external_notifications
+    from packages.core.services.agent_initiative_decision import (
+        INITIATIVE_TASK_MARKER_KEY,
+        INITIATIVE_TASK_MARKER_VERSION,
+    )
+    from packages.core.services.task_event_notifications import notify_task_event
+    from sqlalchemy import select
+
+    entity_id = generate_ulid()
+    owner_id = generate_ulid()
+    initiative_task_id = generate_ulid()
+    ordinary_task_id = generate_ulid()
+    marker = {
+        "version": INITIATIVE_TASK_MARKER_VERSION,
+        "initiative_id": generate_ulid(),
+        "initiative_run_id": generate_ulid(),
+        "initiative_revision": 1,
+        "agent_subscription_id": generate_ulid(),
+        "owner_user_id": owner_id,
+    }
+
+    async with dbmod.async_session() as db:
+        db.add(Entity(
+            id=entity_id,
+            name="Initiative Corp",
+            settings={"notification_policy": {"task_events": {"email": {"enabled": True}}}},
+        ))
+        db.add(User(
+            id=owner_id,
+            entity_id=entity_id,
+            email=f"{owner_id}@test.com",
+            display_name="Owner",
+            password_hash="x",
+            role="owner",
+            status="active",
+        ))
+        db.add_all([
+            Task(
+                id=initiative_task_id,
+                entity_id=entity_id,
+                title="[Auto] [Initiative] Inbox watch",
+                status="blocked",
+                priority=3,
+                task_type="ai_generated",
+                creator_id=owner_id,
+                details={INITIATIVE_TASK_MARKER_KEY: marker},
+            ),
+            Task(
+                id=ordinary_task_id,
+                entity_id=entity_id,
+                title="Ordinary task",
+                status="failed",
+                priority=3,
+                task_type="ai_generated",
+                creator_id=owner_id,
+            ),
+        ])
+        await db.commit()
+
+        for event_type in ("task.failed", "task.succeeded"):
+            assert await notify_task_event(
+                db, entity_id, event_type, {"task_id": initiative_task_id},
+            ) == 0
+        emailed: list[str] = []
+
+        async def record_email(*args, **_kwargs):
+            emailed.append(args[2])
+            return 1
+
+        monkeypatch.setattr(task_external_notifications, "_deliver_email", record_email)
+        external = await task_external_notifications.deliver_task_external_notifications_in_session(
+            db, entity_id, "task.failed", {"task_id": initiative_task_id},
+        )
+        assert external == {"email": 0, "external_chat": 0}
+        assert emailed == []
+
+        # Input requests from the same run and ordinary Task failures still reach people.
+        assert await notify_task_event(
+            db, entity_id, "task.hitl_requested", {"task_id": initiative_task_id},
+        ) == 1
+        assert await notify_task_event(
+            db, entity_id, "task.failed", {"task_id": ordinary_task_id},
+        ) == 1
+        await task_external_notifications.deliver_task_external_notifications_in_session(
+            db, entity_id, "task.failed", {"task_id": ordinary_task_id},
+        )
+        assert emailed == ["task.failed"]
+        await db.commit()
+
+        rows = list((await db.execute(
+            select(Notification).where(Notification.entity_id == entity_id)
+        )).scalars().all())
+        assert sorted((n.meta["task_id"], n.type) for n in rows) == sorted([
+            (initiative_task_id, "task_hitl_requested"),
+            (ordinary_task_id, "task_failed"),
+        ])

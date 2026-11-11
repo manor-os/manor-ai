@@ -208,7 +208,7 @@ def test_quiet_hours_does_not_suppress_warn_by_default():
 
 def test_quiet_hours_critical_fans_out_regardless():
     chans = select_channels(
-        kind="system_health",
+        kind="integration_account_issue",
         severity="critical",
         user_prefs={
             "notifications": {

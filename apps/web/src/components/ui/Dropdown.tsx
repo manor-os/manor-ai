@@ -189,6 +189,8 @@ export default function Dropdown({
                 onClick={(event) => {
                   event.stopPropagation();
                   if (!item.disabled) {
+                    // The menu is going away; focus returns to the control that opened it.
+                    ref.current?.querySelector<HTMLElement>('[aria-haspopup="menu"]')?.focus({ preventScroll: true });
                     onSelect(item.key);
                     setOpen(false);
                   }
@@ -198,9 +200,9 @@ export default function Dropdown({
                   alignItems: "center",
                   gap: 8,
                   width: "100%",
-                  padding: "8px 12px",
+                  padding: "7px 10px",
                   fontSize: 13,
-                  fontWeight: 500,
+                  fontWeight: 400,
                   color: item.danger
                     ? "#a23e38"
                     : item.disabled
@@ -208,7 +210,7 @@ export default function Dropdown({
                       : "var(--text-default)",
                   background: "transparent",
                   border: "none",
-                  borderRadius: 10,
+                  borderRadius: 8,
                   cursor: item.disabled ? "not-allowed" : "pointer",
                   transition: "background 0.15s",
                   textAlign: "left",

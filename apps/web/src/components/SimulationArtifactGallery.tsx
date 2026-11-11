@@ -12,7 +12,6 @@ import {
 } from "./icons";
 import Button from "./ui/Button";
 import Modal from "./ui/Modal";
-import StatusBadge from "./ui/StatusBadge";
 import "./SimulationArtifactGallery.css";
 
 type ArtifactWithReceipt = SimulationArtifact & {
@@ -80,9 +79,6 @@ export default function SimulationArtifactGallery({
             <strong>{t("component.simulation_artifact_gallery.blueprint_outputs")}</strong>
             <span>{t("component.simulation_artifact_gallery.preview_only_desc")}</span>
           </div>
-          <StatusBadge type="neutral">
-            {t("component.simulation_artifact_gallery.workspace_simulation")}
-          </StatusBadge>
         </div>
         <div className="simulation-artifact-gallery__grid">
           {artifacts.map((artifact) => (
@@ -105,10 +101,7 @@ export default function SimulationArtifactGallery({
               <span className="simulation-artifact-card__copy">
                 <strong>{artifact.title}</strong>
                 <span>{artifact.filename}</span>
-                <small>
-                  {artifact.stage || t("component.simulation_artifact_gallery.output_stage")}
-                  {durationLabel(artifact.duration_seconds) ? ` · ${durationLabel(artifact.duration_seconds)}` : ""}
-                </small>
+                {durationLabel(artifact.duration_seconds) && <small>{durationLabel(artifact.duration_seconds)}</small>}
               </span>
             </button>
           ))}
@@ -129,9 +122,6 @@ export default function SimulationArtifactGallery({
         {selected && (
           <div className="simulation-artifact-modal">
             <div className="simulation-artifact-modal__notice">
-              <StatusBadge type="neutral">
-                {t("component.simulation_artifact_gallery.workspace_simulation")}
-              </StatusBadge>
               <span>{t("component.simulation_artifact_gallery.preview_notice")}</span>
             </div>
             <div className="simulation-artifact-modal__preview">

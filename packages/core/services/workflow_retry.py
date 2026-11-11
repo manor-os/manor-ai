@@ -157,20 +157,106 @@ def retry_entries(run, step_ids) -> list[str] | None:
     return entries
 
 
+# Steps that only end a run and report why. Running one again re-renders the
+# same failure from the same inputs; nothing is made again.
+TERMINAL_STEP_TYPES = frozenset({"stop", "end"})
+
+
+def error_route_origin(steps: list[dict], results: dict, step_id: str) -> str | None:
+    """The handled failure whose error route ended at ``step_id``.
+
+    A ``continue_error`` step that fails is recorded as handled, so the run
+    takes its ``error_next`` route. When that route then fails, the work to redo
+    is the step that failed, not the handler where the route stopped. A handled
+    failure whose normal path also reaches ``step_id`` did not cause it, so the
+    run's own completed work stays the source.
+    """
+    from packages.core.services.workflow_service import _declared_step_targets
+
+    edges = graph_edges(steps, results)
+    for step in steps:
+        sid = str(step.get("id") or "")
+        result = results.get(sid)
+        if not sid or sid == step_id or not isinstance(result, dict) or result.get("continued") is not True:
+            continue
+        error_next = (step.get("config") or {}).get("error_next") or []
+        route = [str(item) for item in (error_next if isinstance(error_next, list) else [error_next]) if item]
+        normal = [target for target in _declared_step_targets(step) if target not in route]
+        if not route or step_id not in reachable_ids({**edges, sid: route}, route):
+            continue
+        if normal and step_id in reachable_ids({**edges, sid: normal}, normal):
+            continue
+        return sid
+    return None
+
+
 def retry_target(steps: list[dict], prior, retry_state: dict, requested: str | None) -> str:
-    """Resolve repair hints against failed receipts, not a stale progress pointer."""
-    if requested:
-        return str(requested).strip()
+    """Resolve repair hints against failed receipts, not a stale progress pointer.
+
+    A requested step is honoured unless it is a terminal step: such a target
+    comes from a card drawn before retry learned to redo the work before the
+    terminal, and would only reproduce the old error.
+    """
+    step_map = {step["id"]: step for step in steps if step.get("id")}
+    requested = str(requested or "").strip()
+    if requested and (step_map.get(requested) or {}).get("type") not in TERMINAL_STEP_TYPES:
+        return requested
     results = prior.step_results or {}
     failed = [sid for sid, result in results.items() if result.get("status") == "failed" and not completed(result)]
     current = str(prior.current_step_id or "")
     failed_id = current if current in failed else next(iter(failed), None)
-    step_map = {step["id"]: step for step in steps}
     if failed_id:
-        result = results[failed_id]
-        config = (step_map.get(failed_id) or {}).get("config") or {}
-        return str(result.get("retry_from_step_id") or config.get("retry_from_step_id") or failed_id).strip()
+        hint = _retry_hint(step_map, results, failed_id)
+        if hint:
+            return hint
+        # An error handler that failed is a consequence of the handled failure that routed to it.
+        failed_id = error_route_origin(steps, results, failed_id) or failed_id
+        hint = _retry_hint(step_map, results, failed_id)
+        if hint:
+            return hint
+        if (step_map.get(failed_id) or {}).get("type") in TERMINAL_STEP_TYPES:
+            return work_step_before(steps, results, failed_id) or failed_id
+        return failed_id
     return str(retry_state.get("retry_from_step_id") or current).strip()
+
+
+def _retry_hint(step_map: dict, results: dict, step_id: str) -> str:
+    """A recovery point the Flow or its receipt names for ``step_id``."""
+    config = (step_map.get(step_id) or {}).get("config") or {}
+    return str(results[step_id].get("retry_from_step_id") or config.get("retry_from_step_id") or "").strip()
+
+
+# Steps that do no work of their own: they start the run, route it, or
+# recompute from what they are given, so again with the same inputs they give
+# the same answer.
+_DETERMINISTIC_STEP_TYPES = frozenset({"trigger", "condition", "switch", "transform", "code", "stop", "end", "note"})
+
+
+def work_step_before(steps: list[dict], results: dict, stop_id: str) -> str | None:
+    """The nearest step on the path a run took into ``stop_id`` that did real work.
+
+    A stop node only reports why the run ended; retrying it alone ends the same
+    way. The work that came up short is upstream of it, past the conditions and
+    code that routed there.
+    """
+    step_map = {step["id"]: step for step in steps if step.get("id")}
+    reverse: dict[str, list[str]] = {}
+    for sid, targets in graph_edges(steps, results, strict=True).items():
+        for child in targets:
+            reverse.setdefault(child, []).append(sid)
+    seen = {stop_id}
+    frontier = [stop_id]
+    while frontier:
+        parents = [
+            parent for sid in frontier for parent in reverse.get(sid, [])
+            if parent not in seen and completed(results.get(parent))
+        ]
+        work = [parent for parent in parents if (step_map.get(parent) or {}).get("type") not in _DETERMINISTIC_STEP_TYPES]
+        if work:
+            return work[0]
+        seen.update(parents)
+        frontier = parents
+    return None
 
 
 def merge_retry_evidence(steps: list[dict], attempts: list) -> SimpleNamespace:

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { api, type WorkspaceAppAction } from "../../lib/api";
@@ -7,6 +7,8 @@ import { workflowPath } from "../../lib/workflowRoutes";
 import { IconArrowLeft, IconArrowRight, IconClock } from "../icons";
 import Button from "../ui/Button";
 import { getPreferredTimeZone } from "../../lib/format";
+import { displayReadInterval } from "../../lib/readRefreshPolicy";
+import { usePageVisible } from "../../lib/usePageVisible";
 
 function frequencyLabel(action: WorkspaceAppAction): string {
   const seconds = action.every_seconds;
@@ -36,14 +38,36 @@ export default function WorkspaceAppActionAutomation({ action, canStart, onBack 
   canStart: boolean;
   onBack: () => void;
 }) {
-  const [queued, setQueued] = useState(false);
+  const [queueDiscoveryUntil, setQueueDiscoveryUntil] = useState<number | null>(null);
   const jobId = action.job_id || "";
+  const visible = usePageVisible();
   const runs = useQuery({
-    queryKey: ["workspace-app-automation-runs", jobId],
+    // Share the job history read with the Automation page and socket resync.
+    queryKey: ["job-runs", jobId],
     queryFn: () => api.jobs.runs(jobId),
-    enabled: Boolean(jobId),
-    refetchInterval: queued ? 3_000 : 30_000,
+    enabled: visible && Boolean(jobId),
+    refetchInterval: (query) => {
+      const active = query.state.data?.some((run) => ["pending", "queued", "running"].includes(run.status));
+      const discovering = queueDiscoveryUntil !== null && Date.now() < queueDiscoveryUntil;
+      return displayReadInterval(query.state, active || discovering ? 5_000 : 60_000);
+    },
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: true,
   });
+  useEffect(() => {
+    if (queueDiscoveryUntil === null) return;
+    if (runs.data?.some((run) => ["pending", "queued", "running"].includes(run.status))) {
+      setQueueDiscoveryUntil(null);
+      return;
+    }
+    const remaining = queueDiscoveryUntil - Date.now();
+    if (remaining <= 0) {
+      setQueueDiscoveryUntil(null);
+      return;
+    }
+    const timer = window.setTimeout(() => setQueueDiscoveryUntil(null), remaining);
+    return () => window.clearTimeout(timer);
+  }, [queueDiscoveryUntil, runs.data]);
   const process = useQuery({
     queryKey: ["workspace-app-automation-process", action.target_workflow_id],
     queryFn: () => api.workflows.get(action.target_workflow_id!),
@@ -52,7 +76,9 @@ export default function WorkspaceAppActionAutomation({ action, canStart, onBack 
   const start = useMutation({
     mutationFn: () => api.jobs.runNow(jobId),
     onSuccess: () => {
-      setQueued(true);
+      // The worker creates the history row asynchronously. Keep a short,
+      // bounded discovery window, then return to the normal idle cadence.
+      setQueueDiscoveryUntil(Date.now() + 20_000);
       void runs.refetch();
     },
   });
@@ -80,7 +106,7 @@ export default function WorkspaceAppActionAutomation({ action, canStart, onBack 
         <ol>{steps.map((step, index) => <li key={`${index}:${step}`}><span>{index + 1}</span>{step}</li>)}</ol>
       </div>}
       {instructions && <details className="workspace-app-automation__instructions" open={!action.description}><summary>{t("component.workspace_app_view.automation_instructions")}</summary><p>{instructions}</p></details>}
-      {queued && <p role="status">{t("component.workspace_app_view.automation_queued")}</p>}
+      {queueDiscoveryUntil !== null && <p role="status">{t("component.workspace_app_view.automation_queued")}</p>}
       {action.last_status && <p>{t("component.workspace_app_view.automation_last_status")}: {action.last_status}</p>}
       {start.isError && <p role="alert" className="workspace-app-flow__error">{start.error instanceof Error ? start.error.message : t("component.workspace_app_view.start_error")}</p>}
       <div className="workspace-app-flow__buttons workspace-app-automation__actions">

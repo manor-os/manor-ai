@@ -1,0 +1,29 @@
+{
+  "id": "workspace-workflow-design",
+  "name": "workspace-workflow-design",
+  "display_name": "Workspace Workflow design",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Design a Workspace's Workflows from its services: checked patterns (content calendar, schedule, channel publish, a report that records tracked numbers, project tree) and the node vocabulary for the rest. Guides the Workflows designer.",
+  "category": "workspace-design",
+  "output_format": "guidance",
+  "tags": [
+    "workspace-operations",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "search": {
+    "terms": [
+      "workflow design",
+      "content calendar",
+      "scheduled publishing",
+      "workflow patterns",
+      "numbers report"
+    ],
+    "examples": [
+      "design the workspace workflows",
+      "guidance for designing workspace workflow patterns",
+      "design a weekly report that records numbers"
+    ]
+  }
+}

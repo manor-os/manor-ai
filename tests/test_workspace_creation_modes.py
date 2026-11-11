@@ -954,6 +954,49 @@ async def test_workspace_draft_creation_modes_are_independent(
 
 
 @pytest.mark.asyncio
+async def test_created_workspace_records_its_deployed_custom_agent(db_session) -> None:
+    """Staging 2026-11-01: the model kept the draft's create_custom design, so
+    the first rule saved from the Rules page provisioned a second Agent."""
+    from packages.core.models.workspace import AgentSubscription
+
+    entity_id = generate_ulid()
+    session = WorkspaceSetupSession(
+        entity_id=entity_id,
+        fields={
+            **DEFAULT_FIELDS,
+            "name": "Launch Notes",
+            "kind": "project",
+            "operating_context": "A small team writes launch notes.",
+            "primary_work": "Write short launch notes.",
+            "services": [{
+                "service_key": "launch_notes", "name": "Launch notes",
+                "description": "Write launch notes.", "autonomy_level": "supervised", "owner_role": "operator",
+            }],
+            "agent_mappings": [{
+                "service_key": "launch_notes", "strategy": "create_custom",
+                "create_agent_draft": {"agent_name": "Note Writer", "system_prompt": "Write short launch notes."},
+            }],
+            "goals": [],
+            "channel_config": {},
+            "heartbeat_enabled": False,
+            "_creation_preferences": {"goal_confirmed": True, "autonomy_confirmed": True},
+        },
+        messages=[],
+        ready=True,
+        missing=[],
+    )
+
+    workspace_id = await finalize_setup(session, db_session)
+    workspace = await db_session.get(Workspace, workspace_id)
+    subscription = (await db_session.execute(select(AgentSubscription).where(
+        AgentSubscription.workspace_id == workspace_id, AgentSubscription.status == "active",
+    ))).scalar_one()
+    [mapping] = workspace.operating_model["agent_mappings"]
+    assert mapping["agent_id"] == subscription.agent_id
+    assert "create_agent_draft" not in mapping and mapping.get("strategy") != "create_custom"
+
+
+@pytest.mark.asyncio
 async def test_default_runtime_needs_no_model_autonomy_confirmation(db_session) -> None:
     from packages.core.ai.tools.workspace_arch_tools import _confirm_creation_preferences, _lint_draft
 

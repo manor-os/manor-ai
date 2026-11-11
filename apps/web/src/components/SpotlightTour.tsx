@@ -357,7 +357,7 @@ export default function SpotlightTour({
         width: 0,
         height: 0,
       };
-  const DIM_SHADOW = "0 0 0 200vmax rgba(28,25,23,0.5)";
+  const DIM_SHADOW = "0 0 0 200vmax rgba(29, 29, 31,0.5)";
 
   return (
     <>
@@ -415,7 +415,7 @@ export default function SpotlightTour({
           {steps.length > 6 ? (
             <span
               className="mono"
-              style={{ fontSize: 11, fontWeight: 600, color: "var(--text-faint)", letterSpacing: "0.02em" }}
+              style={{ fontSize: 11, fontWeight: 600, color: "var(--text-faint)", }}
             >
               {currentStep + 1} / {steps.length}
             </span>

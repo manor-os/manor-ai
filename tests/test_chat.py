@@ -1,4 +1,5 @@
 """E2E tests: chat SSE streaming, conversations, messages."""
+from unittest.mock import AsyncMock
 
 import asyncio
 import json
@@ -1857,7 +1858,7 @@ async def test_members_only_workspace_chat_requires_workspace_read_access(
     monkeypatch.setattr(
         workspace_chat,
         "_schedule_workspace_chat_processing",
-        lambda **_kwargs: None,
+        AsyncMock(side_effect=lambda **_kwargs: None),
     )
 
     owner_headers = await _auth(client, "workspace_chat_owner")
@@ -2038,3 +2039,40 @@ async def test_workspace_chat_rejects_deleted_workspace_runtime(
             me["id"],
             workspace_id=ws["id"],
         )
+
+
+@pytest.mark.asyncio
+async def test_a_typed_reply_points_only_at_an_open_card_in_its_conversation(db_session):
+    from apps.api.routers.chat import _pending_card_kind, _with_card_reply_context
+    from packages.core.models.task import Conversation, Message
+
+    conversation = Conversation(entity_id="ent_reply", user_id="user_reply", title="Reply")
+    other = Conversation(entity_id="ent_reply", user_id="user_reply", title="Other")
+    db_session.add_all([conversation, other])
+    await db_session.flush()
+    card = Message(
+        conversation_id=conversation.id, role="assistant", content="Review",
+        pending_action={"kind": "workspace_operation_review"},
+    )
+    answered = Message(
+        conversation_id=conversation.id, role="assistant", content="Done",
+        pending_action={"kind": "workspace_operation_review"}, resolved_at=datetime.now(timezone.utc),
+    )
+    plain = Message(conversation_id=conversation.id, role="assistant", content="Hello")
+    db_session.add_all([card, answered, plain])
+    await db_session.flush()
+
+    assert await _pending_card_kind(db_session, conversation.id, card.id) == "workspace_operation_review"
+    assert await _pending_card_kind(db_session, other.id, card.id) is None
+    assert await _pending_card_kind(db_session, conversation.id, answered.id) is None
+    assert await _pending_card_kind(db_session, conversation.id, plain.id) is None
+    assert await _pending_card_kind(db_session, conversation.id, None) is None
+
+    with_context = _with_card_reply_context("Make it talk to suppliers", card.id, "workspace_operation_review")
+    assert with_context.startswith("Make it talk to suppliers")
+    assert f'message_id="{card.id}"' in with_context
+    # The card it replaced must not stay open with Approve on it.
+    assert 'reject this card with workspace_resolve_hitl' in with_context
+    image = {"type": "image_url", "image_url": {"url": "data:,"}}
+    parts = _with_card_reply_context([{"type": "text", "text": "Look"}, image], card.id, "k")
+    assert "pending_card_reply" in parts[0]["text"] and parts[1] == image

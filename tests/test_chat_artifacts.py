@@ -406,3 +406,86 @@ def test_chat_attachments_ignore_non_terminal_generated_files():
     ]
 
     assert chat_attachments_from_tool_results(tool_results) == []
+
+
+@pytest.mark.asyncio
+async def test_generated_media_attachment_carries_its_knowledge_document_id():
+    from packages.core.services.chat_artifacts import chat_turn_attachments
+
+    def image_result(name: str) -> dict:
+        fs_path = f"Workspaces/_by_id/ws/{name}"
+        open_url = f"/api/v1/fs/ent/{fs_path}"
+        return {
+            "name": "generate_file",
+            "raw_result": json.dumps({
+                "image_url": open_url,
+                "saved_to_knowledge": True,
+                "fs_path": fs_path,
+                "file": {
+                    "name": name, "fs_path": fs_path, "open_url": open_url,
+                    "markdown_link": f"[{name}]({open_url})",
+                },
+            }),
+        }
+
+    class Documents:
+        async def execute(self, _statement):
+            return SimpleNamespace(all=lambda: [("Workspaces/_by_id/ws/poster.png", "doc_poster")])
+
+    attachments = await chat_turn_attachments(
+        [image_result("poster.png"), image_result("scratch.png")], entity_id="ent", db=Documents(),
+    )
+
+    assert attachments == [
+        {
+            "name": "poster.png",
+            "type": "knowledge",
+            "open_url": "/viewer/doc_poster",
+            "markdown_link": "[poster.png](/viewer/doc_poster)",
+            "document_id": "doc_poster",
+            "fs_path": "Workspaces/_by_id/ws/poster.png",
+            "fileType": "png",
+            "mimeType": "image/png",
+            "previewUrl": "/api/v1/fs/ent/Workspaces/_by_id/ws/poster.png",
+        },
+        {
+            "name": "scratch.png",
+            "type": "knowledge",
+            "open_url": "/api/v1/fs/ent/Workspaces/_by_id/ws/scratch.png",
+            "markdown_link": "[scratch.png](/api/v1/fs/ent/Workspaces/_by_id/ws/scratch.png)",
+            "fs_path": "Workspaces/_by_id/ws/scratch.png",
+            "fileType": "png",
+            "mimeType": "image/png",
+            "previewUrl": "/api/v1/fs/ent/Workspaces/_by_id/ws/scratch.png",
+        },
+    ]
+
+
+def _publish_result(site_id: str, revision: int, *, name: str = "Acme", published: bool = True) -> str:
+    return json.dumps({
+        "published": published,
+        "url": f"https://{site_id}.sites.example.com",
+        "name": name,
+        "site_id": site_id,
+        "slug": site_id,
+        "revision": revision,
+    })
+
+
+def test_published_sites_become_one_site_attachment_each_latest_revision_wins():
+    tool_results = [
+        {"name": "publish_site", "raw_result": _publish_result("acme", 1)},
+        # The same site through the call_tool gateway (e.g. after approval).
+        {
+            "name": "call_tool",
+            "arguments": {"name": "publish_site", "arguments": {"name": "Acme v2"}},
+            "raw_result": _publish_result("acme", 2, name="Acme v2"),
+        },
+        {"name": "publish_site", "raw_result": json.dumps({"published": False, "error": "x"})},
+        {"name": "publish_site", "raw_result": _publish_result("other", 1, name="Other")},
+    ]
+
+    assert chat_attachments_from_tool_results(tool_results) == [
+        {"type": "site", "name": "Acme v2", "url": "https://acme.sites.example.com", "site_id": "acme", "revision": 2},
+        {"type": "site", "name": "Other", "url": "https://other.sites.example.com", "site_id": "other", "revision": 1},
+    ]

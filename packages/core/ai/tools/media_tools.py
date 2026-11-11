@@ -373,7 +373,9 @@ MERGE_VIDEOS_SCHEMA = {
                     "description": (
                         "Preserve original audio from source clips. Keep false for clean picture "
                         "masters because video providers may include unwanted music/SFX even when "
-                        "generate_audio=false."
+                        "generate_audio=false. When false, the master's audio stream is silence "
+                        "merge_videos writes itself (audio_track=generated_silence): it needs no "
+                        "measuring or listening."
                     ),
                 },
                 "target_duration_seconds": {
@@ -534,6 +536,8 @@ class SubtitleWord:
     start: float
     end: float
     text: str
+    # How loud it was sung, in dBFS of the song, when measured; louder words can be set larger.
+    energy: float | None = None
 
 
 @dataclass(frozen=True)
@@ -564,6 +568,12 @@ LYRIC_LAYOUTS = ("line", "stack")
 # "follow": a camera reframes on the words sung so far, zooming out and tilting as the line grows.
 LYRIC_CAMERAS = ("none", "follow")
 LYRIC_POSITIONS = ("bottom", "middle", "top")
+# What sung words do on a beat: scale up, rock, light up, or scale and rock.
+LYRIC_BEAT_HITS = ("none", "pulse", "shake", "flash", "punch")
+# What a held note does while it is held: widen or tremble.
+LYRIC_LONG_NOTES = ("none", "stretch", "pulse")
+# Picture colours a lyric look can take from the shot it is sung over.
+LYRIC_PICTURE_COLOR_KEYS = ("accent_color", "glow_color", "outline_color")
 
 
 ALIGN_SUBTITLES_SCHEMA = {
@@ -659,6 +669,38 @@ ALIGN_SUBTITLES_SCHEMA = {
                         "camera_tilts": {"type": "array", "items": {"type": "number"},
                                          "description": "Degrees the camera tilts to, one per sung word, repeating."},
                         "max_chars_per_line": {"type": "integer"},
+                        "small_scale": {"type": "number",
+                                        "description": "Size of small words (the, a, to, of…) against the font size; "
+                                                       "1 keeps every word the same size."},
+                        "auto_emphasis": {"type": "boolean",
+                                          "description": "Also set the loudest, longest sung words of a line larger "
+                                                         "(needs word_timing)."},
+                        "max_emphasis": {"type": "integer", "description": "Key words per line, at most (1-3)."},
+                        "emphasis_font_name": {"type": "string", "description": "A second font for key words."},
+                        "emphasis_bold": {"type": "boolean"},
+                        "beats": {"type": "array",
+                                  "items": {"anyOf": [{"type": "number"},
+                                                      {"type": "array", "items": {"type": "number"}}]},
+                                  "description": "Beat times on the picture timeline, each a number or "
+                                                 "[seconds, strength] (strength 0-2, 1 a normal beat)."},
+                        "beat_hit": {"type": "string", "enum": list(LYRIC_BEAT_HITS),
+                                     "description": "What sung words do on each beat."},
+                        "beat_strength": {"type": "number", "description": "0-1, how hard the beat hits."},
+                        "long_note": {"type": "string", "enum": list(LYRIC_LONG_NOTES),
+                                      "description": "What a held word does while it is held."},
+                        "long_note_ms": {"type": "integer", "description": "How long a word must be held (ms)."},
+                        "picture_colors": {
+                            "type": "object",
+                            "description": "Take these colours from the picture under each line: its most "
+                                           "vivid colour, made readable.",
+                            "properties": {
+                                "path": {"type": "string", "description": "The picture video or image."},
+                                "keys": {"type": "array",
+                                         "items": {"type": "string", "enum": list(LYRIC_PICTURE_COLOR_KEYS)}},
+                            },
+                            "required": ["path", "keys"],
+                            "additionalProperties": False,
+                        },
                     },
                     "additionalProperties": False,
                 },
@@ -1626,6 +1668,9 @@ async def _merge_videos_handler(
                     not include_source_audio
                     and any(item.get("has_audio") for item in input_payloads)
                 ),
+                # Without source audio every clip is given a generated silent track, so the
+                # master's AAC stream is known silence: there is nothing to measure or hear.
+                **({"audio_track": "generated_silence"} if not include_source_audio else {}),
                 "inputs": input_payloads,
             }
         )
@@ -1762,6 +1807,21 @@ async def _compose_video_timeline_handler(
         allowed_presets = MERGE_VIDEOS_SCHEMA["function"]["parameters"]["properties"]["preset"]["enum"]
         target_preset = preset if preset in allowed_presets else "veryfast"
         target_crf = int(_clamp_float(crf, 14, 28, 18))
+
+        # The composed master is about as large as its clean picture, over the full length.
+        from packages.core.database import async_session
+        from packages.core.services.document_service import StorageLimitExceeded
+        from packages.core.services.storage_capacity import ensure_storage_capacity, storage_blocked_result
+
+        length_scale = total_duration / clean_video_duration if clean_video_duration > 0 else 1.0
+        try:
+            async with async_session() as db:
+                await ensure_storage_capacity(
+                    db, entity_id, int(os.path.getsize(clean_abs) * max(1.0, length_scale)),
+                    what="This video",
+                )
+        except StorageLimitExceeded as exc:
+            return _not_applied(storage_blocked_result(exc, kind="video"), "knowledge_storage_limit")
 
         # Burn a normalized copy of an ASS file; the Knowledge file is untouched.
         output_started = True
@@ -2381,21 +2441,57 @@ async def _align_subtitles_handler(
             )
             word_audio_abs = await _resolve_entity_file(entity_root, word_timing_rel)
             _assert_audio_path(word_audio_abs)
+            from packages.core.services.audio_conversion import AudioConversionError, speech_audio_bytes
+
+            # Only the span the cues cover is heard: a whole studio song (a 39 MB WAV) is over the
+            # STT upload limit even though the lines sit in seconds of it.
+            word_offset = _coerce_float(word_timing.get("offset_seconds"), 0.0)
+            span_start = max(0.0, word_offset + min((cue.start for cue in cues), default=0.0) - 2.0)
+            span_end = word_offset + max((cue.end for cue in cues), default=0.0) + 2.0
             try:
-                heard = await _transcribe_narration_audio(
-                    audio_path=word_audio_abs,
-                    user_id=user_id,
-                    entity_id=entity_id,
-                    word_timestamps=True,
-                    workspace_id=workspace_id,
-                    agent_id=agent_id,
-                    conversation_id=conversation_id,
-                )
-            except (WhisperTimestampError, WhisperUploadTooLargeError) as exc:
+                with tempfile.TemporaryDirectory(prefix="lyric-words-") as tmp_dir:
+                    span_audio = Path(tmp_dir) / "words.mp3"
+                    span_audio.write_bytes(await speech_audio_bytes(
+                        Path(word_audio_abs).read_bytes(), start_seconds=span_start, end_seconds=span_end,
+                    ))
+                    heard = await _transcribe_narration_audio(
+                        audio_path=str(span_audio),
+                        user_id=user_id,
+                        entity_id=entity_id,
+                        word_timestamps=True,
+                        workspace_id=workspace_id,
+                        agent_id=agent_id,
+                        conversation_id=conversation_id,
+                    )
+            except (WhisperTimestampError, WhisperUploadTooLargeError, AudioConversionError) as exc:
                 return _json_blocked(str(exc), code="subtitle_word_timestamps_required")
-            heard_words = getattr(heard, "words", None)
-            if isinstance(heard_words, list) and heard_words:
+            # The span's words, back on the song's clock that word_offset is measured on.
+            heard_words = [
+                {**word, "start": float(word["start"]) + span_start, "end": float(word["end"]) + span_start}
+                for word in getattr(heard, "words", None) or []
+                if isinstance(word, dict) and word.get("start") is not None and word.get("end") is not None
+            ]
+            if heard_words:
                 cues = _time_cue_words(cues, heard_words, _coerce_float(word_timing.get("offset_seconds"), 0.0))
+            if isinstance(animation, dict) and animation.get("auto_emphasis"):
+                # How loud each word was sung, so the loudest can be set larger.
+                cues = await _measure_lyric_word_energy(
+                    word_audio_abs, cues, _coerce_float(word_timing.get("offset_seconds"), 0.0))
+
+        cue_colors: dict[int, dict[str, str]] = {}
+        picture_colors = animation.get("picture_colors") if isinstance(animation, dict) else None
+        if isinstance(picture_colors, dict) and str(picture_colors.get("path") or "").strip():
+            picture_rel = await _existing_media_reference(
+                str(picture_colors["path"]),
+                entity_id=entity_id,
+                entity_root=entity_root,
+                workspace_base_dir=workspace_base_dir,
+            )
+            picture_abs = await _resolve_entity_file(entity_root, picture_rel)
+            if Path(picture_abs).suffix.lower() not in VIDEO_EXTENSIONS | IMAGE_EXTENSIONS:
+                return _json_error(f"picture_colors.path is not a video or image: {picture_rel}")
+            keys = [key for key in picture_colors.get("keys") or [] if key in LYRIC_PICTURE_COLOR_KEYS]
+            cue_colors = await _picture_cue_colors(picture_abs, cues, keys)
 
         line_width = int(_clamp_float(max_chars_per_line, 16, 56, 34))
         line_limit = int(_clamp_float(max_lines, 1, 2, 2))
@@ -2435,7 +2531,8 @@ async def _align_subtitles_handler(
         os.makedirs(target.abs_dir, exist_ok=True)
 
         text = (
-            _render_animated_lyrics_ass(cues, animation, canvas_width=canvas_width, canvas_height=canvas_height)
+            _render_animated_lyrics_ass(cues, animation, canvas_width=canvas_width, canvas_height=canvas_height,
+                                        cue_colors=cue_colors)
             if animation is not None
             else _render_subtitles(
                 cues,
@@ -4684,6 +4781,19 @@ async def _verify_stickman_final_media_handler(
         return _json(base_result)
 
 
+def _workflow_unit_origin(context: dict[str, Any]) -> dict[str, str]:
+    """The Workflow run and unit a locally rendered clip belongs to, from trusted context only."""
+    origin: dict[str, str] = {}
+    for key, source in (
+        ("workflow_run_id", "_workflow_run_id_from_context"),
+        ("unit_id", "_workflow_scene_id_from_context"),
+    ):
+        value = str(context.get(source) or "").strip()
+        if value:
+            origin[key] = value
+    return origin
+
+
 @_with_media_file_access
 async def _still_to_video_handler(
     *,
@@ -4704,7 +4814,7 @@ async def _still_to_video_handler(
     task_id: str | None = None,
     agent_id: str | None = None,
     conversation_id: str | None = None,
-    **_: Any,
+    **context: Any,
 ) -> str:
     if not entity_id:
         return _json_error("entity_id is required")
@@ -4715,6 +4825,8 @@ async def _still_to_video_handler(
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         return _json_error("ffmpeg is required to render still scenes", code="ffmpeg_missing")
+    from packages.core.services.document_service import StorageLimitExceeded
+    from packages.core.services.storage_capacity import storage_blocked_result
 
     try:
         from packages.core.services import entity_fs
@@ -4747,6 +4859,16 @@ async def _still_to_video_handler(
         if selected_preset not in {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium"}:
             selected_preset = "veryfast"
         width, height = _target_dimensions(selected_resolution, selected_aspect_ratio)
+        from packages.core.database import async_session
+        from packages.core.services.storage_capacity import ensure_storage_capacity, estimate_media_bytes
+
+        # Each scene is quick, but a Workflow renders dozens: stop before the first that has no room.
+        async with async_session() as db:
+            await ensure_storage_capacity(
+                db, entity_id,
+                estimate_media_bytes("video", duration_seconds=duration, resolution=selected_resolution),
+                what="This scene",
+            )
 
         target = await _build_media_target(
             entity_id=entity_id,
@@ -4837,6 +4959,8 @@ async def _still_to_video_handler(
             **({"motion": selected_motion} if selected_motion != "none" else {}),
             **({"title": title_text} if title_text else {}),
             **({"fade_seconds": round(fade, 3)} if fade else {}),
+            # A Workflow's clip names its run and unit, as a generated clip's job does.
+            **_workflow_unit_origin(context),
         }
         document_id = await _register_file_artifact(
             entity_id=entity_id,
@@ -4881,6 +5005,8 @@ async def _still_to_video_handler(
             "height": height,
             "fps": selected_fps,
         })
+    except StorageLimitExceeded as exc:
+        return storage_blocked_result(exc, kind="video")
     except Exception as exc:  # noqa: BLE001
         logger.exception("still_to_video failed")
         return _json_error(str(exc), code="still_to_video_failed")
@@ -4891,10 +5017,14 @@ DERIVE_IMAGE_ASPECT_SCHEMA = {
     "function": {
         "name": "derive_image_aspect",
         "description": (
-            "Derive an image at another aspect ratio by a centred crop: no padding, stretching or generation, "
-            "at the source's native resolution. An image that already has the requested aspect ratio is returned as "
-            "its own Document unchanged. Otherwise the crop is saved as a new Knowledge image. Returns a poster receipt "
-            "(document_id, fs_path, filename, sha256) with ready=true, or ready=false with a blocker."
+            "Derive an image at another aspect ratio, with no stretching or generation. fit=crop (default) keeps the "
+            "largest centred crop at the source's native resolution and drops what lies outside it. fit=contain keeps "
+            "the whole picture, scaled down into a frame of the same size, on a blurred and darkened backdrop made "
+            "from the same picture; use it whenever the image carries a title or other content near its edges, such "
+            "as album art. An image that already has the requested aspect ratio is returned as its own Document "
+            "unchanged. Otherwise the result is saved as a new Knowledge image. Returns a poster receipt "
+            "(document_id, fs_path, filename, sha256) and cropped_fraction (share of the source's pixels removed) "
+            "with ready=true, or ready=false with a blocker."
         ),
         "parameters": {
             "type": "object",
@@ -4907,6 +5037,12 @@ DERIVE_IMAGE_ASPECT_SCHEMA = {
                     "type": "string",
                     "enum": ["16:9", "9:16", "4:5", "5:4", "1:1", "4:3", "3:4"],
                     "description": "Requested width:height.",
+                },
+                "fit": {
+                    "type": "string",
+                    "enum": ["crop", "contain"],
+                    "default": "crop",
+                    "description": "crop drops the edges; contain keeps the whole picture on a blurred backdrop.",
                 },
                 "output_name": {"type": "string", "description": "Filename for a derived image, without a path."},
             },
@@ -4923,6 +5059,31 @@ def _center_crop_size(width: int, height: int, aspect_w: int, aspect_h: int) -> 
     return width, width * aspect_h // aspect_w
 
 
+def _contain_on_blurred_backdrop(source: Any, frame_w: int, frame_h: int) -> Any:
+    """The whole picture scaled into frame_w x frame_h, over a blurred, darkened fill of itself.
+
+    The frame is the size a centred crop would have, so nothing is upscaled and the file stays close to
+    what a crop would weigh; only the picture is reduced to fit inside it.
+    """
+    from PIL import Image, ImageEnhance, ImageFilter
+
+    picture = source.convert("RGBA") if source.mode in ("RGBA", "LA", "P") else source.convert("RGB")
+    width, height = picture.size
+    cover = max(frame_w / width, frame_h / height)
+    fill_w, fill_h = max(frame_w, round(width * cover)), max(frame_h, round(height * cover))
+    backdrop = picture.convert("RGB").resize((fill_w, fill_h), Image.Resampling.LANCZOS)
+    left, top = (fill_w - frame_w) // 2, (fill_h - frame_h) // 2
+    backdrop = backdrop.crop((left, top, left + frame_w, top + frame_h))
+    backdrop = backdrop.filter(ImageFilter.GaussianBlur(radius=max(frame_w, frame_h) / 30))
+    backdrop = ImageEnhance.Brightness(backdrop).enhance(0.55)
+    scale = min(frame_w / width, frame_h / height)
+    fit_w, fit_h = max(1, round(width * scale)), max(1, round(height * scale))
+    fitted = picture.resize((fit_w, fit_h), Image.Resampling.LANCZOS)
+    position = ((frame_w - fit_w) // 2, (frame_h - fit_h) // 2)
+    backdrop.paste(fitted, position, fitted if fitted.mode == "RGBA" else None)
+    return backdrop
+
+
 @_with_media_file_access
 async def _derive_image_aspect_handler(
     *,
@@ -4930,6 +5091,7 @@ async def _derive_image_aspect_handler(
     user_id: str = "",
     input_path: str = "",
     aspect_ratio: str = "",
+    fit: str = "crop",
     output_name: str = "",
     workspace_id: str | None = None,
     task_id: str | None = None,
@@ -4950,6 +5112,9 @@ async def _derive_image_aspect_handler(
         return blocked("aspect_ratio must look like 16:9")
     if aspect_w <= 0 or aspect_h <= 0:
         return blocked("aspect_ratio must be positive")
+    selected_fit = str(fit or "crop").strip().lower()
+    if selected_fit not in {"crop", "contain"}:
+        return blocked("fit must be crop or contain")
 
     try:
         from PIL import Image
@@ -4975,7 +5140,7 @@ async def _derive_image_aspect_handler(
                 if not source_document_id:
                     return blocked("the source image must be addressed by its Document (/viewer/<document_id>)")
                 return _json({
-                    "ready": True, "derived": False,
+                    "ready": True, "derived": False, "fit": selected_fit, "cropped_fraction": 0.0,
                     "poster": {
                         "document_id": source_document_id, "fs_path": _normalize_user_path(rel_input),
                         "filename": os.path.basename(rel_input), "sha256": _sha256_file(input_abs),
@@ -4984,7 +5149,14 @@ async def _derive_image_aspect_handler(
                 })
             left = (width - crop_w) // 2
             top = (height - crop_h) // 2
-            cropped = source.crop((left, top, left + crop_w, top + crop_h))
+            if selected_fit == "contain":
+                derived = _contain_on_blurred_backdrop(source, crop_w, crop_h)
+                crop_box = None
+                cropped_fraction = 0.0
+            else:
+                derived = source.crop((left, top, left + crop_w, top + crop_h))
+                crop_box = [left, top, left + crop_w, top + crop_h]
+                cropped_fraction = round(1 - (crop_w * crop_h) / (width * height), 4)
             target = await _build_media_target(
                 entity_id=entity_id,
                 workspace_id=workspace_id,
@@ -4997,7 +5169,7 @@ async def _derive_image_aspect_handler(
             if not target.abs_dir or not target.abs_path:
                 raise ValueError("Could not resolve the derived image output path")
             os.makedirs(target.abs_dir, exist_ok=True)
-            cropped.save(target.abs_path, format="PNG")
+            derived.save(target.abs_path, format="PNG")
 
         if not os.path.isfile(target.abs_path) or os.path.getsize(target.abs_path) <= 0:
             raise RuntimeError("the derived image was not written")
@@ -5021,7 +5193,9 @@ async def _derive_image_aspect_handler(
                 "input_path": _normalize_user_path(rel_input),
                 "source_document_id": source_document_id,
                 "aspect_ratio": f"{aspect_w}:{aspect_h}",
-                "crop_box": [left, top, left + crop_w, top + crop_h],
+                "fit": selected_fit,
+                "crop_box": crop_box,
+                "cropped_fraction": cropped_fraction,
                 "width": crop_w,
                 "height": crop_h,
                 "sha256": digest,
@@ -5038,7 +5212,7 @@ async def _derive_image_aspect_handler(
             tool_name="derive_image_aspect",
         )
         return _json({
-            "ready": True, "derived": True,
+            "ready": True, "derived": True, "fit": selected_fit, "cropped_fraction": cropped_fraction,
             "poster": {
                 "document_id": document_id, "fs_path": target.rel_path,
                 "filename": target.filename, "sha256": digest,
@@ -8963,29 +9137,28 @@ async def _transcribe_narration_audio(
         path.read_bytes(),
         **transcribe_kwargs,
     )
-    if not user_key:
-        try:
-            from packages.core.database import async_session
-            from packages.core.services.usage_service import record_media_usage
+    try:
+        from packages.core.database import async_session
+        from packages.core.services.usage_service import record_media_usage
 
-            async with async_session() as db:
-                await record_media_usage(
-                    db,
-                    entity_id=entity_id,
-                    kind="whisper",
-                    model=result.model,
-                    cost_usd=whisper_cost_usd(result.duration_seconds, result.model),
-                    units=int(result.duration_seconds),
-                    workspace_id=workspace_id,
-                    user_id=user_id or None,
-                    agent_id=agent_id,
-                    conversation_id=conversation_id,
-                    source=RUNTIME_AUDIO_TRANSCRIBE_SOURCE,
-                    byok=False,
-                )
-                await db.commit()
-        except Exception:
-            logger.debug("narration STT billing failed (best-effort)", exc_info=True)
+        async with async_session() as db:
+            await record_media_usage(
+                db,
+                entity_id=entity_id,
+                kind="whisper",
+                model=result.model,
+                cost_usd=whisper_cost_usd(result.duration_seconds, result.model, getattr(result, "usage", None)),
+                units=int(result.duration_seconds),
+                workspace_id=workspace_id,
+                user_id=user_id or None,
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+                source=RUNTIME_AUDIO_TRANSCRIBE_SOURCE,
+                byok=bool(user_key),
+            )
+            await db.commit()
+    except Exception:
+        logger.debug("narration STT billing failed (best-effort)", exc_info=True)
     return result
 
 
@@ -9621,6 +9794,136 @@ def _time_cue_words(cues: list[SubtitleCue], heard: list[dict[str, Any]], offset
     return result
 
 
+async def _ffmpeg_raw(args: list[str], *, timeout_seconds: float) -> bytes:
+    """Raw bytes ffmpeg writes to stdout (``-f s16le -`` audio, ``-f rawvideo -`` frames)."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is not installed")
+    process = await asyncio.create_subprocess_exec(
+        ffmpeg, "-v", "error", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+    except asyncio.TimeoutError as exc:
+        process.kill()
+        await process.communicate()
+        raise RuntimeError(f"ffmpeg timed out after {timeout_seconds:.0f}s") from exc
+    if process.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {stderr.decode('utf-8', errors='replace')[-500:]}")
+    return stdout
+
+
+async def _measure_lyric_word_energy(
+    audio_path: str, cues: list[SubtitleCue], offset_seconds: float,
+) -> list[SubtitleCue]:
+    """Each timed word's loudness in the song (dBFS), from 8 kHz mono samples of the sung span.
+
+    Loudness only guides which words are set larger, so a song that cannot be read keeps its cues.
+    """
+    from array import array
+
+    timed = [word for cue in cues for word in cue.words]
+    if not timed:
+        return cues
+    rate = 8000
+    start = max(0.0, min(word.start for word in timed) + offset_seconds)
+    span = max(word.end for word in timed) + offset_seconds - start
+    try:
+        raw = await _ffmpeg_raw(["-ss", f"{start:.3f}", "-t", f"{span + 0.1:.3f}", "-i", audio_path, "-ac", "1",
+                                 "-ar", str(rate), "-f", "s16le", "-"], timeout_seconds=120)
+    except Exception:  # noqa: BLE001 - loudness is optional; the words keep their size
+        logger.warning("Lyric word loudness could not be measured from %s", audio_path, exc_info=True)
+        return cues
+    samples = array("h")
+    samples.frombytes(raw[: len(raw) - len(raw) % 2])
+
+    def loudness(word: SubtitleWord) -> float | None:
+        first = max(0, round((word.start + offset_seconds - start) * rate))
+        last = min(len(samples), round((word.end + offset_seconds - start) * rate))
+        if last - first < rate // 50:
+            return None
+        power = sum(sample * sample for sample in samples[first:last]) / (last - first)
+        return round(20 * math.log10(max(math.sqrt(power), 1.0) / 32768), 1)
+
+    return [replace(cue, words=tuple(replace(word, energy=loudness(word)) for word in cue.words)) for cue in cues]
+
+
+def _vivid_picture_hue(rgb: bytes) -> tuple[float, float] | None:
+    """The hue and saturation of a picture's most vivid colour, or None for a grey picture.
+
+    Pixels count by how saturated and bright they are; the strongest of 18 hue bands wins, so a
+    small neon sign beats a large dull wall.
+    """
+    import colorsys
+
+    bands: dict[int, list[float]] = {}
+    pixels = len(rgb) // 3
+    for offset in range(0, pixels * 3, 3):
+        hue, sat, val = colorsys.rgb_to_hsv(rgb[offset] / 255, rgb[offset + 1] / 255, rgb[offset + 2] / 255)
+        if sat < 0.35 or val < 0.3:
+            continue
+        weight = sat * sat * val
+        band = bands.setdefault(int(hue * 18) % 18, [0.0, 0.0, 0.0, 0.0])
+        # Hue is averaged as an angle so reds either side of 0 stay red.
+        band[0] += weight
+        band[1] += weight * math.cos(hue * 2 * math.pi)
+        band[2] += weight * math.sin(hue * 2 * math.pi)
+        band[3] += weight * sat
+    if not bands:
+        return None
+    weight, cos_sum, sin_sum, sat_sum = max(bands.values(), key=lambda band: band[0])
+    if weight < pixels * 0.01:
+        return None
+    return (math.atan2(sin_sum, cos_sum) / (2 * math.pi)) % 1.0, sat_sum / weight
+
+
+def _picture_lyric_colors(hue: float, sat: float, keys: list[str]) -> dict[str, str]:
+    """Lyric colours of a picture's hue, made readable: bright fills and glows, a dark outline."""
+    import colorsys
+
+    def hex_color(saturation: float, value: float) -> str:
+        red, green, blue = colorsys.hsv_to_rgb(hue, saturation, value)
+        return f"#{round(red * 255):02X}{round(green * 255):02X}{round(blue * 255):02X}"
+
+    shades = {
+        "accent_color": hex_color(min(0.85, max(0.5, sat)), 1.0),
+        "glow_color": hex_color(min(0.95, max(0.7, sat)), 1.0),
+        "outline_color": hex_color(min(0.9, max(0.6, sat)), 0.28),
+    }
+    return {key: shades[key] for key in keys if key in shades}
+
+
+async def _picture_cue_colors(
+    picture_path: str, cues: list[SubtitleCue], keys: list[str],
+) -> dict[int, dict[str, str]]:
+    """Per cue, the given lyric colours taken from the picture in the middle of the cue.
+
+    A frame that cannot be read, or a grey one, leaves that cue in the look's own colours.
+    """
+    if not keys:
+        return {}
+    still = Path(picture_path).suffix.lower() in IMAGE_EXTENSIONS
+    colors: dict[int, dict[str, str]] = {}
+    for cue in cues:
+        seek = [] if still else ["-ss", f"{(cue.start + cue.end) / 2:.3f}"]
+        try:
+            rgb = await _ffmpeg_raw([*seek, "-i", picture_path, "-frames:v", "1", "-vf", "scale=64:36",
+                                     "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], timeout_seconds=30)
+        except Exception:  # noqa: BLE001 - the cue keeps the look's colours
+            logger.warning("Lyric colours could not be read from %s at cue %s", picture_path, cue.index,
+                           exc_info=True)
+            continue
+        vivid = _vivid_picture_hue(rgb)
+        if vivid:
+            colors[cue.index] = _picture_lyric_colors(*vivid, keys)
+            if "accent_color" in keys:
+                # A key word filled with the picture's own colour can sit on that colour: a dark rim
+                # of the same hue keeps it readable.
+                colors[cue.index]["accent_rim_color"] = _picture_lyric_colors(*vivid, ["outline_color"])[
+                    "outline_color"]
+    return colors
+
+
 def _ass_tag_color(value: Any, fallback: str) -> str:
     """``&HBBGGRR&`` for an override tag."""
     raw = _ass_color(value or fallback)
@@ -9674,15 +9977,74 @@ def _lyric_animation(spec: dict[str, Any] | None, canvas_width: int, canvas_heig
         "max_chars_per_line": int(_clamp_float(
             spec.get("max_chars_per_line"), 8, 80, max(10, round(canvas_width * 0.85 / (font_size * 0.55)))
         )),
+        "small_scale": _clamp_float(spec.get("small_scale"), 0.4, 1.0, 1.0),
+        "auto_emphasis": bool(spec.get("auto_emphasis", False)),
+        "max_emphasis": int(_clamp_float(spec.get("max_emphasis"), 1, 3, 1)),
+        "emphasis_font_name": str(spec.get("emphasis_font_name") or "").replace(",", " ").strip(),
+        "emphasis_bold": bool(spec.get("emphasis_bold", spec.get("bold", True))),
+        "beats": _lyric_beats(spec.get("beats")),
+        "beat_hit": choice("beat_hit", LYRIC_BEAT_HITS, "none"),
+        "beat_strength": _clamp_float(spec.get("beat_strength"), 0, 1, 0.6),
+        "long_note": choice("long_note", LYRIC_LONG_NOTES, "none"),
+        "long_note_ms": int(_clamp_float(spec.get("long_note_ms"), 200, 5000, 650)),
     }
 
 
+def _lyric_beats(raw: Any) -> list[tuple[float, float]]:
+    """Beat times with their strengths, in order: a number is a beat of strength 1."""
+    beats = []
+    for item in raw if isinstance(raw, list) else []:
+        at, strength = (item[0], item[1] if len(item) > 1 else 1) if isinstance(item, (list, tuple)) and item else (item, 1)
+        if isinstance(at, (int, float)) and not isinstance(at, bool) and at >= 0:
+            beats.append((float(at), _clamp_float(strength, 0, 2, 1)))
+    return sorted(beats)[:4000]
+
+
+# Words a line leans on less: articles, pronouns, short prepositions and particles.
+_LYRIC_SMALL_WORDS = frozenset(
+    "a an the and or but so to of in on at for by from with as is am are was were be been it its i me my "
+    "you your we our us he him his she her they them their this that these those do did not no if "
+    "的 了 着 过 吗 呢 吧 啊 呀 和 与 在 是 把 被".split()
+)
+
+
+def _lyric_word_scales(words: tuple[SubtitleWord, ...], emphasized: list[bool],
+                       settings: dict[str, Any]) -> tuple[list[float], list[bool]]:
+    """Each word's size against the font size, and which words are key.
+
+    Chosen key words stay key; with auto emphasis the loudest, longest content words that stand
+    out from the line join them, up to the line's limit. Small words of the rest are set smaller.
+    """
+    keys = list(emphasized)
+    if settings["auto_emphasis"] and sum(keys) < settings["max_emphasis"]:
+        loud = [word.energy for word in words if word.energy is not None]
+        floor = min(loud) if loud else 0.0
+        scores = []
+        for index, word in enumerate(words):
+            if keys[index] or _lyric_key(word.text) in _LYRIC_SMALL_WORDS or len(_lyric_key(word.text)) < 2:
+                continue
+            held = max(0.05, word.end - word.start)
+            # 6 dB louder than the line's quietest word counts as much as a second-long note.
+            scores.append((held + (word.energy - floor) / 6 if word.energy is not None else held, index))
+        if scores:
+            typical = sorted(score for score, _index in scores)[(len(scores) - 1) // 2]
+            for score, index in sorted(scores, reverse=True):
+                if sum(keys) >= settings["max_emphasis"] or score < typical * 1.15 or score <= 0:
+                    break
+                keys[index] = True
+    scales = [settings["emphasis_scale"] if keys[index]
+              else settings["small_scale"] if _lyric_key(word.text) in _LYRIC_SMALL_WORDS else 1.0
+              for index, word in enumerate(words)]
+    return scales, keys
+
+
 def _lyric_lines(words: tuple[SubtitleWord, ...], spaces: list[str], emphasized: list[bool],
-                 settings: dict[str, Any]) -> list[list[int]]:
+                 settings: dict[str, Any], scales: list[float] | None = None) -> list[list[int]]:
     """Word indexes per line, balanced so no word is left alone; a stack layout gives each emphasized
-    word its own line and balances the words between them separately."""
-    sizes = [len(word.text) * (settings["emphasis_scale"] if emphasized[index] else 1.0) + (1 if spaces[index] else 0)
-             for index, word in enumerate(words)]
+    word its own line and balances the words between them separately. Words are weighed at their
+    own size."""
+    scales = scales or [settings["emphasis_scale"] if emphasized[index] else 1.0 for index in range(len(words))]
+    sizes = [len(word.text) * scales[index] + (1 if spaces[index] else 0) for index, word in enumerate(words)]
     limit = settings["max_chars_per_line"]
     segments: list[list[int]] = [[]]
     for index in range(len(words)):
@@ -9746,10 +10108,86 @@ def _lyric_font_measure(font_name: str, bold: bool, italic: bool) -> Callable[[s
     return lambda text, size: face.getlength(text) * size / height
 
 
+# How much wider a held word grows; the layout leaves it that much room.
+_LYRIC_HELD_STRETCH = 1.12
+
+
+def _lyric_hit_tags(
+    settings: dict[str, Any],
+    *,
+    begin: float,
+    end: float,
+    settle: float,
+    scale: float = 1.0,
+    tilt: float = 0.0,
+    key: bool = False,
+    glow_layer: bool = False,
+    held: tuple[float, float] | None = None,
+) -> str:
+    """Transforms for an event shown from ``begin`` to ``end``: the beats it is on screen for, once
+    its own entrance has settled, and the hold of a long sung word (``held``, its sung span).
+
+    ``scale`` and ``tilt`` are where the event rests, so every hit returns to them. Key words hit
+    harder. A pulse skips beats inside a held note, which is already widening or trembling.
+    """
+    parts = []
+    hit = settings["beat_hit"]
+    long_note = settings["long_note"] if held and (held[1] - held[0]) * 1000 >= settings["long_note_ms"] else "none"
+    rest = f"\\fscx{scale * 100:.0f}\\fscy{scale * 100:.0f}"
+    if hit != "none":
+        last = None
+        for at, strength in settings["beats"]:
+            if at < begin + settle or at > end - 0.12:
+                continue
+            at_ms = round((at - begin) * 1000)
+            force = settings["beat_strength"] * strength * (1.35 if key else 1.0)
+            if force < 0.02 or (last is not None and at_ms - last < 160):
+                continue
+            last = at_ms
+            holding = long_note != "none" and held[0] <= at <= held[1]
+            if hit in {"pulse", "punch"} and not holding:
+                # At most about a fifth larger, so a hit never lands on the next word.
+                up = scale * (1 + 0.1 * min(force, 1.25))
+                parts.append(f"\\t({at_ms},{at_ms + 70},\\fscx{up * 100:.0f}\\fscy{up * 100:.0f})"
+                             f"\\t({at_ms + 70},{at_ms + 260},{rest})")
+            if hit in {"shake", "punch"}:
+                swing = 7 * force
+                parts.append(f"\\t({at_ms},{at_ms + 50},\\frz{tilt + swing:.1f})"
+                             f"\\t({at_ms + 50},{at_ms + 110},\\frz{tilt - swing * 0.6:.1f})"
+                             f"\\t({at_ms + 110},{at_ms + 200},\\frz{tilt:g})")
+            if hit == "flash" and glow_layer:
+                glow = settings["glow_size"]
+                parts.append(f"\\t({at_ms},{at_ms + 50},\\bord{glow * (1 + force):.0f}\\blur{glow * (1 + 0.8 * force):.0f}"
+                             f"\\1a&H00&\\3a&H00&)\\t({at_ms + 50},{at_ms + 320},\\bord{glow:g}\\blur{glow:g}"
+                             f"\\1a&H40&\\3a&H40&)")
+            elif hit == "flash" and not settings["glow_color"]:
+                # No glow layer: the outline flares in the accent colour and settles back.
+                outline = settings["outline"]
+                flare = _ass_tag_color(settings["accent_color"], "#FFD54A")
+                parts.append(f"\\t({at_ms},{at_ms + 50},\\3c{flare}\\bord{outline + 2 + 5 * force:.0f}"
+                             f"\\blur{2 + 3 * force:.0f})\\t({at_ms + 50},{at_ms + 300},"
+                             f"\\3c{_ass_tag_color(settings['outline_color'], '#000000')}\\bord{outline:g}\\blur0)")
+    if long_note != "none":
+        hold_from, hold_to = max(held[0], begin + settle), min(held[1], end)
+        if hold_to - hold_from >= 0.2:
+            start_ms, end_ms = round((hold_from - begin) * 1000), round((hold_to - begin) * 1000)
+            if long_note == "stretch":
+                stretch = scale * _LYRIC_HELD_STRETCH * 100
+                parts.append(f"\\t({start_ms},{end_ms},\\fscx{stretch:.0f})\\t({end_ms},{end_ms + 180},{rest})")
+            else:
+                # A vibrato: the word trembles while the note is held.
+                for number, at_ms in enumerate(range(start_ms, end_ms - 55, 110)):
+                    wobble = 1.06 if number % 2 == 0 else 0.97
+                    parts.append(f"\\t({at_ms},{at_ms + 110},\\fscx{scale * (2 - wobble) * 100:.0f}"
+                                 f"\\fscy{scale * wobble * 100:.0f})")
+                parts.append(f"\\t({end_ms},{end_ms + 120},{rest})")
+    return "".join(parts)
+
+
 def _camera_follow_events(
     cue: SubtitleCue,
-    pieces: list[tuple[str, int, float, float, float, bool]],
-    width: Callable[[str, float], float],
+    pieces: list[tuple[str, int, float, float, float, bool, float]],
+    width: Callable[[str, float, bool], float],
     settings: dict[str, Any],
     *,
     canvas_width: int,
@@ -9768,8 +10206,8 @@ def _camera_follow_events(
     exit_at = max(cue.start, cue.end - out_ms / 1000)
     boxes = []
     for index in order:
-        text, size, x, y, _start, _key = pieces[index]
-        half = width(text, size) / 2
+        text, size, x, y, _start, key, _end = pieces[index]
+        half = width(text, size, key) / 2
         boxes.append((x - half, y - size, x + half, y))
     # The camera frames the words a little above the middle, clear of the lower picture.
     centre_x, centre_y = canvas_width / 2, canvas_height * settings["camera_focus_y"]
@@ -9874,11 +10312,13 @@ def _camera_follow_events(
         # blur: the line blurs away, leaving the picture clear before the next one.
         return f"\\pos({at_x},{at_y}){hold}\\t(0,{out_ms},\\blur10\\alpha&HFF&)"
 
+    glow_tag = _ass_tag_color(settings["glow_color"], "#FFFFFF") if glow else ""
     for rank, index in enumerate(order):
-        text, size, x, y, _start, key = pieces[index]
+        text, size, x, y, sung, key, sung_end = pieces[index]
         safe = text.replace("{", r"\{").replace("}", r"\}")
-        look = f"\\an2\\fs{size}\\1c{accent if key else color}{pivot}"
+        look = f"\\an2\\fs{size}\\1c{accent if key else color}{pivot}{_lyric_key_font(settings, key, size)}"
         entrance = settings["emphasis_entrance"] if key else settings["entrance"]
+        # Each span: when it shows, its motion, how long that motion takes to settle, and where it rests.
         spans = []
         for step in range(rank, len(order)):
             begin = starts[step]
@@ -9891,22 +10331,44 @@ def _camera_follow_events(
             last = framings[step - 1] if step else framings[step]
             from_x, from_y = place(x, y, last)
             if step == rank:
-                spans.append((begin, end, lambda fx, a=(from_x, from_y), b=(to_x, to_y), l=last, n=framings[step]:
-                              arrive(entrance, rank, size, l, n, a, b, fx=fx)))
+                settle = max(reframe_ms, in_ms) + (200 if entrance in {"drop", "bounce"} else 0)
+                spans.append((begin, end, lambda fx, a=(from_x, from_y), b=(to_x, to_y), was=last, n=framings[step]:
+                              arrive(entrance, rank, size, was, n, a, b, fx=fx), settle, zoom, tilt))
             else:
                 motion = (f"\\move({from_x},{from_y},{to_x},{to_y},0,{reframe_ms}){scale(last[0])}\\frz{last[3]:g}"
                           f"\\t(0,{reframe_ms},{scale(zoom)}\\frz{tilt:g})")
-                spans.append((begin, end, lambda fx, m=motion: m))
+                spans.append((begin, end, lambda fx, m=motion: m, reframe_ms, zoom, tilt))
         if out_ms and exit_at < cue.end and framings:
             gone = leave(settings["exit"], rank, size, framings[-1], place(x, y, framings[-1]))
-            spans.append((exit_at, cue.end, lambda fx, m=gone: m))
-        for begin, end, motion in spans:
+            spans.append((exit_at, cue.end, lambda fx, m=gone: m, None, 1.0, 0.0))
+        for begin, end, motion, settle, rest_zoom, rest_tilt in spans:
             when = f"{_format_ass_time(begin)},{_format_ass_time(end)}"
+
+            def hits(glow_layer: bool, b: float = begin, e: float = end, s: Any = settle,
+                     z: float = rest_zoom, t: float = rest_tilt) -> str:
+                # The exit carries no hits: the line is leaving.
+                return "" if s is None else _lyric_hit_tags(
+                    settings, begin=b, end=e, settle=s / 1000, scale=z, tilt=t, key=key,
+                    glow_layer=glow_layer, held=(sung, sung_end))
+
             if glow:
                 events.append(f"Dialogue: 0,{when},LyricFx,,0,0,0,,{{{look}{motion(True)}"
-                              f"\\bord{glow:g}\\blur{glow:g}\\1a&H40&\\3a&H40&}}{safe}")
-            events.append(f"Dialogue: 1,{when},Lyric,,0,0,0,,{{{look}{motion(False)}}}{safe}")
+                              f"\\3c{glow_tag}\\bord{glow:g}\\blur{glow:g}\\1a&H40&\\3a&H40&{hits(True)}}}{safe}")
+            events.append(f"Dialogue: 1,{when},Lyric,,0,0,0,,{{{look}{motion(False)}{hits(False)}}}{safe}")
     return events
+
+
+def _lyric_key_font(settings: dict[str, Any], key: bool, size: int = 0) -> str:
+    """Override tags for a key word: the look's second font, when it has one, and a dark rim when
+    its fill colour was taken from the picture under it."""
+    if not key:
+        return ""
+    tags = (f"\\fn{settings['emphasis_font_name']}\\b{1 if settings['emphasis_bold'] else 0}"
+            if settings["emphasis_font_name"] else "")
+    if settings.get("accent_rim_color"):
+        tags += (f"\\3c{_ass_tag_color(settings['accent_rim_color'], '#000000')}"
+                 f"\\bord{max(settings['outline'], round(size * 0.05) or 3):g}")
+    return tags
 
 
 def _placed_lyric_events(
@@ -9918,55 +10380,64 @@ def _placed_lyric_events(
     *,
     canvas_width: int,
     canvas_height: int,
+    scales: list[float] | None = None,
 ) -> list[str]:
     """One event per word (or letter), each placed by measured width and moving on its own sung time.
 
     A piece enters with the entrance motion when it is sung, holds, and leaves with the exit motion
-    as the line ends; a glow layer follows every piece.
+    as the line ends; a glow layer follows every piece. Each word is set at its own size
+    (``scales``, against the font size) and key words in the look's second font when it has one.
     """
     base = settings["font_size"]
-    big = round(base * settings["emphasis_scale"])
+    scales = scales or [settings["emphasis_scale"] if emphasized[index] else 1.0 for index in range(len(words))]
     measure = _lyric_font_measure(settings["font_name"], settings["bold"], settings["italic"])
+    key_measure = (_lyric_font_measure(settings["emphasis_font_name"], settings["emphasis_bold"], settings["italic"])
+                   if settings["emphasis_font_name"] else measure)
     spacing = settings["letter_spacing"]
 
-    def width(text: str, size: float) -> float:
-        raw = measure(text, size) if measure else len(text) * size * 0.5
+    def width(text: str, size: float, key: bool = False) -> float:
+        face = key_measure if key else measure
+        raw = face(text, size) if face else len(text) * size * 0.5
         return raw + spacing * len(text)
 
     texts = [word.text.upper() if settings["uppercase"] else word.text for word in words]
-    sizes = [big if emphasized[index] else base for index in range(len(words))]
-    rows = _lyric_lines(words, spaces, emphasized, settings)
+    sizes = [round(base * scales[index]) for index in range(len(words))]
+    rows = _lyric_lines(words, spaces, emphasized, settings, scales)
+    # A word that will stretch while it is held gets its stretched width in the line.
+    room = [_LYRIC_HELD_STRETCH if settings["long_note"] == "stretch" and settings["reveal"] == "word"
+            and (word.end - word.start) * 1000 >= settings["long_note_ms"] else 1.0 for word in words]
     row_heights = [max(sizes[index] for index in row) for row in rows]
     gap = round(base * 0.12)
     block = sum(row_heights) + gap * (len(rows) - 1)
     top = {"bottom": canvas_height - settings["margin_v"] - block, "middle": (canvas_height - block) // 2,
            "top": settings["margin_v"]}[settings["position"]]
 
-    # Each piece: its text, size, bottom-centre point, start time and index for alternating motions.
-    pieces: list[tuple[str, int, float, float, float, bool]] = []
+    # Each piece: its text, size, bottom-centre point, start time, whether it is key, and when its
+    # word stops being sung.
+    pieces: list[tuple[str, int, float, float, float, bool, float]] = []
     for row, row_height in zip(rows, row_heights):
         bottom = top + row_height
-        row_width = sum(width(texts[index], sizes[index]) for index in row) + sum(
-            width(spaces[index], sizes[index]) for index in row[:-1]
-        )
+        # A space between a small and a large word is the large word's space, so they never touch.
+        gaps = [width(spaces[index], max(sizes[index], sizes[after])) for index, after in zip(row, row[1:])]
+        row_width = sum(room[index] * width(texts[index], sizes[index], emphasized[index]) for index in row) + sum(gaps)
         left = (canvas_width - row_width) / 2
         for position, index in enumerate(row):
-            word, size = words[index], sizes[index]
+            word, size, key = words[index], sizes[index], emphasized[index]
             if settings["reveal"] == "letter":
                 # Letters cascade through the word's sung time, at most 70 ms apart.
                 letters = list(texts[index])
                 step = min(0.07, max(0.0, word.end - word.start) / max(1, len(letters)))
                 for offset, letter in enumerate(letters):
-                    letter_width = width(letter, size)
+                    letter_width = width(letter, size, key)
                     pieces.append((letter, size, left + letter_width / 2, bottom, word.start + step * offset,
-                                   emphasized[index]))
+                                   key, word.end))
                     left += letter_width
             else:
-                word_width = width(texts[index], size)
-                pieces.append((texts[index], size, left + word_width / 2, bottom, word.start, emphasized[index]))
+                word_width = room[index] * width(texts[index], size, key)
+                pieces.append((texts[index], size, left + word_width / 2, bottom, word.start, key, word.end))
                 left += word_width
             if position < len(row) - 1:
-                left += width(spaces[index], size)
+                left += gaps[position]
         top = bottom + gap
 
     if settings["camera"] == "follow":
@@ -9978,8 +10449,10 @@ def _placed_lyric_events(
     accent = _ass_tag_color(settings["accent_color"], "#FFD54A")
     glow = settings["glow_size"] if settings["glow_color"] else 0
     events = []
-    for number, (text, size, x, y, start, key) in enumerate(pieces):
+    glow_tag = _ass_tag_color(settings["glow_color"], "#FFFFFF") if glow else ""
+    for number, (text, size, x, y, start, key, sung_end) in enumerate(pieces):
         x, y = round(x), round(y)
+        sung = start
         start = min(max(start, cue.start), exit_at)
         entrance = settings["emphasis_entrance"] if key else settings["entrance"]
         # A highlighted line is all there, dim, from its start; each word lights up when it is sung.
@@ -10035,17 +10508,26 @@ def _placed_lyric_events(
         if leave and entrance == "slam":
             # It leaves from the tilt it settled at.
             leave += f"{centre}\\frz{side * 4}\\fax-0.08"
-        look = f"\\an2\\fs{size}\\1c{accent if key else color}"
+        look = f"\\an2\\fs{size}\\1c{accent if key else color}{_lyric_key_font(settings, key, size)}"
         safe = text.replace("{", r"\{").replace("}", r"\}")
-        spans = [(start, exit_at, enter)] + ([(exit_at, cue.end, leave)] if leave and exit_at < cue.end else [])
-        for begin, end, motion in spans:
+        # Once its entrance settles, the word rides the beats (and its own held note) until the line leaves.
+        settle = (sung_ms if entrance == "highlight" else 0) + in_ms + (200 if entrance in {"drop", "bounce"} else 0)
+        spans = [(start, exit_at, enter, settle)] + (
+            [(exit_at, cue.end, leave, None)] if leave and exit_at < cue.end else [])
+        for begin, end, motion, settle_ms in spans:
             if end <= begin:
                 continue
             when = f"{_format_ass_time(begin)},{_format_ass_time(end)}"
+
+            def hits(glow_layer: bool, b: float = begin, e: float = end, s: Any = settle_ms) -> str:
+                return "" if s is None else _lyric_hit_tags(
+                    settings, begin=b, end=e, settle=s / 1000, tilt=side * 4 if entrance == "slam" else 0,
+                    key=key, glow_layer=glow_layer, held=(sung, sung_end))
+
             if glow:
                 events.append(f"Dialogue: 0,{when},LyricFx,,0,0,0,,{{{look}{motion}"
-                              f"\\bord{glow:g}\\blur{glow:g}\\1a&H40&\\3a&H40&}}{safe}")
-            events.append(f"Dialogue: 1,{when},Lyric,,0,0,0,,{{{look}{motion}}}{safe}")
+                              f"\\3c{glow_tag}\\bord{glow:g}\\blur{glow:g}\\1a&H40&\\3a&H40&{hits(True)}}}{safe}")
+            events.append(f"Dialogue: 1,{when},Lyric,,0,0,0,,{{{look}{motion}{hits(False)}}}{safe}")
     return events
 
 
@@ -10055,12 +10537,14 @@ def _render_animated_lyrics_ass(
     *,
     canvas_width: int,
     canvas_height: int,
+    cue_colors: dict[int, dict[str, str]] | None = None,
 ) -> str:
     """ASS lyrics that move: words revealed on their sung times, key words set larger.
 
-    Every look is configuration (font, colours, reveal, entrance, layout, glow); the code only
-    supplies the motions. Two styles are always written so a burn-in never forces one style
-    over the file.
+    Every look is configuration (font, colours, reveal, entrance, layout, glow, beat hits); the
+    code only supplies the motions. Two styles are always written so a burn-in never forces one
+    style over the file. ``cue_colors`` replaces colours of the look per cue (by cue index), such
+    as colours taken from the picture each line is sung over.
     """
     settings = _lyric_animation(animation, canvas_width, canvas_height)
     color = _ass_color(settings["color"])
@@ -10098,7 +10582,6 @@ def _render_animated_lyrics_ass(
         "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
     ]
     entrance, in_ms, out_ms = settings["entrance"], settings["entrance_ms"], settings["exit_ms"]
-    big = round(settings["font_size"] * settings["emphasis_scale"])
     for cue in cues:
         words = cue.words or _spread_cue_words(cue)
         if not words:
@@ -10110,9 +10593,11 @@ def _render_animated_lyrics_ass(
                         else " " for word in words])
         emphasis_keys = {_lyric_key(word) for word in cue.emphasis}
         emphasized = [_lyric_key(word.text) in emphasis_keys for word in words]
+        look = {**settings, **(cue_colors or {}).get(cue.index, {})}
+        scales, keys = _lyric_word_scales(words, emphasized, look)
         if settings["reveal"] in {"word", "letter"}:
-            lines.extend(_placed_lyric_events(cue, words, spaces, emphasized, settings,
-                                              canvas_width=canvas_width, canvas_height=canvas_height))
+            lines.extend(_placed_lyric_events(cue, words, spaces, keys, look, canvas_width=canvas_width,
+                                              canvas_height=canvas_height, scales=scales))
             continue
         start_ms = round(cue.start * 1000)
         duration_ms = max(1, round(cue.end * 1000) - start_ms)
@@ -10123,21 +10608,30 @@ def _render_animated_lyrics_ass(
             text = text.replace("{", r"\{").replace("}", r"\}")
             at = max(0, round(word.start * 1000) - start_ms)
             tags = []
-            if emphasized[index]:
-                tags.append(f"\\fs{big}" + ("" if karaoke or fx else f"\\1c{_ass_tag_color(settings['accent_color'], '#FFD54A')}"))
+            size = round(settings["font_size"] * scales[index])
+            if keys[index]:
+                tags.append(f"\\fs{size}{_lyric_key_font(look, True, size)}"
+                            + ("" if karaoke or fx else f"\\1c{_ass_tag_color(look['accent_color'], '#FFD54A')}"))
+            elif size != settings["font_size"]:
+                tags.append(f"\\fs{size}")
             if karaoke:
                 previous_end = round(words[index - 1].end * 1000) - start_ms if index else 0
                 gap = max(0, at - max(0, previous_end))
                 sung = max(1, round((word.end - word.start) * 100))
                 tags.insert(0, (f"\\k{round(gap / 10)}" if gap >= 10 else "") + f"\\kf{sung}")
-            reset = ("{" + f"\\fs{settings['font_size']}"
+            back_font = (f"\\fn{settings['font_name']}\\b{1 if settings['bold'] else 0}"
+                         if settings["emphasis_font_name"] else "")
+            if look.get("accent_rim_color") and not fx:
+                back_font += f"\\3c{_ass_tag_color(settings['outline_color'], '#000000')}\\bord{settings['outline']:g}"
+            reset = ("{" + f"\\fs{settings['font_size']}{back_font}"
                      + ("" if karaoke or fx else f"\\1c{_ass_tag_color(settings['color'], '#FFFFFF')}") + "}"
-                     if emphasized[index] else "")
+                     if keys[index] else "{" + f"\\fs{settings['font_size']}" + "}" if size != settings["font_size"]
+                     else "")
             return ("{" + "".join(tags) + "}" if tags else "") + text + reset
 
         def line_text(*, fx: bool) -> str:
             parts = []
-            for line in _lyric_lines(words, spaces, emphasized, settings):
+            for line in _lyric_lines(words, spaces, keys, settings, scales):
                 parts.append("".join(word_text(index, fx=fx) + (spaces[index] if position < len(line) - 1 else "")
                                      for position, index in enumerate(line)))
             return r"\N".join(parts)
@@ -10164,11 +10658,22 @@ def _render_animated_lyrics_ass(
         if entrance == "flicker":
             line_tags.append("\\alpha&HC0&\\t(0,60,\\alpha&H00&)\\t(60,110,\\alpha&HA0&)\\t(110,170,\\alpha&H00&)"
                              "\\t(170,210,\\alpha&H60&)\\t(210,260,\\alpha&H00&)")
-        head = "{" + "".join(line_tags) + "}"
+        if karaoke:
+            # The cue's own fill colours, which may come from its picture.
+            line_tags.append(f"\\1c{_ass_tag_color(look['accent_color'], '#FFD54A')}"
+                             f"\\2c{_ass_tag_color(look['dim_color'], '#9A9A9A')}")
+        settle = max(1, in_ms) / 1000
+
+        def line_hits(glow_layer: bool) -> str:
+            return _lyric_hit_tags(look, begin=cue.start, end=cue.end - out_ms / 1000, settle=settle,
+                                   glow_layer=glow_layer)
+
+        head = "{" + "".join(line_tags) + line_hits(False) + "}"
         when = f"{_format_ass_time(cue.start)},{_format_ass_time(cue.end)}"
         if settings["glow_color"]:
             glow = settings["glow_size"]
-            glow_head = head[:-1] + f"\\bord{glow:g}\\blur{glow:g}\\1a&H40&\\3a&H40&" + "}"
+            glow_head = ("{" + "".join(line_tags) + f"\\3c{_ass_tag_color(look['glow_color'], '#FFFFFF')}"
+                         f"\\bord{glow:g}\\blur{glow:g}\\1a&H40&\\3a&H40&" + line_hits(True) + "}")
             lines.append(f"Dialogue: 0,{when},LyricFx,,0,0,0,,{glow_head}{line_text(fx=True)}")
         if entrance == "glitch":
             # Red and cyan copies shake off the words, then the clean line holds.
@@ -10642,6 +11147,12 @@ async def _compose_video_file(
     for track in audio_tracks:
         if track.loop:
             args.extend(["-stream_loop", "-1", "-t", f"{track.duration:.3f}"])
+        elif track.source_start:
+            # Seek the song before decoding. Trimming after decode made ffmpeg decode
+            # and drop everything before the excerpt while holding the picture, so a
+            # late excerpt (from 155 s of a song) outran the compose timeout. Input
+            # seeking is sample-accurate when transcoding (-accurate_seek default).
+            args.extend(["-ss", f"{track.source_start:.3f}"])
         args.extend(["-i", track.abs_path])
 
     filter_parts: list[str] = []
@@ -10683,8 +11194,9 @@ async def _compose_video_file(
         effects = [
             f"[{index}:a:0]aresample=48000",
             "aformat=sample_fmts=fltp:channel_layouts=stereo",
+            # A seeked input already starts at the excerpt; only a looped one still trims its offset.
             (f"atrim={track.source_start:.3f}:{track.source_start + duration:.3f}"
-             if track.source_start else f"atrim=0:{duration:.3f}"),
+             if track.source_start and track.loop else f"atrim=0:{duration:.3f}"),
             "asetpts=PTS-STARTPTS",
             f"volume={track.volume_db}dB",
         ]
@@ -12211,7 +12723,6 @@ def get_tools():
         (PROBE_MEDIA_SCHEMA, _probe_media_handler),
         (VERIFY_MEDIA_SOURCES_SCHEMA, _verify_media_sources_handler),
         (MEASURE_MEDIA_AUDIO_ALIGNMENT_SCHEMA, _measure_media_audio_alignment_handler),
-        (VERIFY_STICKMAN_FINAL_MEDIA_SCHEMA, _verify_stickman_final_media_handler),
         (RENDER_FRAME_SAMPLES_SCHEMA, _render_frame_samples_handler),
         (TRANSCRIBE_VIDEO_SCHEMA, _transcribe_video_handler),
         (ANALYZE_AUDIO_SCHEMA, _analyze_audio_handler),

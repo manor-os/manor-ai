@@ -1,4 +1,11 @@
-import { decodeFileReferenceHref, fileReferenceKind, viewerPathForDocumentId } from "./fileReferences";
+import {
+  decodeFileReferenceHref,
+  fileExtensionFromReference,
+  fileNameFromReference,
+  fileReferenceKind,
+  isInternalFileTarget,
+  viewerPathForDocumentId,
+} from "./fileReferences";
 
 export type ResultFileMetadata = {
   name: string;
@@ -29,7 +36,8 @@ export function prioritizeVideoResultFiles<T extends ResultFileMetadata>(files: 
 }
 
 const PAGED_SOURCE = /\.(?:pptx?|docx?|xlsx?|key|pages)$/i;
-const RESULT_THUMBNAIL = /\.(?:png|jpe?g|gif|webp|bmp|avif|mp4|mov|webm|m4v|mkv|pptx?|pdf|docx?|xlsx?)$/i;
+const READ_IN_PLACE = /\.(?:md|markdown|txt|csv|tsv)$/i;
+const RESULT_SHOWN_IN_PLACE = /\.(?:png|jpe?g|gif|webp|bmp|avif|mp4|mov|webm|m4v|mkv|pptx?|pdf|docx?|xlsx?|md|markdown|txt|csv|tsv)$/i;
 
 /** A PDF made from an editable file of the same name in the same result (deck.pptx → deck.pdf). */
 export function isRenderedCopy(file: ResultFileMetadata, files: readonly ResultFileMetadata[]): boolean {
@@ -41,13 +49,28 @@ export function isRenderedCopy(file: ResultFileMetadata, files: readonly ResultF
 }
 
 /**
- * Which final files are shown by what they look like (a picture, a frame, a
- * first page) and which as a plain file link: text files, and the PDF copy of
- * a deck or document already shown by its own first page.
+ * Which final files are shown as themselves (a picture, a frame, a first page,
+ * a written result or table read in place) and which as a plain file link:
+ * other formats, and the PDF copy of a deck or document already shown by its
+ * own first page.
  */
 export function partitionPreviewedResultFiles<T extends ResultFileMetadata>(files: readonly T[]): { previewed: T[]; listed: T[] } {
-  const previewed = files.filter((file) => RESULT_THUMBNAIL.test(file.name) && !isRenderedCopy(file, files));
+  const previewed = files.filter((file) => RESULT_SHOWN_IN_PLACE.test(file.name) && !isRenderedCopy(file, files));
   return { previewed, listed: files.filter((file) => !previewed.includes(file)) };
+}
+
+/**
+ * A finished Workflow result in Workspace chat is a sentence and rows that
+ * expand, so scheduled runs do not fill the conversation. A file someone still
+ * has to decide on stays open: it is what the decision is about.
+ */
+export function workspaceResultStartsFolded(message: {
+  meta?: { workflow_result?: unknown } | null;
+  pending_action?: unknown;
+  resolved_at?: unknown;
+}): boolean {
+  if (message.pending_action && !message.resolved_at) return false;
+  return Boolean(message.meta?.workflow_result);
 }
 
 /** Legacy output bundles include production evidence alongside deliverables. */
@@ -65,7 +88,10 @@ export function partitionGeneratedResultFiles<T extends ResultFileMetadata>(file
   const deliverables = ordered.filter((file) => file.isFinal !== false && !isSupportingResultFile(file));
   const videos = deliverables.filter(isVideoResultFile);
   const images = deliverables.filter((file) => fileReferenceKind(file.name, file.mimeType, file.fileType) === "image");
-  const primary = videos.length ? videos : images.length ? images : deliverables;
+  const media = videos.length ? videos : images;
+  // A table or written result is read, not a production asset: it stays beside the media.
+  const readable = deliverables.filter((file) => READ_IN_PLACE.test(file.name) || READ_IN_PLACE.test(`.${file.fileType || ""}`));
+  const primary = media.length ? deliverables.filter((file) => media.includes(file) || readable.includes(file)) : deliverables;
   return { primary, supporting: ordered.filter((file) => !primary.includes(file)) };
 }
 
@@ -91,4 +117,27 @@ export function resultFilePreviewTarget(reference: string, origin: string): { do
     if (url.origin !== origin && /^(?:https?):$/.test(url.protocol)) return { url: decoded };
   } catch { /* An unresolved file address stays a file card. */ }
   return null;
+}
+
+/**
+ * The file a reply's Markdown link hands over, when it is one a chat shows as
+ * itself (a table, a written result, a picture, a page) and this Manor can
+ * preview it. Anything else stays a link.
+ */
+export function inPlaceResultFileForLink(
+  href: string | undefined,
+  label: string,
+  origin: string,
+  { image = false }: { image?: boolean } = {},
+): (ResultFileMetadata & { key: string; reference: string }) | null {
+  if (!href?.trim() || isInternalFileTarget(href)) return null;
+  const reference = decodeFileReferenceHref(href) || href;
+  if (!resultFilePreviewTarget(reference, origin)) return null;
+  const cleanLabel = label.trim();
+  const named = /\.[a-z0-9]{1,8}$/i.test(cleanLabel) ? cleanLabel : fileNameFromReference(reference);
+  const extension = /\.[a-z0-9]{1,8}$/i.test(named) ? fileExtensionFromReference(named) : "";
+  // ``![...](...)`` is a picture whatever its name says; a link must name a shown kind.
+  if (image) return { key: reference, name: extension ? named : cleanLabel || "image", reference, fileType: extension || "png" };
+  if (!named || !partitionPreviewedResultFiles([{ name: named }]).previewed.length) return null;
+  return { key: reference, name: named, reference, fileType: extension || undefined };
 }

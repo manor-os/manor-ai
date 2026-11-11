@@ -137,6 +137,7 @@ export default function InlineFileReferenceCard({
   display = "inline",
   className = "",
   trustedReference = false,
+  creationTarget = false,
   fileType,
   mimeType,
   description,
@@ -151,6 +152,8 @@ export default function InlineFileReferenceCard({
   className?: string;
   /** Structured file metadata from our API, even when it only has an fs_path. */
   trustedReference?: boolean;
+  /** An approval target names a future file, not a readable artifact. */
+  creationTarget?: boolean;
   fileType?: string;
   mimeType?: string;
   description?: string;
@@ -213,6 +216,30 @@ export default function InlineFileReferenceCard({
     });
     return () => window.cancelAnimationFrame(frame);
   }, [sourceAnchorId]);
+
+  if (creationTarget) {
+    const status = t("component.inline_file_reference.creation_target");
+    const detail = t("component.inline_file_reference.creation_target_detail");
+    return display === "card" ? (
+      <CompactCard
+        className={`inline-file-reference-card-surface inline-file-reference-card--creation-target ${className}`}
+        icon={<IconTile size={34}><FileTypeIcon kind={kind} size={17} /></IconTile>}
+        title={resolvedFileName}
+        subtitle={detail}
+        meta={status}
+      />
+    ) : (
+      <span
+        className={`inline-file-reference-card inline-file-reference-card--creation-target${compact ? " inline-file-reference-card--compact" : ""} ${className}`}
+        title={detail}
+      >
+        <span className="inline-file-reference-card__icon" aria-hidden="true"><FileTypeIcon kind={kind} size={12} /></span>
+        <span className="inline-file-reference-card__name">{resolvedFileName}</span>
+        <span className="inline-file-reference-card__type">{typeLabel}</span>
+        <span className="inline-file-reference-card__type">{status}</span>
+      </span>
+    );
+  }
 
   async function openReference() {
     const viewerPath = sameOriginViewerPath(decoded);
@@ -384,7 +411,9 @@ export default function InlineFileReferenceCard({
         <FileTypeIcon kind={kind} size={12} />
       </span>
       <span className="inline-file-reference-card__name">{resolvedFileName}</span>
-      <span className="inline-file-reference-card__type">{typeLabel}</span>
+      {/* The type only when the name does not already say it: "song.mp3" needs no "MP3". */}
+      {typeLabel !== "FILE" && !resolvedFileName.toLowerCase().endsWith(`.${typeLabel.toLowerCase()}`)
+        && <span className="inline-file-reference-card__type">{typeLabel}</span>}
       {unresolved && (
         <span className="inline-file-reference-card__unresolved">
           {t(legacyLookupFailed ? "component.inline_file_reference.link_unavailable" : "component.inline_file_reference.not_available")}

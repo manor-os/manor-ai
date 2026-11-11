@@ -242,12 +242,12 @@ async def build_harness(db_session, monkeypatch, subs, root, *, user_id: str = "
     monkeypatch.setattr(child_worker, "_pinned_agent_active", AsyncMock(return_value=True))
     monkeypatch.setattr(child_worker, "resolve_task_run_user_id", AsyncMock(return_value=user_id))
 
-    def billing(*, source_prefix, **_kwargs):
+    def billing(*, source_prefix, task_id=None, **_kwargs):
         async def reserve(*_args, **_kw):
             return None
 
         async def settle(*args, **_kw):
-            h.billed.append({"source_prefix": source_prefix, "usage": args[-1] if args else None})
+            h.billed.append({"source_prefix": source_prefix, "task_id": task_id, "usage": args[-1] if args else None})
 
         return reserve, settle
 
@@ -579,9 +579,15 @@ async def test_usage_is_attributed_to_the_parent_and_billed_once_per_child_call(
     await h.child_wake(child.id)
     root_before = (await h.root()).checkpoint["runtime_checkpoint"]
 
-    # Each child provider call is billed exactly once, under the child's run.
-    assert len(h.billed) == h.calls["writer"] == 2
-    assert {entry["source_prefix"].rsplit(":", 1)[0] for entry in h.billed} == {f"delegation:{child.id}"}
+    # Root and child calls settle separately, with the same owning Task.
+    def billed_to(prefix):
+        return [entry for entry in h.billed if entry["source_prefix"].rsplit(":", 1)[0] == prefix]
+
+    child_prefix = f"delegation:{child.id}"
+    root_prefix = f"task:{h.task.id}"
+    assert len(billed_to(child_prefix)) == h.calls["writer"] == 2
+    assert len(billed_to(root_prefix)) == h.calls["root"] == 2
+    assert len(h.billed) == 4
     (child,) = await h.children()
     assert child.usage["total_tokens"] == 30
     # Attribution: the parked parent's usage gains the child's usage once.
@@ -594,10 +600,12 @@ async def test_usage_is_attributed_to_the_parent_and_billed_once_per_child_call(
     root_usage = (await h.root()).checkpoint["runtime_checkpoint"]["usage"]
     assert root_usage["total_tokens"] == 2 * 15 + 30
 
-    billed_before = len(h.billed)
     await h.root_wake()
-    # The parent's own resumed round bills nothing on the child's account.
-    assert len(h.billed) == billed_before
+    # The resumed root settles its new call without replaying child usage.
+    assert len(billed_to(child_prefix)) == 2
+    assert len(billed_to(root_prefix)) == h.calls["root"] == 3
+    assert len(h.billed) == 5
+    assert {entry["task_id"] for entry in h.billed} == {h.task.id}
 
     # The journal: each run's rows carry only its own usage, so a reader that
     # sums usage_delta over the Task's runs counts every call once; the

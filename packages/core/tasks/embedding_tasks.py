@@ -174,9 +174,9 @@ async def recover_stale_embedding_documents(
 @celery_app.task(bind=True, name="embeddings.batch_index")
 def batch_index_entity(self, entity_id: str):
     """Index all pending documents for an entity."""
-    import asyncio
     from packages.core.database import create_worker_session
     from packages.core.services.embedding_service import index_documents_for_entity
+    from packages.core.tasks._runtime import run_in_worker
 
     async def _run():
         async with create_worker_session()() as db:
@@ -184,7 +184,7 @@ def batch_index_entity(self, entity_id: str):
             await db.commit()
             return count
 
-    count = asyncio.run(_run())
+    count = run_in_worker(_run())
     return {"entity_id": entity_id, "indexed": count}
 
 

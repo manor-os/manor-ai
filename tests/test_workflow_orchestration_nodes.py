@@ -296,6 +296,95 @@ def test_stage_config_rejects_undeclared_external_edges():
     assert any(error["code"] == "undeclared_stage_route" for error in result["errors"])
 
 
+_ARTICLE_SCHEMA = {"type": "object", "properties": {"draft": {"type": "string"}}}
+
+
+def _article_studio_steps(advance: dict) -> list[dict]:
+    project = {"project_type": "article", "schema_version": 1, "state_schema": _ARTICLE_SCHEMA}
+    return [
+        {"id": "start", "type": "trigger", "next": ["create_article"]},
+        {"id": "create_article", "type": "workflow_project", "next": ["writing_stage"],
+         "config": {**project, "operation": "create", "state": {}, "current_stage": "brief"}},
+        {"id": "writing_stage", "type": "workflow_project", "next": [],
+         "config": {**project, **advance, "current_stage": "writing"}},
+    ]
+
+
+def test_workflow_project_update_shape_is_rejected_with_the_patch_contract():
+    # The architect-generated article studio saved this shape; the runner has
+    # no ``update`` and the create output has no ``id``.
+    result = validate_workflow_steps(_article_studio_steps({
+        "operation": "update", "project_id": "{{create_article.id}}", "state": {"draft": "x"},
+    }))
+
+    by_code = {error["code"]: error["message"] for error in result["errors"]}
+    assert result["valid"] is False
+    assert "'update'" in by_code["unsupported_workflow_project_operation"]
+    assert "'patch'" in by_code["unsupported_workflow_project_operation"]
+    assert "'create_article.id'" in by_code["unknown_workflow_project_output"]
+    assert "project_id" in by_code["unknown_workflow_project_output"]
+
+    # A patch that still carries ``state`` would drop it silently at runtime.
+    stale = validate_workflow_steps(_article_studio_steps({
+        "operation": "patch", "project_id": "{{create_article.project_id}}",
+        "expected_revision": "{{create_article.revision}}", "state": {"draft": "x"},
+    }))
+    assert [error["code"] for error in stale["errors"]] == ["invalid_node_config"]
+    assert "config.patch" in stale["errors"][0]["message"]
+
+    fixed = validate_workflow_steps(_article_studio_steps({
+        "operation": "patch", "project_id": "{{create_article.project_id}}",
+        "expected_revision": "{{create_article.revision}}", "patch": {"draft": "x"},
+    }))
+    assert fixed["valid"] is True, fixed["errors"]
+
+
+def test_a_project_created_under_a_fixed_key_is_rejected():
+    """Local eval 2026-11-03: a daily report created project 'daily_growth' every run; only the first could."""
+    steps = _article_studio_steps({"operation": "patch", "project_id": "{{create_article.project_id}}",
+                                   "expected_revision": "{{create_article.revision}}", "patch": {"draft": "x"}})
+    steps[1]["config"]["project_key"] = "daily_growth"
+    result = validate_workflow_steps(steps)
+    assert [error["code"] for error in result["errors"]] == ["invalid_node_config"]
+    assert "'daily_growth'" in result["errors"][0]["message"] and "every later run fails" in result["errors"][0]["message"]
+
+    # A key built from the run, or none at all, is fine; so is claiming one fixed project.
+    for key in ("{{period_key}}", None):
+        steps[1]["config"].pop("project_key", None)
+        if key:
+            steps[1]["config"]["project_key"] = key
+        assert validate_workflow_steps(steps)["valid"] is True
+    steps[1]["config"].update(operation="claim", project_key="brand_profile")
+    assert validate_workflow_steps(steps)["valid"] is True
+
+
+def test_workflow_project_output_bindings_follow_each_operation_inside_stages():
+    project = {"project_type": "episode", "schema_version": 1, "state_schema": {"type": "object"}}
+    lease = {**project, "operation": "lease_due", "due_path": "due_at", "pending_stages": ["queued"]}
+
+    def graph(project_id: str) -> list[dict]:
+        return [
+            {"id": "start", "type": "trigger", "next": ["queue"]},
+            {"id": "queue", "type": "stage", "next": [], "config": {
+                "entry_operation_id": "due",
+                "routes": {},
+                "operations": [
+                    {"id": "due", "type": "workflow_project", "config": lease, "next": ["finish"]},
+                    {"id": "finish", "type": "workflow_project", "next": [], "config": {
+                        **project, "operation": "complete_lease", "current_stage": "done",
+                        "project_id": project_id,
+                    }},
+                ],
+            }},
+        ]
+
+    assert validate_workflow_steps(graph("{{due.project.project_id}}"))["valid"] is True
+    errors = validate_workflow_steps(graph("{{due.project_id}}"))["errors"]
+    assert [error["code"] for error in errors] == ["unknown_workflow_project_output"]
+    assert "'queue.finish'" in errors[0]["message"]
+    assert "has_project, project" in errors[0]["message"]
+
+
 def test_resolve_structure_preserves_nested_reference_types():
     from packages.core.ai.workflow_runner import _resolve_structure
 
@@ -537,6 +626,26 @@ async def test_workflow_project_patch_appends_traceable_history_event(db_session
 
 
 @pytest.mark.asyncio
+async def test_workflow_project_patch_keeps_its_stage_when_the_new_one_is_missing(db_session):
+    # An edit Flow sets the stage from the person's answer; an answer that left
+    # it out must not blank the record's stage.
+    runner = WorkflowRunner()
+    created = await runner._execute_workflow_project_step(
+        {"id": "create", "config": {"operation": "create", "project_type": "dish", "state": {"name": "水煮鱼"},
+                                    "current_stage": "active", "output_var": "dish"}},
+        {}, _run(), db_session,
+    )
+    patched = await runner._execute_workflow_project_step(
+        {"id": "save", "config": {"operation": "patch", "project_id": "{{dish.project_id}}",
+                                  "expected_revision": "{{dish.revision}}", "patch": {},
+                                  "current_stage": "{{changes.status}}", "output_var": "dish"}},
+        {"dish": created["output"], "changes": {}}, _run(), db_session,
+    )
+
+    assert patched["output"]["current_stage"] == "active"
+
+
+@pytest.mark.asyncio
 async def test_workflow_project_node_rejects_invalid_state_before_persisting(db_session):
     result = await WorkflowRunner()._execute_workflow_project_step(
         {
@@ -559,6 +668,25 @@ async def test_workflow_project_node_rejects_invalid_state_before_persisting(db_
 
     assert result["status"] == "failed"
     assert result["code"] == "workflow_project_state_validation_failed"
+
+
+@pytest.mark.asyncio
+async def test_workflow_project_display_is_kept_beside_a_closed_schema_and_checked_on_its_own(db_session):
+    """A schema that never declares ``display`` still lets the platform display through, and a bad one fails clearly."""
+    schema = {"type": "object", "properties": {"brief": {"type": "string"}}, "additionalProperties": False}
+
+    def create(display):
+        return WorkflowRunner()._execute_workflow_project_step(
+            {"id": "create", "config": {"operation": "create", "project_type": "weekly_content", "state_schema": schema,
+                                        "state": {"brief": "three winter posts", "display": display}}},
+            {}, _run(), db_session)
+
+    made = await create({"title": "Winter scents week", "status": "Ready for review", "media": ["01M6WQRA3ZJ2AKYPSQVQ19NW0X"]})
+    assert made["status"] == "completed"
+    assert made["output"]["state"]["display"]["title"] == "Winter scents week"
+    rejected = await create({"title": "Winter scents week", "media": "01M6WQRA3ZJ2AKYPSQVQ19NW0X"})
+    assert rejected["code"] == "workflow_project_state_validation_failed"
+    assert "display.media" in rejected["error"]
 
 
 @pytest.mark.asyncio
@@ -1020,6 +1148,37 @@ async def test_tool_step_preserves_structured_arguments_and_parses_json(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_tool_step_never_sends_a_reference_the_run_has_no_value_for(monkeypatch):
+    from packages.core.ai import workflow_runner as runner_module
+
+    sent = []
+
+    async def fake_execute(**kwargs):
+        sent.append(kwargs["arguments"])
+        return SimpleNamespace(output="sent", envelope=None)
+
+    async def fake_attach(result, _envelope):
+        return result
+
+    monkeypatch.setattr(runner_module, "runtime_execute_workflow_tool_step", fake_execute)
+    monkeypatch.setattr(runner_module, "runtime_attach_and_persist_workflow_runner_result", fake_attach)
+    step = {"id": "send", "type": "tool", "config": {"tool": "send_email", "args": {
+        "body": "Your cut runs {{video.duration}} seconds.", "cc": "{{reviewer}}",
+    }}}
+
+    failed = await WorkflowRunner()._execute_tool_step(step, {"video": "final.mp4"}, "entity-1")
+    assert failed["code"] == "workflow_reference_unresolved"
+    assert "'video' is text, with no field 'duration'" in failed["error"]
+    assert sent == []
+
+    # An argument the run has no value for (an optional input nobody gave) is
+    # left out, not sent as its placeholder.
+    sent_result = await WorkflowRunner()._execute_tool_step(step, {"video": {"duration": 42}}, "entity-1")
+    assert sent_result["status"] == "completed"
+    assert sent == [{"body": "Your cut runs 42 seconds."}]
+
+
+@pytest.mark.asyncio
 async def test_tool_step_converts_structured_tool_error_to_node_failure(monkeypatch):
     from packages.core.ai import workflow_runner as runner_module
 
@@ -1107,6 +1266,26 @@ async def test_tool_step_rejects_default_text_tool_errors(
 
     assert result["status"] == "failed"
     assert expected_error in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_tool_step_rejects_listing_config_on_an_effectful_tool(monkeypatch):
+    from packages.core.ai import workflow_runner as runner_module
+
+    async def unexpected_execute(**_kwargs):
+        pytest.fail("A write tool must not run as a read-only listing")
+
+    monkeypatch.setattr(runner_module, "runtime_execute_workflow_tool_step", unexpected_execute)
+    result = await WorkflowRunner()._execute_tool_step(
+        {"id": "send", "type": "tool", "config": {
+            "tool": "mcp__gmail__send_email",
+            "new_items": {"items": "messages"},
+        }},
+        {},
+        "entity-1",
+        "user-1",
+    )
+    assert result == {"status": "failed", "error": "Tool step new_items requires a read-only tool"}
 
 
 @pytest.mark.asyncio
@@ -1485,6 +1664,8 @@ async def test_agent_step_includes_declared_output_schema_in_model_prompt(monkey
     # never fails a result that is on target within rounding.
     assert "Finish the work before you report it" in captured["user_message"]
     assert "within one frame or 0.05 seconds" in captured["user_message"]
+    # An unfinished check is completed with the step's tools, never reported as the reason it stopped.
+    assert "A check you could not complete is not a result" in captured["user_message"]
     assert captured["user_message"].index("Finish the work") < captured["user_message"].index("Output contract:")
 
 

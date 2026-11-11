@@ -99,8 +99,7 @@ def test_extracts_only_complete_explicit_durable_guidance(message, expected):
         if draft.candidate_type == "agent_profile_patch":
             assert draft.payload["profile_update"] == expected
             assert "本轮" not in draft.payload["profile_update"]
-        if draft.candidate_type == "memory":
-            assert draft.payload["content"] == expected
+        assert draft.candidate_type != "memory"
     if not expected:
         assert drafts == []
 

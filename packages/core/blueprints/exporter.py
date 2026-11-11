@@ -158,6 +158,17 @@ class _PortableSkillIdentity:
     marketplace_source: str | None
 
 
+async def _marketplace_skill_exists(db: AsyncSession, skill_id: str) -> bool:
+    """Whether ``skill_id`` names a Skill an install can take from the Marketplace."""
+    if skill_id.startswith("builtin:"):
+        return True
+    return (await db.execute(
+        select(Skill.id).where(
+            Skill.id == skill_id, Skill.entity_id.is_(None), Skill.is_public.is_(True), Skill.status == "active",
+        )
+    )).first() is not None
+
+
 async def _portable_skill_identity(
     db: AsyncSession,
     skill: Skill,
@@ -190,6 +201,15 @@ async def _portable_skill_identity(
     marketplace_source, source_skill_id = portable_skill_marketplace_source(
         skill, source_link=source_link,
     )
+    if (
+        source_link is None and source_skill_id and not config.get("source")
+        and not await _marketplace_skill_exists(db, source_skill_id)
+    ):
+        # A bare catalog hint in the Skill's own config — no recorded install
+        # source, naming no Marketplace Skill (e.g. one frozen into a
+        # Blueprint) — is not an identity an install could resolve;
+        # exporting it as a reference would drop the Skill.
+        marketplace_source, source_skill_id = None, None
     embedded = bool(
         skill.entity_id == entity_id
         and not skill.is_public
@@ -648,7 +668,7 @@ async def export_workspace(
     om.pop("agent_mappings", None)
     om.pop("goals", None)
     if (workspace.operating_model or {}).get("app_view") is not None:
-        from packages.core.blueprints.app_view import is_portable_asset_url, remap_app_view
+        from packages.core.blueprints.app_view import remap_app_view, without_local_pictures
 
         source_app_view = dict(workspace.operating_model["app_view"])
         # The Workspace's own cover is what its App opens under (and what a
@@ -661,13 +681,7 @@ async def export_workspace(
         else:
             # A plain payload cannot carry an upload: leave out the cover and
             # the motion cover made for it (a package carries both).
-            def portable(field: str) -> bool:
-                return not source_app_view.get(field) or is_portable_asset_url(source_app_view[field])
-
-            if not portable("cover_image_url"):
-                source_app_view.pop("cover_image_url")
-            if not (portable("motion_cover_url") and portable("motion_cover_source_url")):
-                source_app_view.update(motion_cover_url=None, motion_cover_source_url=None)
+            source_app_view = without_local_pictures(source_app_view)
 
         app_agents = (await db.execute(select(Agent).join(
             AgentSubscription, AgentSubscription.agent_id == Agent.id,
@@ -855,12 +869,13 @@ async def _export_subscriptions(
     allow_generated_private_agent_slugs: bool,
 ) -> list[dict[str, Any]]:
     """Resolve agent_id to a portable Agent slug for import."""
+    # A stable order keeps re-exports of an unchanged Workspace identical.
     rows = list((await db.execute(
         select(AgentSubscription).where(
             AgentSubscription.entity_id == entity_id,
             AgentSubscription.workspace_id == workspace_id,
             AgentSubscription.status == "active",
-        )
+        ).order_by(AgentSubscription.service_key, AgentSubscription.id)
     )).scalars().all())
     if not rows:
         return []
@@ -1426,7 +1441,16 @@ async def _workspace_workflow_export_rows(
         for installation in installations
         if bool((installation.installation_metadata or {}).get("internal"))
     }
-
+    # A Flow another Flow here starts as its child (``workflow_id`` or
+    # ``source_workflow_key`` on a step) is that Flow's part, not an entry of
+    # its own, even when it was added after the install.
+    called: set[str] = set()
+    for workflow in [workflow for _binding, workflow in bound_rows] + scoped:
+        for step in workflow.steps or []:
+            config = step.get("config") if isinstance(step, dict) and isinstance(step.get("config"), dict) else {}
+            for key in ("workflow_id", "source_workflow_key"):
+                if isinstance(config.get(key), str) and config[key].strip():
+                    called.add(config[key].strip())
     export_rows: list[
         tuple[WorkflowDefinition, Optional[WorkflowBinding], str, bool]
     ] = []
@@ -1454,12 +1478,8 @@ async def _workspace_workflow_export_rows(
         if slug in used_slugs:
             slug = f"{slug[:109].rstrip('-_')}-{workflow.id[-8:].lower()}"
         used_slugs.add(slug)
-        export_rows.append((
-            workflow,
-            None,
-            slug,
-            workflow.id in internal_workflow_ids,
-        ))
+        child = workflow.id in called or stable_component_key_by_workflow_id.get(workflow.id) in called
+        export_rows.append((workflow, None, slug, workflow.id in internal_workflow_ids or child))
 
     return export_rows
 

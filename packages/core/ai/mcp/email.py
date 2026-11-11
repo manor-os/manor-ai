@@ -42,6 +42,7 @@ from email.message import EmailMessage
 from email.utils import formataddr, formatdate, getaddresses, make_msgid, parseaddr, parsedate_to_datetime
 from typing import Any, Dict, List
 
+from packages.core.ai.mcp import _email_message as readable
 from packages.core.services import smtp_transport
 
 logger = logging.getLogger(__name__)
@@ -136,13 +137,18 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         },
     },
     "get_message": {
-        "description": "Fetch one message by UID with headers + body.",
+        "description": (
+            "Read one message by UID: sender, recipients, subject, date, the body "
+            "as text and its attachments. A long body comes in pages; when "
+            "next_offset is set, call again with that offset to read the rest."
+        ),
         "required": ["uid"],
         "properties": {
             "uid": {"type": "string"},
             "folder": {"type": "string", "description": "Default 'INBOX'."},
             "format": {"type": "string", "enum": ["full", "text", "headers"],
-                       "description": "Default 'full'."},
+                       "description": "Default 'full' (with body). 'headers' omits the body."},
+            "offset": {"type": "integer", "description": "Body character offset to continue from (default 0)."},
         },
     },
     "list_attachments": {
@@ -221,7 +227,10 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         },
     },
     "get_thread": {
-        "description": "Fetch every discoverable message in the conversation containing an anchor UID.",
+        "description": (
+            "Read every discoverable message in the conversation containing an anchor "
+            "UID; each shows its own text (quoted earlier replies removed)."
+        ),
         "required": ["uid"],
         "properties": {
             "uid": {"type": "string", "description": "Anchor message UID."},
@@ -249,6 +258,7 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "properties": {
             "uid": {"type": "string"},
             "folder": {"type": "string", "description": "Optional Drafts folder override."},
+            "offset": {"type": "integer", "description": "Body character offset to continue from (default 0)."},
         },
     },
     "create_draft": {
@@ -772,10 +782,17 @@ def _get_message(cfg: Dict[str, Any], args: Dict[str, Any]) -> str:
     folder = args.get("folder") or "INBOX"
     uid = args["uid"]
     fmt = args.get("format") or "full"
+    offset = readable.page_offset(args.get("offset"))
     client = _imap_connect(cfg)
     try:
         msg = _fetch_parsed_message(client, folder, uid)
-        return json.dumps(_message_dict(msg, uid, folder, fmt), ensure_ascii=False)
+        fields = _message_fields(msg, uid, folder)
+        if fmt == "headers":
+            return json.dumps(fields, ensure_ascii=False)
+        return json.dumps(
+            readable.paged_message(fields, _message_text(msg), offset=offset),
+            ensure_ascii=False,
+        )
     finally:
         _safe_logout(client)
 
@@ -948,14 +965,17 @@ def _get_thread(cfg: Dict[str, Any], args: Dict[str, Any]) -> str:
         if not matching:
             matching = [anchor]
 
-        messages = []
+        items = []
         for record in sorted(matching, key=_record_sort_key):
             parsed = _fetch_parsed_message(client, record["folder"], record["uid"])
-            messages.append(_message_dict(
-                parsed, record["uid"], record["folder"], fmt,
-            ))
+            fields = _message_fields(parsed, record["uid"], record["folder"])
+            items.append((fields, "" if fmt == "headers" else _message_text(parsed)))
     finally:
         _safe_logout(client)
+    if fmt == "headers":
+        messages = [fields for fields, _ in items]
+    else:
+        messages = readable.thread_messages(items)
 
     return json.dumps({
         "anchor_uid": anchor_uid,
@@ -994,7 +1014,10 @@ def _get_draft(cfg: Dict[str, Any], args: Dict[str, Any]) -> str:
         folder = _resolve_special_folder(client, cfg, "drafts", args.get("folder"))
         msg = _fetch_parsed_message(client, folder, args["uid"])
         return json.dumps(
-            _message_dict(msg, str(args["uid"]), folder, "full"),
+            readable.paged_message(
+                _message_fields(msg, str(args["uid"]), folder), _message_text(msg),
+                offset=readable.page_offset(args.get("offset")),
+            ),
             ensure_ascii=False,
         )
     finally:
@@ -1117,8 +1140,8 @@ def _fetch_parsed_message(client: imaplib.IMAP4, folder: str, uid: str):
     return message_from_bytes(raw)
 
 
-def _message_dict(msg, uid: str, folder: str, fmt: str) -> Dict[str, Any]:
-    out: Dict[str, Any] = {
+def _message_fields(msg, uid: str, folder: str) -> Dict[str, Any]:
+    return {
         "uid": uid,
         "folder": folder,
         "from": _decode(msg.get("From", "")),
@@ -1133,13 +1156,11 @@ def _message_dict(msg, uid: str, folder: str, fmt: str) -> Dict[str, Any]:
         "references": msg.get("References", ""),
         "attachments": [meta for _, _, meta in _iter_attachments(msg)],
     }
-    if fmt == "headers":
-        return out
-    body, html = _extract_body(msg)
-    out["body"] = body
-    if fmt == "full" and html:
-        out["html"] = html
-    return out
+
+
+def _message_text(msg) -> str:
+    plain, html = _extract_body(msg)
+    return readable.body_text(plain, html)
 
 
 def _iter_attachments(msg):

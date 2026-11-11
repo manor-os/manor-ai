@@ -297,12 +297,15 @@ def validate_runtime_tool_arguments(
                 ),
                 path="$", schema_rule="type", expected="object",
             )
-        public_arguments = {
-            str(key): value for key, value in arguments.items()
-            if str(key) not in _RUNTIME_CONTROL_ARGUMENTS
-        }
         properties = parameters.get("properties")
         properties = properties if isinstance(properties, dict) else {}
+        # A context key the tool declares as its own input (get_task_details'
+        # task_id) is the model's argument, not host context: stripping it
+        # failed every such call as "missing task_id".
+        public_arguments = {
+            str(key): value for key, value in arguments.items()
+            if str(key) not in _RUNTIME_CONTROL_ARGUMENTS or str(key) in properties
+        }
         # Provider adapters preserve unparseable arguments in this envelope.
         # A declared _raw property remains ordinary tool input.
         if (

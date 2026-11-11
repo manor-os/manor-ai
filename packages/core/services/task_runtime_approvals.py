@@ -165,6 +165,38 @@ def _approval_id(hitl_data: dict[str, Any] | None) -> str | None:
     return resolved or None
 
 
+async def _task_approval_lead(db: AsyncSession, task: Task, *, delegated_agent: str) -> str:
+    """Who is asking, in the words of where the work came from.
+
+    A delegated agent, a scheduled job, a Workflow and an ordinary Task each
+    say so; the work is named by its title, never as a "scheduled agent"
+    when nothing was scheduled.
+    """
+    from packages.core.constants.task import TaskType
+    from packages.core.models.workspace import AgentSubscription
+
+    title = " ".join(str(task.title or "").split())[:120]
+    named = f"“{title}”" if title else "this Task"
+    if delegated_agent:
+        return (
+            f"Asked by {delegated_agent}, an agent working on {named}: it needs your "
+            "approval before it can continue."
+        )
+    details = task.details if isinstance(task.details, dict) else {}
+    if task.task_type == TaskType.SCHEDULED.value or details.get("scheduled_job_id"):
+        return f"The scheduled run of {named} needs your approval before it can continue."
+    if details.get("workflow_run_id"):
+        return f"The workflow working on {named} needs your approval before it can continue."
+    owner = (
+        await db.get(AgentSubscription, task.owner_subscription_id)
+        if task.owner_subscription_id else None
+    )
+    name = " ".join(str(getattr(owner, "name", "") or "").split())[:80]
+    if name:
+        return f"{name} is working on {named} and needs your approval to continue."
+    return f"The agent working on {named} needs your approval to continue."
+
+
 async def project_task_runtime_approval_card(
     db: AsyncSession,
     *,
@@ -199,12 +231,7 @@ async def project_task_runtime_approval_card(
         db,
         str(task.conversation_id),
         role="assistant",
-        content=(
-            f"Asked by {agent}, an agent working on this Task: it needs approval "
-            "before it can continue."
-            if agent
-            else "This scheduled agent needs approval before it can continue."
-        ),
+        content=await _task_approval_lead(db, task, delegated_agent=agent),
         tool_calls=[
             {
                 "name": str((requests[0] or {}).get("tool") or "runtime_action"),

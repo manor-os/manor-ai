@@ -9,7 +9,9 @@ from contextlib import asynccontextmanager
 
 import anyio
 from fastapi import HTTPException
-from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
+from starlette.datastructures import Headers
+from starlette.responses import MalformedRangeHeader, RangeNotSatisfiable
 
 from packages.core.services.entity_fs import (
     EntityFilesystemBusyError,
@@ -125,14 +127,63 @@ def _copy_file_snapshot(path: str) -> str:
         raise
 
 
+def _read_file_slice(path: str, start: int, length: int) -> bytes:
+    with open(path, "rb") as source:
+        source.seek(start)
+        return source.read(length)
+
+
 class EntitySnapshotFileResponse(FileResponse):
     """Snapshot under the read boundary, then stream without an entity lock."""
 
-    def __init__(self, *args, read_boundary, **kwargs):
+    def __init__(self, *args, read_boundary, range_slice_bytes: int | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self._read_boundary = read_boundary
+        # A player streaming a recording asks for byte ranges; when set, one range is
+        # answered with at most this many bytes read under the boundary, instead of a
+        # snapshot of the whole file first. The player asks again for the rest.
+        self.range_slice_bytes = range_slice_bytes
+
+    def _requested_slice(self, scope, file_size: int) -> tuple[int, int] | None:
+        headers = Headers(scope=scope)
+        http_range, http_if_range = headers.get("range"), headers.get("if-range")
+        if http_range is None or (http_if_range is not None and not self._should_use_range(http_if_range)):
+            return None
+        try:
+            ranges = self._parse_range_header(http_range, file_size)
+        except (MalformedRangeHeader, RangeNotSatisfiable):
+            return None
+        if len(ranges) != 1:
+            return None
+        start, end = ranges[0]
+        return start, min(end, start + int(self.range_slice_bytes or 0))
+
+    async def _slice_response(self, scope) -> Response | None:
+        """One bounded range read under the boundary, or None to take the snapshot path."""
+        if not self.range_slice_bytes or scope.get("type") != "http":
+            return None
+        source_stat = await anyio.to_thread.run_sync(os.stat, str(self.path))
+        self.set_stat_headers(source_stat)
+        requested = self._requested_slice(scope, source_stat.st_size)
+        if requested is None:
+            return None
+        start, end = requested
+        data = await anyio.to_thread.run_sync(_read_file_slice, str(self.path), start, end - start)
+        headers = {key: value for key, value in self.headers.items() if key.lower() != "content-length"}
+        headers["content-range"] = f"bytes {start}-{start + len(data) - 1}/{source_stat.st_size}"
+        return Response(content=b"" if scope.get("method", "").upper() == "HEAD" else data, status_code=206,
+                        headers=headers, media_type=self.media_type)
 
     async def __call__(self, scope, receive, send) -> None:
+        try:
+            sliced = await self._slice_response(scope)
+        except BaseException:
+            await self._read_boundary.__aexit__(None, None, None)
+            raise
+        if sliced is not None:
+            await self._read_boundary.__aexit__(None, None, None)
+            await sliced(scope, receive, send)
+            return
         snapshot_path: str | None = None
         reserved_size: int | None = None
         rejection: PlainTextResponse | None = None

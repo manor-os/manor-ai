@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { Navigate, Outlet, useLocation } from "react-router-dom";
 import { useAuthStore } from "../stores/auth";
 import { signInPath } from "../lib/persistentSession";
+import { PageLoading } from "./ui/Skeleton";
 
 export default function ProtectedRoute() {
   const { token, isLoading, checkAuth } = useAuthStore();
@@ -13,8 +14,8 @@ export default function ProtectedRoute() {
 
   if (isLoading) {
     return (
-      <div className="flex h-screen items-center justify-center">
-        <div className="h-8 w-8 animate-spin rounded-full border-4 border-manor-700 border-t-transparent" />
+      <div className="h-screen">
+        <PageLoading />
       </div>
     );
   }

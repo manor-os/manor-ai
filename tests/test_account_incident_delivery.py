@@ -179,7 +179,7 @@ async def test_a_database_error_scanning_one_workspace_leaves_the_others(db_sess
 
     result = await delivery.scan_entity_workspaces(db_session, entity_id, NOW)
 
-    assert [(name, owners, providers) for name, owners, providers in result] == [(scanned[1], [owner], {"gmail"})]
+    assert [(name, owners, providers) for _id, name, owners, providers in result] == [(scanned[1], [owner], {"gmail"})]
 
 
 @pytest.mark.asyncio

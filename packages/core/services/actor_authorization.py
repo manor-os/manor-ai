@@ -6,8 +6,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, event, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from packages.core.models.staff import Staff, StaffRole
 from packages.core.models.user import Entity, User, UserMembership
@@ -60,6 +61,9 @@ class ResolvedUserActor:
     can_read_all_documents: bool
     can_manage_all_documents: bool
     can_read_all_workspaces: bool
+    # Set when a platform admin suspended the entity: the reason, possibly "".
+    # Only an actor resolved with enforce_entity_suspension=False can carry it.
+    entity_suspended_reason: str | None = None
 
 
 async def resolve_current_user_actor(
@@ -84,11 +88,48 @@ async def resolve_current_user_actor(
     if credential.admission_validator is not None:
         if not await credential.admission_validator(db, credential):
             return None
+    _user, actor = await _read_actor(
+        db, credential,
+        enforce_entity_suspension=enforce_entity_suspension, with_user=False,
+    )
+    return actor
 
+
+async def resolve_authenticating_user_actor(
+    db: AsyncSession,
+    credential: AuthenticatedUserCredential,
+    *,
+    enforce_entity_suspension: bool = True,
+) -> tuple[User | None, ResolvedUserActor | None]:
+    """``resolve_current_user_actor`` plus the User row, read in the same query.
+
+    Request authentication needs both. The User is returned even when no
+    actor is admitted, so callers can explain why; it is None when the row
+    does not exist or the credential itself is refused before any read.
+    """
+    now = datetime.now(timezone.utc)
+    if credential.expires_at_epoch is not None and now.timestamp() >= credential.expires_at_epoch:
+        return None, None
+    if credential.impersonation_session_id or credential.admission_validator is not None:
+        return None, None
+    return await _read_actor(
+        db, credential,
+        enforce_entity_suspension=enforce_entity_suspension, with_user=True,
+    )
+
+
+async def _read_actor(
+    db: AsyncSession,
+    credential: AuthenticatedUserCredential,
+    *,
+    enforce_entity_suspension: bool,
+    with_user: bool,
+) -> tuple[User | None, ResolvedUserActor | None]:
     rows = list(
         (
             await db.execute(
                 select(
+                    *((User,) if with_user else ()),
                     User.id.label("user_id"),
                     User.entity_id.label("user_primary_entity_id"),
                     User.role.label("user_role"),
@@ -140,8 +181,19 @@ async def resolve_current_user_actor(
         ).mappings().all()
     )
     if not rows:
-        return None
+        return None, None
+    user_row = rows[0]["User"] if with_user else None
+    return user_row, _actor_from_rows(
+        rows, credential, enforce_entity_suspension=enforce_entity_suspension,
+    )
 
+
+def _actor_from_rows(
+    rows: list,
+    credential: AuthenticatedUserCredential,
+    *,
+    enforce_entity_suspension: bool,
+) -> ResolvedUserActor | None:
     user = rows[0]
     if (
         user["user_status"] != "active"
@@ -253,6 +305,7 @@ async def resolve_current_user_actor(
         or ""
     )
 
+    entity_settings = user["entity_settings"] or {}
     return ResolvedUserActor(
         user_id=credential.user_id,
         entity_id=credential.entity_id,
@@ -263,4 +316,67 @@ async def resolve_current_user_actor(
         can_read_all_documents=can_read_all_documents,
         can_manage_all_documents=can_manage_all_documents,
         can_read_all_workspaces=can_read_all_workspaces,
+        entity_suspended_reason=(
+            str(entity_settings.get("platform_suspended_reason") or "")
+            if entity_settings.get("platform_suspended_at") else None
+        ),
     )
+
+
+# Request authentication resolves the actor once; a protected read in the same
+# request starts from that result instead of resolving it again. Each gate still
+# re-resolves after its policy reads, so a change during the request is denied
+# if its identity or permissions changed. ORM writes drop the remembered actor.
+_ADMITTED_ACTOR_KEY = "manor_admitted_actor"
+# Reads repeated by one request's access checks (Staff role assignment) live
+# exactly as long as the admitted actor: the next write drops both.
+_REQUEST_MEMO_KEY = "manor_admitted_request_memo"
+
+
+def remember_admitted_actor(
+    db: AsyncSession,
+    credential: AuthenticatedUserCredential,
+    actor: ResolvedUserActor,
+) -> None:
+    _forget_admitted_actor(db.info)
+    if actor.entity_suspended_reason is None:
+        db.info[_ADMITTED_ACTOR_KEY] = (credential, actor)
+
+
+def admitted_request_memo(db: AsyncSession) -> dict | None:
+    """This request's read memo, or None outside an admitted request."""
+    info = getattr(db, "info", None)
+    if not isinstance(info, dict) or _ADMITTED_ACTOR_KEY not in info:
+        return None
+    return info.setdefault(_REQUEST_MEMO_KEY, {})
+
+
+def _forget_admitted_actor(info: dict) -> None:
+    info.pop(_ADMITTED_ACTOR_KEY, None)
+    info.pop(_REQUEST_MEMO_KEY, None)
+
+
+async def admitted_or_current_actor(
+    db: AsyncSession,
+    credential: AuthenticatedUserCredential,
+) -> ResolvedUserActor | None:
+    """The actor this request admitted, else a fresh resolution.
+
+    Only for a gate's first read: what it authorizes must still be checked
+    against a fresh ``resolve_current_user_actor`` afterwards.
+    """
+    admitted = db.info.get(_ADMITTED_ACTOR_KEY)
+    if admitted is not None and admitted[0] is credential:
+        return admitted[1]
+    return await resolve_current_user_actor(db, credential)
+
+
+@event.listens_for(Session, "after_flush")
+def _forget_admitted_actor_after_flush(session, _flush_context) -> None:
+    _forget_admitted_actor(session.info)
+
+
+@event.listens_for(Session, "do_orm_execute")
+def _forget_admitted_actor_after_write(state) -> None:
+    if state.is_insert or state.is_update or state.is_delete:
+        _forget_admitted_actor(state.session.info)

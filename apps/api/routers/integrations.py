@@ -62,6 +62,8 @@ from packages.core.services.provider_keys import (
     provider_key_aliases,
 )
 from packages.core.ai.mcp.nango import get_nango_secret
+from packages.core.services.channels.base import INTEGRATION_CHANNEL_ACCOUNTS
+from packages.core.services.workspace_channel_routes import route_declared_channels_after_connect
 from packages.core.services.whatsapp_business_config import (
     load_whatsapp_business_config,
 )
@@ -860,7 +862,7 @@ _PROVIDER_DISPLAY: dict[str, dict] = {
                        "setup_hint": "Sign up at tavily.com to get an API key (starts with tvly-).",
                        "color_hex": "#0F766E",
                        "supports_multi_account": True},
-    "apify":          {"category": "Social", "tagline": "Collect Instagram posts and Reels through Apify's official MCP within a budget.",
+    "apify":          {"category": "Social", "tagline": "Collect Instagram posts and Reels, and public YouTube and TikTok post counts, through Apify's official MCP within a budget.",
                        "docs_url": "https://console.apify.com/settings/integrations",
                        "setup_hint": "Connect to Apify's official MCP with an API token from Apify Console → Settings → Integrations. Runs on this connection use your Apify account balance.",
                        "color_hex": "#F86606",
@@ -1151,12 +1153,12 @@ async def list_mcp_server_status(
         normalize_builtin_plugin_preferences,
     )
     if not snapshot:
-        from packages.core.services.builtin_skill_loader import seed_builtin_skills
+        from packages.core.services.skill_service import _seed_builtin_skills
 
-        # Preserve the existing repair of missing AND stale packaged Skills.
-        # Only the fast snapshot skips this work; it paints before the full read.
-        async with db.begin_nested():
-            await seed_builtin_skills(db)
+        # Repair missing and stale packaged Skills once per process, like the
+        # Skill list: every full read paid for 100+ statements that wrote nothing.
+        # The fast snapshot skips this work; it paints before the full read.
+        await _seed_builtin_skills(db)
     expected_plugin_skill_slugs = {
         skill.slug
         for definition in BUILTIN_PLUGINS.values()
@@ -2771,6 +2773,13 @@ async def wechat_personal_finish_session(
             provider="wechat_personal",
             integration_id=integration.id,
         )
+        await route_declared_channels_after_connect(
+            db,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            provider="wechat_personal",
+            credential_source_id=integration.id,
+        )
         pairing_session.integration_id = integration.id
         pairing_session.status = "active"
         await db.commit()
@@ -3436,16 +3445,23 @@ async def oauth_callback(
     # no token exchange or account mutation occurs.
     from packages.core.services.manor_integration_oauth import is_manor_oauth_provider
 
-    if error == "access_denied" and (is_manor_oauth_provider(server_key) or server_key == "lark"):
+    # A flow that asked to come back somewhere (the chat that opened it, a
+    # Workspace App) goes back there on cancel too, for every provider.
+    manor_flow = is_manor_oauth_provider(server_key) or server_key == "lark"
+    if error == "access_denied" and (manor_flow or state):
         from fastapi.responses import RedirectResponse
         from packages.core.services.oauth_flow import consume_pending_state
 
         try:
             cancelled = await consume_pending_state(state or "", server_key=server_key)
         except OAuthFlowError as exc:
+            if not manor_flow:
+                return render_oauth_error_page(server_key, error, error_description)
             raise HTTPException(exc.status, exc.message) from exc
-        target = _safe_oauth_return_path(cancelled.get("return_to")) or "/integrations"
-        parts = urlsplit(target)
+        target = _safe_oauth_return_path(cancelled.get("return_to"))
+        if not target and not manor_flow:
+            return render_oauth_error_page(server_key, error, error_description)
+        parts = urlsplit(target or "/integrations")
         query = dict(parse_qsl(parts.query, keep_blank_values=True))
         query.pop("connected", None)
         query["oauth_cancelled"] = server_key
@@ -3710,6 +3726,13 @@ async def oauth_callback(
                 "Ask its owner to share the connection instead.",
             ) from exc
         raise
+    await route_declared_channels_after_connect(
+        db,
+        entity_id=oauth_entity_id,
+        user_id=user_id,
+        provider=server_key,
+        credential_source_id=oauth_row_id,
+    )
     if server_key == "discord":
         guild_id = str(
             (existing.profile if existing else new_row.profile).get("guild_id")
@@ -4095,6 +4118,13 @@ async def create_new_integration(
             telegram_bot_id=telegram_bot_id,
             whatsapp_phone_number_id=whatsapp_phone_number_id,
         )
+        await route_declared_channels_after_connect(
+            db,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            provider=integration.provider,
+            credential_source_id=integration.id,
+        )
         await db.commit()
     except CredentialError as exc:
         await _raise_credential_backend_unavailable(db, exc, action="create_integration")
@@ -4128,23 +4158,6 @@ async def create_new_integration(
 
 # ── Integration ↔ ChannelConfig bridge ────────────────────────────────
 
-# integration.provider → [(channel_type, channel_provider), ...]
-# Keep this list aligned with registered ChannelAdapters.
-_INTEGRATION_TO_CHANNELS: dict[str, list[tuple[str, str]]] = {
-    "telegram":        [("telegram",         "telegram_bot")],
-    "whatsapp":        [("whatsapp",         "whatsapp_cloud")],
-    "wechat_official": [("wechat",           "wechat_oa")],
-    "wechat_personal": [("wechat_personal",  "itchat_runner")],
-    "email":           [("email",            "smtp_imap")],
-    "slack":           [("slack",            "slack_app")],
-    "discord":         [("discord",          "discord_app")],
-    "ms_teams":        [("ms_teams",          "microsoft_graph")],
-    "outlook":         [("outlook",           "microsoft_graph")],
-    # Twilio needs two channel types so one account can serve both SMS
-    # and voice webhooks/dispatch without manual DB surgery.
-    "twilio":          [("twilio_sms",       "twilio"), ("twilio_voice", "twilio")],
-    "facebook":        [("facebook",         "facebook_graph")],
-}
 
 
 class TelegramBotAlreadyConnected(ValueError):
@@ -4968,7 +4981,7 @@ async def _sync_oauth_channel_config_if_needed(
     oauth_account_id: str,
     connection_profile: dict | None = None,
 ) -> None:
-    mappings = _INTEGRATION_TO_CHANNELS.get(provider)
+    mappings = INTEGRATION_CHANNEL_ACCOUNTS.get(provider)
     if not mappings:
         return
 
@@ -5080,7 +5093,7 @@ async def _sync_channel_config_if_needed(
     inbound routing can bind to it. Credentials remain exclusively on the
     linked Integration. Idempotent per typed source account.
     """
-    mappings = _INTEGRATION_TO_CHANNELS.get(provider)
+    mappings = INTEGRATION_CHANNEL_ACCOUNTS.get(provider)
     if not mappings:
         return
 

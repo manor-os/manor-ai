@@ -1,3 +1,4 @@
+import { t } from "../../lib/i18n";
 import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { api, translateApiError } from "../../lib/api";
@@ -159,14 +160,14 @@ export default function WorkflowRunInputModal({
       maxWidth="560px"
       footer={(
         <>
-          <Button variant="ghost" onClick={() => onClose()} disabled={busy}>Cancel</Button>
-          <Button onClick={() => void submitWorkflowRun()} loading={busy}>Run workflow</Button>
+          <Button variant="ghost" onClick={() => onClose()} disabled={busy}>{t("ui.cancel")}</Button>
+          <Button onClick={() => void submitWorkflowRun()} loading={busy}>{t("ui.run_workflow")}</Button>
         </>
       )}
     >
       <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
         <p style={{ margin: 0, color: "var(--text-muted)", fontSize: 13, lineHeight: 1.55 }}>
-          Provide the information and materials for this run.
+          {t("ui.provide_the_information_and_materials_for_this_r")}
         </p>
         {submitError && <p role="alert" style={{ margin: 0, color: "var(--danger)" }}>{submitError}</p>}
         {progress && <p role="status" style={{ margin: 0 }}>{progress}</p>}
@@ -198,9 +199,9 @@ export default function WorkflowRunInputModal({
                     event.target.value = "";
                   }} />
                 <div style={{ display: "flex", gap: 8 }}>
-                  <Button variant="outline" onClick={() => fileInputs.current[input.key]?.click()}>Upload files</Button>
+                  <Button variant="outline" onClick={() => fileInputs.current[input.key]?.click()}>{t("ui.upload_files")}</Button>
                   <button className="btn-manor-outline" type="button" ref={(element) => { pickerButtons.current[input.key] = element; }}
-                    onClick={() => setPickerKey(input.key)}>Choose from Knowledge</button>
+                    onClick={() => setPickerKey(input.key)}>{t("ui.choose_from_knowledge")}</button>
                 </div>
                 <small style={{ color: "var(--text-muted)" }}>
                   Files upload when you run. Saved files remain in Knowledge{workspaceId ? " and are added to this Workspace" : ""}.
@@ -209,14 +210,14 @@ export default function WorkflowRunInputModal({
                   <div key={document.document_id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
                     <span style={{ overflowWrap: "anywhere" }}>{document.name || document.document_id} · Knowledge</span>
                     <Button variant="ghost" size="sm" ariaLabel={`Remove ${document.name || document.document_id}`}
-                      onClick={() => setSelected((current) => ({ ...current, [input.key]: current[input.key].filter((item) => item.document_id !== document.document_id) }))}>Remove</Button>
+                      onClick={() => setSelected((current) => ({ ...current, [input.key]: current[input.key].filter((item) => item.document_id !== document.document_id) }))}>{t("ui.remove")}</Button>
                   </div>
                 ))}
                 {(uploads[input.key] || []).map((item) => (
                   <WorkflowUploadProgress key={item.uploadKey} file={item.file}
                     status={uploadStatuses[item.uploadKey] || { phase: item.document ? "uploaded" : "queued" }}>
                     <Button variant="ghost" size="sm" ariaLabel={`Remove ${item.file.name}`}
-                      onClick={() => setUploads((current) => ({ ...current, [input.key]: current[input.key].filter((other) => other !== item) }))}>Remove</Button>
+                      onClick={() => setUploads((current) => ({ ...current, [input.key]: current[input.key].filter((other) => other !== item) }))}>{t("ui.remove")}</Button>
                   </WorkflowUploadProgress>
                 ))}
                 {runInputErrors[input.key] && <p role="alert" style={{ margin: 0, color: "var(--danger)" }}>{runInputErrors[input.key]}</p>}
@@ -321,7 +322,7 @@ export default function WorkflowRunInputModal({
                 value={runInputValues[input.key] || "false"}
                 onChange={(value) => setRunInputValues((current) => ({ ...current, [input.key]: value }))}
                 ariaLabel={`Run value for ${input.label}`}
-                options={[{ value: "false", label: "False" }, { value: "true", label: "True" }]}
+                options={[{ value: "false", label: t("ui.false") }, { value: "true", label: t("ui.true") }]}
               />
             ) : (
               <Input

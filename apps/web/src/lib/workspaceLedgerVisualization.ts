@@ -316,6 +316,24 @@ type WorkspaceLedgerQueryBlockLike = {
   data?: unknown;
 };
 
+/**
+ * A ledger query that matched nothing has nothing to show: once the reply
+ * says so in its own words, the empty result is not a block of its own.
+ */
+export function omitEmptyLedgerResults<
+  Block extends WorkspaceLedgerQueryBlockLike & { text?: string },
+>(blocks: Block[], replyText: string): Block[] {
+  const replied = Boolean(replyText.trim())
+    || blocks.some((block) => block.type === "text" && Boolean(String(block.text || "").trim()));
+  if (!replied) return blocks;
+  return blocks.filter((block) => !(
+    block.type === "visualization"
+    && block.kind === "ledger_query_result"
+    && isWorkspaceLedgerQueryVisualization(block.data)
+    && block.data.layout === "empty"
+  ));
+}
+
 export function coalesceWorkspaceLedgerQueryBlocks<
   Block extends WorkspaceLedgerQueryBlockLike,
 >(blocks: Block[]): Block[] {
@@ -505,8 +523,8 @@ export function workspaceLedgerOverviewHtml(
   const ledgers = overview.ledgers.slice(0, 8).map(ledgerSection).join("");
   const colorScheme = theme === "dark" ? "dark" : "light";
   const palette = theme === "dark"
-    ? "--bg:#121211;--panel:#1c1c1b;--muted:#282725;--ink:#f5f5f4;--subtle:#c4c0bb;--faint:#8f8a84;--bar:#908a83;--positive:#74a995;--negative:#df8179;--shadow:0 7px 20px rgba(0,0,0,.22)"
-    : "--bg:#f7f6f3;--panel:rgba(255,255,255,.82);--muted:#efede8;--ink:#292524;--subtle:#78716c;--faint:#a8a29e;--bar:#78716c;--positive:#437f6b;--negative:#c14a44;--shadow:0 7px 20px rgba(28,25,23,.07)";
+    ? "--bg:#121211;--panel:#1c1c1b;--muted:#282725;--ink:#f5f5f7;--subtle:#c4c0bb;--faint:#8f8a84;--bar:#908a83;--positive:#74a995;--negative:#df8179;--shadow:0 7px 20px rgba(0,0,0,.22)"
+    : "--bg:#f7f6f3;--panel:rgba(255,255,255,.82);--muted:#efede8;--ink:#2c2c2e;--subtle:#8e8e93;--faint:#aeaeb2;--bar:#8e8e93;--positive:#437f6b;--negative:#c14a44;--shadow:0 7px 20px rgba(29, 29, 31,.07)";
   return `<!doctype html>
 <html lang="${escapeHtml(locale)}">
 <head>
@@ -1272,8 +1290,8 @@ export function workspaceLedgerQueryHtml(
   const kind = queryLedgerKind(data.contract_id);
   const colorScheme = theme === "dark" ? "dark" : "light";
   const palette = theme === "dark"
-    ? "--bg:#121211;--panel:#1c1c1b;--muted:#282725;--ink:#f5f5f4;--subtle:#c4c0bb;--faint:#8f8a84;--bar:#a8a29e;--accent:#74a995;--positive:#74a995;--negative:#df8179;--line:#3a3835;--series-1:#74a995;--series-2:#b6a37e;--series-3:#8d98ad;--series-4:#b48d93;--series-5:#929d7d;--series-6:#9d8eaa;--series-7:#b19b8c;--series-8:#7f9fa1;--shadow:0 7px 20px rgba(0,0,0,.22)"
-    : "--bg:#f7f6f3;--panel:rgba(255,255,255,.86);--muted:#efede8;--ink:#292524;--subtle:#78716c;--faint:#a8a29e;--bar:#78716c;--accent:#437f6b;--positive:#437f6b;--negative:#c14a44;--line:#e7e3dd;--series-1:#527d73;--series-2:#aa8c5e;--series-3:#71809a;--series-4:#9d6f77;--series-5:#788663;--series-6:#806f90;--series-7:#967a68;--series-8:#608487;--shadow:0 7px 20px rgba(28,25,23,.07)";
+    ? "--bg:#121211;--panel:#1c1c1b;--muted:#282725;--ink:#f5f5f7;--subtle:#c4c0bb;--faint:#8f8a84;--bar:#aeaeb2;--accent:#74a995;--positive:#74a995;--negative:#df8179;--line:#3a3835;--series-1:#74a995;--series-2:#b6a37e;--series-3:#8d98ad;--series-4:#b48d93;--series-5:#929d7d;--series-6:#9d8eaa;--series-7:#b19b8c;--series-8:#7f9fa1;--shadow:0 7px 20px rgba(0,0,0,.22)"
+    : "--bg:#f7f6f3;--panel:rgba(255,255,255,.86);--muted:#efede8;--ink:#2c2c2e;--subtle:#8e8e93;--faint:#aeaeb2;--bar:#8e8e93;--accent:#437f6b;--positive:#437f6b;--negative:#c14a44;--line:#e7e3dd;--series-1:#527d73;--series-2:#aa8c5e;--series-3:#71809a;--series-4:#9d6f77;--series-5:#788663;--series-6:#806f90;--series-7:#967a68;--series-8:#608487;--shadow:0 7px 20px rgba(29, 29, 31,.07)";
   const projection = data.view === "current"
     ? t("component.workspace_chat.current_projection")
     : t("component.workspace_chat.event_stream");

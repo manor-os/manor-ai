@@ -100,14 +100,21 @@ for (const surface of ["workspace", "embedded", "floating"]) {
       if (surface !== "floating") {
         await viewport.evaluate((el) => el.scrollTo({ top: 0, behavior: "instant" }));
         const anchor = page.getByText("History paragraph 1.", { exact: true }).first();
-        await page.evaluate(() => document.fonts.ready);
-        await viewport.evaluate(async (el) => {
-          await Promise.all(el.getAnimations({ subtree: true }).filter((animation) => animation.effect?.getTiming().iterations !== Infinity).map((animation) => animation.finished));
-        });
-        const anchorTop = await anchor.evaluate((el) => el.getBoundingClientRect().top);
-        await page.getByRole("button", { name: "Load earlier messages", exact: true }).click();
-        await expect(page.getByText("Earlier assistant answer", { exact: true }).first()).toBeVisible();
-        await expect.poll(async () => Math.abs(await anchor.evaluate((el) => el.getBoundingClientRect().top) - anchorTop)).toBeLessThanOrEqual(2);
+        if (surface === "workspace") {
+          // Scrolling up near the top reads the older page and keeps the reader's place.
+          await expect(page.getByText("Earlier assistant answer", { exact: true }).first()).toBeAttached();
+          await expect.poll(() => viewport.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
+          await expect(anchor).toBeInViewport();
+        } else {
+          await page.evaluate(() => document.fonts.ready);
+          await viewport.evaluate(async (el) => {
+            await Promise.all(el.getAnimations({ subtree: true }).filter((animation) => animation.effect?.getTiming().iterations !== Infinity).map((animation) => animation.finished));
+          });
+          const anchorTop = await anchor.evaluate((el) => el.getBoundingClientRect().top);
+          await page.getByRole("button", { name: "Load earlier messages", exact: true }).click();
+          await expect(page.getByText("Earlier assistant answer", { exact: true }).first()).toBeVisible();
+          await expect.poll(async () => Math.abs(await anchor.evaluate((el) => el.getBoundingClientRect().top) - anchorTop)).toBeLessThanOrEqual(2);
+        }
       }
       await page.locator('[role="textbox"][contenteditable="true"]').fill("Show a long reply.");
       await page.getByRole("button", { name: "Send", exact: true }).click();
@@ -160,7 +167,6 @@ for (const surface of ["workspace", "embedded", "floating"]) {
         await expect.poll(gap).toBeLessThanOrEqual(2);
       } else {
         await page.setViewportSize({ width: 1280, height: 800 });
-        if (surface === "workspace") await page.getByRole("button", { name: "Hide workspace app", exact: true }).click();
         await page.getByRole("navigation", { name: "Conversation map" }).getByRole("button").first().click();
         await expect(page.getByText("Earlier user question", { exact: true }).first()).toBeVisible();
         // The first message can follow a date divider; navigation targets the message.
@@ -168,7 +174,14 @@ for (const surface of ["workspace", "embedded", "floating"]) {
           const first = el.querySelector("[data-chat-scroll-marker-id], [data-chat-message-index]")!;
           return Math.abs(first.getBoundingClientRect().top - el.getBoundingClientRect().top);
         })).toBeLessThanOrEqual(16);
-        const navigationTop = await viewport.evaluate((el) => el.scrollTop);
+        // Navigation scrolls smoothly; read the position once it has come to rest.
+        let navigationTop = -1;
+        await expect.poll(async () => {
+          const top = await viewport.evaluate((el) => el.scrollTop);
+          const atRest = top === navigationTop;
+          navigationTop = top;
+          return atRest;
+        }).toBe(true);
         await append("\n\nNavigation keeps its position.");
         await expect(page.getByText("Navigation keeps its position.", { exact: true }).first()).toBeAttached();
         await expect.poll(() => viewport.evaluate((el) => el.scrollTop)).toBeCloseTo(navigationTop, 0);

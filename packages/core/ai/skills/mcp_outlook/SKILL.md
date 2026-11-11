@@ -20,7 +20,8 @@ Authenticates via Microsoft OAuth. On an auth/scope error (token expired, consen
 
 Read / search:
 - `list_messages` — list mail (optionally by folder/query); returns IDs.
-- `get_message` — full message by `message_id`.
+- `get_message` — sender, recipients, subject, date, body as text and `attachments` by `message_id`. A long body arrives in pages: while `next_offset` is set, call again with `offset=<next_offset>` and read every page before summarizing or archiving the email.
+- `save_attachment_to_workspace` — save one file attachment to the Workspace and get its readable text and a document link. Use it whenever an attachment must be read or kept.
 - `list_folders` — folder IDs (needed for `move_message`).
 - `list_attachments` / `download_attachment` — attachments by `message_id` (+ `attachment_id`).
 

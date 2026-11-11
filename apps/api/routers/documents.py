@@ -79,6 +79,7 @@ from packages.core.services.version_service import (
     trash_document, restore_document, list_trash, empty_trash,
 )
 from packages.core.services.document_metadata import merge_document_metadata
+from packages.core.services.media_urls import MediaUrlSigner, signer_for_request
 from packages.core.services.entity_fs import (
     EntityFilesystemBusyError,
     EntityFilesystemError,
@@ -163,6 +164,9 @@ class DocumentResponse(BaseModel):
     # What the file is, in one line, when its name may not say: the prompt that made it or what
     # media analysis heard or saw in it.
     hint: str | None = None
+    # Signed manor-media URL of the ``thumb`` variant; only on browser-session
+    # list responses (services/media_urls). Absent means use /thumbnail.
+    thumbnail_url: str | None = None
     current_user_capabilities: list[str] = Field(default_factory=list)
 
 
@@ -265,9 +269,12 @@ _DOCUMENT_OWNER_CAPABILITIES = set(_DOCUMENT_CAPABILITY_ORDER) - {Capability.UPL
 _FOLDER_OWNER_CAPABILITIES = set(_DOCUMENT_CAPABILITY_ORDER)
 
 
+_ORDERED_CAPABILITIES = frozenset(_DOCUMENT_CAPABILITY_ORDER)
+
+
 def _ordered_capabilities(capabilities: set[str]) -> list[str]:
     ordered = [capability for capability in _DOCUMENT_CAPABILITY_ORDER if capability in capabilities]
-    ordered.extend(sorted(capability for capability in capabilities if capability not in set(_DOCUMENT_CAPABILITY_ORDER)))
+    ordered.extend(sorted(capability for capability in capabilities if capability not in _ORDERED_CAPABILITIES))
     return ordered
 
 
@@ -276,6 +283,7 @@ def _doc_resp(
     *,
     current_user_capabilities: set[str] | None = None,
     display_path: str | None = None,
+    media_signer: MediaUrlSigner | None = None,
 ) -> DocumentResponse:
     meta = d.metadata_ if hasattr(d, "metadata_") else None
     # Mutation handlers may return an ORM instance after a commit, where
@@ -307,6 +315,7 @@ def _doc_resp(
         editor_recipe_path=artifact_meta.get("editor_recipe_path") or generation_meta.get("editor_recipe_path"),
         editor_recipe_name=artifact_meta.get("editor_recipe_name") or generation_meta.get("editor_recipe_name"),
         hint=_document_hint(meta),
+        thumbnail_url=media_signer.thumbnail_url(d) if media_signer is not None else None,
         current_user_capabilities=_ordered_capabilities(current_user_capabilities or set()),
     )
 
@@ -331,6 +340,9 @@ async def _doc_resp_for_user(
     d,
     user: User,
     access_ctx: DocumentAccessContext | None = None,
+    *,
+    media_signer: MediaUrlSigner | None = None,
+    artifact_folder_names: dict[str, str] | None = None,
 ) -> DocumentResponse:
     if access_ctx is not None:
         capabilities = await access_ctx.effective_document_capabilities(db, d)
@@ -361,12 +373,16 @@ async def _doc_resp_for_user(
     if artifact_folder_id:
         from packages.core.models.document import DocumentFolder
 
-        folder_name = (await db.execute(
-            select(DocumentFolder.name).where(
-                DocumentFolder.id == artifact_folder_id,
-                DocumentFolder.entity_id == d.entity_id,
-            ).limit(1)
-        )).scalar_one_or_none()
+        folder_name = (
+            artifact_folder_names.get(artifact_folder_id)
+            if artifact_folder_names is not None
+            else (await db.execute(
+                select(DocumentFolder.name).where(
+                    DocumentFolder.id == artifact_folder_id,
+                    DocumentFolder.entity_id == d.entity_id,
+                ).limit(1)
+            )).scalar_one_or_none()
+        )
         display_path = workspace_artifact_display_path(
             d.fs_path,
             artifact_folder_id=artifact_folder_id,
@@ -376,7 +392,29 @@ async def _doc_resp_for_user(
         d,
         current_user_capabilities=capabilities,
         display_path=display_path,
+        media_signer=media_signer,
     )
+
+
+async def _artifact_folder_names(db: AsyncSession, entity_id: str, documents) -> dict[str, str]:
+    """Names of the Workspace artifact folders these Documents live in, read at once."""
+    from packages.core.models.document import DocumentFolder
+    from packages.core.services.workspace_artifacts import artifact_folder_id_from_entity_storage_path
+
+    folder_ids = {
+        folder_id
+        for document in documents
+        if (folder_id := artifact_folder_id_from_entity_storage_path(getattr(document, "fs_path", None)))
+    }
+    if not folder_ids:
+        return {}
+    rows = await db.execute(
+        select(DocumentFolder.id, DocumentFolder.name).where(
+            DocumentFolder.id.in_(folder_ids),
+            DocumentFolder.entity_id == entity_id,
+        )
+    )
+    return {str(folder_id): name for folder_id, name in rows.all()}
 
 
 async def _can_manage_document(db: AsyncSession, user: User, doc) -> bool:
@@ -5012,6 +5050,10 @@ def _first_page_thumbnail_ext(doc) -> str | None:
     return None
 
 
+# About 600 px wide on a letter or A4 page, the same bound image thumbnails use.
+_FIRST_PAGE_THUMBNAIL_DPI = 72
+
+
 async def _document_first_page_thumbnail(doc, entity_id: str):
     """Render + serve a first-page JPEG thumbnail for a PDF/office document."""
     source_ext = _first_page_thumbnail_ext(doc)
@@ -5037,6 +5079,7 @@ async def _document_first_page_thumbnail(doc, entity_id: str):
         rendered_file, image_path = await open_first_page(
             source_path,
             cache_dir,
+            dpi=_FIRST_PAGE_THUMBNAIL_DPI,
             source_ext=source_ext,
         )
         response = FileResponse(
@@ -5060,38 +5103,55 @@ async def _document_first_page_thumbnail(doc, entity_id: str):
 
 async def _generate_image_thumbnail(source_path: str, target_path: str) -> None:
     """Create a bounded JPEG preview without sending the source image."""
-
-    def _render() -> None:
-        from PIL import Image, ImageOps
-
-        temp_path = f"{target_path}.tmp"
-        with Image.open(source_path) as opened:
-            # A JPEG decodes straight at a fraction of its size; others decode once, then shrink.
-            opened.draft("RGB", (1280, 1280))
-            image = ImageOps.exif_transpose(opened)
-            image.thumbnail((640, 640))
-            if image.mode not in {"RGB", "L"}:
-                rgba = image.convert("RGBA")
-                background = Image.new("RGB", rgba.size, "white")
-                background.paste(rgba, mask=rgba.getchannel("A"))
-                image = background
-            elif image.mode == "L":
-                image = image.convert("RGB")
-            image.save(temp_path, format="JPEG", quality=82, optimize=True)
-        os.replace(temp_path, target_path)
+    from packages.core.services.media_variants import render_image_thumbnail
 
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
-    try:
-        async with _THUMBNAIL_SLOTS:
-            await asyncio.to_thread(_render)
-    except Exception:
-        temp_path = f"{target_path}.tmp"
-        if os.path.exists(temp_path):
+    async with _THUMBNAIL_SLOTS:
+        await asyncio.to_thread(render_image_thumbnail, source_path, target_path)
+
+
+def _thumbnail_variant_source(doc):
+    """The fields that name a Document's display-media version, detached from its session."""
+    if not getattr(doc, "fs_path", None):
+        return None
+    return SimpleNamespace(
+        id=doc.id, entity_id=doc.entity_id, name=doc.name, fs_path=doc.fs_path, file_size=doc.file_size,
+        file_type=doc.file_type, mime_type=doc.mime_type, content_sha256=doc.content_sha256,
+        metadata_=dict(doc.metadata_ or {}),
+    )
+
+
+async def _backfill_thumbnail_variant(doc, entity_id: str, thumb_path: str | None = None, *, data: bytes | None = None) -> None:
+    """Also publish this thumbnail at its versioned manor-media path.
+
+    Older Documents (and writes whose worker dispatch was lost) get their
+    variant the first time someone asks for the API thumbnail; the worker
+    then records it, so later list responses can sign it.
+    """
+    from packages.core.services.media_urls import content_version, media_signing_enabled, thumbnail_source_kind
+    from packages.core.services.media_variants import (
+        publish_variant_bytes,
+        publish_variant_file,
+        schedule_display_variants,
+        variant_path,
+    )
+
+    if doc is None or not media_signing_enabled() or thumbnail_source_kind(doc) is None:
+        return
+    # Also restores a recorded variant whose file went missing (a signed URL
+    # answered 404 and the browser fell back here).
+    version = content_version(doc)
+    if version is not None:
+        target = variant_path(_entity_root(entity_id), doc.id, version)
+        if not os.path.isfile(target):
             try:
-                os.remove(temp_path)
+                if data is not None:
+                    await asyncio.to_thread(publish_variant_bytes, data, target)
+                elif thumb_path:
+                    await asyncio.to_thread(publish_variant_file, thumb_path, target)
             except OSError:
-                pass
-        raise
+                logger.info("thumbnail variant backfill failed for %s", doc.id, exc_info=True)
+    schedule_display_variants(doc)
 
 
 async def _cache_thumbnail_file_response(doc, response: FileResponse) -> FileResponse:
@@ -5156,6 +5216,10 @@ async def document_thumbnail(
         if current_doc is None:
             raise HTTPException(404, "Document not found")
         if document_hot_cache_key(current_doc, "thumbnail") == cached_key:
+            # These are the current version's bytes (the cache key matched).
+            await _backfill_thumbnail_variant(
+                _thumbnail_variant_source(current_doc), entity_id, data=cached_thumbnail.data,
+            )
             return Response(
                 content=cached_thumbnail.data,
                 media_type=cached_thumbnail.media_type,
@@ -5213,7 +5277,12 @@ async def document_thumbnail(
             },
         )
         image_response = await _cache_thumbnail_file_response(doc, image_response)
+        # Read before revalidation, which rolls back and expires the row.
+        variant_source = _thumbnail_variant_source(doc) if not remote_source_path else None
+        variant_entity_id = str(user.entity_id)
         await _revalidate_thumbnail_response(db, document=doc, user=user)
+        if variant_source is not None:
+            await _backfill_thumbnail_variant(variant_source, variant_entity_id, thumb_path)
         return image_response
 
     if not _is_video_document(doc):
@@ -5339,7 +5408,11 @@ async def document_thumbnail(
         },
     )
     video_response = await _cache_thumbnail_file_response(doc, video_response)
+    variant_source = _thumbnail_variant_source(doc) if not remote_source_path else None
+    variant_entity_id = str(user.entity_id)
     await _revalidate_thumbnail_response(db, document=doc, user=user)
+    if variant_source is not None:
+        await _backfill_thumbnail_variant(variant_source, variant_entity_id, thumb_path)
     return video_response
 
 
@@ -5508,11 +5581,66 @@ async def preview_document_content(
     if not doc:
         raise HTTPException(404, "Document not found")
     response = await _document_read_response(doc, user, db)
+    return _inline_view_headers(response)
+
+
+def _inline_view_headers(response):
     response.headers["Content-Disposition"] = "inline"
     response.headers["Cache-Control"] = "private, no-store"
     response.headers["Content-Security-Policy"] = "sandbox"
     response.headers["X-Content-Type-Options"] = "nosniff"
     return response
+
+
+# A player's range is answered with this much at a time, so playback starts on the
+# first slice instead of after the whole recording is read.
+_STREAM_RANGE_SLICE_BYTES = 8 * 1024 * 1024
+
+
+@router.get("/{doc_id}/stream-url")
+async def document_stream_url(
+    doc_id: str,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """An address a ``<video>``/``<audio>`` element can play from while it downloads."""
+    from packages.core.services.file_access_tokens import DOCUMENT_STREAM_TOKEN_SECONDS, create_document_stream_token
+
+    doc = await get_visible_document(db, doc_id, user.entity_id, user_id=user.id, role=user.role)
+    if not doc:
+        raise HTTPException(404, "Document not found")
+    token = create_document_stream_token(document_id=doc.id, claims=request.state.auth_claims)
+    return {"url": f"{router.prefix}/{doc.id}/stream?t={urllib.parse.quote(token)}",
+            "expires_in": DOCUMENT_STREAM_TOKEN_SECONDS}
+
+
+@router.get("/{doc_id}/stream")
+async def stream_document_content(
+    doc_id: str,
+    request: Request,
+    t: str = Query(..., min_length=16, max_length=8192),
+    db: AsyncSession = Depends(get_db),
+):
+    """The inline bytes of ``preview/content``, admitted from a stream address and served in ranges.
+
+    The address stands in for the person who asked for it: their sign-in is admitted
+    again and the Document authorized again on every request.
+    """
+    from apps.api.deps import authenticate_token_claims
+    from packages.core.services.file_access_tokens import verify_document_stream_token
+
+    claims = verify_document_stream_token(t, document_id=doc_id)
+    if claims is None:
+        raise HTTPException(401, "Invalid or expired stream address")
+    user = await authenticate_token_claims(request, claims, db)
+    doc = await get_visible_document(db, doc_id, user.entity_id, user_id=user.id, role=user.role)
+    if not doc:
+        raise HTTPException(404, "Document not found")
+    response = await _document_read_response(doc, user, db)
+    if isinstance(response, EntitySnapshotFileResponse):
+        response.range_slice_bytes = _STREAM_RANGE_SLICE_BYTES
+    return _inline_view_headers(response)
 
 
 async def _metadata_document_file_response(
@@ -6541,6 +6669,7 @@ async def browse_documents_page(
     sort_by: str = Query("date", pattern="^(date|name|size)$"),
     limit: int = Query(50, ge=1, le=100),
     cursor: str | None = Query(None, max_length=1024),
+    request: Request = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -6556,13 +6685,18 @@ async def browse_documents_page(
         raise HTTPException(422, "Invalid file type filter")
     search_query = (search or "").strip() or None
     browse_folder_id = None if folder_id in (None, "", "root") else folder_id
-    visible_folders, visible_folder_by_id, _ = await _visible_document_folders_for_user(
-        db, user, credential=credential,
-    )
-    if browse_folder_id and browse_folder_id not in visible_folder_by_id:
-        raise HTTPException(404, "Folder not found")
     global_document_scope = scope == "all" or bool(workspace_id) or bool(search_query)
     query_folder_id = None if global_document_scope else browse_folder_id or "root"
+    # Reading across folders skips those the viewer cannot see while filling the
+    # page. A single folder (or a Workspace) has nothing to skip: the final check
+    # below, made after the scan, decides whether it may be shown at all.
+    visible_folder_by_id: dict[str, object] | None = None
+    if global_document_scope and workspace_id is None:
+        _, visible_folder_by_id, _ = await _visible_document_folders_for_user(
+            db, user, credential=credential,
+        )
+        if browse_folder_id and browse_folder_id not in visible_folder_by_id:
+            raise HTTPException(404, "Folder not found")
 
     page_documents: list[Document] = []
     position = _decode_browse_cursor(cursor, sort_by)
@@ -6608,7 +6742,7 @@ async def browse_documents_page(
                 include_generated_assets=include_generated_assets,
                 access_context=authorized.access_context,
             ) and (
-                workspace_id is not None
+                visible_folder_by_id is None
                 or document.folder_id is None
                 or str(document.folder_id) in visible_folder_by_id
             ):
@@ -6635,8 +6769,14 @@ async def browse_documents_page(
     )
     if browse_folder_id and browse_folder_id not in final_folder_by_id:
         raise HTTPException(404, "Folder not found")
+    # The final Gate admitted every listed Document; signing adds no query.
+    media_signer = signer_for_request(request, user)
+    artifact_folder_names = await _artifact_folder_names(db, user.entity_id, final_docs.documents)
     final_items = [
-        await _doc_resp_for_user(db, document, user, final_docs.access_context)
+        await _doc_resp_for_user(
+            db, document, user, final_docs.access_context,
+            media_signer=media_signer, artifact_folder_names=artifact_folder_names,
+        )
         for document in final_docs.documents
         if _document_matches_browse_filters(
             document,
@@ -6690,6 +6830,7 @@ async def browse_documents(
     workspace_id: str | None = Query(None),
     scope: str | None = Query(None),
     include_generated_assets: bool = Query(True),
+    request: Request = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -6875,8 +7016,9 @@ async def browse_documents(
         ]
     direct_folders.sort(key=lambda folder: (folder.name or "").lower())
 
+    media_signer = signer_for_request(request, user)
     items = [
-        await _doc_resp_for_user(db, document, user, final_documents.access_context)
+        await _doc_resp_for_user(db, document, user, final_documents.access_context, media_signer=media_signer)
         for document in docs
     ]
     total = len(docs)

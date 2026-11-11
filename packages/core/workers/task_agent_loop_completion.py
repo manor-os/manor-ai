@@ -11,7 +11,8 @@ the submission is *coherent with what this run observably did*:
    that needs something from a person;
 2. every deliverable is real: a receipt handle in this run's ledger, or a
    Knowledge file that exists and is readable in the Task's scope;
-3. every file deliverable was inspected after this run last wrote it;
+3. every file deliverable is checked: the run is asked once per written
+   revision to inspect it;
 4. nothing this Task started is still running (delegation, media jobs);
 5. an unconfirmed effect is never reported as confirmed (W1a outcome rule,
    "delivered + exceptions"): a ``completed`` report with at least one
@@ -145,6 +146,9 @@ class InspectionTracker:
         self.inspected_dirs: dict[str, int] = {
             str(k): int(v) for k, v in (state.get("inspected_dirs") or {}).items() if isinstance(v, int)
         }
+        self.refused: dict[str, int] = {
+            str(k): int(v) for k, v in (state.get("refused") or {}).items() if isinstance(v, int)
+        }
 
     def state(self) -> dict[str, Any]:
         return {
@@ -153,6 +157,7 @@ class InspectionTracker:
             "written": dict(self.written),
             "inspected": dict(self.inspected),
             "inspected_dirs": dict(self.inspected_dirs),
+            "refused": dict(self.refused),
         }
 
     def observe(self, name: str, result: Any, arguments: Any, evidence: Any) -> None:
@@ -214,6 +219,18 @@ class InspectionTracker:
                 if path == directory or path.startswith(directory.rstrip("/") + "/"):
                     read = max(read, seq)
         return read > written
+
+    def refuse_once(self, keys: list[str]) -> bool:
+        """True the first time this revision of a file is refused for inspection."""
+
+        revision = max((self.written.get(key, 0) for key in keys), default=0)
+        if any(self.refused.get(key, -1) >= revision for key in keys):
+            return False
+        for key in keys:
+            self.refused.pop(key, None)
+            self.refused[key] = revision
+        _bounded(self.refused)
+        return True
 
 
 def _resolved_read_keys(result: Any) -> list[str]:
@@ -469,15 +486,22 @@ async def resolve_deliverables(
 
 
 def inspection_problems(resolved: list[dict[str, Any]], tracker: InspectionTracker) -> list[str]:
+    """Ask once per file revision, like the unconfirmed-effects refusal.
+
+    The host has already verified the file exists and is readable. Not every
+    Agent has a read tool, so asking again could never end.
+    """
     problems = []
     for entry in resolved:
         keys = entry.get("keys") or []
-        if not keys or tracker.inspected_after_write(keys):
+        if not keys or tracker.inspected_after_write(keys) or not tracker.refuse_once(keys):
             continue
         path = (entry.get("file_ref") or {}).get("fs_path") or entry.get("reference")
         problems.append(
-            f"Inspect {path} before completing (e.g. read_file/probe_media): deliverable "
-            f"{entry['index']} was not read or inspected in this run after it was last written."
+            f"Inspect {path} before completing: deliverable {entry['index']} was not read or "
+            "inspected in this run after it was last written. If you checked it another way, "
+            "or have no tool that can read it, say what you checked in the acceptance evidence "
+            "and call complete_task again."
         )
     return problems
 
@@ -806,6 +830,16 @@ def ledger_file_refs(identities: Any, *, entity_id: str) -> list[dict[str, Any]]
         for identity in identities if isinstance(identity, dict)
     ] if isinstance(identities, list) else []
     return dedupe_generated_file_refs(refs, entity_id=entity_id) if refs else []
+
+
+def saved_deliverables(receipts: Any) -> list[dict[str, Any]]:
+    """This run's confirmed saved files, as deliverables the host can verify."""
+
+    work = ledger_work_so_far({"receipts": list(receipts or ())})
+    return [
+        {"title": identity.get("name"), "reference": identity.get("document_id") or identity.get("fs_path")}
+        for identity in work.get("ledger_files") or []
+    ]
 
 
 def output_receipts(evidence_state: Any) -> list[dict[str, Any]]:

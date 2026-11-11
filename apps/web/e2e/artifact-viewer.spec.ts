@@ -138,17 +138,22 @@ test("DOCX server pages avoid the original preview download while edit and downl
   expect(api.calls).toContain("/api/v1/documents/docx-server/pages");
   expect(api.calls).not.toContain("/api/v1/documents/docx-server/preview/content");
   await expect(page.getByRole("link", { name: "Edit", exact: true })).toHaveAttribute("href", "/editor/docx-server");
-  await expect(page.getByRole("button", { name: "Download", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "More", exact: true }).click();
+  await expect(page.getByRole("menuitem", { name: "Download", exact: true })).toBeEnabled();
 });
 
 test("DOCX comments request one protected original preview for selectable legacy rendering", async ({ page }) => {
   const api = await installViewerBehaviorApi(page, "docx-comments");
   await page.goto("/viewer/docx-comments");
   await expect(page.getByRole("img", { name: /docx-comments\.docx — page 1/ })).toBeVisible();
-  await page.getByRole("button", { name: "Comments", exact: true }).click();
+  const toggleComments = async () => {
+    await page.getByRole("button", { name: "More", exact: true }).click();
+    await page.getByRole("menuitem", { name: "Comments", exact: true }).click();
+  };
+  await toggleComments();
   await expect(page.locator(".docx-viewer-stage").getByText("Selectable DOCX fixture", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Comments", exact: true }).click();
-  await page.getByRole("button", { name: "Comments", exact: true }).click();
+  await toggleComments();
+  await toggleComments();
   await expect(page.locator(".docx-viewer-stage").getByText("Selectable DOCX fixture", { exact: true })).toBeVisible();
   expect(api.calls.filter((call) => call === "/api/v1/documents/docx-comments/preview/content")).toHaveLength(1);
 });
@@ -195,11 +200,9 @@ for (const width of [1280, 390]) {
     await installApi(page);
     await page.goto(`${workspace}?case=canonical`);
     await page.getByRole("button", { name: new RegExp(name) }).click();
-    const parentFolder = page.locator(".manor-editor-header-main").getByRole("link", { name: "Containing folder", exact: true });
+    await page.getByRole("button", { name: "More", exact: true }).click();
+    const parentFolder = page.getByRole("menuitem", { name: "Show in Knowledge", exact: true });
     await expect(parentFolder).toBeVisible();
-    await expect(parentFolder).toHaveAttribute("title", "Open containing folder");
-    await expect(parentFolder).toHaveAttribute("href", `/knowledge?folder_id=${folderId}`);
-    expect(await parentFolder.evaluate((link) => link.getBoundingClientRect().right <= window.innerWidth)).toBe(true);
     await page.screenshot({ path: testInfo.outputPath(`viewer-parent-folder-${width}.png`) });
     await parentFolder.click();
     await expect(page).toHaveURL(`/knowledge?folder_id=${folderId}`);
@@ -220,7 +223,7 @@ for (const width of [1280, 390]) {
     await installApi(page);
     await page.goto(`${workspace}?case=canonical`);
     await page.getByRole("button", { name: new RegExp(name) }).click();
-    await page.getByRole("button", { name: "Close", exact: true }).click();
+    await page.getByRole("button", { name: "Go Back", exact: true }).click();
     await expect(page).toHaveURL(`${workspace}?case=canonical#completion`);
     await expect(page.getByRole("button", { name: new RegExp(name) })).toBeVisible();
   });
@@ -253,14 +256,16 @@ test("viewer parent-folder navigation survives a direct URL and reload", async (
   await installApi(page);
   await page.goto(`/viewer/${id}`);
   await page.reload();
-  await page.getByRole("link", { name: "Containing folder", exact: true }).click();
+  await page.getByRole("button", { name: "More", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Show in Knowledge", exact: true }).click();
   await expect(page).toHaveURL(`/knowledge?folder_id=${folderId}`);
 });
 
 test("viewer library link opens the Knowledge root for an unfiled document", async ({ page }) => {
   await installApi(page, "root-folder");
   await page.goto(`/viewer/${id}`);
-  await page.getByRole("link", { name: "Open library", exact: true }).click();
+  await page.getByRole("button", { name: "More", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Show in Knowledge", exact: true }).click();
   await expect(page).toHaveURL("/knowledge");
 });
 

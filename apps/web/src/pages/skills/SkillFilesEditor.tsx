@@ -57,7 +57,7 @@ export function SkillFilesEditor({
 
   return (
     <div>
-      <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-1.5">
+      <label className="block text-xs font-semibold text-stone-500 mb-1.5">
         {t("page.skill_form.files")}
       </label>
       <p style={{ margin: "0 0 8px", fontSize: 12, color: "var(--text-muted)", lineHeight: 1.5 }}>
@@ -88,7 +88,7 @@ export function SkillFilesEditor({
               <div
                 key={file.path}
                 style={{
-                  borderTop: index > 0 ? "1px solid rgba(28,25,23,0.06)" : "none",
+                  borderTop: index > 0 ? "0.5px solid rgba(29, 29, 31,0.06)" : "none",
                 }}
               >
                 <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "2px 6px 2px 0" }}>

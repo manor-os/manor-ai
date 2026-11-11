@@ -1,8 +1,10 @@
+import { displayReadInterval } from "../lib/readRefreshPolicy";
 import { useMemo, useState, type ComponentType } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../lib/api";
 import { relativeTime } from "../lib/format";
+import { localizeEventText } from "../lib/eventCopy";
 import PageHeader from "../components/ui/PageHeader";
 import TabSwitcher from "../components/ui/TabSwitcher";
 import Select from "../components/ui/Select";
@@ -47,6 +49,7 @@ import {
   IconUsers,
   IconWarning,
   type IconProps,
+  IconTrash,
 } from "../components/icons";
 
 import { t } from "../lib/i18n";
@@ -68,6 +71,7 @@ const TYPE_ICONS: Record<string, ComponentType<IconProps>> = {
   task_hitl_reminder: IconBell,
   task_retried: IconReopen,
   task_sla_breach: IconClock,
+  task_overdue: IconClock,
   sla_escalation: IconFlag,
   proposal: IconSparkles,
   booking_confirmed: IconCalendar,
@@ -82,6 +86,7 @@ const TYPE_ICONS: Record<string, ComponentType<IconProps>> = {
   workflow: IconFlow,
   automation_paused: IconPause,
   workspace_setup_required: IconConnection,
+  workspace_update_available: IconSparkles,
   system_health: IconServer,
   daily_briefing: IconReport,
   workspace_digest: IconReport,
@@ -106,6 +111,7 @@ const TYPE_LABELS: Record<string, string> = {
   task_hitl_reminder: "Input reminder",
   task_retried: "Task retried",
   task_sla_breach: "Task SLA breach",
+  task_overdue: "Task overdue",
   sla_escalation: "SLA escalation",
   proposal: "Proposal",
   booking_confirmed: "Booking confirmed",
@@ -120,6 +126,7 @@ const TYPE_LABELS: Record<string, string> = {
   workflow: "Workflow",
   automation_paused: "Automation paused",
   workspace_setup_required: "Workspace setup",
+  workspace_update_available: "Workspace update",
   system_health: "System health",
   daily_briefing: "Daily briefing",
   workspace_digest: "Daily digest",
@@ -284,16 +291,20 @@ export default function Notifications() {
     setSearchParams(nextParams, { replace: true });
   };
 
+  // An empty inbox is only its empty state: no count line, filters or
+  // a disabled "mark all read" repeating that there is nothing here.
+  const filtersNarrowed = statusFilter !== "all" || typeFilter !== ALL_NOTIFICATION_TYPES;
+  const showControls = rows.length > 0 || filtersNarrowed;
+
   return (
     <div style={{ height: "100%", overflowY: "auto", padding: 0 }}>
       <PageHeader
         title={t("nav.notifications")}
-        meta={unreadCount > 0 ? `${unreadCount} unread` : t("page.notifications.you_re_all_caught_up")}
-        actions={
+        actions={unreadCount > 0 &&
           <button
             onClick={() => markAllReadMutation.mutate()}
             disabled={markAllReadMutation.isPending || unreadCount === 0}
-            className="btn-manor-teal-light"
+            className="btn-manor-ghost"
             style={{ opacity: markAllReadMutation.isPending || unreadCount === 0 ? 0.5 : 1 }}
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
@@ -304,7 +315,7 @@ export default function Notifications() {
         }
       />
 
-      <div style={{
+      {showControls && <div style={{
         display: "flex",
         alignItems: "center",
         justifyContent: "space-between",
@@ -328,7 +339,7 @@ export default function Notifications() {
           style={{ width: 220, maxWidth: "100%" }}
           dropdownMinWidth={220}
         />
-      </div>
+      </div>}
 
       {/* Loading */}
       {isLoading && (
@@ -342,7 +353,7 @@ export default function Notifications() {
       {showEmpty && (
         <EmptyState
           icon={
-            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#d6d3d1" strokeWidth={1.5}>
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#d1d1d6" strokeWidth={1.5}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
             </svg>
           }
@@ -357,7 +368,7 @@ export default function Notifications() {
 
       {/* List */}
       {!isLoading && rows.length > 0 && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        <div className="inset-list">
           {rows.map((row) => (
             <StandardRow
               key={row.key}
@@ -415,53 +426,17 @@ function StandardRow({
       }}
       role="button"
       tabIndex={0}
-      className="glass-card-sm"
-      style={{
-        cursor: "pointer",
-        boxSizing: "border-box",
-        height: 76,
-        overflow: "hidden",
-      }}
+      className="inset-row"
     >
-      <div style={{ display: "flex", alignItems: "center", gap: 12, height: "100%" }}>
-        <div
-          style={{
-            width: 40, height: 40, borderRadius: 10,
-            background: "var(--surface-sunken)",
-            display: "flex", alignItems: "center", justifyContent: "center",
-            flexShrink: 0,
-          }}
-        >
-          <NotificationTypeIcon type={n.type} />
+      <NotificationTypeIcon type={n.type} size={18} />
+      <div className="inset-row-copy">
+        <div className="inset-row-title">
+          <span className={n.read_at ? "" : "is-unread"}>{localizeEventText(n.title || "") || t("page.notifications.notification")}</span>
+          {!n.read_at && <span className="inset-row-dot" aria-hidden="true" />}
         </div>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <p style={{
-              fontSize: 14, fontWeight: !n.read_at ? 700 : 600,
-              color: !n.read_at ? "var(--text-default)" : "var(--text-muted)",
-              margin: 0, overflow: "hidden",
-              textOverflow: "ellipsis", whiteSpace: "nowrap",
-            }}>
-              {n.title || t("page.notifications.notification")}
-            </p>
-            {!n.read_at && (
-              <span style={{
-                width: 6, height: 6, borderRadius: "50%",
-                background: "var(--text-muted)", flexShrink: 0,
-              }} />
-            )}
-          </div>
-          {n.content && (
-            <p style={{
-              fontSize: 13, color: "var(--text-faint)", margin: "4px 0 0 0",
-              overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-            }}>
-              {n.content}
-            </p>
-          )}
-        </div>
-        <RowMeta n={n} onDelete={onDelete} actionLabel={actionLabel} />
+        {n.content && <div className="inset-row-desc">{localizeEventText(n.content)}</div>}
       </div>
+      <RowMeta n={n} onDelete={onDelete} actionLabel={actionLabel} />
     </div>
   );
 }
@@ -476,29 +451,16 @@ function RowMeta({
   actionLabel?: string;
 }) {
   return (
-    <div style={{
-      display: "flex", flexDirection: "column",
-      alignItems: "flex-end", gap: 4, flexShrink: 0,
-    }}>
-      <span style={{ fontSize: 12, color: "var(--text-faint)" }}>
-        {n.created_at ? relativeTime(n.created_at) : ""}
-      </span>
+    <div className="inset-row-meta">
+      <span>{n.created_at ? relativeTime(n.created_at) : ""}</span>
       <button
+        type="button"
+        className="inset-row-action"
         onClick={(e) => { e.stopPropagation(); onDelete(); }}
-        style={{
-          background: "none", border: "none", cursor: "pointer",
-          color: "var(--border-strong)", padding: 2, transition: "color 0.2s", lineHeight: 0,
-        }}
-        onMouseEnter={(e) => { e.currentTarget.style.color = "var(--text-default)"; }}
-        onMouseLeave={(e) => { e.currentTarget.style.color = "var(--border-strong)"; }}
         title={actionLabel || t("action.delete")}
         aria-label={actionLabel || t("action.delete")}
       >
-        <svg width="14" height="14" fill="none" viewBox="0 0 24 24"
-             stroke="currentColor" strokeWidth={2}>
-          <path strokeLinecap="round" strokeLinejoin="round"
-                d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-        </svg>
+        <IconTrash size={14} />
       </button>
     </div>
   );
@@ -562,7 +524,7 @@ function toneColors(tone: BriefingTone) {
   if (tone === "warn") {
     return { fg: "#8c5e25", bg: "rgba(207,155,68,0.08)", border: "rgba(207,155,68,0.18)" };
   }
-  return { fg: "#57534e", bg: "rgba(245,245,244,0.72)", border: "rgba(28,25,23,0.06)" };
+  return { fg: "#6e6e73", bg: "rgba(245,245,244,0.72)", border: "rgba(29, 29, 31,0.06)" };
 }
 
 function isClearBriefingText(text: string) {
@@ -617,7 +579,7 @@ function BriefingValue({ value, fallbackTone = "neutral" }: { value: string; fal
         const colors = toneColors(tone);
         return (
           <span key={`${part}-${index}`} style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-            {index > 0 && <span style={{ color: "#d6d3d1", fontWeight: 500 }}>·</span>}
+            {index > 0 && <span style={{ color: "var(--text-faint)", fontWeight: 500 }}>·</span>}
             <span style={{ color: colors.fg, fontWeight: tone !== "neutral" ? 720 : 500 }}>
               {part}
             </span>
@@ -672,9 +634,9 @@ function usefulBriefingRow(row: BriefingRow) {
 
 function BriefingDetailRows({ rows }: { rows: BriefingRow[] }) {
   return (
-    <section style={{ borderTop: "1px solid rgba(28,25,23,0.08)", paddingTop: 14 }}>
-      <div style={{ fontSize: 13, fontWeight: 820, color: "#292524", marginBottom: 9 }}>
-        Details
+    <section style={{ borderTop: "0.5px solid rgba(29, 29, 31,0.08)", paddingTop: 14 }}>
+      <div style={{ fontSize: 13, fontWeight: 820, color: "var(--text-strong)", marginBottom: 9 }}>
+        {t("ui.details")}
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
         {rows.map((row) => {
@@ -690,7 +652,7 @@ function BriefingDetailRows({ rows }: { rows: BriefingRow[] }) {
                 lineHeight: 1.45,
               }}
             >
-              <span style={{ color: "#78716c", fontWeight: 650 }}>{row.label}</span>
+              <span style={{ color: "var(--text-muted)", fontWeight: 650 }}>{row.label}</span>
               <BriefingValue value={row.value} fallbackTone={row.tone || "neutral"} />
             </div>
           );
@@ -835,10 +797,10 @@ function DailyBriefingBody({ notification }: { notification: any }) {
             {hasRisk ? <IconWarning size={17} /> : <IconCheckCircle size={17} />}
           </div>
           <div style={{ minWidth: 0 }}>
-            <div style={{ fontSize: 14, fontWeight: 820, color: "#292524" }}>
+            <div style={{ fontSize: 14, fontWeight: 820, color: "var(--text-strong)" }}>
               {hasRisk ? "Needs attention" : "All clear"}
             </div>
-            <div style={{ marginTop: 4, fontSize: 13, color: "#57534e", lineHeight: 1.45 }}>
+            <div style={{ marginTop: 4, fontSize: 13, color: "var(--text-muted)", lineHeight: 1.45 }}>
               {statusBody}
             </div>
           </div>
@@ -849,13 +811,13 @@ function DailyBriefingBody({ notification }: { notification: any }) {
 
       <section
         style={{
-          borderTop: "1px solid rgba(28,25,23,0.08)",
+          borderTop: "0.5px solid rgba(29, 29, 31,0.08)",
           paddingTop: 14,
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13, fontWeight: 820, color: "#292524", marginBottom: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13, fontWeight: 820, color: "var(--text-strong)", marginBottom: 10 }}>
           <IconChecklist size={15} style={{ color: "#4f7d75" }} />
-          Action items
+          {t("ui.action_items")}
         </div>
         {usefulActions.length > 0 ? (
           <ol style={{ margin: 0, padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 9 }}>
@@ -878,13 +840,13 @@ function DailyBriefingBody({ notification }: { notification: any }) {
                 >
                   {index + 1}
                 </span>
-                <span style={{ fontSize: 13, color: "#44403c", lineHeight: 1.5 }}>{item}</span>
+                <span style={{ fontSize: 13, color: "var(--text-default)", lineHeight: 1.5 }}>{item}</span>
               </li>
             ))}
           </ol>
         ) : (
-          <div style={{ fontSize: 13, color: "#78716c", lineHeight: 1.45 }}>
-            No action needed today.
+          <div style={{ fontSize: 13, color: "var(--text-muted)", lineHeight: 1.45 }}>
+            {t("ui.no_action_needed_today")}
           </div>
         )}
       </section>
@@ -927,7 +889,7 @@ function NotificationDetailModal({
       ) : (
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         {blocks.length === 0 && (
-          <div style={{ fontSize: 13, color: "#a8a29e" }}>
+          <div style={{ fontSize: 13, color: "var(--text-muted)" }}>
             {t("page.notifications.no_body_content")}
           </div>
         )}
@@ -937,9 +899,7 @@ function NotificationDetailModal({
               <div key={i} style={{
                 marginTop: i === 0 ? 0 : 6,
                 fontSize: 11, fontWeight: 800,
-                letterSpacing: "0.08em",
-                textTransform: "uppercase" as const,
-                color: "#78716c",
+                color: "var(--text-muted)",
               }}>
                 {b.text}
               </div>
@@ -947,8 +907,8 @@ function NotificationDetailModal({
           }
           if (b.kind === "kv") {
             return (
-              <div key={i} style={{ fontSize: 13, color: "#44403c", lineHeight: 1.6 }}>
-                <span style={{ color: "#78716c", fontWeight: 600 }}>{b.key}: </span>
+              <div key={i} style={{ fontSize: 13, color: "var(--text-default)", lineHeight: 1.6 }}>
+                <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>{b.key}: </span>
                 <span>{b.value}</span>
               </div>
             );
@@ -962,7 +922,7 @@ function NotificationDetailModal({
                 {b.items.map((item, j) => (
                   <li key={j} style={{
                     display: "flex", alignItems: "flex-start", gap: 8,
-                    fontSize: 13, color: "#44403c", lineHeight: 1.5,
+                    fontSize: 13, color: "var(--text-muted)", lineHeight: 1.5,
                   }}>
                     <span style={{
                       flexShrink: 0, color: "#436b65", fontWeight: 700,
@@ -979,7 +939,7 @@ function NotificationDetailModal({
           // paragraph
           return (
             <p key={i} style={{
-              margin: 0, fontSize: 13, color: "#44403c", lineHeight: 1.55,
+              margin: 0, fontSize: 13, color: "var(--text-muted)", lineHeight: 1.55,
             }}>
               {b.text}
             </p>

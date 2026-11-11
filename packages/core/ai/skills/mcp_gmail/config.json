@@ -32,6 +32,7 @@
     "mcp__gmail__delete_label",
     "mcp__gmail__add_label",
     "mcp__gmail__remove_label",
+    "mcp__gmail__save_attachment_to_workspace",
     "mcp__gmail__download_attachment",
     "mcp__gmail__get_profile"
   ],

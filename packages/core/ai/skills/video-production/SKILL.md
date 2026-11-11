@@ -15,7 +15,7 @@ For every mode, retain the caller's authorization and the input identities separ
 
 Use `reuse` only when the caller explicitly authorizes delivery of that exact finished source unchanged. When it has a Knowledge Document, first read/probe that Document and verify its returned identity against `expected_source_sha256`; use `probe_media`, then `render_frame_samples(document_id=source_document_id, expected_source_sha256=..., output_dir=<new review-only project path>)` across `0..measured_duration`, read each returned frame, and call `analyze_audio(document_id=source_document_id, expected_source_sha256=...)` when audio analysis is required. When no Document exists, use the exact authorized attachment path only for tools that accept that attachment route; never invent a Document ID or hash. In particular, do not promise `analyze_audio` for `uploads/chat` attachment paths. If a required audio measurement has no supported route, record it as unavailable and report the exact missing evidence. Record line-level observations with timestamp, frame/reference receipt, what is visibly present, each readable subtitle/text line, and uncertainty. Do not claim a line is readable because a file name, matching hash, or source name suggests it; if sampling cannot establish a required line or its timing, report that missing evidence.
 
-For `reuse`, perform the available duration, format, source-identity, visual/text readability, audio, rights, factual-claim, destination-fit, and artifact checks. Preserve the original bytes and whole source range `0..measured_duration`; do not trim, transcode, burn subtitles, recompress, generate a replacement, or compose a new video. A `reuse` review may save a review record and extracted frames under a distinct output path, but it returns the original Document ID and observed SHA-256 when they exist, otherwise the original authorized attachment reference. It never skips a caller-required independent reviewer, normal platform authorization, or publication approval.
+For `reuse`, perform the available duration, format, source-identity, visual/text readability, audio, rights, factual-claim, destination-fit, and artifact checks. Preserve the original bytes and whole source range `0..measured_duration`; do not trim, transcode, burn subtitles, recompress, generate a replacement, or compose a new video. A `reuse` review may save a review record and extracted frames under a distinct output path, but it returns the original Document ID and observed SHA-256 when they exist, otherwise the original authorized attachment reference. It never skips independent review, normal platform authorization, or publication approval.
 
 Use `adapt` when a caller-authorized change needs an editable source/timeline, such as a cut, reframing, new captions, audio, graphics, or platform version. Use `generate` when new footage or audio is authorized. Both modes retain the existing CANVAS, editable-source, subtitle, composition, review, and approval requirements below. Do not downgrade an incomplete `adapt` or `generate` request to `reuse`; return its exact blocker instead.
 
@@ -139,15 +139,28 @@ For a long production that cannot finish in one invocation, reply with stage `pr
 
 ## 4. Assemble and refine (`adapt` and `generate` only)
 
-Read `references/production-and-edit.md`. Keep canvas shot IDs on assets, prompts, selected takes, source in/out, and timeline entries. Measure real narration timing and revise the canvas when shot timing changes. **Honor the edit route named in an existing canvas.** For a footage-led film whose canvas selects the native timeline, use Manor's `merge_videos`, `align_subtitles`, and `compose_video_timeline` with a complete Knowledge timeline JSON. Its registered `.video-edit.json` sidecar is the editable source; a flat merge alone is never the final deliverable. For a canvas selecting Video Edit, or for designed motion graphics, independently editable brand typography, and audio automation the native timeline cannot express, resolve and invoke built-in `video-edit` with the real canvas, completed assets, and edit decision list; that skill owns its separate review and approval gate. Do not silently render via the native composer when Video Edit review is blocked, and do not claim its render succeeded when the runtime fails.
+Read `references/production-and-edit.md`. Keep canvas shot IDs on assets, prompts, selected takes, source in/out, and timeline entries. Measure real narration timing and revise the canvas when shot timing changes. **Honor the edit route named in an existing canvas.** For a footage-led film whose canvas selects the native timeline, use Manor's `merge_videos`, `align_subtitles`, and `compose_video_timeline` with a complete Knowledge timeline JSON. Its registered `.video-edit.json` sidecar is the editable source; a flat merge alone is never the final deliverable. For a canvas selecting Video Edit, or for designed motion graphics, independently editable brand typography, and audio automation the native timeline cannot express, resolve and invoke built-in `video-edit` with the real canvas, completed assets, and edit decision list; that skill owns its own technical review and render approval gate. Do not silently render via the native composer when Video Edit review is blocked, and do not claim its render succeeded when the runtime fails.
 
 Apply the review-evidence rule in `references/production-and-edit.md` to all
 checks below. Keep measured results, sampled observations, and explicit human
 creative acceptance distinct. An unavailable playback tool alone must not
 repeatedly block the same unchanged deliverable whose creative result the user
 has explicitly accepted; retain the limitation and complete the available
-technical checks and any required independent review. Known defects and
-unresolved mandatory delivery requirements still block completion.
+technical checks and the independent review. Known defects and unresolved
+mandatory delivery requirements still block completion.
+
+Independent review always has an owner: the reviewer or review step the
+request, brief, or Workflow names, otherwise Manor AI. The `video_edit` review
+is a technical gate, not independent review. When a later Workflow step owns the
+review, leave it to that step without waiting for it. Otherwise, once the master
+and its sampled frames exist, call `delegate_to_agent` with agent `Manor AI`
+(find it with `search_tools` if it is not listed), giving it the brief, the exact
+Canvas path, the master Document ID, and the saved frame paths. It only reads,
+so it checks what already exists. Fix the real defects it reports in at most one
+revision, then deliver and list any remaining findings. Report its verdict as the
+independent-review state. If this invocation cannot call it, end your result with
+`independent-review state: pending Manor AI` and that same request, so the calling
+Agent asks it next. Its verdict does not replace the user's creative acceptance.
 
 Review in small batches. Immediately save each batch's actual observations,
 asset IDs/hashes, sampled times and remaining checks in the same project's
@@ -157,7 +170,7 @@ ledger once and inspect only missing, changed or contradictory evidence;
 evicted image attachments do not erase recorded observations. If repeating
 inventory and image reads produces no new finding or artifact, save the exact
 unresolved check and return a partial handoff instead of looping. This does
-not approve unchecked content or replace an independent review.
+not approve unchecked content or replace the independent review.
 
 Treat the measured end of the last spoken phrase as a hard timing constraint. A
 delivery duration shorter than the narration file is not acceptable merely

@@ -27,7 +27,7 @@ export interface StepGraphProps {
 
 const COMPLETED_STYLE = { border: "#34d399", bg: "#f1f6f3", dot: "#44895f", arrow: "#34d399" };
 const RUNNING_STYLE = { border: "#8aa9d1", bg: "#f3f6fa", dot: "#5f84bd", arrow: "#8aa9d1" };
-const PENDING_STYLE = { border: "#e7e5e4", bg: "#fafaf9", dot: "#a8a29e", arrow: "#e7e5e4" };
+const PENDING_STYLE = { border: "#e5e5ea", bg: "#fafafa", dot: "#aeaeb2", arrow: "#e5e5ea" };
 const FAILED_STYLE = { border: "#d18b86", bg: "#f8f0ef", dot: "#d65f59", arrow: "#d18b86" };
 const WAITING_STYLE = { border: "#ddbb63", bg: "#faf7ef", dot: "#cf9b44", arrow: "#ddbb63" };
 
@@ -244,7 +244,7 @@ export default function StepGraph({ steps, onStepClick, activeStepId, height: co
 
   if (steps.length === 0) {
     return (
-      <p style={{ fontSize: 13, color: "#a8a29e", margin: 0 }}>{t("component.step_graph.no_steps_yet")}</p>
+      <p style={{ fontSize: 13, color: "var(--text-muted)", margin: 0 }}>{t("component.step_graph.no_steps_yet")}</p>
     );
   }
 
@@ -297,7 +297,7 @@ export default function StepGraph({ steps, onStepClick, activeStepId, height: co
         borderRadius: isGoalVariant ? 14 : 16,
         background: isGoalVariant
           ? "linear-gradient(180deg, #ffffff 0%, #fbfdff 100%)"
-          : "linear-gradient(135deg, #fafaf9 0%, #f5f5f4 100%)",
+          : "linear-gradient(135deg, #fafafa 0%, #f5f5f7 100%)",
         border: isGoalVariant ? "1px solid rgba(214,211,209,0.86)" : "1px solid rgba(231,229,228,0.6)",
         boxShadow: isGoalVariant ? "inset 0 1px 0 rgba(255,255,255,0.9)" : undefined,
         cursor: isPanning ? "grabbing" : "grab",
@@ -326,7 +326,7 @@ export default function StepGraph({ steps, onStepClick, activeStepId, height: co
         position: "absolute", top: 12, right: 12, zIndex: 10,
         display: "flex", flexDirection: isGoalVariant ? "row" : "column", gap: 4,
         background: "rgba(255,255,255,0.9)", borderRadius: isGoalVariant ? 999 : 10,
-        border: "1px solid rgba(28,25,23,0.06)", padding: 4,
+        border: "0.5px solid rgba(29, 29, 31,0.06)", padding: 4,
         backdropFilter: "blur(8px)",
       }}>
         <CanvasButton onClick={zoomIn} title={t("component.step_graph.zoom_in")}>+</CanvasButton>
@@ -341,9 +341,9 @@ export default function StepGraph({ steps, onStepClick, activeStepId, height: co
       {/* Zoom indicator */}
       <div className="step-graph-zoom-indicator" style={{
         position: "absolute", bottom: 12, left: 12, zIndex: 10,
-        fontSize: 10, fontWeight: 600, color: "#a8a29e",
+        fontSize: 10, fontWeight: 600, color: "var(--text-faint)",
         background: "rgba(255,255,255,0.8)", padding: "3px 8px",
-        borderRadius: isGoalVariant ? 999 : 6, border: "1px solid rgba(28,25,23,0.06)",
+        borderRadius: isGoalVariant ? 999 : 6, border: "0.5px solid rgba(29, 29, 31,0.06)",
       }}>
         {Math.round(zoom * 100)}%
       </div>
@@ -367,7 +367,7 @@ export default function StepGraph({ steps, onStepClick, activeStepId, height: co
       >
         <defs>
           <marker id="arrow-head" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
-            <path d="M 0 0 L 10 5 L 0 10 z" fill="#d6d3d1" />
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#d1d1d6" />
           </marker>
           <marker id="arrow-head-active" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
             <path d="M 0 0 L 10 5 L 0 10 z" fill="#4f7d75" />
@@ -406,7 +406,7 @@ export default function StepGraph({ steps, onStepClick, activeStepId, height: co
               className={`step-graph-edge${isPending ? " step-graph-edge--pending" : ""}${isCompleted ? " step-graph-edge--completed" : ""}`}
               d={pathD}
               fill="none"
-              stroke={isPending ? "#e7e5e4" : e.color}
+              stroke={isPending ? "#e5e5ea" : e.color}
               strokeWidth={isGoalVariant ? (isCompleted ? 1.7 : 1.35) : (isCompleted ? 2 : 1.5)}
               strokeLinecap="round"
               strokeDasharray={isPending ? "4 6" : "none"}
@@ -432,8 +432,8 @@ export default function StepGraph({ steps, onStepClick, activeStepId, height: co
           const delay = e.from.col * 1.2 + i * 0.3;
           const isActive = e.isActive;
           const isCompleted = isCompletedStatus(e.from.step.status);
-          const particleColor = isActive ? "#5f928a" : isCompleted ? "#34d399" : "#a8a29e";
-          const glowColor = isActive ? "#abccc4" : isCompleted ? "#6ee7b7" : "#d6d3d1";
+          const particleColor = isActive ? "#5f928a" : isCompleted ? "#34d399" : "#aeaeb2";
+          const glowColor = isActive ? "#abccc4" : isCompleted ? "#6ee7b7" : "#d1d1d6";
           const speed = isActive ? 1.5 : isCompleted ? 2.5 : 3.5;
 
           return (
@@ -541,7 +541,7 @@ export default function StepGraph({ steps, onStepClick, activeStepId, height: co
                 className="step-graph-node-name"
                 x={nx + 38} y={ny + 22}
                 fontSize={11.5} fontWeight={700}
-                fill="#292524" dominantBaseline="middle"
+                fill="#2c2c2e" dominantBaseline="middle"
               >
                 {n.step.name.length > maxNameLength ? n.step.name.slice(0, maxNameLength) + "\u2026" : n.step.name}
               </text>
@@ -556,7 +556,7 @@ export default function StepGraph({ steps, onStepClick, activeStepId, height: co
                 className="step-graph-node-status"
                 x={nx + 48} y={ny + 42}
                 fontSize={10} fontWeight={500}
-                fill="#a8a29e" dominantBaseline="middle"
+                fill="#aeaeb2" dominantBaseline="middle"
               >
                 {displayStatus(n.step.status)}
               </text>
@@ -586,7 +586,7 @@ export default function StepGraph({ steps, onStepClick, activeStepId, height: co
               {/* Hover tooltip — full name */}
               {isHov && n.step.name.length > maxNameLength && (
                 <g>
-                  <rect x={nx + 8} y={ny + nodeH + 4} width={Math.min(n.step.name.length * 6.5 + 16, nodeW + 40)} height={22} rx={6} fill="#292524" opacity={0.92} />
+                  <rect x={nx + 8} y={ny + nodeH + 4} width={Math.min(n.step.name.length * 6.5 + 16, nodeW + 40)} height={22} rx={6} fill="#2c2c2e" opacity={0.92} />
                   <text x={nx + 16} y={ny + nodeH + 17} fontSize={10} fontWeight={500} fill="#fff" dominantBaseline="middle">
                     {n.step.name}
                   </text>
@@ -613,7 +613,7 @@ function CanvasButton({ onClick, title, children }: { onClick: () => void; title
         display: "flex", alignItems: "center", justifyContent: "center",
         border: "none", borderRadius: 6,
         background: "transparent",
-        color: "#78716c", fontSize: 16, fontWeight: 700,
+        color: "var(--text-muted)", fontSize: 16, fontWeight: 700,
         cursor: "pointer",
         transition: "background 0.15s",
       }}

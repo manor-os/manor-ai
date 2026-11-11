@@ -622,6 +622,8 @@ export interface Document {
   editor_recipe_name?: string | null;
   /** What the file is in one line (its generation prompt or media analysis), when its name may not say. */
   hint?: string | null;
+  /** Signed manor-media thumbnail, on browser list responses when the server issues one. */
+  thumbnail_url?: string | null;
   current_user_capabilities?: string[];
 }
 
@@ -736,7 +738,9 @@ export interface Workspace {
   kind?: string;
   operating_context?: string;
   primary_work?: string;
+  /** Partial on list items: only `app_view.open_as`. Full from workspaces.get(id). */
   operating_model?: Record<string, any>;
+  /** Partial on list items: only `access_mode` and `sandbox`. Full from workspaces.get(id). */
   settings?: Record<string, any>;
   longitude?: number;
   latitude?: number;
@@ -892,6 +896,8 @@ export interface TeamUsageTotals {
   active_seconds: number;
   active_users: number;
   active_now: number;
+  /** Credits in the window no member made (automations, client trials). */
+  unattributed_credits_used?: number;
 }
 
 export interface TeamActivityItem {

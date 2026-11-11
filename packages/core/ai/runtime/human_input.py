@@ -35,33 +35,20 @@ REQUEST_INPUT_TOOL_NAME = "request_input"
 # reported lookup happened. Shared by schema discovery and handler preflight.
 REQUEST_INPUT_JUSTIFICATION_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "description": (
-        "Explain why a person is needed and what you checked. Internal errors, "
-        "missing schemas, execution or file-write checks, and acceptance failures "
-        "belong to the agent. This rationale grants no permission."
-    ),
+    "description": "Explain the human dependency. Handle tool errors, file writes and validation yourself. No permission is granted.",
     "properties": {
         "kind": {
             "type": "string",
             "enum": ["human_fact", "human_decision", "human_material", "file_review", "authorization_setup"],
-            "description": (
-                "Choose a user-only fact, decision, or material; human review of "
-                "specific files; or connecting an external account through its "
-                "normal authorization flow (authorization_setup never asks for tool "
-                "access or Agent configuration). Internal recovery and execution "
-                "checks are not human decisions."
-            ),
+            "description": "authorization_setup is only for connecting an external account through its normal flow.",
         },
         "why_human_required": {
             "type": "string", "minLength": 1, "maxLength": 1200, "pattern": r"\S",
-            "description": "Why the agent cannot obtain this answer from authorized tools, records or existing context.",
+            "description": "Why authorized tools or context cannot answer.",
         },
         "attempted_resolution": {
             "type": "array", "minItems": 1, "maxItems": 6,
-            "description": (
-                "What you actually checked before interrupting. Reading the current user "
-                "request is enough for an explicit human preference; never invent tool calls."
-            ),
+            "description": "Actual checks, not invented calls. An explicit preference in the request counts.",
             "items": {
                 "type": "object", "additionalProperties": False,
                 "properties": {
@@ -76,10 +63,7 @@ REQUEST_INPUT_JUSTIFICATION_SCHEMA: dict[str, Any] = {
             # carousel plus its caption copy must fit in one review.
             "type": "array", "minItems": 1, "maxItems": 12,
             "items": {"type": "string", "minLength": 1, "maxLength": 2048, "pattern": r"\S"},
-            "description": (
-                "For file_review, cite exact existing paths or Document references for "
-                "human judgment. The agent verifies file writes. References grant no access."
-            ),
+            "description": "Exact existing paths or Document references for human judgment; grants no access.",
         },
     },
     "required": ["kind", "why_human_required", "attempted_resolution"],
@@ -322,14 +306,231 @@ _MAX_QUESTION_CHARS = 2000
 _MAX_CONTEXT_CHARS = 4000
 _MAX_OPTIONS = 12
 _MAX_FIELDS = 12
-#: ``file``: the person uploads or picks a Knowledge file; the answer is its
-#: file reference. Ordered: the tool schema lists them in this order.
-INPUT_FIELD_TYPES = ("boolean", "date", "file", "number", "select", "text", "textarea")
+#: Each field type is one form control; ``input_field_schema`` gives the JSON
+#: schema the shared form (web, phone) draws it from and the answer is checked
+#: against. ``file`` / ``photo`` / ``audio`` / ``signature`` answer with
+#: Document references; ``record`` / ``records`` with Workspace project ids of
+#: ``project_type``. Ordered: the tool schema lists them in this order.
+INPUT_FIELD_TYPES = (
+    "address", "audio", "boolean", "color", "date", "date_range", "datetime", "email", "file",
+    "line_items", "multi_select", "number", "phone", "photo", "rating", "record", "records",
+    "rich_text", "select", "signature", "tags", "text", "textarea",
+)
 _FIELD_TYPES = frozenset(INPUT_FIELD_TYPES)
+#: A line-item row's cells: words, numbers, or one of a few values.
+LINE_ITEM_COLUMN_TYPES = ("integer", "number", "select", "text")
+_MAX_LINE_ITEM_COLUMNS = 8
+_PROJECT_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_DOCUMENT_ITEMS: dict[str, Any] = {
+    "type": "object",
+    "required": ["document_id"],
+    "properties": {"document_id": {"type": "string", "minLength": 1}},
+}
 
 
 def _clean_text(value: Any, limit: int) -> str:
     return str(value or "").strip()[:limit]
+
+
+def _clean_options(raw: Any) -> list[str]:
+    if not isinstance(raw, (list, tuple)):
+        return []
+    options: list[str] = []
+    for item in raw:
+        label = _clean_text(item, 200)
+        if label and label not in options:
+            options.append(label)
+    return options[:_MAX_OPTIONS]
+
+
+def _line_item_columns(raw: Any) -> list[dict[str, Any]]:
+    columns: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw if isinstance(raw, (list, tuple)) else ():
+        if not isinstance(item, dict):
+            continue
+        name = _clean_text(item.get("name") or item.get("label"), 60)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        kind = _clean_text(item.get("type"), 20).lower() or "text"
+        column: dict[str, Any] = {
+            "name": name,
+            "label": _clean_text(item.get("label") or name, 120),
+            "type": kind if kind in LINE_ITEM_COLUMN_TYPES else "text",
+        }
+        if column["type"] == "select":
+            column["options"] = _clean_options(item.get("options"))
+            if not column["options"]:
+                column["type"] = "text"
+                del column["options"]
+        columns.append(column)
+        if len(columns) >= _MAX_LINE_ITEM_COLUMNS:
+            break
+    return columns
+
+
+def _documents_schema(**ui: Any) -> dict[str, Any]:
+    return {"type": "array", "items": deepcopy(_DOCUMENT_ITEMS), "x-ui": {"control": "documents", **ui}}
+
+
+def input_field_schema(field: dict[str, Any]) -> dict[str, Any]:
+    """The JSON schema of one normalized ``request_input`` field.
+
+    The same vocabulary as Workflow run inputs (``workflow_run_input_guidance``):
+    the form picks the control from ``format`` and ``x-ui.control``, and the
+    answer is validated against this schema.
+    """
+    kind = field.get("type") or "text"
+    options = field.get("options") or []
+    schema: dict[str, Any]
+    if kind == "textarea":
+        schema = {"type": "string", "x-ui": {"control": "textarea"}}
+    elif kind == "rich_text":
+        schema = {"type": "string", "x-ui": {"control": "rich_text"}}
+    elif kind == "number":
+        schema = {"type": "number"}
+    elif kind == "rating":
+        schema = {"type": "integer", "minimum": 1, "maximum": 5, "x-ui": {"control": "rating"}}
+    elif kind == "boolean":
+        schema = {"type": "boolean"}
+    elif kind == "date":
+        schema = {"type": "string", "format": "date"}
+    elif kind == "datetime":
+        schema = {"type": "string", "format": "date-time"}
+    elif kind == "date_range":
+        schema = {
+            "type": "object",
+            "properties": {
+                "start": {"type": "string", "format": "date"},
+                "end": {"type": "string", "format": "date"},
+            },
+            "required": ["start", "end"],
+            "additionalProperties": False,
+            "x-ui": {"control": "date_range"},
+        }
+    elif kind == "select":
+        schema = {"type": "string", "enum": list(options)}
+    elif kind == "multi_select":
+        schema = {"type": "array", "items": {"type": "string", "enum": list(options)}, "uniqueItems": True}
+    elif kind == "tags":
+        schema = {"type": "array", "items": {"type": "string", "minLength": 1}, "x-ui": {"control": "tags"}}
+    elif kind == "email":
+        schema = {"type": "string", "format": "email"}
+    elif kind == "phone":
+        schema = {"type": "string", "format": "phone"}
+    elif kind == "color":
+        schema = {"type": "string", "x-ui": {"control": "color"}}
+    elif kind == "address":
+        schema = {"type": "string", "x-ui": {"control": "address"}}
+    elif kind == "file":
+        schema = _documents_schema()
+    elif kind == "photo":
+        schema = _documents_schema(accept=["image"], capture="environment")
+    elif kind == "audio":
+        schema = _documents_schema(accept=["audio"], capture="user")
+    elif kind == "signature":
+        schema = {"type": "array", "items": deepcopy(_DOCUMENT_ITEMS), "maxItems": 1, "x-ui": {"control": "signature"}}
+    elif kind == "record":
+        schema = {"type": "string", "x-ui": {"control": "workflow_project_select", "project_type": field["project_type"]}}
+    elif kind == "records":
+        schema = {
+            "type": "array", "items": {"type": "string"}, "uniqueItems": True,
+            "x-ui": {"control": "workflow_project_select", "project_type": field["project_type"]},
+        }
+    elif kind == "line_items":
+        properties: dict[str, Any] = {}
+        for column in field.get("columns") or []:
+            cell: dict[str, Any] = {"title": column["label"]}
+            if column["type"] == "select":
+                cell.update({"type": "string", "enum": list(column.get("options") or [])})
+            else:
+                cell["type"] = {"text": "string"}.get(column["type"], column["type"])
+            properties[column["name"]] = cell
+        schema = {
+            "type": "array",
+            "items": {"type": "object", "properties": properties, "additionalProperties": False},
+            "x-ui": {"control": "line_items"},
+        }
+    else:
+        schema = {"type": "string"}
+    schema["title"] = field.get("label") or field.get("name") or ""
+    if field.get("description"):
+        schema["description"] = field["description"]
+    if field.get("placeholder"):
+        schema.setdefault("x-ui", {})["placeholder"] = field["placeholder"]
+    if field.get("required") and schema["type"] == "array":
+        # A required list is answered by at least one item.
+        schema["minItems"] = 1
+    return schema
+
+
+def input_fields_schema(fields: Any) -> dict[str, Any] | None:
+    """One object schema over a question's fields that carry a schema, or None."""
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+    for field in fields if isinstance(fields, (list, tuple)) else ():
+        if not isinstance(field, dict) or not isinstance(field.get("schema"), dict):
+            continue
+        name = str(field.get("name") or "")
+        if not name:
+            continue
+        properties[name] = field["schema"]
+        if field.get("required"):
+            required.append(name)
+    if not properties:
+        return None
+    return {"type": "object", "properties": properties, "required": required}
+
+
+def _blank(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, dict)):
+        return not value
+    return False
+
+
+def input_field_answer_errors(fields: Any, submitted: Any) -> dict[str, str]:
+    """Field name -> why the submitted value is refused, for fields declared with a schema.
+
+    Blank optional answers are absent (the form leaves them out). Legacy
+    questions whose fields carry no schema are not checked.
+    """
+    from packages.core.contracts.json_schema import SchemaContractValidatorFactory
+
+    schema = input_fields_schema(fields)
+    if schema is None:
+        return {}
+    values = {
+        key: value for key, value in (submitted if isinstance(submitted, dict) else {}).items()
+        if key in schema["properties"] and not _blank(value)
+    }
+    errors: dict[str, str] = {}
+    for key in schema["required"]:
+        if key not in values:
+            errors[key] = "This field is required."
+    for error in SchemaContractValidatorFactory.build({**schema, "required": []}).iter_errors(values):
+        path = [str(part) for part in error.absolute_path]
+        errors.setdefault(path[0] if path else "", error.message)
+    return errors
+
+
+def input_field_answer_text(value: Any) -> str:
+    """One answer value as a person reads it in the transcript."""
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, dict):
+        if set(value) >= {"start", "end"} and len(value) == 2:
+            return f"{value.get('start')} – {value.get('end')}"
+        if "document_id" in value:
+            return str(value.get("name") or value.get("document_id"))
+        return ", ".join(f"{key}: {input_field_answer_text(item)}" for key, item in value.items() if not _blank(item))
+    if isinstance(value, list):
+        return "; ".join(input_field_answer_text(item) for item in value if not _blank(item))
+    return "" if value is None else str(value).strip()
 
 
 def normalize_input_request(
@@ -339,13 +540,19 @@ def normalize_input_request(
     fields: Any = None,
     context: Any = None,
     justification: Any = None,
+    recommended: Any = None,
+    recommendation_reason: Any = None,
+    recommendation: Any = None,
     action_link: Any = None,
     action_to_take: Any = None,
 ) -> dict[str, Any]:
     """Shape a question, including historical payloads without justification.
 
-    New model calls validate the explicit justification before reaching this
-    compatibility normalizer; persisted questions/host-owned inputs stay readable.
+    New model calls validate the explicit justification and recommendation
+    before reaching this compatibility normalizer; persisted questions and
+    host-owned inputs stay readable. ``recommended`` /
+    ``recommendation_reason`` are the tool's arguments; ``recommendation`` is
+    an already-shaped one (a stored question being re-normalized).
 
     ``action_link`` / ``action_to_take`` say where in Manor the person acts
     before answering (a screen hand-over opens a live view). They
@@ -382,16 +589,41 @@ def normalize_input_request(
                 "type": field_type,
                 "required": bool(raw.get("required", True)),
             }
-            if field_type == "select" and isinstance(raw.get("options"), (list, tuple)):
-                entry["options"] = [
-                    _clean_text(item, 200) for item in raw["options"] if _clean_text(item, 200)
-                ][:_MAX_OPTIONS]
+            for key, limit in (("description", 400), ("placeholder", 200)):
+                if note := _clean_text(raw.get(key), limit):
+                    entry[key] = note
+            # A control that lacks what it needs falls back to one that works.
+            if field_type in {"select", "multi_select"}:
+                entry["options"] = _clean_options(raw.get("options"))
+                if not entry["options"]:
+                    del entry["options"]
+                    entry["type"] = "text" if field_type == "select" else "tags"
+            elif field_type in {"record", "records"}:
+                project_type = _clean_text(raw.get("project_type"), 64).lower()
+                if _PROJECT_TYPE_PATTERN.match(project_type):
+                    entry["project_type"] = project_type
+                else:
+                    entry["type"] = "text" if field_type == "record" else "textarea"
+            elif field_type == "line_items":
+                entry["columns"] = _line_item_columns(raw.get("columns"))
+                if not entry["columns"]:
+                    del entry["columns"]
+                    entry["type"] = "textarea"
+            entry["schema"] = input_field_schema(entry)
             normalized_fields.append(entry)
             if len(normalized_fields) >= _MAX_FIELDS:
                 break
+    if isinstance(recommendation, dict) and recommended is None:
+        recommended = recommendation.get("option")
+        recommendation_reason = recommendation.get("reason")
+    shaped_recommendation = _shape_recommendation(
+        recommended, recommendation_reason, normalized_options, has_fields=bool(normalized_fields),
+    )
     payload: dict[str, Any] = {"question": text}
     if normalized_options:
         payload["options"] = normalized_options
+    if shaped_recommendation is not None:
+        payload["recommendation"] = shaped_recommendation
     if normalized_fields:
         payload["fields"] = normalized_fields
     summary = _clean_text(context, _MAX_CONTEXT_CHARS)
@@ -406,6 +638,35 @@ def normalize_input_request(
         if step:
             payload["action_to_take"] = step
     return payload
+
+
+def _shape_recommendation(
+    recommended: Any, reason: Any, options: list[str], *, has_fields: bool,
+) -> dict[str, Any] | None:
+    """The question's one recommended answer, placed first among ``options``.
+
+    A recommended answer that is not one of the options becomes the first
+    option (the model named its best answer; the person picks it in one tap).
+    A question with neither options nor fields offers it as its single option;
+    the person can always answer in their own words instead. Mutates
+    ``options`` so the recommended answer leads.
+    """
+    from packages.core.services.decision_recommendation import MAX_REASON_CHARS
+
+    answer = _clean_text(recommended, 200)
+    if not answer:
+        return None
+    why = " ".join(str(reason or "").split())[:MAX_REASON_CHARS]
+    if answer in options:
+        options.remove(answer)
+        options.insert(0, answer)
+    elif options or not has_fields:
+        options.insert(0, answer)
+        del options[_MAX_OPTIONS:]
+    value: dict[str, Any] = {"option": answer, "reason": why or "This is the most likely answer."}
+    if not why:
+        value["reason_code"] = "most_likely"
+    return value
 
 
 def in_app_action_link(value: Any) -> str | None:
@@ -478,7 +739,13 @@ __all__ = [
     "REQUEST_INPUT_PLATFORM_FAULT_CODE",
     "REQUEST_INPUT_TOOL_GRANT_CODE",
     "REQUEST_INPUT_TOOL_NAME",
+    "INPUT_FIELD_TYPES",
+    "LINE_ITEM_COLUMN_TYPES",
     "human_input_answer_result",
+    "input_field_answer_errors",
+    "input_field_answer_text",
+    "input_field_schema",
+    "input_fields_schema",
     "runtime_answered_input_questions",
     "runtime_input_question_key",
     "runtime_request_input_refusal",

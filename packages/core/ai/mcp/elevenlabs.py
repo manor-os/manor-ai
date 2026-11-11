@@ -543,6 +543,7 @@ async def _save_audio_bytes(audio_bytes: bytes, filename_hint: str) -> tuple[Pat
             task_id=call_context.get("task_id"),
             workflow_run_id=call_context.get("workflow_run_id"),
             workflow_lineage_root_run_id=call_context.get("workflow_lineage_root_run_id"),
+            workflow_project_root=call_context.get("workflow_project_root"),
         )
         rel_dir = workspace_artifact_default_dir(base_dir, "audio") if base_dir else "audio"
         rel_path = f"{rel_dir}/{fname}"

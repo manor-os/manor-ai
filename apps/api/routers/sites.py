@@ -74,9 +74,11 @@ _PRIVATE_URL_FIELD_PARTS = _SENSITIVE_FIELD_PARTS + (
 # CSS/JS plus the cross-origin Manor Webchat embed. The API-wide CSP is
 # intentionally ``default-src 'none'`` and would otherwise make every
 # published website inert, so site documents opt into this website policy.
+# ``frame-ancestors`` is filled per deployment: only the Manor app may frame a
+# site (the chat's live preview); any other page is refused.
 _SITE_CONTENT_SECURITY_POLICY = (
     "default-src 'self' data: blob: http: https:; "
-    "base-uri 'self'; object-src 'none'; frame-ancestors 'none'; "
+    "base-uri 'self'; object-src 'none'; frame-ancestors {frame_ancestors}; "
     "form-action 'self' http: https:; "
     "script-src 'self' 'unsafe-inline' http: https:; "
     "style-src 'self' 'unsafe-inline' http: https:; "
@@ -87,11 +89,34 @@ _SITE_CONTENT_SECURITY_POLICY = (
     "connect-src 'self' http: https: ws: wss:"
 )
 _site_event_limiter = RateLimiter()
+
+
+def _manor_app_origins() -> list[str]:
+    """Origins of the Manor app (APP_URL, PUBLIC_BASE_URL) that may frame a site."""
+    settings = get_settings()
+    origins: list[str] = []
+    for raw in (settings.APP_URL, settings.PUBLIC_BASE_URL):
+        try:
+            parts = urlsplit(str(raw or "").strip())
+        except ValueError:
+            continue
+        if parts.scheme not in {"http", "https"} or not parts.hostname:
+            continue
+        origin = f"{parts.scheme}://{parts.netloc.rsplit('@', 1)[-1].lower()}"
+        if origin not in origins:
+            origins.append(origin)
+    return origins
+
+
+def _site_content_security_policy() -> str:
+    return _SITE_CONTENT_SECURITY_POLICY.format(
+        frame_ancestors=" ".join(_manor_app_origins()) or "'none'",
+    )
 logger = logging.getLogger(__name__)
 
 
 def _sites_domain() -> str:
-    return (get_settings().MANOR_SITES_DOMAIN or "").strip().lower()
+    return sp.sites_domain()
 
 
 # Without a sites domain there is no address to serve a site at: slug hosts
@@ -437,7 +462,7 @@ async def record_site_event(
             **properties,
             "site_id": site.id,
             "site_name": site.name,
-            "site_url": _site_url(site),
+            "site_url": sp.site_public_url(site),
             "site_path": safe_path or "",
             "site_action": action,
         }
@@ -531,7 +556,7 @@ async def serve_site(path: str, request: Request, db: AsyncSession = Depends(get
         "X-Content-Type-Options": "nosniff",
     }
     if is_html:
-        headers["Content-Security-Policy"] = _SITE_CONTENT_SECURITY_POLICY
+        headers["Content-Security-Policy"] = _site_content_security_policy()
         headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         with open(full, "rb") as html_file:
             html = html_file.read().decode("utf-8", errors="replace")
@@ -568,13 +593,6 @@ async def tls_check(domain: str = Query(...), db: AsyncSession = Depends(get_db)
 # ── Management (auth) ────────────────────────────────────────────────────────
 
 
-def _site_url(site: Site) -> str:
-    if site.custom_domain and site.domain_status == "active":
-        return f"https://{site.custom_domain}"
-    domain = _sites_domain()
-    return f"https://{site.slug}.{domain}" if domain else ""
-
-
 def _site_payload(site: Site) -> dict:
     domain = _sites_domain()
     connections = dict(site.connections or {})
@@ -584,8 +602,8 @@ def _site_payload(site: Site) -> dict:
         "slug": site.slug,
         "status": site.status,
         "revision": site.revision,
-        "url": _site_url(site),
-        "platform_url": f"https://{site.slug}.{domain}" if domain else "",
+        "url": sp.site_public_url(site),
+        "platform_url": sp.site_platform_url(site),
         "sites_domain": domain,
         "custom_domain": site.custom_domain,
         "domain_status": site.domain_status,

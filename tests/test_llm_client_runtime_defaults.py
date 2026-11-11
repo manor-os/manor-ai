@@ -831,7 +831,7 @@ async def test_custom_model_probe_checks_tool_call_shape(monkeypatch) -> None:
 
     monkeypatch.setattr(auth.httpx, "AsyncClient", FakeClient)
 
-    provider, latency_ms = await auth._probe_custom_model(
+    provider, latency_ms, _note = await auth._probe_custom_model(
         "primary",
         "gpt-5.5",
         "sk-test",
@@ -917,7 +917,7 @@ async def test_custom_model_probe_accepts_anthropic_response_shape(monkeypatch) 
 
     monkeypatch.setattr(auth.httpx, "AsyncClient", FakeClient)
 
-    provider, latency_ms = await auth._probe_custom_model(
+    provider, latency_ms, _note = await auth._probe_custom_model(
         "primary",
         "claude-sonnet-4-5",
         "sk-ant-test",
@@ -960,7 +960,7 @@ async def test_kimi_byok_probe_uses_native_adapter(monkeypatch) -> None:
 
     monkeypatch.setattr(auth.httpx, "AsyncClient", FakeClient)
 
-    provider, latency_ms = await auth._probe_custom_model(
+    provider, latency_ms, _note = await auth._probe_custom_model(
         "primary",
         "moonshotai/kimi-k3",
         "sk-" + "m" * 32,

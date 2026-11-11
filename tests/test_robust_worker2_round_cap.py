@@ -89,7 +89,8 @@ def test_chat_surface_subagents_share_the_one_round_cap():
         )
     )
     specs = {spec.name: spec.max_steps for spec in runtime_subagent_specs_from_envelope(workspace)}
-    assert specs == {"workspace_strategist": 200, "workspace_app_designer": 200}
+    assert specs == {"workspace_strategist": 200, **{f"workspace_{part}_designer": 200 for part in (
+        "app", "workflow", "agents", "knowledge", "automations")}}
 
 
 def test_nested_plan_child_uses_plan_cap_and_chat_uses_general_bound():

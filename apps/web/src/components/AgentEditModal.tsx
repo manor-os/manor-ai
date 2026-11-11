@@ -74,7 +74,7 @@ function GeneratedAgentReviewCard({ agent }: { agent: Agent }) {
           <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
             <div
               style={{
-                color: "#292524",
+                color: "var(--text-strong)",
                 fontSize: 16,
                 fontWeight: 800,
                 overflow: "hidden",
@@ -100,7 +100,7 @@ function GeneratedAgentReviewCard({ agent }: { agent: Agent }) {
             </span>
           </div>
           {description && (
-            <p style={{ margin: "6px 0 0", color: "#57534e", fontSize: 13, lineHeight: 1.55 }}>
+            <p style={{ margin: "6px 0 0", color: "var(--text-muted)", fontSize: 13, lineHeight: 1.55 }}>
               {description}
             </p>
           )}
@@ -109,15 +109,15 @@ function GeneratedAgentReviewCard({ agent }: { agent: Agent }) {
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
         <div style={{ borderRadius: 10, background: "#f7f6f3", padding: "9px 10px" }}>
-          <div style={{ color: "#a8a29e", fontSize: 10, fontWeight: 800, textTransform: "uppercase" }}>
+          <div style={{ color: "var(--text-muted)", fontSize: 10, fontWeight: 800, }}>
             {t("page.agent_form.ai_preview_category")}
           </div>
-          <div style={{ marginTop: 3, color: "#44403c", fontSize: 12, fontWeight: 700 }}>
+          <div style={{ marginTop: 3, color: "var(--text-default)", fontSize: 12, fontWeight: 700 }}>
             {displayAgentCategory(agent.category)}
           </div>
         </div>
         <div style={{ borderRadius: 10, background: "#f7f6f3", padding: "9px 10px" }}>
-          <div style={{ color: "#a8a29e", fontSize: 10, fontWeight: 800, textTransform: "uppercase" }}>
+          <div style={{ color: "var(--text-muted)", fontSize: 10, fontWeight: 800, }}>
             {t("page.agent_form.ai_preview_tags")}
           </div>
           <div
@@ -135,9 +135,9 @@ function GeneratedAgentReviewCard({ agent }: { agent: Agent }) {
                   key={tag}
                   style={{
                     borderRadius: 999,
-                    background: "#fff",
-                    border: "1px solid #e7e5e4",
-                    color: "#57534e",
+                    background: "var(--surface-panel)",
+                    border: "0.5px solid #e5e5ea",
+                    color: "var(--text-muted)",
                     fontSize: 11,
                     fontWeight: 700,
                     padding: "2px 6px",
@@ -147,7 +147,7 @@ function GeneratedAgentReviewCard({ agent }: { agent: Agent }) {
                 </span>
               ))
             ) : (
-              <span style={{ color: "#78716c", fontSize: 12 }}>
+              <span style={{ color: "var(--text-muted)", fontSize: 12 }}>
                 {t("page.agent_form.ai_preview_no_tags")}
               </span>
             )}
@@ -157,7 +157,7 @@ function GeneratedAgentReviewCard({ agent }: { agent: Agent }) {
 
       {systemPrompt && (
         <div>
-          <div style={{ color: "#a8a29e", fontSize: 10, fontWeight: 800, textTransform: "uppercase", marginBottom: 6 }}>
+          <div style={{ color: "var(--text-muted)", fontSize: 10, fontWeight: 800, marginBottom: 6 }}>
             {t("page.agent_form.ai_preview_prompt")}
           </div>
           <div
@@ -167,7 +167,7 @@ function GeneratedAgentReviewCard({ agent }: { agent: Agent }) {
               borderRadius: 10,
               border: "1px solid #efede8",
               background: "#fffdfa",
-              color: "#44403c",
+              color: "var(--text-muted)",
               fontSize: 12,
               lineHeight: 1.55,
               padding: "9px 10px",
@@ -1013,7 +1013,7 @@ export default function AgentEditModal() {
             <div className="mb-3 flex items-start justify-between gap-4">
               <div className="min-w-0">
                 <div className="text-[13px] font-semibold text-stone-900">
-                  Run method
+                  {t("ui.run_method")}
                 </div>
                 <p className="mt-1 text-xs leading-5 text-stone-500">
                   This describes where the agent runs. HTTPS endpoints are
@@ -1088,7 +1088,7 @@ export default function AgentEditModal() {
               </button>
             </div>
             <div className="mb-2 flex flex-wrap items-center gap-1.5">
-              <span className="mr-1 text-[10px] font-bold uppercase tracking-wide text-stone-400">
+              <span className="mr-1 text-[10px] font-bold text-stone-400">
                 {t("page.agents.insert")}
               </span>
               {PROMPT_VARIABLES.map((v) => (
@@ -1104,7 +1104,7 @@ export default function AgentEditModal() {
                     )
                   }
                   className="rounded-md border border-stone-200 bg-stone-50 px-2 py-0.5 text-[11px] font-medium text-stone-700 hover:bg-white"
-                  style={{ fontFamily: "monospace" }}
+                  style={{ fontFamily: "var(--font-mono)" }}
                 >
                   {v}
                 </button>
@@ -1120,7 +1120,7 @@ export default function AgentEditModal() {
               placeholder={t("page.agents.you_are_a_helpful_assistant")}
               className="manor-input"
               style={{
-                fontFamily: "monospace",
+                fontFamily: "var(--font-mono)",
                 fontSize: 13,
                 lineHeight: 1.5,
                 resize: "vertical",
@@ -1134,7 +1134,7 @@ export default function AgentEditModal() {
             <div className="mb-3 flex items-start justify-between gap-3">
               <div className="min-w-0">
                 <div className="text-[13px] font-semibold text-stone-900">
-                  Capabilities
+                  {t("ui.capabilities")}
                 </div>
                 <p className="mt-1 text-xs leading-5 text-stone-500">
                   Choose the reusable skills and runtime actions this agent can use.
@@ -1148,12 +1148,12 @@ export default function AgentEditModal() {
               {[
                 {
                   key: "skills" as const,
-                  label: "Skills",
+                  label: t("ui.skills"),
                   count: selectedSkillCount,
                 },
                 {
                   key: "tools" as const,
-                  label: "Tools",
+                  label: t("ui.tools"),
                   count: selectedRuntimeToolCount,
                 },
                 {
@@ -1270,7 +1270,7 @@ export default function AgentEditModal() {
               <Input
                 value={toolSearch}
                 onChange={(e) => setToolSearch(e.target.value)}
-                placeholder="Search runtime tools"
+                placeholder={t("ui.search_runtime_tools")}
               />
               <div className="mt-2 flex items-center justify-between text-xs text-stone-500">
                 <span>
@@ -1329,12 +1329,12 @@ export default function AgentEditModal() {
                             </div>
                             <div className="flex items-center gap-1.5">
                               {tool.category ? (
-                                <span className="text-[10px] uppercase tracking-wide text-stone-500 bg-stone-100 px-2 py-0.5 rounded">
+                                <span className="text-[10px] text-stone-500 bg-stone-100 px-2 py-0.5 rounded">
                                   {displayAgentCategory(tool.category)}
                                 </span>
                               ) : null}
                               {inactive ? (
-                                <span className="text-[10px] uppercase tracking-wide text-stone-500 bg-stone-100 px-2 py-0.5 rounded">
+                                <span className="text-[10px] text-stone-500 bg-stone-100 px-2 py-0.5 rounded">
                                   {t("page.agents.inactive")}
                                 </span>
                               ) : null}
@@ -1364,26 +1364,26 @@ export default function AgentEditModal() {
               <div>
                 <div className="flex items-center justify-between gap-3">
                   <div className="min-w-0">
-                    <div className="text-[13px] font-semibold text-stone-900">MCP integrations</div>
+                    <div className="text-[13px] font-semibold text-stone-900">{t("ui.mcp_integrations")}</div>
                     <p className="mt-1 text-xs leading-5 text-stone-500">
                       Bind external actions and verify readiness. {selectedMcpActionCount}/{mcpActionCount} actions selected.
                     </p>
                   </div>
                   <Button variant="outline" size="sm" onClick={() => navigate("/integrations")}>
-                    Open Integrations
+                    {t("ui.open_integrations")}
                   </Button>
                 </div>
                 <Input
                   value={mcpSearch}
                   onChange={(e) => setMcpSearch(e.target.value)}
-                  placeholder="Search MCP integrations or actions"
+                  placeholder={t("ui.search_mcp_integrations_or_actions")}
                   className="mt-3"
                 />
                 <div className="mt-2 max-h-[24rem] overflow-y-auto rounded-xl border border-stone-200 bg-white divide-y divide-stone-100">
                   {!mcpServerStatus ? (
-                    <div className="p-3 text-xs text-stone-400">Loading MCP integrations...</div>
+                    <div className="p-3 text-xs text-stone-400">{t("ui.loading_mcp_integrations")}</div>
                   ) : filteredMcpServers.length === 0 ? (
-                    <div className="p-3 text-xs text-stone-400">No MCP integrations match this search.</div>
+                    <div className="p-3 text-xs text-stone-400">{t("ui.no_mcp_integrations_match_this_search")}</div>
                   ) : (
                     filteredMcpServers.map((server: any) => {
                       const tools = mcpToolsByServer.get(server.server_key) || [];

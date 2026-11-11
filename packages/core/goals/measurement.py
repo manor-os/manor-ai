@@ -466,10 +466,14 @@ async def _maybe_emit_events(
         return
 
     try:
+        from packages.core.attention.delivery import delivery_enabled
+
         async with async_session() as db:
             goal = (await db.execute(
                 select(Goal).where(Goal.id == goal_id)
             )).scalar_one_or_none()
+            # With attention delivery on, goal_off_pace tells a worse pace.
+            off_pace_told_elsewhere = goal is not None and await delivery_enabled(db, goal.entity_id)
         if goal is None:
             return
         entity_id = goal.entity_id
@@ -481,19 +485,14 @@ async def _maybe_emit_events(
             )
             return
 
-        if prev_pace != new_pace and new_pace in ("at_risk", "behind", "ahead"):
+        # Only a change is news: an unchanged pace says nothing the last
+        # message did not, however often the goal is measured.
+        off_pace = new_pace in ("at_risk", "behind")
+        if prev_pace != new_pace and (new_pace == "ahead" or (off_pace and not off_pace_told_elsewhere)):
             await chat_notify.notify_goal_pace_changed(
                 entity_id=entity_id, workspace_id=workspace_id,
                 goal_id=goal_id, metric_key=metric_key, value=value,
                 prev_pace=prev_pace, new_pace=new_pace,
-            )
-        else:
-            # Quiet tick — notifier filters to only post when pace is
-            # interesting, so most measurements stay invisible in chat.
-            await chat_notify.notify_goal_measured(
-                entity_id=entity_id, workspace_id=workspace_id,
-                goal_id=goal_id, metric_key=metric_key, value=value,
-                pace=new_pace,
             )
     except Exception:
         logger.debug("goal event chat emission failed", exc_info=True)

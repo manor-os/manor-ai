@@ -10,10 +10,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime
 from typing import Any, AsyncGenerator, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
@@ -21,7 +22,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
+from packages.core.ai.tools.workspace_arch_tools import PENDING_QUESTION_FIELD
 from packages.core.constants.blueprints import BlueprintStatus
+from packages.core.constants.workspace_drafts import STAFF_REQUEST_TEXT_FIELD
 from packages.core.database import async_session, get_db
 from packages.core.models.blueprint import WorkspaceBlueprint
 from packages.core.models.user import User
@@ -34,7 +37,7 @@ from packages.core.services.plan_gate import WorkspacePlanLimitError
 from packages.core.services.sse_events import format_sse
 from packages.core.services.workspace_draft_sources import strip_source_text
 from apps.api.deps import enforce_plan_resource, get_current_user, require_plan
-from apps.api.streaming_concurrency import acquire_chat_stream_lease
+from apps.api.streaming_concurrency import LeasedStreamingResponse, acquire_chat_stream_lease
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +45,32 @@ logger = logging.getLogger(__name__)
 _sse = format_sse
 
 _DRAFT_STREAM_KEEPALIVE_SECONDS = 15.0
+# An Architect turn that sends nothing but keepalives for this long is stuck
+# (capability matching is bounded well below it; a design wave has its own
+# longer bound and reports progress meanwhile): stop it and free its chat stream
+# slot. Its saved request runs it again, so the client is told it continues.
+# Longer than one model round that streams only tool-call arguments, which sends
+# no events either.
+_DRAFT_TURN_STALL_SECONDS = 420.0
+# A turn waits for another live turn only this far into the stall window, so a
+# stall always finds this turn's message saved.
+_DRAFT_TURN_STALL_CLAIM_MARGIN_SECONDS = 60.0
+
+
+def _draft_turn_stall_seconds() -> float:
+    try:
+        seconds = float(os.getenv("WORKSPACE_DRAFT_STREAM_STALL_SECONDS") or _DRAFT_TURN_STALL_SECONDS)
+    except ValueError:
+        seconds = _DRAFT_TURN_STALL_SECONDS
+    return seconds if seconds > 0 else _DRAFT_TURN_STALL_SECONDS
+
+
+def _is_turn_progress(frame: str) -> bool:
+    return not frame.startswith("event: keepalive\n")
+
+
+def _draft_turn_continuing_frame() -> str:
+    return _sse("continuing", {"working": True})
 
 
 class _HiddenBlockTokenFilter:
@@ -126,12 +155,20 @@ class DraftResponse(BaseModel):
     messages: list[dict[str, Any]] = []
     missing: list[str] = []
     ready: bool = False
+    # An Architect turn is running, or one that lost its process is being run
+    # again; its reply and readiness land when it ends. False with a user
+    # message last: that turn ended without a reply (it was lost too long ago
+    # or kept failing), and the user's next message continues the conversation.
+    working: bool = False
     suggested_blueprint: Optional[BlueprintSuggestionResponse] = None
     applied_blueprint_id: Optional[str] = None
     finalized_workspace_id: Optional[str] = None
     finalized_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # Each part of a team build (agents, knowledge, workflows, automations,
+    # app): pending, candidate, accepted, skipped or lead. Empty without one.
+    build_progress: dict[str, str] = {}
 
 
 class DraftTurnResponse(BaseModel):
@@ -189,6 +226,21 @@ class FinalizeDraftResponse(BaseModel):
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
+def _draft_busy(exc: Exception) -> HTTPException:
+    retry = draft_service.DRAFT_BUSY_RETRY_SECONDS
+    return HTTPException(
+        409,
+        detail={"code": "draft_busy", "message": str(exc), "retry_after_seconds": retry},
+        headers={"Retry-After": str(retry)},
+    )
+
+
+def _is_mcp_client(request: Request) -> bool:
+    """The caller is an agent on Manor's MCP tools (its token's ``act`` claim)."""
+    claims = getattr(request.state, "auth_claims", None) or {}
+    return str((claims.get("act") or {}).get("sub") or "").startswith("mcp:")
+
+
 async def _hydrate_response(
     db: AsyncSession, draft: WorkspaceDraft,
     *, blueprints: dict[str, WorkspaceBlueprint] | None = None,
@@ -230,7 +282,11 @@ async def _hydrate_response(
         elif role == "assistant":
             if not stripped:
                 continue
-            visible_messages.append({"role": "assistant", "content": stripped})
+            reply: dict[str, Any] = {"role": "assistant", "content": stripped}
+            # The architect's question rides on its reply as answer buttons.
+            if isinstance(m.get("question"), dict):
+                reply["question"] = m["question"]
+            visible_messages.append(reply)
         # silently skip any system/tool messages persisted for context
 
     return DraftResponse(
@@ -240,18 +296,32 @@ async def _hydrate_response(
         status=draft.status,
         fields=strip_source_text({
             key: value for key, value in (draft.fields or {}).items()
-            if key not in {"_blueprint_source_payload", draft_service.TURN_CLAIM_FIELD}
+            if key not in {
+                "_blueprint_source_payload", draft_service.TURN_CLAIM_FIELD,
+                draft_service.TURN_REQUEST_FIELD, PENDING_QUESTION_FIELD, STAFF_REQUEST_TEXT_FIELD,
+            }
         }),
         messages=visible_messages,
         missing=list(draft.missing or []),
         ready=bool(draft.ready),
+        working=draft_service.turn_working(draft),
         suggested_blueprint=suggestion,
         applied_blueprint_id=draft.applied_blueprint_id,
         finalized_workspace_id=draft.finalized_workspace_id,
         finalized_at=draft.finalized_at,
         created_at=draft.created_at,
         updated_at=getattr(draft, "updated_at", None),
+        build_progress=_build_progress(draft.fields or {}),
     )
+
+
+def _build_progress(fields: dict[str, Any]) -> dict[str, str]:
+    from packages.core.services.workspace_build_spec import build_spec
+
+    spec = build_spec(fields)
+    if spec is None or spec.get("mode") != "team":
+        return {}
+    return {str(part): str(state) for part, state in (spec.get("progress") or {}).items()}
 
 
 def _strip_hidden_blocks(text: str) -> str:
@@ -276,6 +346,7 @@ def _strip_hidden_blocks(text: str) -> str:
 @router.post("", response_model=DraftTurnResponse, status_code=201)
 async def create_draft(
     req: StartDraftRequest,
+    request: Request,
     _gate=Depends(require_plan("workspaces")),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -287,14 +358,38 @@ async def create_draft(
     chat for ten minutes only to be blocked at finalize. The frontend
     catches 402 and renders a plan-limit overlay with the exact
     current/limit numbers from the gate's structured detail payload.
+
+    Like ``/stream``, the shell is committed first and the turn holds its
+    claim, not a transaction, so other requests see the draft as busy (409)
+    rather than waiting on its row lock. A caller-chosen ``draft_id`` makes
+    the call retryable: a finished opening turn is returned, not re-run.
     """
-    reply, draft = await draft_service.start_draft(
-        db,
+    draft_id = await _persist_stream_draft_shell(
         entity_id=user.entity_id,
         user_id=user.id,
         initial_brief=req.initial_brief,
+        draft_id=req.draft_id,
         document_ids=req.document_ids,
     )
+    opening_message = (
+        await _resume_stream_draft_shell(entity_id=user.entity_id, user_id=user.id, draft_id=draft_id)
+        if req.draft_id else draft_service.opening_user_message(req.initial_brief)
+    )
+    try:
+        reply, draft = await draft_service.process_draft_message(
+            db,
+            draft_id=draft_id,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            user_message=opening_message,
+            dedupe_opening=True,
+            claim_wait_seconds=0,
+            mcp_client=_is_mcp_client(request),
+        )
+    except draft_service.WorkspaceDraftBusyError as exc:
+        raise _draft_busy(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     await db.commit()
     return DraftTurnResponse(reply=reply, draft=await _hydrate_response(db, draft))
 
@@ -309,7 +404,10 @@ async def create_draft(
 #   start    {draft_id, status}
 #   token    {content}            -- one or more deltas of assistant text
 #   keepalive {draft_id}           -- keeps quiet tool phases connected
+#   tool_progress {step}          -- a long tool (a design wave) is still going
 #   done     {reply, draft}       -- the full final reply + hydrated draft
+#   continuing {working}          -- this stream ends, the turn does not: follow
+#                                    the draft until ``working`` is false
 #   error    {message}
 
 async def _stream_turn(
@@ -362,6 +460,8 @@ async def _stream_turn(
         elif event_name == "turn_meta":
             # Tokens / duration / rounds for the just-completed turn.
             await queue.put(("turn_meta", payload))
+        elif event_name == "tool_progress":
+            await queue.put(("tool_progress", {"step": tool_step["i"]}))
 
     def on_tool_start(name: str, args: dict) -> None:
         tool_step["i"] += 1
@@ -410,6 +510,10 @@ async def _stream_turn(
                     on_tool_end=on_tool_end,
                     dedupe_opening=mode == "create",
                     document_ids=document_ids,
+                    claim_wait_seconds=min(
+                        draft_service.TURN_CLAIM_WAIT_SECONDS,
+                        max(0.0, _draft_turn_stall_seconds() - _DRAFT_TURN_STALL_CLAIM_MARGIN_SECONDS),
+                    ),
                 )
                 await db.commit()
                 hydrated = await _hydrate_response(db, draft)
@@ -423,12 +527,22 @@ async def _stream_turn(
                     {"reply": visible_reply, "draft": hydrated.model_dump(mode="json")},
                 ))
         except ValueError as exc:
-            await queue.put(("error", {"message": str(exc)}))
+            await queue.put(await turn_ended_event(str(exc)))
         except Exception as exc:  # noqa: BLE001
             logger.exception("workspace draft stream failed")
-            await queue.put(("error", {"message": f"Internal error: {exc}"}))
+            await queue.put(await turn_ended_event(f"Internal error: {exc}"))
         finally:
             await queue.put(DONE)
+
+    async def turn_ended_event(message: str) -> tuple[str, dict]:
+        """A failed turn whose saved message is run again is not over for the person."""
+        try:
+            async with async_session() as db:
+                if await draft_service.turn_continues(db, draft_id=draft_id, user_message=user_message):
+                    return ("continuing", {"working": True})
+        except Exception:  # noqa: BLE001 - the turn's own failure is what to report
+            logger.warning("Could not check draft %s for a continuing turn", draft_id, exc_info=True)
+        return ("error", {"message": message})
 
     # The shell is already committed before this generator is created. Emit
     # its exact recovery ID before acquiring another database connection, so
@@ -476,13 +590,25 @@ async def _workspace_draft_streaming_response(
     source: AsyncGenerator[str, None],
     *,
     status_code: int = 200,
+    architect_turn: bool = False,
 ) -> StreamingResponse:
-    """Release the request transaction before a long-lived SSE response."""
+    """Release the request transaction before a long-lived SSE response.
+
+    An Architect turn is stopped once it makes no progress for the stall
+    window: closing its stream cancels the turn, the recovery sweep runs its
+    saved request again, and a ``continuing`` frame sends the client to follow
+    the draft.
+    """
     try:
         await db.commit()
         await db.close()
-        return StreamingResponse(
-            lease.wrap(source),
+        watchdog = {
+            "stall_timeout_seconds": _draft_turn_stall_seconds(),
+            "is_progress": _is_turn_progress,
+            "stalled_chunk": _draft_turn_continuing_frame,
+        } if architect_turn else {}
+        return LeasedStreamingResponse(
+            lease.wrap(source, **watchdog),
             status_code=status_code,
             media_type="text/event-stream",
             headers=_SSE_HEADERS,
@@ -636,7 +762,19 @@ async def create_draft_stream(
         lease,
         stream,
         status_code=201,
+        architect_turn=True,
     )
+
+
+@router.get("/recommendations")
+async def workspace_recommendations(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Workspaces worth creating for this person; a stale result refreshes in the background."""
+    from packages.core.services.workspace_recommendations import read_workspace_recommendations
+
+    return await read_workspace_recommendations(db, user)
 
 
 @router.get("", response_model=list[DraftResponse])
@@ -698,6 +836,7 @@ async def get_one_draft(
 async def post_draft_message(
     draft_id: str,
     req: DraftMessageRequest,
+    request: Request,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -712,7 +851,13 @@ async def post_draft_message(
             user_id=user.id,
             user_message=req.message,
             document_ids=req.document_ids,
+            # A synchronous caller is told the draft is busy instead of
+            # waiting out another turn before running its own.
+            claim_wait_seconds=0,
+            mcp_client=_is_mcp_client(request),
         )
+    except draft_service.WorkspaceDraftBusyError as exc:
+        raise _draft_busy(exc) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     await db.commit()
@@ -741,6 +886,7 @@ async def post_draft_message_stream(
             mode="message",
             document_ids=req.document_ids,
         ),
+        architect_turn=True,
     )
 
 
@@ -763,6 +909,8 @@ async def apply_blueprint_to_draft(
     except PermissionError as exc:
         # Paid blueprint without a completed purchase.
         raise HTTPException(402, str(exc))
+    except draft_service.WorkspaceDraftBusyError as exc:
+        raise _draft_busy(exc) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     await db.commit()
@@ -797,9 +945,12 @@ async def update_draft_fields(
             for key, value in selections.items()
         ):
             raise HTTPException(400, "Blueprint channel selections must map keys to account IDs")
-    draft = await draft_service.get_draft(
-        db, draft_id, user.entity_id, user.id, for_update=True,
-    )
+    try:
+        draft = await draft_service.get_draft(
+            db, draft_id, user.entity_id, user.id, for_update=True,
+        )
+    except draft_service.WorkspaceDraftBusyError as exc:
+        raise _draft_busy(exc) from exc
     if not draft:
         raise HTTPException(404, "Draft not found")
     if draft.status not in {"active", "ready"}:
@@ -842,6 +993,8 @@ async def finalize(
         # lint-derived readiness correction before the HTTP error rolls back.
         await db.commit()
         raise HTTPException(400, str(exc)) from exc
+    except draft_service.WorkspaceDraftBusyError as exc:
+        raise _draft_busy(exc) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     await db.commit()
@@ -1059,12 +1212,15 @@ async def delete_draft(
     db: AsyncSession = Depends(get_db),
 ):
     """Mark a draft abandoned. Finalized drafts cannot be abandoned."""
-    ok = await draft_service.abandon_draft(
-        db,
-        draft_id=draft_id,
-        entity_id=user.entity_id,
-        user_id=user.id,
-    )
+    try:
+        ok = await draft_service.abandon_draft(
+            db,
+            draft_id=draft_id,
+            entity_id=user.entity_id,
+            user_id=user.id,
+        )
+    except draft_service.WorkspaceDraftBusyError as exc:
+        raise _draft_busy(exc) from exc
     if not ok:
         raise HTTPException(404, "Draft not found or already finalized")
     await db.commit()

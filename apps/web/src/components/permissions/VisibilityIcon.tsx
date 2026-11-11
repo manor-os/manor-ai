@@ -21,7 +21,7 @@ const VISIBILITY_CONFIG: Record<
 > = {
   private: {
     Icon: IconLock,
-    color: "#78716c",
+    color: "var(--text-muted)",
     titleKey: "permissions.visibility.private.tooltip",
   },
   workspace: {

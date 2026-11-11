@@ -135,6 +135,7 @@ def test_loop_keeps_the_system_prompt_identical_across_rounds_and_never_stores_t
         system_prompt="stable system", user_message="find it",
         tools=[{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
         tool_executor=execute, max_rounds=3, turn_context="memories picked for this message",
+        answer_reminder="REPLY-PREFERENCES",
     ))
 
     assert sent[0][0]["content"] == sent[1][0]["content"]
@@ -145,6 +146,10 @@ def test_loop_keeps_the_system_prompt_identical_across_rounds_and_never_stores_t
     # After a tool call the final-answer marker joins the turn context, not the system prompt.
     assert "Final Response Stream Marker" in next(m for m in sent[1] if runtime_is_turn_context_message(m))["content"]
     assert not any(runtime_is_turn_context_message(m) for m in result.messages)
+    # The speaker's preferences follow the tool result, so the prefix before it still matches.
+    assert not any("REPLY-PREFERENCES" in str(m.get("content")) for m in sent[0])
+    assert "REPLY-PREFERENCES" in sent[1][-1]["content"]
+    assert not any("REPLY-PREFERENCES" in str(m.get("content")) for m in result.messages)
 
 
 @pytest.mark.parametrize("model,stays_system", [

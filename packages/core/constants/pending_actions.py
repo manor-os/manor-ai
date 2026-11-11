@@ -68,6 +68,11 @@ class PendingActionKind(str, Enum):
     #: A failed workflow run offering a corrected retry.
     WORKFLOW_RETRY = "workflow_retry"
 
+    # ── Blueprint releases ──
+    #: A delivered Workspace's provider sent a new release; one click applies
+    #: it with the default choices (packages/core/services/workspace_update_offer.py).
+    BLUEPRINT_UPDATE = "blueprint_update"
+
     # ``str(member)`` and ``f"{member}"`` must render the wire value, not
     # "PendingActionKind.HUMAN_INPUT". Without these, a mixin enum stringifies
     # to its qualified name — and every ``str(pa.get("kind") or KIND_HUMAN_INPUT)``

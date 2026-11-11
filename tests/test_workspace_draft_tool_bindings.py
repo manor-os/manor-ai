@@ -16,12 +16,6 @@ from packages.core.ai.runtime.task_requirements import (
 from packages.core.ai.runtime.tool_registry import runtime_registered_tool_names
 from packages.core.ai.tools import workspace_arch_tools
 from packages.core.services.agent_provisioning_service import spec_from_create_agent_draft
-from packages.core.services.agent_capability_catalog import (
-    AgentCapabilityCatalog,
-    AgentCapabilityCandidate,
-    AgentCapabilityKind,
-    AgentCapabilityPlanStatus,
-)
 
 
 def test_propose_service_schema_requires_canonical_capability_contract():
@@ -82,33 +76,12 @@ def test_custom_agent_capability_projection_uses_tools_skills_and_exact_mcp_acti
     assert {"web.safe_search", "skill.invoke", "external.social"} <= capabilities
 
 
-def test_workspace_creation_catalog_exposes_only_existing_integrations():
-    ready = AgentCapabilityCandidate(
-        catalog_id="mcp:slack", kind=AgentCapabilityKind.MCP_ACTION,
-        ref="slack", name="Slack", metadata={"server_key": "slack"},
-    )
-    missing = AgentCapabilityCandidate(
-        catalog_id="mcp:linkedin", kind=AgentCapabilityKind.MCP_ACTION,
-        ref="linkedin", name="LinkedIn", readiness=AgentCapabilityPlanStatus.SETUP_REQUIRED,
-        metadata={"server_key": "linkedin"},
-    )
-    catalog = AgentCapabilityCatalog(
-        candidates=(ready, missing),
-        integrations=(
-            {"mcp_server_key": "slack"}, {"mcp_server_key": "linkedin"},
-        ),
-    )
-
-    filtered = workspace_arch_tools._workspace_existing_integration_catalog(catalog)
-
-    assert [candidate.catalog_id for candidate in filtered.candidates] == ["mcp:slack"]
-    assert filtered.integrations == ({"mcp_server_key": "slack"},)
-    assert [candidate.catalog_id for candidate in catalog.candidates] == ["mcp:slack", "mcp:linkedin"]
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("connected", [False, True])
-async def test_workspace_creation_channel_requires_existing_integration(monkeypatch, connected):
+async def test_workspace_creation_keeps_unconnected_integrations_pending(monkeypatch, connected):
+    """A channel or Agent integration the user asked for that is not connected
+    yet is kept as waiting for connection, never a creation blocker the model
+    can only clear by deleting it (or the user's rules about it)."""
     from packages.core.services import integration_service
 
     draft = SimpleNamespace(fields={
@@ -117,6 +90,16 @@ async def test_workspace_creation_channel_requires_existing_integration(monkeypa
         "channel_config": {"primary_external_channel": {
             "channel_type": "slack", "purpose": "Receive support requests",
         }},
+        "flagged_integrations": [{
+            "provider": "slack", "required": True, "linked_service_keys": ["support"],
+            "source": "agent_design", "blocks_creation": False,
+        }],
+        "rules": [
+            {"rule_key": "confirm_replies", "rule_type": "approval_required",
+             "description": "Ask me before replying.", "action_patterns": ["external_message.send"]},
+            {"rule_key": "confirm_vaguely", "rule_type": "approval_required",
+             "description": "Ask me before anything risky."},
+        ],
     })
     monkeypatch.setattr(workspace_arch_tools, "_load_draft", AsyncMock(return_value=draft))
     monkeypatch.setattr(
@@ -133,12 +116,15 @@ async def test_workspace_creation_channel_requires_existing_integration(monkeypa
         db, draft_id="draft", entity_id="entity", user_id="user",
     ))
 
-    channel_errors = [
+    connection_issues = [
         issue for issue in result["issues"]
-        if issue["where"] == "channel_config.primary_external_channel"
-        and issue["severity"] == "P0"
+        if issue["where"] in {"channel_config.primary_external_channel", "flagged_integrations"}
     ]
-    assert bool(channel_errors) is not connected
+    assert not any(issue["severity"] == "P0" for issue in connection_issues)
+    # One pending note per provider, whether a channel, a flag or both name it.
+    assert len(connection_issues) == 1
+    unenforced = [issue["where"] for issue in result["issues"] if issue["where"].startswith("rules.")]
+    assert unenforced == ["rules.confirm_vaguely"]
 
 
 def test_sandbox_agent_capability_expands_only_to_registered_tools():
@@ -185,7 +171,7 @@ async def test_lint_checks_materialized_tools_without_erasing_invalid_bindings(
     })
     monkeypatch.setattr(workspace_arch_tools, "_load_draft", AsyncMock(return_value=draft))
     monkeypatch.setattr(
-        integration_resolution, "supported_integration_provider_keys",
+        integration_resolution, "bindable_mcp_provider_keys",
         AsyncMock(return_value=set()),
     )
     registered = {*WORKSPACE_CUSTOM_AGENT_BASE_TOOL_NAMES, "sandbox", "video_edit", "invoke_skill"}
@@ -252,7 +238,7 @@ async def test_lint_requires_declared_service_capabilities_in_custom_agent_scope
     })
     monkeypatch.setattr(workspace_arch_tools, "_load_draft", AsyncMock(return_value=draft))
     monkeypatch.setattr(
-        integration_resolution, "supported_integration_provider_keys",
+        integration_resolution, "bindable_mcp_provider_keys",
         AsyncMock(return_value=set()),
     )
     monkeypatch.setattr(

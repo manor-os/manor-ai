@@ -56,6 +56,7 @@ _WS = "/api/v1/workspaces/{workspace_id}"
 WORKSPACE_ADMIN_DENY = frozenset({
     # Deletion and recovery of the customer's Workspace.
     ("DELETE", _WS),
+    ("DELETE", "/api/v1/workspaces/trash/{workspace_id}"),
     ("POST", f"{_WS}/restore"),
     # Who is in the Workspace and with which role.
     ("POST", f"{_WS}/staff"),
@@ -95,6 +96,7 @@ WORKSPACE_ROUTES_REVIEWED = _routes("""
     GET ~
     PUT ~
     GET ~/activity
+    GET ~/attention-items
     GET ~/agents
     POST ~/agents
     GET ~/agents/assignable
@@ -103,11 +105,14 @@ WORKSPACE_ROUTES_REVIEWED = _routes("""
     GET ~/app-view/components/{component_key}/contexts
     GET ~/app-view/components/{component_key}/data
     GET ~/app-view/sections/{section_id}
+    GET ~/app-view/design/audience
     POST ~/app-view/design
+    GET ~/app-view/test
     POST ~/apply-template
     GET ~/automation-health
     POST ~/blueprint-startup/reconcile
     POST ~/blueprint/revert
+    POST ~/blueprint/releases
     GET ~/blueprint/upgrade
     POST ~/blueprint/upgrade
     POST ~/blueprint/upgrade/preview
@@ -115,6 +120,7 @@ WORKSPACE_ROUTES_REVIEWED = _routes("""
     GET ~/blueprint/upgrade/v3
     POST ~/blueprint/upgrade/v3
     POST ~/blueprint/upgrade/v3/preview
+    POST ~/blueprint/upgrade/v3/recommended
     GET ~/budget
     PUT ~/budget
     GET ~/capabilities

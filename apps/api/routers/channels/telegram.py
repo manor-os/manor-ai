@@ -18,8 +18,7 @@ from sqlalchemy import select
 from packages.core.database import async_session
 from packages.core.models.channel import ChannelConfig
 from packages.core.services.channels.telegram_adapter import TelegramAdapter
-from packages.core.services.channel_service import handle_inbound_message
-from packages.core.tasks.channel_tasks import dispatch_inbound_task
+from packages.core.services.channels.telegram_inbound import enqueue_telegram_update
 
 logger = logging.getLogger(__name__)
 
@@ -125,42 +124,15 @@ async def telegram_webhook(
         # Unsupported update type — acknowledge silently
         return {"ok": True}
 
-    # Log the inbound message (synchronous — cheap, keeps an audit trail
-    # even if the agent dispatch fails downstream)
+    # Record the receipt and enqueue the agent dispatch on Celery in one
+    # commit, so the webhook acks in <100 ms, a Telegram retry of the same
+    # update is acknowledged once, and the run survives worker restarts.
     try:
-        async with async_session() as db:
-            await handle_inbound_message(
-                db,
-                entity_id=cc.entity_id,
-                channel_config_id=cc.id,
-                payload={
-                    "from": parsed["sender_id"],
-                    "to": str(parsed.get("chat_id", "")),
-                    "content": parsed["content"],
-                    "message_id": parsed.get("msg_id"),
-                    "channel_type": "telegram",
-                    "metadata": {
-                        "message_type": parsed["message_type"],
-                        "sender_name": parsed.get("sender_name", ""),
-                        "chat_id": parsed.get("chat_id"),
-                    },
-                },
-            )
-            await db.commit()
+        await enqueue_telegram_update(cc, parsed, source="webhook")
     except Exception:
-        logger.exception("Failed to log inbound Telegram message from %s", parsed.get("sender_id"))
-
-    # Enqueue agent dispatch on Celery so the webhook acks in <100 ms
-    # and the LLM run survives worker restarts via broker persistence.
-    dispatch_inbound_task.delay(
-        entity_id=cc.entity_id,
-        channel_config_id=cc.id,
-        channel_type="telegram",
-        sender_id=str(parsed["sender_id"]),
-        sender_name=parsed.get("sender_name"),
-        chat_id=str(parsed.get("chat_id") or parsed["sender_id"]),
-        content=parsed["content"] or "",
-    )
+        logger.exception("Could not enqueue Telegram update for config=%s", cc.id)
+        # Telegram redelivers an update it did not get a 2xx for.
+        raise HTTPException(503, "Telegram update queue unavailable")
 
     # Telegram requires 200 OK to acknowledge receipt
     return {"ok": True}

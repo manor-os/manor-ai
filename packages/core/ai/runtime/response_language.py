@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 from typing import Any, Iterable
 
 from packages.core.ai.response_language import (
     is_external_response_audience,
+    replies_in_message_language,
     RESPONSE_LANGUAGE_BLOCK_END,
     RESPONSE_LANGUAGE_BLOCK_START,
     resolve_response_locale,
@@ -34,6 +35,7 @@ class RuntimeResponseLanguage:
     user_id: str | None
     locale: str | None = None
     external_audience: bool = False
+    reply_in_message_language: bool = False
 
 
 _response_language: ContextVar[RuntimeResponseLanguage | None] = ContextVar(
@@ -63,9 +65,12 @@ async def resolve_runtime_response_language(
     # surface still wins for verified staff talking through a channel.
     if profile is None and surface is None and source in {"channel", "channel_hold"}:
         external = True
+    message_language = not external and replies_in_message_language(surface=surface)
     if same_scope and parent is not None:
         if external and not parent.external_audience:
             return RuntimeResponseLanguage(entity_id, user_id or parent.user_id, external_audience=True)
+        if message_language and not parent.external_audience and not parent.reply_in_message_language:
+            return replace(parent, reply_in_message_language=True)
         return parent
     if external:
         return RuntimeResponseLanguage(entity_id, user_id, external_audience=True)
@@ -88,7 +93,9 @@ async def resolve_runtime_response_language(
             await resolve_response_locale(user_id, db=db)
             if db is not None else await resolve_response_locale(user_id)
         )
-    return RuntimeResponseLanguage(entity_id, user_id, locale=locale)
+    return RuntimeResponseLanguage(
+        entity_id, user_id, locale=locale, reply_in_message_language=message_language,
+    )
 
 
 def current_response_locale() -> str | None:
@@ -119,7 +126,9 @@ def _without_response_language_guidance(prompt: str) -> str:
 
 
 def response_language_prompt(prompt: str, language: RuntimeResponseLanguage) -> str:
-    guidance = None if language.external_audience else response_language_guidance(language.locale)
+    guidance = None if language.external_audience else response_language_guidance(
+        language.locale, reply_in_message_language=language.reply_in_message_language,
+    )
     if not guidance and not language.external_audience:
         return prompt
     prompt = _without_response_language_guidance(prompt)

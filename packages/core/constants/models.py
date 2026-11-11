@@ -153,9 +153,11 @@ CATALOG = {
     # The product catalog includes native/BYOK models alongside the subset
     # that can use Vercel's image protocol.
     "image": [
+        {"id": "openai/gpt-image-2.6-flare", "name": "GPT Image 2.6 Flare", "tier": "premium", "quality": "highest", "tag": "Animated GIF"},
         {"id": "openai/gpt-5-image-mini", "name": "GPT-5 Image Mini", "tier": "balanced", "quality": "high", "tag": ""},
         {"id": "google/gemini-3.1-flash-image-preview", "name": "Nano Banana 2", "tier": "balanced", "quality": "high", "tag": "New"},
         {"id": "openai/gpt-image-2", "name": "GPT Image 2", "tier": "premium", "quality": "highest", "tag": "Recommended"},
+        {"id": "openai/gpt-image-2.6-sunburst", "name": "GPT Image 2.6 Sunburst", "tier": "premium", "quality": "highest", "tag": "New"},
         # Grok Imagine: managed through the Vercel AI Gateway, or the Account's own xAI key / relay.
         {"id": "xai/grok-imagine-image-2.0", "name": "Grok Imagine Image 2.0", "tier": "balanced", "quality": "high", "tag": "Edits"},
         {"id": "xai/grok-imagine-image", "name": "Grok Imagine Image", "tier": "cheap", "quality": "good", "tag": ""},
@@ -372,6 +374,40 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
 }
 
 
+# What each model role is billed as, for the platform price check.
+ROLE_PRICE_KIND = {
+    "primary": "text",
+    "worker": "text",
+    "image": "image",
+    "video": "video",
+    "voice": "speech",
+    "audio": "music",
+    "sfx": "music",
+    "stt": "transcription",
+    "embedding": "embedding",
+}
+
+
+def platform_model_billable(role: str, model_id: object, *, catalog_item: dict | None = None) -> bool:
+    """Whether the platform key may run ``model_id`` for ``role``: we can bill it.
+
+    Only Manor Cloud bills. A model that runs locally costs the platform
+    nothing. Everything else needs a price (curated, or the gateway catalog);
+    a model without one is never offered or run on the platform key. BYOK
+    calls are not gated by this.
+    """
+    from packages.core.constants.plans import is_cloud
+
+    normalized = str(model_id or "").strip()
+    if not normalized or not is_cloud():
+        return True
+    if (catalog_item or {}).get("deployment") == "local" or (role == "embedding" and "/" not in normalized):
+        return True
+    from packages.core.services.catalog_pricing import is_priceable
+
+    return is_priceable(normalized, ROLE_PRICE_KIND.get(role, "text"))
+
+
 def model_preference_is_available(
     role: str,
     model_id: object,
@@ -384,10 +420,13 @@ def model_preference_is_available(
     A catalog-only role also accepts a custom model ID when ``settings`` (the
     document the preference came from) binds that role's BYOK key to exactly
     that ID: the account routes save that binding only after a live test.
+    A model the platform cannot bill is kept only with such a BYOK binding.
     """
 
     normalized = str(model_id or "").strip()
     if not normalized or normalized in disabled_models:
+        return False
+    if not platform_model_billable(role, normalized) and not byok_custom_model_is_bound(role, normalized, settings):
         return False
     if role not in CATALOG_ONLY_ROLES:
         return True

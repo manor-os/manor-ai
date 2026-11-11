@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Publish built-in Skills and the platform Blueprint catalogue after a deploy."""
+"""Publish the platform's code registries after a deploy.
+
+Built-in Skills, known feature flags and the platform Blueprint catalogue
+ship in the image. Cloud disables API startup side effects, so this
+post-rollout job is where a deploy's registry changes reach the database.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -11,17 +16,20 @@ from packages.core.blueprints.seed import seed_platform_blueprints
 from packages.core.database import async_session
 from packages.core.models.blueprint import WorkspaceBlueprint
 from packages.core.services.builtin_skill_loader import seed_builtin_skills
+from packages.core.services.feature_flags import seed_known_flags
 
 
 async def publish_platform_blueprints() -> None:
     published_blueprints: list[dict[str, str]] = []
 
     async with async_session() as db:
-        # Built-in Skills ship in the image. Cloud disables API startup side
-        # effects, so this post-rollout job is where a deploy's Skill changes
-        # reach the database; chat turns only verify them once per process.
-        # Same transaction as the Blueprints: a failed publish writes nothing.
+        # Chat turns only verify built-in Skills once per process, and an
+        # unregistered flag evaluates as missing, so tenant overrides on it
+        # do nothing. Same transaction as the Blueprints: a failed publish
+        # writes nothing. The flag seed only creates missing rows; an
+        # ops-set default or an archived flag is never changed.
         builtin_skills = await seed_builtin_skills(db)
+        registered_flags = await seed_known_flags(db)
         seeded_versions = await seed_platform_blueprints(db)
 
         if seeded_versions:
@@ -59,6 +67,7 @@ async def publish_platform_blueprints() -> None:
 
     print(json.dumps({
         "builtin_skills": len(builtin_skills),
+        "registered_flags": registered_flags,
         "published_blueprints": published_blueprints,
     }))
 

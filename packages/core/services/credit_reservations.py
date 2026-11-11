@@ -33,6 +33,10 @@ RESERVATION_STATUSES = {
 DEFAULT_RESERVATION_TTL_SECONDS = int(
     os.getenv("CREDIT_RESERVATION_TTL_SECONDS", "7200") or 7200
 )
+# A lapsed hold is reconciled only this long after it expired, so a
+# settlement still in flight at the deadline finishes first.
+LAPSED_RESERVATION_GRACE_SECONDS = 600
+PROVIDER_REPORTED_CREDITS_KEY = "provider_reported_credits"
 
 
 class CreditReservationError(ValueError):
@@ -85,10 +89,14 @@ async def active_reserved_credits(
 
 
 async def _lock_entity(db: AsyncSession, entity_id: str) -> None:
+    # FOR NO KEY UPDATE still serializes balance checks, but does not wait on
+    # the key-share lock a job takes on its payer when it inserts a row that
+    # references the Entity (media_jobs.entity_id). FOR UPDATE had to upgrade
+    # past that lock, and parallel jobs of one company deadlocked on it.
     entity_row = (await db.execute(
         select(Entity.id)
         .where(Entity.id == entity_id)
-        .with_for_update()
+        .with_for_update(key_share=True)
     )).scalar_one_or_none()
     if not entity_row:
         raise CreditReservationError(f"entity {entity_id!r} not found")
@@ -378,6 +386,10 @@ async def resize_reservation_by_source(
         pass
 
     row.amount_credits = amount
+    if allow_overdraft:
+        # The provider already did this work: a hold that lapses unsettled
+        # is charged this amount by ``reconcile_lapsed_reservation``.
+        row.meta = {**(row.meta or {}), PROVIDER_REPORTED_CREDITS_KEY: amount}
     return row
 
 
@@ -442,4 +454,61 @@ async def _release_row(
         meta = dict(row.meta or {})
         meta["release_reason"] = reason
         row.meta = meta
+    return row
+
+
+# ── Lapsed holds ─────────────────────────────────────────────────────
+
+
+async def lapsed_reservation_ids(
+    db: AsyncSession,
+    *,
+    now: Optional[datetime] = None,
+    limit: int = 200,
+) -> list[str]:
+    """Active holds whose TTL ended at least the grace period ago, oldest first.
+
+    A lapsed hold no longer counts against the balance, yet its work was
+    never settled: ``usage_service.reconcile_lapsed_reservation`` decides
+    whether that work is charged.
+    """
+    cutoff = (now or _now()) - timedelta(seconds=LAPSED_RESERVATION_GRACE_SECONDS)
+    return list((await db.execute(
+        select(CreditReservation.id)
+        .where(
+            CreditReservation.status == RESERVATION_STATUS_ACTIVE,
+            CreditReservation.expires_at.is_not(None),
+            CreditReservation.expires_at <= cutoff,
+        )
+        .order_by(CreditReservation.expires_at.asc(), CreditReservation.id.asc())
+        .limit(max(1, int(limit)))
+    )).scalars().all())
+
+
+async def lock_active_reservation(
+    db: AsyncSession, reservation_id: str,
+) -> CreditReservation | None:
+    """Lock a hold in the Entity -> reservation order; None once it is not active."""
+    row = await _reservation_by_id(db, reservation_id)
+    if row is None:
+        return None
+    await _lock_entity(db, row.entity_id)
+    row = (await db.execute(
+        select(CreditReservation)
+        .where(CreditReservation.id == reservation_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if row is None or row.status != RESERVATION_STATUS_ACTIVE:
+        return None
+    return row
+
+
+def expire_reservation_row(row: CreditReservation, *, reason: str) -> CreditReservation:
+    """End a lapsed hold that is charged nothing (its work cannot be shown to have run)."""
+    if row.status != RESERVATION_STATUS_ACTIVE:
+        return row
+    row.status = RESERVATION_STATUS_EXPIRED
+    row.released_at = _now()
+    row.meta = {**(row.meta or {}), "expire_reason": reason}
     return row

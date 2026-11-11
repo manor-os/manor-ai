@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from packages.core.models.artifact_purge import (
@@ -37,6 +37,21 @@ from packages.core.services.workspace_artifact_purge import (
     enqueue_artifact_cleanup_jobs,
 )
 from packages.core.services.workspace_artifacts import workspace_artifact_storage_base
+
+
+@pytest.fixture
+async def db_session(db_session):
+    """Give global cleanup sweeps an empty queue in the disposable test DB."""
+    # The shared session only rolls back uncommitted work. Lifecycle tests
+    # commit purge jobs, and these tests also exercise per-job commits.
+    await db_session.execute(delete(WorkspaceArtifactPurgeJob))
+    await db_session.commit()
+    try:
+        yield db_session
+    finally:
+        await db_session.rollback()
+        await db_session.execute(delete(WorkspaceArtifactPurgeJob))
+        await db_session.commit()
 
 
 def test_cleanup_job_storage_base_accommodates_runtime_backup_suffix() -> None:

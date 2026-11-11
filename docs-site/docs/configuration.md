@@ -190,8 +190,8 @@ them on any deployment shared with real users.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `RATE_LIMIT_ENABLED` | `false` | Master switch for the general API limiter. |
-| `API_RATE_LIMIT_REQUESTS` | `200` | Requests allowed per window per client. |
+| `RATE_LIMIT_ENABLED` | `false` | Per-IP limiter (`RATE_LIMIT_PER_MINUTE`, default `100`). When `CHAT_RATE_LIMIT_ENABLED` is also on, signed-in requests skip it and use their per-user budget. |
+| `API_RATE_LIMIT_REQUESTS` | `600` | API requests allowed per window per signed-in user (per IP when signed out). Needs `CHAT_RATE_LIMIT_ENABLED`. |
 | `API_RATE_LIMIT_WINDOW_SECONDS` | `60` | Window length for the general limiter. |
 | `CHAT_RATE_LIMIT_ENABLED` | `false` | Separate limiter for chat routes, which are the most expensive. |
 | `CHAT_RATE_LIMIT_REQUESTS` | `30` | Chat requests allowed per window. |

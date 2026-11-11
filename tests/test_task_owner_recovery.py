@@ -106,6 +106,10 @@ async def test_first_execution_and_retry_have_identical_routes(client, db_sessio
     ))
     assert accepted["created"] is True
     assert accepted["owner_resolution"]["owner_subscription_id"] == (subs[owner].id if owner else None)
+    # Live: stages "由成本分析员执行" were created with no owner and run by the Workspace Agent.
+    assert ("unowned" in accepted["owner_resolution"]) is (owner is None)
+    if owner is None:
+        assert set(subs) <= set(accepted["owner_resolution"]["available_service_keys"])
     event = (await db_session.execute(
         select(RuntimeOutboxEvent).where(
             RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
@@ -568,3 +572,59 @@ async def test_api_waiting_team_task_resume_uses_factory_without_owner_switch(
         )
     )).scalars().all())
     assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_task_that_names_its_agent_must_set_it_as_owner(client, db_session):
+    """Live: "由成本分析员执行" with no owner_service_key; the Workspace Agent ran the stage instead."""
+    from packages.core.ai.runtime.workspace_task_actions import runtime_workspace_create_task_action
+
+    _headers, me, workspace, _subs = await _workspace(client, db_session)
+    kwargs = {"entity_id": me["entity_id"], "workspace_id": workspace["id"], "user_id": me["id"]}
+    named = json.loads(await runtime_workspace_create_task_action(**kwargs, params={
+        "title": "Draft the post", "runtime_instructions": "Executed by content_creation.",
+    }))
+    assert named["error"] == "owner_named_not_set"
+    assert named["named_owners"] == {"content_creation": "content_creation"}
+    owned = json.loads(await runtime_workspace_create_task_action(**kwargs, params={
+        "title": "Draft the post", "runtime_instructions": "Executed by content_creation.",
+        "owner_service_key": "content_creation",
+    }))
+    assert owned["created"] is True
+    unnamed = json.loads(await runtime_workspace_create_task_action(**kwargs, params={"title": "Tidy notes"}))
+    assert unnamed["created"] is True and "unowned" in unnamed["owner_resolution"]
+
+
+@pytest.mark.asyncio
+async def test_a_flow_step_does_not_hand_its_own_project_on_as_a_task(client, db_session):
+    """Staging 2026-11-03: the article Flow's editor made a revise Task nobody ran; the Flow's next step was that revision."""
+    from packages.core.ai.runtime.workspace_task_actions import runtime_workspace_create_task_action
+    from packages.core.models.workflow import WorkflowProject, WorkflowRun
+
+    _headers, me, workspace, _subs = await _workspace(client, db_session)
+    run = WorkflowRun(workflow_id=generate_ulid(), entity_id=me["entity_id"], workspace_id=workspace["id"], status="running",
+                      variables={}, step_results={}, trigger_data={}, definition_snapshot={}, execution_trace=[])
+    other_run = WorkflowRun(workflow_id=generate_ulid(), entity_id=me["entity_id"], workspace_id=workspace["id"], status="running",
+                            variables={}, step_results={}, trigger_data={}, definition_snapshot={}, execution_trace=[])
+    db_session.add_all([run, other_run])
+    await db_session.flush()
+    article = WorkflowProject(entity_id=me["entity_id"], workspace_id=workspace["id"], project_type="article", created_by=me["id"],
+                              state={"project_root": "projects/pre-cool-checklist"}, last_run_id=run.id)
+    db_session.add(article)
+    await db_session.commit()
+
+    async def create(flow_run_id, **params):
+        return json.loads(await runtime_workspace_create_task_action(
+            entity_id=me["entity_id"], workspace_id=workspace["id"], user_id=me["id"],
+            params={"owner_service_key": "content_creation", **params, **(
+                {"_workflow_run_id_from_context": flow_run_id} if flow_run_id else {})},
+        ))
+
+    by_id = await create(run.id, title=f"Revise article for project {article.id}")
+    assert by_id["error"] == "flow_owns_this_work"
+    by_folder = await create(run.id, title="Revise it", description="Files under projects/pre-cool-checklist.")
+    assert by_folder["error"] == "flow_owns_this_work"
+    # Other work from a step is its own; so is naming this project from another run or from chat.
+    assert (await create(run.id, title="Plan next quarter's topics"))["created"] is True
+    assert (await create(other_run.id, title=f"Follow up on {article.id}"))["created"] is True
+    assert (await create(None, title=f"Follow up on {article.id}"))["created"] is True

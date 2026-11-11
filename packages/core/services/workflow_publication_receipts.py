@@ -70,10 +70,15 @@ def _http_url(value: str | None) -> str | None:
     return value
 
 
-def _iso_datetime(value: Any, *, fallback: datetime | None = None) -> str:
+def _iso_datetime(
+    value: Any,
+    *,
+    fallback: datetime | None = None,
+    key: str = "published_at",
+) -> str | None:
     if value in (None, ""):
         if fallback is None:
-            raise PublicationReceiptError("Publication receipt published_at is required")
+            return None
         parsed = fallback
     elif isinstance(value, datetime):
         parsed = value
@@ -82,11 +87,11 @@ def _iso_datetime(value: Any, *, fallback: datetime | None = None) -> str:
             parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
         except ValueError as exc:
             raise PublicationReceiptError(
-                "Publication receipt published_at must be an ISO 8601 datetime"
+                f"Publication receipt {key} must be an ISO 8601 datetime"
             ) from exc
     else:
         raise PublicationReceiptError(
-            "Publication receipt published_at must be an ISO 8601 datetime"
+            f"Publication receipt {key} must be an ISO 8601 datetime"
         )
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
@@ -175,8 +180,11 @@ def normalize_publication_receipt(
         "verification_status": verification_status,
         "external_id": external_id,
         "published_url": published_url,
-        "published_at": _iso_datetime(record.get("published_at"), fallback=now),
-        "verified_at": _iso_datetime(record.get("verified_at"), fallback=now),
+        # A verification time is evidence of when Manor observed the post, not
+        # evidence of when the platform published it.  Keep the latter unknown
+        # until the provider supplies it.
+        "published_at": _iso_datetime(record.get("published_at")),
+        "verified_at": _iso_datetime(record.get("verified_at"), fallback=now, key="verified_at"),
         "payload_hash": payload_hash,
         "fallback_used": fallback_used,
         "evidence": evidence,

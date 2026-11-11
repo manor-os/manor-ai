@@ -6,6 +6,8 @@ easy to audit and update separately from runtime workflows.
 """
 from __future__ import annotations
 
+from typing import Any
+
 from packages.core.constants.plans import is_cloud
 from packages.core.services import model_pricing
 
@@ -28,7 +30,8 @@ def estimate_token_cost_usd(
     audio_input_tokens: int = 0,
     audio_output_tokens: int = 0,
     cached_audio_input_tokens: int = 0,
-) -> float:
+    require_price: bool = False,
+) -> float | None:
     return model_pricing.estimate_token_cost_usd(
         input_tokens,
         output_tokens,
@@ -42,6 +45,7 @@ def estimate_token_cost_usd(
         audio_input_tokens=audio_input_tokens,
         audio_output_tokens=audio_output_tokens,
         cached_audio_input_tokens=cached_audio_input_tokens,
+        require_price=require_price,
     )
 
 
@@ -107,12 +111,57 @@ def estimate_video_cost_usd(
     )
 
 
+def video_is_priced(model: str | None) -> bool:
+    return model_pricing.video_is_priced(model)
+
+
+def video_output_tokens(model: str, duration_seconds: float, resolution: str = "720p") -> int:
+    return model_pricing.video_output_tokens(model, duration_seconds, resolution)
+
+
+def video_token_price_per_m(model: str | None, resolution: str = "720p", *, has_video_input: bool = False) -> float | None:
+    return model_pricing.video_token_price_per_m(model, resolution, has_video_input=has_video_input)
+
+
+def video_cost_from_tokens(
+    model: str | None,
+    output_tokens: float | None,
+    resolution: str = "720p",
+    *,
+    has_video_input: bool = False,
+) -> float | None:
+    return model_pricing.video_cost_from_tokens(
+        model, output_tokens, resolution, has_video_input=has_video_input,
+    )
+
+
 def estimate_image_cost_usd(model: str, size: str = "1024x1024") -> float:
     return model_pricing.estimate_image_cost_usd(model, size=size)
 
 
+def image_call_cost_usd(model: str, usage: Any, size: str = "1024x1024") -> tuple[float | None, str]:
+    return model_pricing.image_call_cost_usd(model, usage, size=size)
+
+
 def estimate_audio_cost_usd(model: str, *, purpose: str = "", characters: int | None = None) -> float:
     return model_pricing.estimate_audio_cost_usd(model, purpose=purpose, characters=characters)
+
+
+def audio_call_cost_usd(
+    model: str,
+    *,
+    characters: int | None = None,
+    seconds: float | None = None,
+    input_tokens: int | None = None,
+    audio_output_tokens: int | None = None,
+) -> tuple[float | None, str]:
+    return model_pricing.audio_call_cost_usd(
+        model,
+        characters=characters,
+        seconds=seconds,
+        input_tokens=input_tokens,
+        audio_output_tokens=audio_output_tokens,
+    )
 
 
 def embedding_cost_usd(model: str, total_tokens: int) -> float:

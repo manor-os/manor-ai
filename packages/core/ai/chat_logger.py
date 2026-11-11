@@ -29,6 +29,9 @@ logger = logging.getLogger("manor.chat")
 CHAT_TOOL_CALL_SOURCE = "chat"
 """``tool_call_logs.source`` for rows written from a chat turn."""
 
+DELEGATION_TOOL_CALL_SOURCE = "delegation"
+"""``tool_call_logs.source`` for rows written from a delegated child Agent."""
+
 _TOOL_ARG_PREVIEW_CHARS = 200
 
 
@@ -59,7 +62,7 @@ def schedule_tool_call_log(
     entity_id: str,
     tool_name: str,
     source: str,
-    round_num: int,
+    round_num: int | None,
     duration_ms: int,
     result_chars: int,
     success: bool,

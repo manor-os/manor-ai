@@ -52,6 +52,7 @@ def metrics_daily_rollup(self, target_day: str | None = None):
         logger.exception("metrics_daily_rollup workspace health failed")
 
 
+
 @celery_app.task(bind=True, max_retries=0, name="metrics.http_flush")
 def metrics_http_flush(self):
     """Snapshot-sync the Redis HTTP traffic counters (written per-request

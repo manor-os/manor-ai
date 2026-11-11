@@ -5,8 +5,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from apps.api.deps import get_current_user
 from packages.core.database import get_db
 from packages.core.governance.approval_commands import (
-    ApprovalCommandConflict, ApprovalCommandError, ApproveAndSaveRuleCommand,
-    approve_and_save_rule, project_approval_command,
+    ApprovalCommand, ApprovalCommandConflict, ApprovalCommandError,
+    approve_and_save_rule, project_approval_command, save_rule,
 )
 from packages.core.governance.approval_policy_service import (
     ApprovalPolicyAccessError, ApprovalPolicyConflict, ApprovalPolicyIntegrityError,
@@ -35,9 +35,12 @@ async def get_command(request_id: str, actor: User = Depends(get_current_user), 
 
 
 @router.post('')
-async def post_command(command: ApproveAndSaveRuleCommand, actor: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def post_command(command: ApprovalCommand, actor: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     try:
-        result = await approve_and_save_rule(db, command=command, actor=actor)
+        if getattr(command, 'choice', None) == 'save_rule':
+            result = await save_rule(db, command=command, actor=actor)
+        else:
+            result = await approve_and_save_rule(db, command=command, actor=actor)
     except (ApprovalPolicyAccessError, ApprovalPolicyConflict, ApprovalPolicyIntegrityError, ApprovalCommandError, RuntimeError, ValueError, PermissionError) as exc:
         _raise_http(exc)
     # Commit the decision, policy and recovery outbox before acknowledging

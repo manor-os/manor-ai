@@ -1,4 +1,5 @@
 """Real OAuth service/ASGI/SQLite PKCE tests; no configured application DB."""
+import base64
 import json
 from urllib.parse import parse_qs, urlsplit
 
@@ -68,7 +69,9 @@ async def test_actual_consent_persists_s256_and_requires_verifier_at_real_token_
     body = response.json()
     code = body["code"]
     assert body["state"] == state
-    assert parse_qs(urlsplit(body["redirect_to"]).query) == {"code": [code], "state": [state]}
+    assert parse_qs(urlsplit(body["redirect_to"]).query) == {
+        "code": [code], "state": [state], "iss": ["http://test"],
+    }
     async with sessions() as db:
         row = await db.scalar(select(OAuthAuthorizationCode).where(OAuthAuthorizationCode.code == code))
         assert (row.code_challenge, row.code_challenge_method) == (CHALLENGE, "S256")
@@ -233,3 +236,50 @@ async def test_duplicate_query_parameters_rejected_even_with_valid_body(pkce_htt
     http, _ = pkce_http
     code = await issued(http)
     assert (await http.post("/api/v1/oauth/token?" + extra, json=exchange(code))).status_code == 400
+
+
+def basic(client_id=CLIENT_ID, secret=CLIENT_SECRET):
+    return {"Authorization": "Basic " + base64.b64encode(f"{client_id}:{secret}".encode()).decode()}
+
+
+async def test_confidential_client_renews_only_with_its_secret(pkce_http):
+    http, sessions = pkce_http
+    first = (await http.post("/api/v1/oauth/token", json=exchange(await issued(http)))).json()
+    assert first["refresh_token"]  # issued without offline_access, like a public client's
+
+    def renew(token, **changes):
+        return http.post("/api/v1/oauth/token", data={
+            "grant_type": "refresh_token", "refresh_token": token, "client_id": CLIENT_ID, **changes})
+
+    assert (await renew(first["refresh_token"])).json()["error"] == "invalid_client"
+    assert (await renew(first["refresh_token"], client_secret="wrong")).json()["error"] == "invalid_client"
+    renewed = await renew(first["refresh_token"], client_secret=CLIENT_SECRET)
+    assert renewed.status_code == 200, renewed.text
+    assert renewed.json()["user"]["entity_id"] == SELECTED_ENTITY
+    # The client's current team restriction applies to renewals as to redemption.
+    async with sessions.begin() as db:
+        await db.execute(update(OAuthClientApp).values(restricted_entity_id="another-team"))
+    moved = await renew(renewed.json()["refresh_token"], client_secret=CLIENT_SECRET)
+    assert moved.status_code == 400 and moved.json()["error"] == "invalid_grant"
+
+
+async def test_http_basic_client_authentication(pkce_http):
+    http, _ = pkce_http
+    body = {k: v for k, v in exchange(await issued(http)).items() if k not in ("client_id", "client_secret")}
+    wrong = await http.post("/api/v1/oauth/token", data=body, headers=basic(secret="wrong"))
+    assert wrong.status_code == 401 and wrong.json()["error"] == "invalid_client"
+    assert wrong.headers["www-authenticate"].startswith("Basic")
+    # One method per request: Basic plus a body secret, or two different ids, is refused.
+    both = await http.post("/api/v1/oauth/token", data={**body, "client_secret": CLIENT_SECRET}, headers=basic())
+    assert both.status_code == 400 and both.json()["error"] == "invalid_request"
+    mismatch = await http.post("/api/v1/oauth/token", data={**body, "client_id": "other"}, headers=basic())
+    assert mismatch.status_code == 400 and mismatch.json()["error"] == "invalid_request"
+    malformed = await http.post("/api/v1/oauth/token", data=body, headers={"Authorization": "Basic !!!"})
+    assert malformed.status_code == 400
+    ok = await http.post("/api/v1/oauth/token", data=body, headers=basic())
+    assert ok.status_code == 200, ok.text
+    revoked = await http.post("/api/v1/oauth/revoke", data={"token": ok.json()["refresh_token"]}, headers=basic())
+    assert revoked.status_code == 200
+    renew = await http.post("/api/v1/oauth/token", data={
+        "grant_type": "refresh_token", "refresh_token": ok.json()["refresh_token"]}, headers=basic())
+    assert renew.status_code == 400 and renew.json()["error"] == "invalid_grant"

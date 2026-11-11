@@ -14,7 +14,8 @@ address is left alone, as are the platform's own pictures (``/blueprints/...``,
 the same on every deployment) and ``https://`` links. Knowledge files and run
 data never travel: they belong to the Workspace, not its Blueprint.
 
-Layout (a gzip tar, deterministic so the same content packs to the same bytes)::
+Layout (a gzip tar, deterministic so the same content packs to the same bytes;
+``pack_source`` lays the same content out as a ``source_tree`` for git)::
 
     package/manifest.json   format, title, payload digest, one entry per asset
     package/blueprint.json  the payload, each embedded address replaced by
@@ -142,14 +143,45 @@ def _canonical(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
 
 
-def _add(archive: tarfile.TarFile, name: str, data: bytes) -> None:
-    info = tarfile.TarInfo(f"package/{name}")
+def _add(archive: tarfile.TarFile, name: str, data: bytes, *, prefix: str = "package/") -> None:
+    info = tarfile.TarInfo(f"{prefix}{name}")
     info.size = len(data)
     info.mtime = _EPOCH
     info.mode = 0o644
     info.uid = info.gid = 0
     info.uname = info.gname = ""
     archive.addfile(info, io.BytesIO(data))
+
+
+def _gzip(raw: bytes) -> bytes:
+    out = io.BytesIO()
+    with gzip.GzipFile(fileobj=out, mode="wb", mtime=0, filename="") as zipped:
+        zipped.write(raw)
+    return out.getvalue()
+
+
+def _asset_entries(assets: list[Asset]) -> list[dict[str, Any]]:
+    return [
+        {"sha256": asset.sha256, "path": asset.path, "size": len(asset.data),
+         "mime_type": asset.mime_type, "name": asset.name}
+        for asset in assets
+    ]
+
+
+def pack_source(payload: dict[str, Any], assets: list[Asset]) -> bytes:
+    """The package as a source tree (``blueprints.source_tree``) at the archive
+    root: extract it into a git repository, and pack the directory back with
+    ``tar -czf blueprint.manor -C <dir> .`` to install or publish it."""
+    from packages.core.blueprints.source_tree import split
+
+    files = split(payload, assets=_asset_entries(assets))
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        for name in sorted(files):
+            _add(archive, name, files[name], prefix="")
+        for asset in assets:
+            _add(archive, asset.path, asset.data, prefix="")
+    return _gzip(raw.getvalue())
 
 
 def pack(payload: dict[str, Any], assets: list[Asset]) -> bytes:
@@ -160,11 +192,7 @@ def pack(payload: dict[str, Any], assets: list[Asset]) -> bytes:
         "title": (payload.get("manifest") or {}).get("title"),
         "payload_format": (payload.get("manifest") or {}).get("blueprint_version"),
         "blueprint_sha256": hashlib.sha256(blueprint).hexdigest(),
-        "assets": [
-            {"sha256": asset.sha256, "path": asset.path, "size": len(asset.data),
-             "mime_type": asset.mime_type, "name": asset.name}
-            for asset in assets
-        ],
+        "assets": _asset_entries(assets),
     }
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as archive:
@@ -172,10 +200,7 @@ def pack(payload: dict[str, Any], assets: list[Asset]) -> bytes:
         _add(archive, "blueprint.json", blueprint)
         for asset in assets:
             _add(archive, asset.path, asset.data)
-    out = io.BytesIO()
-    with gzip.GzipFile(fileobj=out, mode="wb", mtime=0, filename="") as zipped:
-        zipped.write(raw.getvalue())
-    return out.getvalue()
+    return _gzip(raw.getvalue())
 
 
 def is_package(data: bytes) -> bool:
@@ -185,8 +210,10 @@ def is_package(data: bytes) -> bool:
 def unpack(data: bytes) -> tuple[dict[str, Any], list[Asset]]:
     """The payload (placeholders intact) and its verified assets.
 
-    Refuses anything but regular files under ``package/``, oversize content,
-    and any file whose bytes do not match its recorded digest.
+    Reads the ``package/`` layout or a source tree (``pack_source``, or a
+    directory of one packed by hand, at the root or in one folder). Refuses
+    links and paths outside the archive, oversize content, and any file whose
+    bytes do not match its recorded digest.
     """
     if len(data) > MAX_PACKAGE_BYTES:
         raise PackageError("the package is too large")
@@ -196,31 +223,29 @@ def unpack(data: bytes) -> tuple[dict[str, Any], list[Asset]]:
         raise PackageError("not a Blueprint package") from exc
     if len(raw) > MAX_PACKAGE_BYTES:
         raise PackageError("the package is too large")
-    files: dict[str, bytes] = {}
+    entries: dict[str, bytes] = {}
     try:
         with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
             for member in archive.getmembers():
-                name = member.name
-                if not member.isfile() or not name.startswith("package/") or ".." in name.split("/"):
-                    raise PackageError(f"unexpected entry {name!r} in the package")
+                name = member.name.removeprefix("./")
+                base = posixpath.basename(name)
+                # A directory packed by hand: skip its folders and macOS litter.
+                if member.isdir() or base == ".DS_Store" or base.startswith("._") or not name:
+                    continue
+                if not member.isfile() or name.startswith("/") or ".." in name.split("/"):
+                    raise PackageError(f"unexpected entry {member.name!r} in the package")
                 handle = archive.extractfile(member)
-                files[name.removeprefix("package/")] = handle.read() if handle else b""
+                entries[name] = handle.read() if handle else b""
     except tarfile.TarError as exc:
         raise PackageError("not a Blueprint package") from exc
-    try:
-        manifest = json.loads(files["manifest.json"])
-        blueprint = files["blueprint.json"]
-        payload = json.loads(blueprint)
-    except (KeyError, ValueError) as exc:
-        raise PackageError("the package has no readable manifest or blueprint") from exc
-    if manifest.get("format") != FORMAT:
-        raise PackageError(f"unsupported package format {manifest.get('format')!r}")
-    if hashlib.sha256(blueprint).hexdigest() != manifest.get("blueprint_sha256"):
-        raise PackageError("blueprint.json does not match the manifest")
-    if not isinstance(payload, dict):
-        raise PackageError("blueprint.json is not a payload")
+    files = _package_files(entries)
+    if files is None:
+        payload, entries_list = _source_tree(entries)
+        files = _strip_tree_root(entries)
+    else:
+        payload, entries_list = _package_payload(files)
     assets = []
-    for entry in manifest.get("assets") or []:
+    for entry in entries_list:
         sha = str(entry.get("sha256") or "")
         if not _SHA256.fullmatch(sha):
             raise PackageError("an asset has no valid digest")
@@ -235,6 +260,53 @@ def unpack(data: bytes) -> tuple[dict[str, Any], list[Asset]]:
     if referenced - known:
         raise PackageError("the payload names files the package does not carry")
     return payload, assets
+
+
+def _package_files(entries: dict[str, bytes]) -> dict[str, bytes] | None:
+    """The ``package/`` layout's files, or ``None`` for a source tree."""
+    if not any(name.startswith("package/") for name in entries):
+        return None
+    if any(not name.startswith("package/") for name in entries):
+        raise PackageError("the package mixes a package/ layout with other files")
+    return {name.removeprefix("package/"): data for name, data in entries.items()}
+
+
+def _strip_tree_root(entries: dict[str, bytes]) -> dict[str, bytes]:
+    """The tree's files relative to its manor.json, which may sit in one folder."""
+    from packages.core.blueprints.source_tree import ROOT
+
+    roots = [name for name in entries if posixpath.basename(name) == ROOT and name.count("/") <= 1]
+    if len(roots) != 1:
+        raise PackageError("not a Blueprint package or source tree")
+    prefix = roots[0][: -len(ROOT)]
+    if any(not name.startswith(prefix) for name in entries):
+        raise PackageError("the source tree has files outside its folder")
+    return {name[len(prefix):]: data for name, data in entries.items()}
+
+
+def _source_tree(entries: dict[str, bytes]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    from packages.core.blueprints.source_tree import SourceTreeError, join
+
+    try:
+        return join(_strip_tree_root(entries))
+    except SourceTreeError as exc:
+        raise PackageError(str(exc)) from exc
+
+
+def _package_payload(files: dict[str, bytes]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    try:
+        manifest = json.loads(files["manifest.json"])
+        blueprint = files["blueprint.json"]
+        payload = json.loads(blueprint)
+    except (KeyError, ValueError) as exc:
+        raise PackageError("the package has no readable manifest or blueprint") from exc
+    if manifest.get("format") != FORMAT:
+        raise PackageError(f"unsupported package format {manifest.get('format')!r}")
+    if hashlib.sha256(blueprint).hexdigest() != manifest.get("blueprint_sha256"):
+        raise PackageError("blueprint.json does not match the manifest")
+    if not isinstance(payload, dict):
+        raise PackageError("blueprint.json is not a payload")
+    return payload, list(manifest.get("assets") or [])
 
 
 def restore_assets(payload: dict[str, Any], addresses: dict[str, str]) -> dict[str, Any]:

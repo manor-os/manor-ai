@@ -9,7 +9,7 @@ Promote does that atomically:
      real entity. If not, return the unmet requirements without
      touching the workspace.
   2. Flip — ``settings.sandbox=false``; restore ``kind`` from the
-     blueprint metadata; clear the ``[SIM] `` name prefix.
+     blueprint metadata; clear the ``[SIM] `` prefix older installs added.
   3. Annotate — append a promotion event to ``settings._blueprint``
      so the audit trail shows when sandbox→live happened.
 
@@ -34,10 +34,16 @@ from typing import Any, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.blueprints import BlueprintInstallTodoKind
 from packages.core.models.document import Channel
 from packages.core.models.goal import Goal
 from packages.core.models.integration_session import IntegrationSession
 from packages.core.models.workspace import Workspace
+from packages.core.services.workspace_readiness import (
+    BUILT_IN_CHANNEL_TYPES,
+    channel_type_has_account_model,
+)
+from packages.core.workspaces.sandbox import SANDBOX_KIND
 
 logger = logging.getLogger(__name__)
 
@@ -48,9 +54,10 @@ class PromoteError(Exception):
 
 @dataclass
 class UnmetRequirement:
-    kind: str  # 'channel' | 'browser_session'
+    kind: str  # 'setup' | 'channel' | 'browser_session'
     detail: str
     payload: dict[str, Any] = field(default_factory=dict)
+    can_defer_connection: bool = False
 
 
 @dataclass
@@ -133,6 +140,14 @@ async def preflight_promote(
                     "key": str(check.get("key") or "blocking_setup_incomplete"),
                     "todo_kind": str(check.get("todo_kind") or "blocking_setup"),
                 },
+                can_defer_connection=(
+                    check.get("kind") == "integration_provider"
+                    or check.get("todo_kind") in {
+                        BlueprintInstallTodoKind.CHANNEL,
+                        BlueprintInstallTodoKind.BROWSER_SESSION,
+                        BlueprintInstallTodoKind.MISSING_INTEGRATION,
+                    }
+                ),
             ))
 
     for req in bp_meta.get("channel_requirements") or []:
@@ -146,6 +161,7 @@ async def preflight_promote(
                     + (f" for {req.get('purpose')}" if req.get("purpose") else "")
                 ),
                 payload=dict(req),
+                can_defer_connection=True,
             ))
 
     for req in bp_meta.get("session_requirements") or []:
@@ -159,6 +175,7 @@ async def preflight_promote(
                     + (f" labelled {req.get('label')!r}" if req.get("label") else "")
                 ),
                 payload=dict(req),
+                can_defer_connection=True,
             ))
 
     return unmet
@@ -171,17 +188,21 @@ async def promote_workspace(
     *,
     user_id: Optional[str] = None,
     force: bool = False,
+    defer_connections: bool = False,
 ) -> PromoteResult:
     """Flip a sandboxed workspace into live mode. Caller commits.
 
     ``force=True`` skips the preflight — useful for testing or for
     operators who deliberately want to ship with unpaired channels.
-    Default is to refuse + return the todo list.
+    ``defer_connections=True`` still checks setup under the Workspace lock
+    and lets a person connect accounts or browser sessions later.
     """
     ws = await _load(db, workspace_id, for_update=True)
     settings = dict(ws.settings or {})
 
-    if not settings.get("sandbox"):
+    from packages.core.workspaces import is_sandbox_workspace
+
+    if not is_sandbox_workspace(ws):
         raise PromoteError(
             f"workspace {workspace_id!r} is not in Workspace simulation mode "
             f"(settings.sandbox is not true)"
@@ -189,14 +210,13 @@ async def promote_workspace(
 
     if not force:
         unmet = await preflight_promote(db, workspace_id)
-        if unmet:
+        if any(not (defer_connections and item.can_defer_connection) for item in unmet):
             return PromoteResult(
                 workspace_id=workspace_id,
                 promoted=False,
                 unmet=unmet,
                 notes=[
-                    "Preflight failed — pair the listed channels / capture "
-                    "the listed sessions, then retry.",
+                    "Complete the required setup before promoting the Workspace.",
                 ],
             )
 
@@ -210,14 +230,17 @@ async def promote_workspace(
     settings["sandbox"] = False
     if bp_meta.get("original_kind"):
         ws.kind = bp_meta["original_kind"]
+    elif (ws.kind or "").lower() == SANDBOX_KIND:
+        # A demo Workspace has no other kind to restore; it stays a simulation otherwise.
+        ws.kind = None
 
     retired_measurements = await _retire_simulation_measurement_sources(
         db,
         ws.id,
     )
 
-    # Strip the [SIM] prefix the installer added.
-    if ws.name and ws.name.startswith("[SIM] "):
+    # Older installs prefixed the name, sometimes twice.
+    while ws.name and ws.name.startswith("[SIM] "):
         ws.name = ws.name[len("[SIM] "):]
 
     # Annotate the audit trail.
@@ -275,6 +298,10 @@ async def _channel_present(
     channel_type = req.get("channel_type")
     if not channel_type:
         return True  # malformed requirement — don't block on it
+    if channel_type in BUILT_IN_CHANNEL_TYPES or not channel_type_has_account_model(channel_type):
+        # Workspace chat is always there, and a platform with no channel
+        # adapter has no account to pair; neither can be missing.
+        return True
     row = (await db.execute(
         select(Channel).where(
             Channel.entity_id == entity_id,

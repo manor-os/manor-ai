@@ -1,5 +1,6 @@
 export function stripEditorLiveEditBlocks(value?: unknown): string;
 export function redactInternalAssistantErrorDetails(value?: unknown): string;
+export function stripInternalReferences(value?: unknown): string;
 export function visibleAssistantText(value?: unknown): string;
 export function hasAppendedCanonicalFinal(
   content: string,

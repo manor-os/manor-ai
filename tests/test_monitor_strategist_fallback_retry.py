@@ -10,8 +10,7 @@ import pytest
 from packages.core.tasks.monitor_tasks import _async_readiness_check
 
 
-def _setup_tick(monkeypatch, *, reason_code=None, changed=False):
-    from packages.core.models.document import Integration
+def _setup_tick(monkeypatch, *, reason_code=None, changed=False, snapshot=None):
     from packages.core.models.goal import Goal
     from packages.core.models.review_run import ReviewRun
     from packages.core.models.runtime_learning import RuntimeEvidence
@@ -24,7 +23,9 @@ def _setup_tick(monkeypatch, *, reason_code=None, changed=False):
         status="active", heartbeat_enabled=True,
         settings={
             "created_by_user_id": "user-1",
-            "_readiness_snapshot": {"agents": 1, "goals": 0 if changed else 1, "integrations": 1},
+            "_readiness_snapshot": snapshot or {
+                "agents": 1, "goals": 0 if changed else 1, "integration_providers": 1,
+            },
             "_strategist_llm_retry": {"retried_review_ids": ["original-fallback"]},
             "user_setting": "preserved",
         },
@@ -58,7 +59,7 @@ def _setup_tick(monkeypatch, *, reason_code=None, changed=False):
             return scalar_result(evidence)
         if table == Goal.__tablename__ and statement.column_descriptions[0]["entity"] is Goal:
             return rows_result([SimpleNamespace(current_value=0, target_value=10)])
-        if table in {AgentSubscription.__tablename__, Goal.__tablename__, Integration.__tablename__}:
+        if table == AgentSubscription.__tablename__:
             return scalar_result(1)
         if table in {Task.__tablename__, ReviewRun.__tablename__}:
             return scalar_result(0)
@@ -76,6 +77,10 @@ def _setup_tick(monkeypatch, *, reason_code=None, changed=False):
     monkeypatch.setattr("packages.core.services.workspace_access.lock_workspace_access_boundary", AsyncMock(return_value=workspace))
     monkeypatch.setattr("packages.core.tasks.monitor_tasks._reconcile_blueprint_startup_after_monitor", startup)
     monkeypatch.setattr(run_strategist_review, "apply_async", dispatch)
+    monkeypatch.setattr(
+        "packages.core.strategist.context.workspace_configured_provider_keys",
+        AsyncMock(return_value=["gmail"]),
+    )
     return workspace, history, queried_tables, db, dispatch, startup
 
 
@@ -93,7 +98,7 @@ async def test_two_idle_ticks_do_not_retry_legacy_fallback_or_rejected_cohort(mo
     assert workspace.settings == original_settings
     assert history == original_history
     assert workspace.status == "active" and workspace.heartbeat_enabled is True
-    assert queried == ["workspaces", "agent_subscriptions", "goals", "integrations"] * 2
+    assert queried == ["workspaces", "agent_subscriptions", "goals"] * 2
     assert db.commit.await_count == 2
     assert startup.await_count == 2
 
@@ -117,7 +122,26 @@ async def test_readiness_change_still_dispatches_once_without_fallback_retry(mon
         countdown=5,
     )
     assert workspace.settings["_strategist_llm_retry"] == original_retry_state
-    assert workspace.settings["_readiness_snapshot"] == {"agents": 1, "goals": 1, "integrations": 1}
+    assert workspace.settings["_readiness_snapshot"] == {"agents": 1, "goals": 1, "integration_providers": 1}
     assert workspace.status == "active" and workspace.heartbeat_enabled is True
-    assert queried == ["workspaces", "agent_subscriptions", "goals", "integrations"] * 2
+    assert queried == ["workspaces", "agent_subscriptions", "goals"] * 2
     assert db.commit.await_count == startup.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_provider_baseline_is_recorded_without_a_review(monkeypatch):
+    # A snapshot from before the Workspace-scoped provider count (or none):
+    # the first tick records the baseline; only a later increase is news.
+    workspace, _, _, _, dispatch, _ = _setup_tick(
+        monkeypatch, snapshot={"agents": 1, "goals": 1, "integrations": 7},
+    )
+
+    assert await _async_readiness_check() == 0
+    dispatch.assert_not_called()
+    assert workspace.settings["_readiness_snapshot"]["integration_providers"] == 1
+
+    workspace.settings["_readiness_snapshot"]["integration_providers"] = 0
+    assert await _async_readiness_check() == 1
+    assert dispatch.call_args.kwargs["kwargs"]["trigger_detail"] == (
+        "readiness changed: integration_providers: 0->1"
+    )

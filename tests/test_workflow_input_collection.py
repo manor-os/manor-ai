@@ -251,3 +251,18 @@ def test_release_assets_are_visible_in_final_chat_attachments():
     )
     assert attachments[0]["name"] == "master.wav"
     assert attachments[0]["fsPath"] == "bundle/assets/audio/master.wav"
+
+
+def test_the_knowledge_a_result_cites_is_not_something_it_delivered():
+    """An article that cites Knowledge files lists none of them; a linked deliverable still shows."""
+    attachments = _workflow_final_output_attachments(
+        {
+            "title": "Five morning habits",
+            "markdown": "Read the full piece in [habits.md](/viewer/01M64R5AFZVP5MMT961QF2NTB7).",
+            "knowledge_refs": ["brand-voice.md — /viewer/01M64QGMG7QZEV3QTAD4QB91KB"],
+            "citations": ["content-package.md (/viewer/01M64QGMRR8CAFW95BMZYM17C4): packages keep references."],
+            "brief": {"knowledge_refs": ["visual-style.md — /viewer/01M64QGMJKV16ECWWAJF09GZ1P"]},
+        },
+        entity_id="test-entity",
+    )
+    assert [attachment["name"] for attachment in attachments] == ["habits.md"]

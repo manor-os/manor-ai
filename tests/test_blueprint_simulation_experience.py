@@ -64,12 +64,25 @@ def test_generator_derives_blueprint_specific_media_artifacts():
     assert all(artifact["filename"] for artifact in experience["artifacts"])
     assert "external system" in experience["completion_summary"]
     stages = experience["stages"]
-    assert stages[0]["id"] == "goal-request"
-    assert stages[-1]["id"] == "goal-completed"
-    assert [stage["kind"] for stage in stages].count("proposal") == 3
-    assert {stage["kind"] for stage in stages} >= {
-        "input", "workflow", "artifact", "approval", "failure", "receipt", "goal",
-    }
+    assert [stage["id"] for stage in stages] == [
+        "request", "plan-proposal", "first-work", "operator-input", "output-approval", "delivery",
+    ]
+    # The plan, one question and the results: the three places a live run stops.
+    assert [stage["pending_action"]["kind"] for stage in stages if stage.get("pending_action")] == [
+        "approve_proposals", "needs_input", "governance_approval",
+    ]
+    assert "failure" not in {stage["kind"] for stage in stages}
+    assert all(stage["i18n"]["zh"]["body"] for stage in stages)
+
+    # Reinstallation can return independent schedule rows in a different order.
+    payload = _payload()
+    payload["recipe"]["scheduled_jobs"] = [
+        {"job_id": "weekly", "name": "Weekly content distribution review"},
+        {"job_id": "daily", "name": "Assess audience metrics daily"},
+    ]
+    first = generate_simulation_experience(payload)
+    payload["recipe"]["scheduled_jobs"].reverse()
+    assert generate_simulation_experience(payload) == first
 
 
 def test_authored_experience_overrides_generated_fallback_without_mutating_payload():
@@ -89,7 +102,7 @@ def test_legacy_authored_experience_is_enriched_with_a_blueprint_scenario():
     payload["recipe"]["simulation_experience"] = authored
     resolved = resolve_simulation_experience(payload)
     assert resolved["artifacts"] == authored["artifacts"]
-    assert len(resolved["stages"]) == 13
+    assert len(resolved["stages"]) == 6
     assert "stages" not in payload["recipe"]["simulation_experience"]
 
 

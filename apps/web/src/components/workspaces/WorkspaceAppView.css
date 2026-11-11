@@ -54,7 +54,7 @@
   color: var(--text-muted);
   font-size: 11px;
   font-weight: 700;
-  letter-spacing: .08em;
+  letter-spacing: normal;
 }
 .workspace-app-view__intro h2 {
   margin: 0;
@@ -142,7 +142,7 @@
 .workspace-app-view__hero-art span:nth-child(2) { inset: 36px; animation-duration: 24s; animation-direction: reverse; }
 .workspace-app-view__hero-art span:nth-child(3) { inset: 72px; animation-duration: 15s; }
 .workspace-app-view__hero-content { display: grid; gap: 6px; min-width: 0; max-width: 46ch; }
-.workspace-app-view__hero-kicker { color: var(--text-muted); font-size: 11px; font-weight: 500; letter-spacing: .02em; }
+.workspace-app-view__hero-kicker { color: var(--text-muted); font-size: 11px; font-weight: 500; letter-spacing: normal; }
 .workspace-app-view__hero-content strong {
   font-size: clamp(20px, 5cqi, 24px);
   font-weight: 650;
@@ -197,8 +197,17 @@
   content: "";
   background: linear-gradient(180deg, rgb(19 21 20 / 72%), rgb(19 21 20 / 38%) 62%, rgb(19 21 20 / 65%));
 }
+/* A cover with no picture yet is a colour field in the App's accent (grey without one), never an empty panel. */
+.workspace-app-view__cover--color {
+  color: white;
+  background:
+    radial-gradient(90% 80% at 85% 8%, hsl(var(--app-cover-accent, 0) var(--app-cover-saturation, 0%) 62% / 70%), transparent 62%),
+    radial-gradient(110% 100% at 0% 100%, hsl(var(--app-cover-hue, 0) var(--app-cover-saturation, 0%) 24%), transparent 75%),
+    linear-gradient(150deg, hsl(var(--app-cover-hue, 0) var(--app-cover-saturation, 0%) 38%), hsl(var(--app-cover-accent, 0) var(--app-cover-saturation, 0%) 12%));
+}
+.workspace-app-view__cover--color .workspace-app-view__hero-art span { border-color: rgb(255 255 255 / 18%); }
 .workspace-app-view__cover .workspace-app-view__intro { margin: 0; }
-.workspace-app-view__cover--image .workspace-app-view__intro :is(h2, p, .workspace-app-view__eyebrow) { color: white; }
+.workspace-app-view__cover:is(.workspace-app-view__cover--image, .workspace-app-view__cover--color) .workspace-app-view__intro :is(h2, p, .workspace-app-view__eyebrow) { color: white; }
 .workspace-app-view__cover .workspace-app-view__intro h2 { font-size: clamp(24px, 6cqi, 34px); }
 .workspace-app-view__cover .workspace-app-view__intro p { max-width: 38ch; }
 .workspace-app-view__cover-action {
@@ -263,7 +272,7 @@
   flex: 0 0 auto;
   font-size: 12px;
   font-weight: 700;
-  letter-spacing: .02em;
+  letter-spacing: normal;
   color: var(--text-strong);
 }
 .workspace-app-view__search {
@@ -275,7 +284,7 @@
   height: 32px;
   gap: 8px;
   padding: 0 10px;
-  border: 1px solid var(--border-subtle);
+  border: 0.5px solid var(--border-subtle);
   border-radius: calc(10px * var(--app-radius-scale, 1));
   background: color-mix(in srgb, var(--surface-muted) 72%, var(--surface-panel));
   color: var(--text-muted);
@@ -330,7 +339,7 @@
 }
 .workspace-app-view__action-icon { width: 20px; height: 20px; }
 .workspace-app-view__action-copy { display: grid; flex: 1; min-width: 0; gap: 3px; }
-.workspace-app-view__action-kind { color: var(--text-muted); font-size: 10px; font-weight: 700; letter-spacing: .04em; }
+.workspace-app-view__action-kind { color: var(--text-muted); font-size: 10px; font-weight: 700; letter-spacing: normal; }
 .workspace-app-view__action-copy strong { color: var(--text-strong); font-size: 13px; font-weight: 680; line-height: 1.35; overflow-wrap: anywhere; }
 .workspace-app-view__action-copy small { color: var(--text-muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
 .workspace-app-view__action > svg { flex: 0 0 auto; align-self: center; }
@@ -365,6 +374,19 @@
 .workspace-app-view__empty p { margin: 10px 0; }
 .workspace-app-view__no-results { padding: 16px; color: var(--text-muted); font-size: 12px; }
 .workspace-app-view__busy { margin: 4px 0 0; color: var(--text-muted); font-size: 12px; }
+/* A design draft's page: real data, nothing to start, until its review card is approved. */
+.workspace-app-view__draft {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 18px;
+  padding: 8px 8px 8px 14px;
+  border-radius: calc(12px * var(--app-radius-scale, 1));
+  background: var(--accent-soft);
+  color: var(--text-strong);
+  font-size: 12px;
+}
+.workspace-app-view__draft p { flex: 1; margin: 0; }
 
 /* An entry grows with the App: a narrow column on a small pane, a wide page on a wide one. */
 .workspace-app-flow { display: grid; align-content: start; gap: 16px; width: 100%; max-width: clamp(580px, 82cqi, 1120px); margin: 0 auto; }
@@ -415,7 +437,7 @@
 .workspace-app-flow__run-progress-count { flex: 0 0 auto; color: var(--text-muted); font: 11px/1 var(--font-mono, monospace); font-variant-numeric: tabular-nums; }
 .workspace-app-flow__panel h4 { margin: 0 0 9px; color: var(--text-strong); font-size: 12px; }
 .workspace-app-flow__panel p { margin: 0; color: var(--text-muted); font-size: 12px; line-height: 1.55; }
-.workspace-app-flow__kicker { color: var(--text-muted); font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.workspace-app-flow__kicker { color: var(--text-muted); font-size: 11px; font-weight: 700; letter-spacing: normal; text-transform: none; }
 .workspace-app-flow__buttons { display: flex; justify-content: flex-end; align-items: center; flex-wrap: wrap; gap: 9px; margin-top: 4px; }
 .workspace-app-flow__result-actions { justify-content: flex-start; }
 .workspace-app-flow__result-actions .workspace-app-flow__details { margin-left: auto; }
@@ -427,10 +449,21 @@
 .workspace-app-flow__fields--compact > .chat-workflow-review-pairs { grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 18px 24px; }
 .workspace-app-flow__fields--compact .chat-workflow-review-pairs > div { gap: 5px; }
 .workspace-app-flow__fields--compact .chat-workflow-review-pairs dd { font-size: 13px; line-height: 1.5; }
+.workspace-app-flow__fields--reads > .chat-workflow-review-pairs { grid-template-columns: minmax(0, 1fr); gap: 14px; }
+.workspace-app-flow__fields--reads .chat-workflow-review-pairs > div { align-content: start; }
+.workspace-app-flow__fields--reads .chat-workflow-review-pairs dd { font-size: 13.5px; line-height: 1.6; }
+.workspace-app-flow__fields--reads .chat-workflow-review-items { gap: 4px; padding-left: 18px; list-style: disc; }
+.workspace-app-flow__fields--reads .chat-workflow-review-items > li { padding: 0; background: none; }
 .workspace-app-flow__output { max-height: 360px; margin: 0; padding: 15px; overflow: auto; border-radius: var(--radius-control); background: var(--surface-muted); color: var(--text-default); font: 12px/1.6 var(--font-mono, monospace); white-space: pre-wrap; overflow-wrap: anywhere; }
 .workspace-app-flow__raw > summary { width: fit-content; color: var(--text-muted); font-size: 12.5px; cursor: pointer; }
 .workspace-app-flow__raw[open] > summary { margin-bottom: 8px; }
 .workspace-app-flow__summary { margin: 0; color: var(--text-default); font-size: 13px; line-height: 1.6; }
+/* A written result (an article, a script) reads as a page: its title, then the text at reading size. */
+.workspace-app-flow__article { margin-top: 14px; padding-top: 14px; border-top: 0.5px solid rgba(29, 29, 31, 0.06); color: var(--text-default); font-size: 14px; line-height: 1.7; }
+.workspace-app-flow__article .workspace-app-flow__article-title { margin: 0 0 10px; color: var(--text-strong); font-size: 18px; font-weight: 600; line-height: 1.35; }
+/* Its own sections sit under its title, never above it. */
+.workspace-app-flow__article :is(h1, h2, h3, h4):not(.workspace-app-flow__article-title) { margin: 18px 0 6px; color: var(--text-strong); font-size: 15px; font-weight: 600; line-height: 1.4; }
+.workspace-app-flow__article p { margin: 0 0 10px; }
 .workspace-app-flow__panel .workspace-app-flow__result-title { margin: 0; color: var(--text-strong); font-size: 16px; font-weight: 600; line-height: 1.45; }
 .workspace-app-flow__fields { margin-top: 10px; }
 .workspace-app-flow__timeline { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
@@ -455,7 +488,7 @@
 .workspace-app-flow__history[open] > summary svg { transform: rotate(180deg); }
 .workspace-app-flow__history-count { padding: 1px 7px; border-radius: 999px; background: var(--surface-muted); color: var(--text-muted); font-size: 11px; font-weight: 500; }
 .workspace-app-flow__history-tally { min-width: 0; overflow: hidden; color: var(--text-muted); font-size: 12px; font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
-.workspace-app-flow__history > button { display: grid; grid-template-columns: minmax(0, 1fr) auto 14px; align-items: center; gap: 12px; width: 100%; padding: 10px 4px; border: 0; border-bottom: 1px solid var(--border-subtle); background: transparent; cursor: pointer; color: var(--text-default); font: inherit; font-size: 12px; text-align: left; }
+.workspace-app-flow__history > button { display: grid; grid-template-columns: minmax(0, 1fr) auto 14px; align-items: center; gap: 12px; width: 100%; padding: 10px 4px; border: 0; border-bottom: 0.5px solid var(--border-subtle); background: transparent; cursor: pointer; color: var(--text-default); font: inherit; font-size: 12px; text-align: left; }
 .workspace-app-flow__history > button:hover, .workspace-app-flow__history > button[aria-current="true"] { background: var(--glass-card-hover); }
 .workspace-app-flow__history > button:focus-visible { outline: 2px solid var(--text-default); outline-offset: 2px; }
 .workspace-app-flow__history > button time { color: var(--text-muted); font-size: 11px; white-space: nowrap; }
@@ -484,7 +517,7 @@
 .workspace-app-flow__file-icon { display: inline-grid; flex: 0 0 34px; place-items: center; width: 34px; height: 34px; border-radius: calc(9px * var(--app-radius-scale, 1)); background: var(--surface-muted); color: var(--text-default); }
 .workspace-app-flow__file-copy { display: grid; flex: 1; gap: 2px; min-width: 0; }
 .workspace-app-flow__file-copy strong { overflow-wrap: anywhere; color: var(--text-strong); font-size: 12px; font-weight: 650; line-height: 1.35; }
-.workspace-app-flow__file-copy small { color: var(--text-muted); font: 600 10px/1.2 var(--font-mono, monospace); letter-spacing: .04em; }
+.workspace-app-flow__file-copy small { color: var(--text-muted); font: 600 10px/1.2 var(--font-mono, monospace); letter-spacing: normal; }
 .workspace-app-flow__file-arrow { flex: 0 0 auto; color: var(--text-faint); }
 .workspace-app-flow__files-toggle { display: inline-flex; align-items: center; gap: 5px; min-height: 36px; margin-top: 4px; padding: 8px 1px; border: 0; background: transparent; color: var(--text-muted); font: inherit; font-size: 11px; font-weight: 600; cursor: pointer; }
 .workspace-app-flow__files-toggle:hover { color: var(--text-strong); }
@@ -545,7 +578,7 @@
   --app-queue-bg: #f8f1e3;
   --app-card-fill: #f5f5f7;
   --app-card-fill-hover: #ececef;
-  --app-hairline: rgba(28, 25, 23, 0.06);
+  --app-hairline: rgba(29, 29, 31, 0.06);
 }
 html[data-theme="dark"] {
   --app-status-done: #7fc0a8;
@@ -661,9 +694,11 @@ a.workspace-app-gallery__card:hover { box-shadow: var(--shadow-md); transform: t
 .workspace-app-gallery__tall .workspace-app-gallery__card { aspect-ratio: 9 / 16; }
 /* A recording: a square with its note, a play button, and how far it has played along the bottom. */
 .workspace-app-gallery__card--audio { aspect-ratio: 1; }
-.workspace-app-gallery__card--audio .workspace-app-gallery__glyph { place-items: start center; padding-top: 22%; }
-.workspace-app-gallery__play { position: absolute; top: 50%; left: 50%; display: grid; place-items: center; width: 40px; height: 40px; padding: 0; border: 0; border-radius: 50%; background: var(--text-strong); color: var(--surface-panel); cursor: pointer; transform: translate(-50%, -10%); transition: transform .15s ease; }
-.workspace-app-gallery__play:hover { transform: translate(-50%, -10%) scale(1.06); }
+/* The note sits in a corner so the play button has the space above the caption to itself. */
+.workspace-app-gallery__card--audio .workspace-app-gallery__glyph { inset: 9px auto auto 10px; }
+.workspace-app-gallery__play { position: absolute; top: calc((100% - 30px) / 2); left: 50%; display: grid; place-items: center; width: 40px; height: 40px; padding: 0; border: 0; border-radius: 50%; background: var(--text-strong); color: var(--surface-panel); cursor: pointer; transform: translate(-50%, -50%); transition: transform .15s ease; }
+.workspace-app-gallery__play:hover { transform: translate(-50%, -50%) scale(1.06); }
+.workspace-app-gallery__time { position: absolute; top: calc((100% - 30px) / 2 + 26px); right: 0; left: 0; color: var(--text-secondary); font-family: var(--font-mono); font-size: 10.5px; font-variant-numeric: tabular-nums; text-align: center; }
 .workspace-app-gallery__play[aria-busy="true"] { opacity: .6; cursor: progress; }
 .workspace-app-gallery__card--audio .workspace-app-gallery__caption a { min-width: 0; overflow: hidden; color: inherit; text-decoration: none; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-app-gallery__played { position: absolute; right: 0; bottom: 0; left: 0; height: 3px; background: color-mix(in srgb, var(--text-default) 8%, transparent); }
@@ -762,7 +797,7 @@ button.workspace-app-gallery__card:hover { box-shadow: var(--shadow-md); transfo
 .workspace-app-connections__lead strong::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 7px; border-radius: 50%; background: var(--app-status-attention); vertical-align: 1px; }
 .workspace-app-connections ul { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; }
 .workspace-app-connections__row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 8px 0; }
-.workspace-app-connections__row + .workspace-app-connections__row { border-top: 1px solid rgba(28, 25, 23, 0.06); }
+.workspace-app-connections__row + .workspace-app-connections__row { border-top: 0.5px solid rgba(29, 29, 31, 0.06); }
 .workspace-app-connections__row > button { flex: none; }
 .workspace-app-connections__name { display: flex; min-width: 0; flex: 1 1 0; align-items: center; gap: 10px; }
 .workspace-app-connections__name > span { display: grid; min-width: 0; }
@@ -779,17 +814,12 @@ button.workspace-app-gallery__card:hover { box-shadow: var(--shadow-md); transfo
 .workspace-app-metric-detail__value { color: var(--text-strong); font-family: var(--font-mono); font-size: 20px; font-variant-numeric: tabular-nums; }
 .workspace-app-metric-detail { display: grid; gap: 22px; }
 .workspace-app-metric-detail section { display: grid; gap: 8px; }
-.workspace-app-metric-detail h4 { margin: 0; color: var(--text-strong); font-size: 12px; font-weight: 700; letter-spacing: .02em; }
+.workspace-app-metric-detail h4 { margin: 0; color: var(--text-strong); font-size: 12px; font-weight: 700; letter-spacing: normal; }
 .workspace-app-metric-detail p { margin: 0; font-size: 12.5px; line-height: 1.55; overflow-wrap: anywhere; }
 .workspace-app-metric-detail__muted { color: var(--text-muted); }
 .workspace-app-metric-detail__goal-title { color: var(--text-strong); font-weight: 600; }
 .workspace-app-metric-detail__link { color: var(--text-default); font-size: 12.5px; text-decoration: underline; text-underline-offset: 3px; }
-.workspace-app-metric-detail__chart { margin: 0; }
-.workspace-app-metric-detail__chart svg { display: block; width: 100%; height: 120px; overflow: visible; }
-.workspace-app-metric-detail__chart line { stroke: var(--app-hairline); stroke-width: 1; vector-effect: non-scaling-stroke; }
-.workspace-app-metric-detail__chart polygon { fill: color-mix(in srgb, var(--accent) 12%, transparent); }
-.workspace-app-metric-detail__chart polyline { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; }
-.workspace-app-metric-detail__chart figcaption { display: flex; justify-content: space-between; margin-top: 4px; color: var(--text-faint); font-family: var(--font-mono); font-size: 11px; }
+.workspace-app-metric-detail__chart { margin: 0; min-width: 0; }
 .workspace-app-metric-detail__gaps, .workspace-app-metric-detail__readings, .workspace-app-metric-detail__refs { margin: 0; padding: 0; list-style: none; }
 .workspace-app-metric-detail__gaps li { padding: 8px 10px; border-radius: calc(10px * var(--app-radius-scale, 1)); background: var(--app-queue-bg); color: var(--text-default); font-size: 12.5px; }
 .workspace-app-metric-detail__gaps li + li { margin-top: 6px; }
@@ -910,7 +940,7 @@ button.workspace-app-gallery__card:hover { box-shadow: var(--shadow-md); transfo
 .workspace-app-connections__lead strong::before { content: none; }
 .workspace-app-connections__optional summary { margin: 2px 4px 0; font-size: 12.5px; }
 .workspace-app-connections__optional .workspace-app-group { margin-top: 8px; }
-.workspace-app-connections__steps { padding: 0 0 4px 42px; }
+.workspace-app-notices .integration-connect-row__steps { padding: 0 14px 4px 56px; }
 
 /* Tracking widgets sit on the canvas like the other groups. */
 .workspace-app-metric { border-radius: calc(18px * var(--app-radius-scale, 1)); box-shadow: var(--shadow-sm); }
@@ -961,9 +991,9 @@ button.workspace-app-gallery__card:hover { box-shadow: var(--shadow-md); transfo
 .workspace-app-notices__list > li { position: relative; }
 .workspace-app-notices__list > li + li::before { content: ""; position: absolute; top: 0; right: 14px; left: 56px; height: 1px; background: color-mix(in srgb, var(--app-status-attention) 18%, transparent); }
 .workspace-app-notices__row > button { display: flex; align-items: center; width: 100%; gap: 12px; padding: 8px 14px; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
-.workspace-app-notices__list .workspace-app-group__row { min-height: 52px; padding: 8px 14px; }
+.workspace-app-notices__list :is(.workspace-app-group__row, .integration-connect-row) { min-height: 52px; padding: 8px 14px; }
 .workspace-app-notices__list .workspace-app-group__row::before { display: none; }
-.workspace-app-notices .workspace-app-group__icon { background: var(--surface-panel); }
+.workspace-app-notices :is(.workspace-app-group__icon, .integration-connect-row__icon) { background: var(--surface-panel); }
 .workspace-app-notices__open { display: inline-flex; flex: none; align-items: center; gap: 4px; color: var(--text-muted); font-size: 12px; }
 .workspace-app-notices__row > button:hover .workspace-app-notices__open { color: var(--text-strong); }
 .workspace-app-notices__optional { display: block; margin: 2px 0 0; padding: 6px 14px 0; border: 0; background: none; color: var(--text-muted); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer; }
@@ -1020,6 +1050,14 @@ button.workspace-app-gallery__card:hover { box-shadow: var(--shadow-md); transfo
 /* A track is a record: a square sleeve with its disc tucked behind. On hover
    the disc slides out and turns; the sleeve art repeats on the disc label. */
 .workspace-app-data__gallery--records { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 22px 18px; }
+.workspace-app-data__gallery--text { grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+.workspace-app-data__gallery--text .workspace-app-data__pack { align-content: start; gap: 6px; padding: 14px 16px; border-radius: var(--radius-card); background: var(--surface-panel); box-shadow: var(--shadow-sm); transition: transform 0.15s ease, box-shadow 0.15s ease; }
+.workspace-app-data__gallery--text .workspace-app-data__pack:hover:not(:disabled) { transform: translateY(-2px); box-shadow: var(--shadow-md); }
+.workspace-app-data__gallery--text .workspace-app-data__pack-summary { display: -webkit-box; overflow: hidden; color: var(--text-muted); font-size: 13px; line-height: 1.5; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+.workspace-app-data__gallery--text .workspace-app-data__pack-date { color: var(--text-muted); font-size: 11px; }
+.workspace-app-data__written { display: grid; gap: 20px; }
+.workspace-app-data__written h4 { margin: 0 0 8px; color: var(--text-strong); font-size: 13px; font-weight: 600; }
+.workspace-app-data__gallery--text .workspace-app-data__pack-caption strong { font-size: 14px; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .workspace-app-data__record-card {
   display: grid; gap: 10px; min-width: 0; padding: 0; border: 0; background: none;
   color: var(--text-strong); font: inherit; text-align: left; cursor: pointer;
@@ -1031,6 +1069,11 @@ button.workspace-app-gallery__card:hover { box-shadow: var(--shadow-md); transfo
 .workspace-app-data__record-disc { position: absolute; inset: 0; display: block; }
 .workspace-app-data__record-sleeve {
   z-index: 1; overflow: hidden; border-radius: calc(6px * var(--app-radius-scale, 1));
+  box-shadow: 0 1px 2px rgb(0 0 0 / 18%), 0 10px 24px -12px rgb(0 0 0 / 45%);
+}
+/* A song still being made shows the shared making cover in the sleeve's place and shape. */
+.workspace-app-data__record-stage > .workspace-app-data__gallery-tile {
+  overflow: hidden; border-radius: calc(6px * var(--app-radius-scale, 1));
   box-shadow: 0 1px 2px rgb(0 0 0 / 18%), 0 10px 24px -12px rgb(0 0 0 / 45%);
 }
 .workspace-app-data__record-sleeve > *, .workspace-app-data__record-label > * { display: block; width: 100%; height: 100%; object-fit: cover; }
@@ -1059,27 +1102,24 @@ button.workspace-app-gallery__card:hover { box-shadow: var(--shadow-md); transfo
 }
 .workspace-app-data__record-art {
   background:
-    radial-gradient(120% 90% at 18% 12%, hsl(var(--record-accent) 85% 72% / 90%), transparent 58%),
-    radial-gradient(110% 100% at 92% 96%, hsl(var(--record-hue) 70% 38%), transparent 70%),
-    linear-gradient(150deg, hsl(var(--record-hue) 55% 52%), hsl(var(--record-accent) 45% 22%));
+    radial-gradient(120% 90% at 18% 12%, hsl(var(--app-cover-accent, var(--record-accent)) 85% 72% / 90%), transparent 58%),
+    radial-gradient(110% 100% at 92% 96%, hsl(var(--app-cover-hue, var(--record-hue)) 70% 38%), transparent 70%),
+    linear-gradient(150deg, hsl(var(--app-cover-hue, var(--record-hue)) 55% 52%), hsl(var(--app-cover-accent, var(--record-accent)) 45% 22%));
 }
 .workspace-app-data__record-card:is(:hover, :focus-visible):not(:disabled) .workspace-app-data__record-disc { transform: translateX(60%); }
 .workspace-app-data__record-card:is(:hover, :focus-visible):not(:disabled) .workspace-app-data__record-label { animation-play-state: running; }
 .workspace-app-data__record-caption { display: grid; gap: 2px; min-width: 0; }
 .workspace-app-data__record-caption strong { overflow: hidden; font-size: 13.5px; font-weight: 600; letter-spacing: -.01em; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-app-data__record-caption small { overflow: hidden; color: var(--text-muted); font-size: 12px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
-/* A record still being made sits half out of its sleeve and keeps turning. */
-.workspace-app-data__record-card[data-making] .workspace-app-data__record-disc { transform: translateX(46%); }
-.workspace-app-data__record-card[data-making] .workspace-app-data__record-label { animation-play-state: running; }
 @keyframes workspace-app-record-spin { to { transform: rotate(360deg); } }
 /* A picture or video still being made: a slow colour field in the result's own hues, a light passing
    over it and a pulse, so the card reads as working rather than empty. */
 .workspace-app-data__gallery-tile[data-making] {
   position: relative; overflow: hidden;
   background:
-    radial-gradient(60% 70% at 20% 25%, hsl(var(--making-accent) 70% 58% / 55%), transparent 70%),
-    radial-gradient(70% 80% at 85% 80%, hsl(var(--making-hue) 65% 45% / 60%), transparent 72%),
-    linear-gradient(140deg, hsl(var(--making-hue) 35% 22%), hsl(var(--making-accent) 30% 14%));
+    radial-gradient(60% 70% at 20% 25%, hsl(var(--app-cover-accent, var(--making-accent)) 70% 58% / 55%), transparent 70%),
+    radial-gradient(70% 80% at 85% 80%, hsl(var(--app-cover-hue, var(--making-hue)) 65% 45% / 60%), transparent 72%),
+    linear-gradient(140deg, hsl(var(--app-cover-hue, var(--making-hue)) 35% 22%), hsl(var(--app-cover-accent, var(--making-accent)) 30% 14%));
   background-size: 180% 180%, 180% 180%, 100% 100%;
   animation: workspace-app-making-drift 7s ease-in-out infinite alternate;
 }
@@ -1108,10 +1148,6 @@ button.workspace-app-gallery__card:hover { box-shadow: var(--shadow-md); transfo
   background: rgb(0 0 0 / 38%); backdrop-filter: blur(6px);
 }
 .workspace-app-data__record-card { position: relative; }
-.workspace-app-data__record-progress {
-  position: absolute; top: 0; left: 0; z-index: 3; display: grid; place-items: center;
-  width: 60%; aspect-ratio: 1; pointer-events: none;
-}
 @keyframes workspace-app-making-drift {
   from { background-position: 0% 0%, 100% 100%, 0 0; }
   to { background-position: 100% 60%, 0% 30%, 0 0; }

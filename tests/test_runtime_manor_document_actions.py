@@ -115,6 +115,7 @@ async def test_runtime_manor_document_actions_delegate_to_shared_document_action
             "workspace_id": "ws_1",
             "params": {"limit": 5},
             "db": db,
+            "person_in_chat": False,
         },
         {
             "handler": "search",
@@ -124,5 +125,6 @@ async def test_runtime_manor_document_actions_delegate_to_shared_document_action
             "params": {"query": "brief"},
             "db": db,
             "user_wording": None,
+            "person_in_chat": False,
         },
     ]

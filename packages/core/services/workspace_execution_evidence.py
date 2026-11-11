@@ -540,3 +540,58 @@ async def read_current_turn_task_references(scope: ExecutionEvidenceScope) -> li
             # Created and started in one turn reads as started.
             reference["effect"] = "started"
     return list(references.values())[:8]
+
+
+async def read_lone_requested_task(scope: ExecutionEvidenceScope) -> list[dict[str, str]]:
+    """The one Task this turn created when the user asked for Tasks.
+
+    Asked to "create these Tasks and start", the agent created the first
+    stage and promised to create the rest once it completed. Nothing wakes
+    Chat when a Task completes, so the later stages were never created.
+    """
+    references = await read_current_turn_task_references(scope)
+    if len(references) != 1:
+        return []
+    from packages.core.ai.runtime.task_handoff import user_asked_for_tasks
+    from packages.core.database import async_session
+    from packages.core.models.task import Message, Task
+
+    async with async_session() as db:
+        request = (await db.execute(select(Message.content).where(
+            Message.id == scope.origin_user_message_id,
+            Message.conversation_id == scope.conversation_id,
+        ))).scalar_one_or_none()
+        if not user_asked_for_tasks(str(request or "")):
+            return []
+        task = (await db.execute(select(Task).where(
+            Task.id == references[0]["id"],
+            Task.entity_id == scope.entity_id, Task.workspace_id == scope.workspace_id,
+        ))).scalar_one_or_none()
+    return [{"id": task.id, "title": task.title}] if task is not None else []
+
+
+async def read_stranded_turn_tasks(scope: ExecutionEvidenceScope) -> list[dict[str, str]]:
+    """Stages this turn created that nothing will ever start.
+
+    The turn created several Tasks and started some; a sibling still pending
+    with no predecessor link waits for no one, and the turn ending leaves no
+    one to start it.
+    """
+    references = await read_current_turn_task_references(scope)
+    if len(references) < 2:
+        return []
+    from packages.core.database import async_session
+    from packages.core.models.task import Task
+
+    async with async_session() as db:
+        tasks = (await db.execute(select(Task).where(
+            Task.id.in_([ref["id"] for ref in references]),
+            Task.entity_id == scope.entity_id, Task.workspace_id == scope.workspace_id,
+        ))).scalars().all()
+    if not any(task.status != TaskStatus.PENDING for task in tasks):
+        return []  # nothing started: the whole set is a draft
+    return [
+        {"id": task.id, "title": task.title}
+        for task in tasks
+        if task.status == TaskStatus.PENDING and not (task.details or {}).get("depends_on_task_ids")
+    ]

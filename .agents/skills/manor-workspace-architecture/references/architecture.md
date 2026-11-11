@@ -179,9 +179,26 @@ Purpose: materialize the Workspace shell and its declared operating parts.
   credentials. Required external Blueprint channels select an accessible
   user-owned credential source before Workspace mutation and create only the
   Workspace routing binding inside the install transaction. Conversational
-  creation offers only actor-ready integrations for new Agent
-  MCP bindings and requires an existing usable connection for external channel
-  selections; lint and finalize recheck this. Blueprint dependency declarations
+  creation offers the full actor catalog: an integration or external channel
+  the user asked for that is not connected yet is kept as a non-blocking
+  pending requirement (Agent MCP binding, `flagged_integrations`, channel
+  declaration), never dropped, and the user's rules about it keep their
+  `action_patterns`. Created and live-installed Workspaces then ask once in
+  Workspace chat (`ask_to_connect_pending_integrations`, a needs_login card
+  with connecting recommended); the binding works once connected and its
+  approvals still apply. Connecting happens where the person is: chat
+  integration links, connect cards and the App's Connect call
+  `openIntegrationConnect`, and `IntegrationConnectHost` (beside the global
+  DetailDrawer) opens the Integrations page's own setup panel and forms over
+  the page, OAuth in a popup returning to `/integrations/connected` (or a
+  redirect back to the same page). A connected card offers "continue", which
+  hands the waiting work back to the AI. A Workflow step that fails because
+  its Agent's integration is not connected (`workflow_step_connection_need`)
+  pauses as a re-execute `wait_type: "connection"` instead of failing
+  (`workflow_connection_wait`): one connect card in Workspace chat, the run
+  page's resume action is "Connect X", and the run continues from that step
+  when the card is continued, the run is continued, or a backed-off
+  continuation recheck finds it connected. Blueprint dependency declarations
   retain their separate install-time setup contract. A dependency that
   passed during install remains re-checkable
   after later disablement. Required MCP binding fields remain live readiness
@@ -256,6 +273,15 @@ Non-resumable entrypoints omit `request_input` from schemas, discovery and tool
 scope unless their host supplies an explicit end-turn bridge/custom handler.
 Capability refresh preserves host restrictions; registration is not proof of
 continuation support. This is runtime behavior, not Blueprint configuration.
+
+Exhausted Sandbox allocation and queue waits return a host-owned failure result
+to the exact parked Chat checkpoint. The reservation stays failed/expired; the
+same RuntimeRun is queued only for its model-authored final explanation, with
+no tool replay or dependent calls. Existing lease, cancellation, authorization,
+credit and final-response validation remain authoritative. The final run stays
+failed, and live/history projections preserve the accepted explanation before
+collapsed activity. Missing/invalid checkpoints or an unavailable model retain
+the terminal fallback. No runtime state becomes Blueprint configuration.
 
 Workspace Chat buffers final candidates until its response contract accepts
 them; live host/tool events remain streamable. `execution_summary` references
@@ -1049,6 +1075,16 @@ links and the separate enterprise SAML admission contract remain unchanged.
 Purpose: determine whether useful work can start and assemble the evidence the
 Strategist or agent is allowed to use.
 
+Remote MCP clients retain audience-bound OAuth grants and current user/team
+admission. Read-only grants filter mutating tools before a batch runs, and
+feature-specific scopes remain independently enforced. Typed `scp` and older
+`scope` claims carry the same grant into internal REST calls as an MCP actor.
+Client metadata is public HTTPS data fetched through the pinned-address policy,
+never credentials or Workspace authority. Personal tokens store only a hash,
+remain bound to their original team, support only MCP/read-only grants, and
+stop on revocation, expiry, account removal or token-version rotation. These
+tokens, client caches and grants are runtime state, not Blueprint content.
+
 - Code entry: `packages/core/services/workspace_readiness.py`,
   `packages/core/strategist/context.py`, Knowledge visibility/memory services,
   integration resolution, and goal/stat services.
@@ -1738,6 +1774,15 @@ These frames are runtime-only and excluded from Blueprint configuration.
 Purpose: pause an exact execution origin for approval, login, user input, or
 operator intervention, then resume that same origin.
 
+Conversation review demands must express a prospective approval requirement.
+Mentions of past approval cards and instructions about what to show if an
+existing gate asks do not create category-wide holds. Configuration-specific
+demands stay in the Workspace category; explicit stored holds still tighten
+the ordinary policy. These runtime constraints do not grant permission or
+resolve pending requests. File-create approval paths are displayed as creation
+targets, not readable Knowledge artifacts; existing files and review artifacts
+retain their normal viewer links. Saving still owns the WS-10 projection.
+
 Browser reload discovers only the caller's active Chat run and reconnects to
 its events; it never resends the originating prompt. Pending input is projected
 from durable HITL even when the event cache has expired. Answers name the exact
@@ -2191,6 +2236,14 @@ retry attempts and UI projections are runtime-only, not Blueprint content.
 
 Purpose: turn concrete execution output into a durable, visible Workspace
 artifact contract.
+
+Task upload links are authenticated resources. The task attachment list,
+shared comment row and Markdown links use the same download control, fetch
+bytes with the current session and retain the task/Workspace access check.
+Only exact same-origin attachment endpoints receive credentials; external
+links remain ordinary links. A stored attachment URL does not make it public
+or require a Knowledge projection. Cancelled or denied downloads never report
+a successful save.
 
 Authenticated file reads may use an active Document stored under another
 Workspace's original path when an explicit DocumentGroup membership links that exact Document
@@ -2760,6 +2813,13 @@ WS-14 Blueprint configuration.
   the App and observability; deletion still stops every Workspace automation.
   Workflow-only live Blueprint installations use paused autonomy without
   disabling their configured Workflow schedules.
+  A Job disabled only by lifecycle admission carries runtime-only
+  `ScheduledJob.workspace_hold`. Lifecycle reconciliation releases that hold
+  only after the current admission check: configured independent work uses
+  `workspace_allows_configured_work`, while autonomy work requires active
+  autonomy. An explicit Job enable/disable clears the hold, so activation
+  never restarts a Job the person or system stopped. Existing disabled rows
+  default to no hold; the marker is not Blueprint configuration.
   Manual Task/Plan execution receipts are server-owned runtime lineage, not
   tool authority or Blueprint configuration; automatic provenance is retained.
   Runtime tools recognize an explicit foreground profile or an exact scoped

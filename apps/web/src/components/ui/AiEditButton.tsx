@@ -1,4 +1,5 @@
 import type { ButtonHTMLAttributes } from "react";
+import { t } from "../../lib/i18n";
 import { IconSparkles } from "../icons";
 
 type AiEditButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
@@ -7,7 +8,7 @@ type AiEditButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
 };
 
 export default function AiEditButton({
-  label = "AI edit",
+  label = t("ui.ai_edit"),
   iconSize = 15,
   className,
   children,

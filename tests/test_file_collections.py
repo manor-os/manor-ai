@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 
 import pytest
 
@@ -56,6 +57,53 @@ def _source_receipts(ids):
         {"document_id": ids["audio_id"], "role": "source_audio"},
         {"document_id": ids["cover_id"], "role": "source_cover"},
     ]
+
+
+@pytest.mark.cloud
+@pytest.mark.asyncio
+async def test_release_package_checks_audio_before_preparing_materials(db_session, tmp_path):
+    """An MP4 with an audio track must fail before the release's agents prepare files."""
+    from packages.core.ai.workflow_runner import _resolve_structure
+    from packages.core.blueprints.package import unpack
+
+    package = Path(__file__).parents[1] / "docs/blueprints/jr-music-studio-campaign-final-review-2026-10-30.manor"
+    payload, _ = unpack(package.read_bytes())
+    workflow = next(item for item in payload["recipe"]["workflows"]
+                    if item["slug"] == "jr-music-prepare-single-release")
+    steps = {step["id"]: step for step in workflow["steps"]}
+    audio_input = next(item for item in steps["start_release_preparation"]["config"]["run_inputs"]
+                       if item["key"] == "audio_files")
+    assert audio_input["schema"]["x-ui"]["accept"] == ["audio"]
+    assert audio_input["schema"]["minItems"] == audio_input["schema"]["maxItems"] == 1
+    assert next(item for item in workflow["run_inputs"] if item["key"] == "audio_files") == audio_input
+
+    gate = steps[steps["claim_release_project"]["next"][0]]
+    assert gate["type"] == "tool"
+    assert gate["config"]["tool"] == "verify_file_collection"
+    assert gate["next"] == ["pin_release_source_audio"]
+    assert steps["pin_release_source_audio"]["next"] == ["intake_release_identity"]
+    ids = await _seed(db_session, tmp_path)
+    args = _resolve_structure(gate["config"]["args"], {
+        "audio_files": [{"document_id": ids["audio_id"]}],
+        "release_project": {"project_id": "release-project", "revision": 0},
+    })
+    assert args["required_roles"] == ["source_audio"]
+    assert args["verification_scope"] == "preparation"
+    assert args["expected_sources"] == []
+    context = dict(entity_id=ids["entity_id"], workspace_id=ids["workspace_id"], user_id=ids["user_id"])
+    result = await verify_file_collection(db_session, **context, **args)
+    assert result["preparation_completed"] is True
+    assert result["delivery_verified"] is False
+    assert result["files"][0]["document_id"] == ids["audio_id"]
+
+    document = await db_session.get(Document, ids["audio_id"])
+    document.name = "captioned-video.mp4"
+    document.file_type = "mp4"
+    document.mime_type = "video/mp4"
+    await db_session.flush()
+    with pytest.raises(FileCollectionError) as rejected:
+        await verify_file_collection(db_session, **context, **args)
+    assert rejected.value.code == "source_media_type_invalid"
 
 
 @pytest.mark.asyncio
@@ -242,6 +290,21 @@ async def test_archive_collection_copies_sources_to_the_workflow_lineage_and_reu
     assert [item["source_document_id"] for item in reused_in_new_run["files"]] == [
         item["document_id"] for item in archived["files"]
     ]
+
+    # A run working on a WorkflowProject archives into the project's folder,
+    # the folder its approval was computed for.
+    project_run = generate_ulid()
+    db_session.add(WorkflowRun(
+        id=project_run, workflow_id=generate_ulid(), entity_id=ids["entity_id"], workspace_id=ids["workspace_id"],
+        lineage_root_run_id=project_run, variables={}, step_results={}, trigger_data={}, definition_snapshot={}, execution_trace=[],
+    ))
+    await db_session.commit()
+    in_project = await archive_file_collection(
+        db_session, entity_id=ids["entity_id"], workspace_id=ids["workspace_id"], user_id=ids["user_id"],
+        workflow_run_id=project_run, workflow_lineage_root_run_id=project_run,
+        workflow_project_root="projects/first-release", collection=archived,
+    )
+    assert all("/projects/first-release/" in item["archive_path"] for item in in_project["files"])
 
 
 @pytest.mark.asyncio

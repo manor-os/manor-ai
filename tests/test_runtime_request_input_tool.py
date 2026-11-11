@@ -41,6 +41,10 @@ def _justification(kind: str = "human_decision", **extra) -> dict:
     }
 
 
+#: Every new request_input call recommends one answer with a reason.
+_REC = {"recommended": "4C", "recommendation_reason": "It is the cheaper of the two."}
+
+
 # ── payload shaping ───────────────────────────────────────────────────────
 
 
@@ -62,6 +66,8 @@ def test_normalize_trims_dedupes_and_bounds_the_question() -> None:
     assert [f["name"] for f in payload["fields"]] == ["budget", "Move-in date", "tier"]
     assert payload["fields"][1] == {
         "name": "Move-in date", "label": "Move-in date", "type": "date", "required": False,
+        # The form draws its control from this schema, the same set as a Workflow run form.
+        "schema": {"type": "string", "format": "date", "title": "Move-in date"},
     }
     assert payload["fields"][2]["options"] == ["gold", "silver"]
     assert payload["context"] == "We found two matching units."
@@ -116,7 +122,7 @@ def test_new_call_schema_requires_human_only_justification_without_defaulting_it
 ])
 async def test_invalid_escalation_returns_same_loop_error_before_any_pause(justification, path, rule) -> None:
     result = await request_input_tool._request_input(
-        question="Please confirm the result.", justification=justification,
+        question="Please confirm the result.", **_REC, justification=justification,
         _runtime_human_input_from_context=True,
     )
     assert isinstance(result, RuntimePreflightValidationError)
@@ -141,7 +147,7 @@ async def test_valid_human_fact_material_or_file_review_keeps_original_pause_con
         justification["file_refs"] = ["/viewer/document-1"]
     result = await request_input_tool._request_input(
         question="Please review the draft's tone or supply your final copy.",
-        justification=justification, _runtime_human_input_from_context=True,
+        **_REC, justification=justification, _runtime_human_input_from_context=True,
     )
     assert isinstance(result, RuntimeToolSuspension)
     assert result.kind == HUMAN_INPUT_SUSPENSION_KIND
@@ -162,6 +168,7 @@ async def test_justification_is_preserved_on_input_card_and_projection_not_as_au
     assert "scope" not in card and "authorization" not in card
     request = SimpleNamespace(
         id="request-1", status="pending", context={"question": question}, reason=question["question"],
+        action_key=runtime_human_input.RUNTIME_INPUT_ACTION_KEY, hitl_type="input",
     )
     projection = await runtime_human_input.human_input_projection(
         SimpleNamespace(get=AsyncMock(return_value=request)),
@@ -180,14 +187,17 @@ async def test_handler_suspends_when_the_runtime_can_park_the_turn() -> None:
     result = await request_input_tool._request_input(
         question="Which unit?",
         options=["4C", "5A"],
-        justification=_justification(),
+        **_REC, justification=_justification(),
         _runtime_human_input_from_context=True,
         _runtime_tool_call_id_from_context="call-1",
     )
     assert isinstance(result, RuntimeToolSuspension)
     assert result.kind == HUMAN_INPUT_SUSPENSION_KIND
     assert result.reason == HUMAN_INPUT_SUSPENSION_REASON
-    assert result.payload == {"question": "Which unit?", "options": ["4C", "5A"], "justification": _justification()}
+    assert result.payload == {
+        "question": "Which unit?", "options": ["4C", "5A"], "justification": _justification(),
+        "recommendation": {"option": "4C", "reason": _REC["recommendation_reason"]},
+    }
     control = result.to_dict()
     assert is_human_input_suspension_control(control)
     assert control["payload"]["question"] == "Which unit?"
@@ -211,7 +221,7 @@ def _setup(why: str) -> dict:
 ])
 async def test_tool_grant_question_is_refused_in_every_mode_before_any_pause(mode, question, why) -> None:
     result = await request_input_tool._request_input(
-        question=question, justification=_setup(why), _runtime_human_input_from_context=mode,
+        question=question, **_REC, justification=_setup(why), _runtime_human_input_from_context=mode,
     )
     assert isinstance(result, RuntimePreflightValidationError)
     error = json.loads(result)
@@ -226,14 +236,14 @@ async def test_account_connection_still_pauses_and_other_kinds_are_not_scanned()
     connect = _setup("Sending needs the user's own Gmail account; only they can sign in.")
     result = await request_input_tool._request_input(
         question="Please connect your Gmail account in Integrations so I can send the reply.",
-        justification=connect, _runtime_human_input_from_context=True,
+        **_REC, justification=connect, _runtime_human_input_from_context=True,
     )
     assert isinstance(result, RuntimeToolSuspension)
     assert result.payload["justification"] == connect
     # The guard is scoped to authorization_setup: a preference about a
     # configuration is still an ordinary human decision.
     result = await request_input_tool._request_input(
-        question="Which report configuration do you prefer?", justification=_justification(),
+        question="Which report configuration do you prefer?", **_REC, justification=_justification(),
         _runtime_human_input_from_context=True,
     )
     assert isinstance(result, RuntimeToolSuspension)
@@ -242,7 +252,7 @@ async def test_account_connection_still_pauses_and_other_kinds_are_not_scanned()
 @pytest.mark.asyncio
 async def test_handler_reports_an_empty_question_as_an_error_not_a_pause() -> None:
     result = await request_input_tool._request_input(
-        question="", justification=_justification(), _runtime_human_input_from_context=True,
+        question="", **_REC, justification=_justification(), _runtime_human_input_from_context=True,
     )
     assert isinstance(result, RuntimePreflightValidationError)
     assert json.loads(result)["contract"] == "tool_error"
@@ -265,7 +275,7 @@ async def test_registered_execution_preserves_unavailable_input_preflight_type(m
     monkeypatch.setattr(tool_registry, "_tool_pool", lambda: pool)
     monkeypatch.setattr(tool_execution, "runtime_prepare_tool_execution", allow_without_database)
     result = await tool_registry.runtime_execute_tool(
-        "request_input", {"question": "Which unit?", "justification": _justification()},
+        "request_input", {"question": "Which unit?", **_REC, "justification": _justification()},
         allowed_tool_names={"request_input"},
     )
 
@@ -341,7 +351,7 @@ async def test_internal_escalation_error_reaches_model_before_it_selects_next_st
         if rounds == 1:
             return "", [{
                 "id": "invalid-ask", "name": "request_input",
-                "arguments": {"question": "Did the system write the file?", "justification": _justification("execution_verification")},
+                "arguments": {"question": "Did the system write the file?", **_REC, "justification": _justification("execution_verification")},
             }], {}
         if rounds == 2:
             feedback = json.loads(next(
@@ -353,7 +363,7 @@ async def test_internal_escalation_error_reaches_model_before_it_selects_next_st
             if next_action == "human_only_decision":
                 return "", [{
                     "id": "valid-ask", "name": "request_input",
-                    "arguments": {"question": "Which unit?", "justification": _justification()},
+                    "arguments": {"question": "Which unit?", **_REC, "justification": _justification()},
                 }], {}
             return "", [{"id": "inspect-file", "name": "read_file", "arguments": {}}], {}
         assert rounds == 3
@@ -396,7 +406,7 @@ async def test_loop_parks_on_request_input_without_a_runtime_run(monkeypatch) ->
                 "id": "call-ask", "name": "request_input",
                 "arguments": {
                     "question": "Which unit?",
-                    "justification": _justification(),
+                    **_REC, "justification": _justification(),
                     "_runtime_human_input_from_context": "end_turn",
                 },
             }
@@ -421,7 +431,10 @@ async def test_loop_parks_on_request_input_without_a_runtime_run(monkeypatch) ->
 
     assert result.stop_reason == "waiting_resource"
     assert is_human_input_suspension_control(result.control)
-    assert result.control["payload"] == {"question": "Which unit?", "justification": _justification()}
+    assert result.control["payload"] == {
+        "question": "Which unit?", "options": ["4C"], "justification": _justification(),
+        "recommendation": {"option": "4C", "reason": _REC["recommendation_reason"]},
+    }
     assert seen_args[0]["_runtime_human_input_from_context"] is True
     assert seen_args[0]["_runtime_tool_call_id_from_context"] == "call-ask"
     assert "_runtime_run_id_from_context" not in seen_args[0]
@@ -445,7 +458,7 @@ async def test_loop_ignores_the_flag_when_disabled(monkeypatch, forged_mode) -> 
                     "id": "call-ask", "name": "request_input",
                     "arguments": {
                         "question": "Which unit?",
-                        "justification": _justification(),
+                        **_REC, "justification": _justification(),
                         "_runtime_human_input_from_context": forged_mode,
                     },
                 },
@@ -786,7 +799,7 @@ async def test_answered_question_is_not_parked_again_and_its_answer_returns(monk
         seen.append([dict(m) for m in messages])
         if len(seen) == 1:
             return "", [{"id": "call-again", "name": "request_input", "arguments": {
-                "question": "Can I proceed with the platform admin's fix?", "justification": _justification(),
+                "question": "Can I proceed with the platform admin's fix?", **_REC, "justification": _justification(),
             }}], {}
         return "Proceeding.", [], {}
 
@@ -828,11 +841,11 @@ async def test_platform_fault_refuses_every_question_until_the_operation_recover
     calls = iter([
         [{"id": "c1", "name": "replan_task", "arguments": {}}],
         [{"id": "c2", "name": "request_input", "arguments": {
-            "question": "Please apply the platform fix.", "justification": _justification("human_material"),
+            "question": "Please apply the platform fix.", **_REC, "justification": _justification("human_material"),
         }}],
         [{"id": "c3", "name": "replan_task", "arguments": {}}],
         [{"id": "c4", "name": "request_input", "arguments": {
-            "question": "Which unit?", "justification": _justification(),
+            "question": "Which unit?", **_REC, "justification": _justification(),
         }}],
     ])
 
@@ -956,7 +969,7 @@ def test_request_input_is_serialized_with_its_round() -> None:
 @pytest.mark.asyncio
 async def test_handler_is_honest_where_the_runtime_cannot_pause() -> None:
     """No flag: the tool must not claim the question was delivered."""
-    result = await request_input_tool._request_input(question="Which unit?", justification=_justification())
+    result = await request_input_tool._request_input(question="Which unit?", **_REC, justification=_justification())
     assert isinstance(result, RuntimePreflightValidationError)
     parsed = json.loads(result)
     assert parsed["contract"] == "tool_error"
@@ -973,3 +986,27 @@ def test_services_import_the_runtime_bridge_not_the_tool() -> None:
         "packages/core/services/task_input_resume.py",
     ):
         assert "packages.core.ai.tools.request_input_tool" not in Path(rel).read_text(), rel
+
+
+@pytest.mark.asyncio
+async def test_a_question_without_a_recommended_answer_is_refused_before_any_pause() -> None:
+    result = await request_input_tool._request_input(
+        question="Which unit?", options=["4C", "5A"], justification=_justification(),
+        _runtime_human_input_from_context=True,
+    )
+    error = json.loads(result)
+    assert error["error"] == "tool_input_validation_failed"
+    assert error["details"]["schema_rule"] == "required"
+    assert error["details"]["expected"] == "recommended"
+
+
+def test_the_recommended_answer_leads_and_a_new_one_becomes_an_option() -> None:
+    payload = normalize_input_request(
+        question="Which unit?", options=["5A", "4C"], recommended="4C",
+        recommendation_reason="It is the cheaper of the two.",
+    )
+    assert payload["options"] == ["4C", "5A"]
+    assert payload["recommendation"] == {"option": "4C", "reason": "It is the cheaper of the two."}
+    free = normalize_input_request(question="What is the client's email?", recommended="lena@studio.com",
+                                   recommendation_reason="It is on the signed contract.")
+    assert free["options"] == ["lena@studio.com"]

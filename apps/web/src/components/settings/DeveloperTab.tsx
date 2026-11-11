@@ -85,7 +85,7 @@ function WorkersSection() {
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, gap: 12 }}>
         <div>
           <h3 className="manor-section-title" style={{ margin: "0 0 4px" }}>{t("page.developer.workers_title")}</h3>
-          <p style={{ margin: 0, fontSize: 12, color: "var(--ink-3, #78716c)" }}>
+          <p style={{ margin: 0, fontSize: 12, color: "var(--ink-3, #8e8e93)" }}>
             {t("page.developer.workers_subtitle")}
           </p>
         </div>
@@ -99,7 +99,7 @@ function WorkersSection() {
       )}
 
       {!workers.isLoading && items.length === 0 && (
-        <div className="glass-card" style={{ padding: 24, textAlign: "center", fontSize: 13, color: "var(--ink-3, #78716c)" }}>
+        <div className="glass-card" style={{ padding: 24, textAlign: "center", fontSize: 13, color: "var(--ink-3, #8e8e93)" }}>
           {t("page.developer.no_workers")}
         </div>
       )}
@@ -122,7 +122,7 @@ function WorkersSection() {
                   <tr key={w.id}>
                     <td>
                       <div style={{ fontWeight: 600 }}>{w.display_name}</div>
-                      <div className="mono" style={{ fontSize: 11, color: "var(--ink-3, #78716c)" }}>{w.id}</div>
+                      <div className="mono" style={{ fontSize: 11, color: "var(--ink-3, #8e8e93)" }}>{w.id}</div>
                     </td>
                     <td>{w.kind}</td>
                     <td><StatusPill status={w.status} size="sm" /></td>

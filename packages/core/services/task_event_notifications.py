@@ -29,6 +29,25 @@ _TASK_EVENT_COPY: dict[str, tuple[str, str]] = {
 }
 
 
+_OUTCOME_EVENTS = frozenset({"task.failed", "task.succeeded"})
+
+
+def task_outcome_reaches_people_elsewhere(event_type: str, task: Task | None) -> bool:
+    """Whether a Task's outcome event must not fan out to people.
+
+    An Agent Initiative run's Task is the platform's internal execution: its
+    decision reaches the owner through the Initiative's own delivery, and a
+    technical failure settles that run while the next occurrence retries.
+    Announcing the Task's success or failure as well would notify the owner on
+    every check. Input requests still fan out.
+    """
+    if event_type not in _OUTCOME_EVENTS or task is None:
+        return False
+    from packages.core.services.agent_initiative_decision import has_initiative_task_marker
+
+    return has_initiative_task_marker(task.details)
+
+
 def task_event_title(event_type: str) -> str:
     copy = _TASK_EVENT_COPY.get(event_type)
     return copy[1] if copy else "Task updated"
@@ -257,6 +276,8 @@ async def notify_task_event(
         return 0
 
     task, users = await task_event_recipient_users(db, entity_id, event_type, event_payload)
+    if task_outcome_reaches_people_elsewhere(event_type, task):
+        return 0
     if not users:
         return 0
 

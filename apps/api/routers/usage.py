@@ -21,6 +21,8 @@ from apps.api.deps import get_current_user
 router = APIRouter(prefix="/api/v1/usage", tags=["usage"])
 
 UsageScope = Literal["company", "member"]
+# The by-source row for calls on the company's own model keys.
+BYOK_USAGE_SOURCE = "byok"
 
 
 # ── Schemas ──
@@ -88,6 +90,8 @@ class TeamUsageTotals(BaseModel):
     active_seconds: int = 0
     active_users: int = 0
     active_now: int = 0
+    # Credits in the window no member made (automations, client trials).
+    unattributed_credits_used: int = 0
 
 
 class TeamActivityItem(BaseModel):
@@ -262,13 +266,19 @@ async def daily_usage(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get daily aggregated token usage for the chart."""
+    """Get daily token usage and charged credits for the chart.
+
+    ``credits`` comes from the billing ledger, so media and other charges
+    without a token log count, and calls on the company's own keys do not.
+    """
     from sqlalchemy import func, cast, Date
+    from packages.core.models.billing import CreditUsageLog
     from packages.core.services.timezone_utils import user_range_start_utc, user_timezone_name
 
     start = user_range_start_utc(user.timezone, days)
+    tz_name = user_timezone_name(user.timezone)
     from packages.core.models.usage import TokenUsageLog as UsageLog
-    usage_day = cast(func.timezone(user_timezone_name(user.timezone), UsageLog.created_at), Date)
+    usage_day = cast(func.timezone(tz_name, UsageLog.created_at), Date)
     filters = _usage_scope_filters(UsageLog, user, scope)
 
     rows = (await db.execute(
@@ -280,13 +290,26 @@ async def daily_usage(
         )
         .where(*filters, UsageLog.created_at >= start)
         .group_by(usage_day)
-        .order_by(usage_day)
+    )).all()
+    credit_day = cast(func.timezone(tz_name, CreditUsageLog.created_at), Date)
+    credit_rows = (await db.execute(
+        select(credit_day.label("date"), func.sum(CreditUsageLog.total_credit).label("credits"))
+        .where(*_usage_scope_filters(CreditUsageLog, user, scope), CreditUsageLog.created_at >= start)
+        .group_by(credit_day)
     )).all()
 
-    return [
-        {"date": str(r.date), "input": r.input or 0, "output": r.output or 0, "total": r.total or 0}
-        for r in rows
-    ]
+    days_by_date: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        days_by_date[str(r.date)] = {
+            "date": str(r.date), "input": r.input or 0, "output": r.output or 0,
+            "total": r.total or 0, "credits": 0,
+        }
+    for r in credit_rows:
+        day = days_by_date.setdefault(
+            str(r.date), {"date": str(r.date), "input": 0, "output": 0, "total": 0, "credits": 0},
+        )
+        day["credits"] = int(r.credits or 0)
+    return [days_by_date[key] for key in sorted(days_by_date)]
 
 
 @router.get("/by-source")
@@ -296,7 +319,13 @@ async def usage_by_source(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get token usage aggregated by source (agent name, chat, etc.)."""
+    """Usage by source: credits charged plus the platform calls behind them.
+
+    The billing ledger decides which sources appear, so charges without a
+    token log (images, audio, transcription) are listed. Calls on the
+    company's own model keys are charged nothing and come back as one
+    ``byok`` row instead of inflating the sources they ran under.
+    """
     from datetime import datetime, timezone, timedelta
     from sqlalchemy import func
 
@@ -304,20 +333,24 @@ async def usage_by_source(
     from packages.core.models.usage import TokenUsageLog as UsageLog
     from packages.core.models.billing import CreditUsageLog
     filters = _usage_scope_filters(UsageLog, user, scope)
+    filters.append(UsageLog.created_at >= start)
+    is_byok = func.coalesce(UsageLog.billing_mode, "") == "byok"
 
-    rows = (await db.execute(
-        select(
-            UsageLog.source,
+    def token_columns():
+        return (
             func.count().label("request_count"),
             func.sum(UsageLog.prompt_tokens).label("input_tokens"),
             func.sum(UsageLog.completion_tokens).label("output_tokens"),
             func.sum(UsageLog.total_tokens).label("total_tokens"),
             func.max(UsageLog.created_at).label("last_used"),
         )
-        .where(*filters, UsageLog.created_at >= start)
+
+    rows = (await db.execute(
+        select(UsageLog.source, *token_columns())
+        .where(*filters, ~is_byok)
         .group_by(UsageLog.source)
-        .order_by(func.sum(UsageLog.total_tokens).desc())
     )).all()
+    byok = (await db.execute(select(*token_columns()).where(*filters, is_byok))).one()
 
     # Credits actually charged live in the billing ledger (CreditUsageLog,
     # source == business_type) — TokenUsageLog.cost_usd is an estimated
@@ -343,15 +376,42 @@ async def usage_by_source(
     credit_rows = (await db.execute(
         select(
             CreditUsageLog.business_type,
+            func.count().label("charge_count"),
             func.sum(CreditUsageLog.total_credit).label("credit_used"),
+            func.max(CreditUsageLog.created_at).label("last_used"),
         )
         .where(*own_credit_filters)
         .group_by(CreditUsageLog.business_type)
     )).all()
-    credits_by_source = {
-        (r.business_type or "Unknown"): int(r.credit_used or 0)
-        for r in credit_rows
-    }
+
+    sources: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        sources[r.source or "Unknown"] = {
+            "source": r.source or "Unknown",
+            "request_count": r.request_count or 0,
+            "input_tokens": r.input_tokens or 0,
+            "output_tokens": r.output_tokens or 0,
+            "total_tokens": r.total_tokens or 0,
+            "credit_used": 0,
+            "last_used": r.last_used,
+        }
+    for r in credit_rows:
+        key = r.business_type or "Unknown"
+        row = sources.get(key)
+        if row is None:
+            # A charge with no token log, e.g. a generated image: its ledger
+            # row counts units, not tokens, so only the count carries over.
+            row = sources[key] = {
+                "source": key, "request_count": r.charge_count or 0,
+                "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                "credit_used": 0, "last_used": r.last_used,
+            }
+        row["credit_used"] = int(r.credit_used or 0)
+        if r.last_used and (row["last_used"] is None or r.last_used > row["last_used"]):
+            row["last_used"] = r.last_used
+    source_rows = sorted(
+        sources.values(), key=lambda row: (-row["credit_used"], -row["total_tokens"], row["source"]),
+    )
 
     trial_rows = []
     if trials:
@@ -370,17 +430,19 @@ async def usage_by_source(
             .order_by(func.sum(CreditUsageLog.total_credit).desc())
         )).all()
 
+    byok_rows = [{
+        "source": BYOK_USAGE_SOURCE,
+        "request_count": byok.request_count or 0,
+        "input_tokens": int(byok.input_tokens or 0),
+        "output_tokens": int(byok.output_tokens or 0),
+        "total_tokens": int(byok.total_tokens or 0),
+        "credit_used": 0,
+        "last_used": byok.last_used.isoformat() if byok.last_used else None,
+    }] if byok.request_count else []
+
     return [
-        {
-            "source": r.source or "Unknown",
-            "request_count": r.request_count or 0,
-            "input_tokens": r.input_tokens or 0,
-            "output_tokens": r.output_tokens or 0,
-            "total_tokens": r.total_tokens or 0,
-            "credit_used": credits_by_source.get(r.source or "Unknown", 0),
-            "last_used": r.last_used.isoformat() if r.last_used else None,
-        }
-        for r in rows
+        {**row, "last_used": row["last_used"].isoformat() if row["last_used"] else None}
+        for row in source_rows
     ] + [
         {
             "source": TRIAL_USAGE_SOURCE,
@@ -395,7 +457,7 @@ async def usage_by_source(
             "last_used": r.last_used.isoformat() if r.last_used else None,
         }
         for r in trial_rows
-    ]
+    ] + byok_rows
 
 
 @router.get("/team", response_model=TeamUsageResponse)

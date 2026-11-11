@@ -12,6 +12,7 @@ from packages.core.models.permission import Capability, Classification
 from packages.core.services.actor_authorization import (
     AuthenticatedUserCredential,
     ResolvedUserActor,
+    admitted_or_current_actor,
     resolve_current_user_actor,
 )
 from packages.core.services.document_access import (
@@ -107,7 +108,7 @@ class ResourcePermissionGate:
         document: Document,
         download: bool = False,
     ) -> AuthorizedDocumentRead | None:
-        actor = await resolve_current_user_actor(db, credential)
+        actor = await admitted_or_current_actor(db, credential)
         if actor is None:
             return None
         if not await user_can_read_document(
@@ -120,6 +121,7 @@ class ResourcePermissionGate:
             _actor=actor,
         ):
             return None
+        download_allowed = True
         if download:
             classification, _, _ = await effective_document_folder_policy(db, document)
             capabilities = await effective_document_capabilities_for_user(
@@ -129,10 +131,11 @@ class ResourcePermissionGate:
                 role=actor.role,
                 _actor=actor,
             )
-            if classification == Classification.RESTRICTED or Capability.DOWNLOAD not in capabilities:
-                raise DocumentDownloadNotAllowed
+            download_allowed = classification != Classification.RESTRICTED and Capability.DOWNLOAD in capabilities
         if await resolve_current_user_actor(db, credential) != actor:
             return None
+        if not download_allowed:
+            raise DocumentDownloadNotAllowed
         return AuthorizedDocumentRead(actor=actor)
 
     @staticmethod
@@ -144,7 +147,7 @@ class ResourcePermissionGate:
         workspace_id: str | None = None,
         allow_redacted: bool = True,
     ) -> AuthorizedDocumentBatchRead | None:
-        actor = await resolve_current_user_actor(db, credential)
+        actor = await admitted_or_current_actor(db, credential)
         if actor is None:
             return None
         requested_ids = list(
@@ -235,7 +238,7 @@ class ResourcePermissionGate:
         folders: list[DocumentFolder],
         allow_redacted: bool = True,
     ) -> AuthorizedFolderBatchRead | None:
-        actor = await resolve_current_user_actor(db, credential)
+        actor = await admitted_or_current_actor(db, credential)
         if actor is None:
             return None
         requested_ids = list(
@@ -306,7 +309,7 @@ class ResourcePermissionGate:
         credential: AuthenticatedUserCredential,
         workspace_id: str,
     ) -> AuthorizedWorkspaceRead | None:
-        actor = await resolve_current_user_actor(db, credential)
+        actor = await admitted_or_current_actor(db, credential)
         if actor is None:
             return None
         if not await user_can_read_workspace_id(
@@ -329,7 +332,7 @@ class ResourcePermissionGate:
         credential: AuthenticatedUserCredential,
         workspace_ids: set[str],
     ) -> AuthorizedWorkspaceBatchRead | None:
-        actor = await resolve_current_user_actor(db, credential)
+        actor = await admitted_or_current_actor(db, credential)
         if actor is None:
             return None
         readable_ids = await user_readable_workspace_ids(
@@ -356,7 +359,7 @@ class ResourcePermissionGate:
         directory_paths: list[str] | None = None,
         workspace_id: str | None = None,
     ) -> AuthorizedFilesystemPathBatch | None:
-        actor = await resolve_current_user_actor(db, credential)
+        actor = await admitted_or_current_actor(db, credential)
         if actor is None:
             return None
         blocked = await unreadable_document_paths(

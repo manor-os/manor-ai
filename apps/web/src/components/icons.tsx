@@ -202,6 +202,15 @@ export function IconSearch(props: IconProps) {
   );
 }
 
+/** Four outward corner arrows — enlarge (not search) */
+export function IconExpand(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M3.75 3.75v4.5m0-4.5h4.5m-4.5 0L9 9M3.75 20.25v-4.5m0 4.5h4.5m-4.5 0L9 15M20.25 3.75h-4.5m4.5 0v4.5m0-4.5L15 9M20.25 20.25h-4.5m4.5 0v-4.5m0 4.5L15 15" />
+    </Svg>
+  );
+}
+
 /** X mark — close / dismiss */
 export function IconClose(props: IconProps) {
   return (
@@ -599,6 +608,16 @@ export function IconGrid(props: IconProps) {
 }
 
 /** Right sidebar — open a right-hand pane beside the current view */
+/** Show or hide the sidebar. */
+export function IconSidebar(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <rect x="3" y="3.5" width="18" height="17" rx="3.5" />
+            <rect x="5.7" y="7.7" width="2.15" height="8.6" rx="1.05" fill="currentColor" stroke="none" />
+    </Svg>
+  );
+}
+
 export function IconPanelRight(props: IconProps) {
   return (
     <Svg {...props}>

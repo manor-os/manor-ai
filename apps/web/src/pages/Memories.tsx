@@ -7,7 +7,7 @@ import { useToastStore } from "../stores/toast";
 import { formatDate, statusBadgeType } from "../lib/format";
 import PageHeader, { PageHeaderAddButton } from "../components/ui/PageHeader";
 import SmartToolbar from "../components/ui/SmartToolbar";
-import StatusBadge from "../components/ui/StatusBadge";
+import Dropdown from "../components/ui/Dropdown";
 import Modal from "../components/ui/Modal";
 import ConfirmDialog from "../components/ui/ConfirmDialog";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
@@ -20,7 +20,20 @@ import { t } from "../lib/i18n";
 
 /* -- component ------------------------------------------------ */
 
-export default function Memories() {
+/** A memory is Markdown: its first line names it, the rest reads as one plain line. */
+function memoryPreview(content: string) {
+  const plain = (text: string) => text
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/\*\*|__|`/g, "")
+    .replace(/^\s*[-*]\s+/gm, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const [first, ...rest] = content.trim().split("\n");
+  return { title: plain(first), body: plain(rest.join("\n")) };
+}
+
+/** `embedded`: shown inside Settings › AI, so the header stays in the panel. */
+export default function Memories({ embedded = false }: { embedded?: boolean } = {}) {
   const catalogScope = useCatalogScope();
   const queryClient = useQueryClient();
   const toast = useToastStore();
@@ -35,7 +48,6 @@ export default function Memories() {
   // Form state
   const [formContent, setFormContent] = useState("");
   const [formAgentId, setFormAgentId] = useState("");
-  const [formContext, setFormContext] = useState("");
 
   // Extract form
   const [extractText, setExtractText] = useState("");
@@ -120,7 +132,6 @@ export default function Memories() {
     setEditMemory(null);
     setFormContent("");
     setFormAgentId("");
-    setFormContext("");
     setModalOpen(true);
   }
 
@@ -128,7 +139,6 @@ export default function Memories() {
     setEditMemory(memory);
     setFormContent(memory.content);
     setFormAgentId(memory.agent_id || "");
-    setFormContext(memory.context || "");
     setModalOpen(true);
   }
 
@@ -141,21 +151,19 @@ export default function Memories() {
     const data = {
       content: formContent,
       agent_id: formAgentId || undefined,
-      context: formContext || undefined,
     };
 
     if (editMemory) {
       updateMutation.mutate({ id: editMemory.id, data });
     } else {
-      createMutation.mutate({ content: formContent, agent_id: formAgentId || undefined, context: formContext || undefined });
+      createMutation.mutate({ content: formContent, agent_id: formAgentId || undefined });
     }
   }
 
   return (
-    <div style={{ maxWidth: 1060 }}>
+    <div>
       <PageHeader
-        title={t("page.memories.agent_memories")}
-        subtitle={t("page.memories.subtitle")}
+        title={embedded ? t("ui.memories") : t("page.memories.agent_memories")}
         actions={
           <div style={{ display: "flex", gap: 8 }}>
             <Button
@@ -203,7 +211,7 @@ export default function Memories() {
       {!isLoading && filtered.length === 0 && (
         <EmptyState
           icon={
-            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#d6d3d1" strokeWidth={1.5}>
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#d1d1d6" strokeWidth={1.5}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M12 18v-5.25m0 0a6.01 6.01 0 001.5-.189m-1.5.189a6.01 6.01 0 01-1.5-.189m3.75 7.478a12.06 12.06 0 01-4.5 0m3.75 2.383a14.406 14.406 0 01-3 0M14.25 18v-.192c0-.983.658-1.823 1.508-2.316a7.5 7.5 0 10-7.517 0c.85.493 1.509 1.333 1.509 2.316V18" />
             </svg>
           }
@@ -214,85 +222,48 @@ export default function Memories() {
 
       {/* Memory cards */}
       {!isLoading && filtered.length > 0 && (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 320px), 1fr))", gap: 16 }}>
+        <div className="inset-list">
           {filtered.map((memory) => (
             <div
               key={memory.id}
-              className="glass-card"
-              style={{
-                padding: 20,
-                display: "flex",
-                flexDirection: "column",
-                gap: 12,
-                transition: "all 0.2s",
-              }}
+              className="inset-row"
+              role="button"
+              tabIndex={0}
+              onClick={() => openEdit(memory)}
+              onKeyDown={(event) => { if (event.key === "Enter") openEdit(memory); }}
             >
-              {/* Header */}
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{
-                    padding: "2px 8px",
-                    borderRadius: 6,
-                    fontSize: 10,
-                    fontWeight: 600,
-                    background: "#f5f5f4",
-                    color: "#57534e",
-                  }}>
-                    {agentName(memory.agent_id)}
-                  </span>
-                  <StatusBadge type={statusBadgeType(memory.status)}>{memory.status}</StatusBadge>
+              <div className="inset-row-copy">
+                <div className="inset-row-title"><span>{memoryPreview(memory.content).title}</span></div>
+                <div className="inset-row-desc">
+                  {[
+                    agentName(memory.agent_id),
+                    memory.status !== "active" ? memory.status : "",
+                    memoryPreview(memory.content).body,
+                  ].filter(Boolean).join(" · ")}
                 </div>
-                <span style={{ fontSize: 11, color: "#a8a29e" }}>{formatDate(memory.created_at)}</span>
               </div>
-
-              {/* Content preview */}
-              <p style={{
-                fontSize: 13,
-                color: "#44403c",
-                lineHeight: 1.6,
-                margin: 0,
-                display: "-webkit-box",
-                WebkitLineClamp: 3,
-                WebkitBoxOrient: "vertical" as const,
-                overflow: "hidden",
-              }}>
-                {memory.content}
-              </p>
-
-              {/* Context */}
-              {memory.context && (
-                <p style={{ fontSize: 11, color: "#a8a29e", margin: 0, fontStyle: "italic" }}>
-                  {t("page.memories.context")}: {memory.context}
-                </p>
-              )}
-
-              {/* Actions */}
-              <div style={{ display: "flex", alignItems: "center", gap: 4, marginTop: "auto" }}>
-                <button
-                  onClick={() => openEdit(memory)}
-                  style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "#a8a29e" }}
-                  title={t("action.edit")}
-                >
-                  <IconEdit size={16} />
-                </button>
-                {memory.status === "active" && (
-                  <button
-                    onClick={() => archiveMutation.mutate(memory.id)}
-                    style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "#a8a29e" }}
-                    title={t("action.archive")}
-                  >
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}>
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M20.25 7.5l-.625 10.632a2.25 2.25 0 01-2.247 2.118H6.622a2.25 2.25 0 01-2.247-2.118L3.75 7.5M10 11.25h4M3.375 7.5h17.25c.621 0 1.125-.504 1.125-1.125v-1.5c0-.621-.504-1.125-1.125-1.125H3.375c-.621 0-1.125.504-1.125 1.125v1.5c0 .621.504 1.125 1.125 1.125z" />
-                    </svg>
-                  </button>
-                )}
-                <button
-                  onClick={() => setDeleteTarget(memory.id)}
-                  style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "#a8a29e" }}
-                  title={t("action.delete")}
-                >
-                  <IconTrash size={16} />
-                </button>
+              <div className="inset-row-meta">
+                {memory.created_at && <span>{formatDate(memory.created_at)}</span>}
+                <span onClick={(event) => event.stopPropagation()}>
+                  <Dropdown
+                    align="right"
+                    trigger={(
+                      <button type="button" className="inset-row-action" aria-label={t("nav.more")} title={t("nav.more")}>
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                          <circle cx="3.5" cy="8" r="1.3" /><circle cx="8" cy="8" r="1.3" /><circle cx="12.5" cy="8" r="1.3" />
+                        </svg>
+                      </button>
+                    )}
+                    items={[
+                      ...(memory.status === "active" ? [{ key: "archive", label: t("action.archive") }] : []),
+                      { key: "delete", label: t("action.delete"), danger: true },
+                    ]}
+                    onSelect={(key) => {
+                      if (key === "archive") archiveMutation.mutate(memory.id);
+                      if (key === "delete") setDeleteTarget(memory.id);
+                    }}
+                  />
+                </span>
               </div>
             </div>
           ))}
@@ -337,7 +308,7 @@ export default function Memories() {
             placeholder={t("page.memories.content_placeholder")}
           />
           <div>
-            <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: "#78716c", marginBottom: 4 }}>{t("page.memories.agent_optional")}</label>
+            <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: "var(--text-muted)", marginBottom: 4 }}>{t("page.memories.agent_optional")}</label>
             <select value={formAgentId} onChange={(e) => setFormAgentId(e.target.value)} className="manor-input">
               <option value="">{t("page.memories.global_all_agents")}</option>
               {agentsList.map((a) => (
@@ -345,12 +316,6 @@ export default function Memories() {
               ))}
             </select>
           </div>
-          <Input
-            label={t("page.memories.context_optional")}
-            value={formContext}
-            onChange={(e) => setFormContext(e.target.value)}
-            placeholder={t("page.memories.context_placeholder")}
-          />
         </div>
       </Modal>
 

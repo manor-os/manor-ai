@@ -98,6 +98,7 @@ def create_access_token(
     scopes: Sequence[str] | None = None,
     actor: str | None = None,
     authorized_party: str | None = None,
+    scope: str | None = None,
 ) -> str:
     """Create a server-revocable API access token, valid for at most 24 hours.
 
@@ -107,7 +108,10 @@ def create_access_token(
     is the OAuth client the token was issued to.
 
     ``audience`` binds the token to one resource (e.g. the MCP endpoint). Such a
-    token fails ``decode_token`` and therefore every REST route.
+    token fails ``decode_token`` and therefore every REST route. ``scope`` (space
+    separated) is what that resource may let the token do. ``authorized_party``
+    (the ``azp`` claim) names the OAuth client or access token acting for the
+    user; first-party web tokens carry none.
 
     ``remember`` is retained for client compatibility, but no longer creates a
     seven-day bearer token. Persistent browser login uses a separate rotating refresh
@@ -135,6 +139,8 @@ def create_access_token(
         payload["act"] = {"sub": str(actor)}
     if authorized_party:
         payload["azp"] = str(authorized_party)
+    if scope is not None:
+        payload["scope"] = scope
     return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 

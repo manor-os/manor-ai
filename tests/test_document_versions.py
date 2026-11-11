@@ -734,6 +734,7 @@ async def test_empty_trash(client: AsyncClient, db_session, monkeypatch, tmp_pat
             ".slide-cache",
             ".slide-object-cache",
             ".doc-thumb-cache",
+            ".manor-media",
         ):
             cache_base = tmp_path / doc["entity_id"] / cache_root / doc["id"]
             version_cache = cache_base / "0123456789abcdef"

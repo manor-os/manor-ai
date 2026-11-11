@@ -37,7 +37,7 @@ export default function MessageBubble({
           : "var(--message-bubble-other-fg, var(--text-strong))",
         border: mine
           ? "var(--message-bubble-user-border, 1px solid var(--accent))"
-          : "var(--message-bubble-other-border, 1px solid var(--border-subtle))",
+          : "var(--message-bubble-other-border, 0.5px solid var(--border-subtle))",
         boxShadow: mine
           ? "var(--message-bubble-user-shadow, var(--shadow-sm))"
           : "var(--message-bubble-other-shadow, var(--shadow-sm))",

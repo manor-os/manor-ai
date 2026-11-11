@@ -607,7 +607,7 @@ _MCP_READ_ONLY_ACTIONS_BY_SERVER: dict[str, frozenset[str]] = {
         "get_page", "get_page_insights", "get_post", "get_post_insights", "list_comments",
         "list_conversation_messages", "list_conversations", "list_instagram_accounts",
         "list_instagram_comments", "list_instagram_media", "list_live_videos", "list_page_albums",
-        "list_pages", "list_posts",
+        "list_pages", "list_posts", "list_recent_instagram_comments",
     }),
     "github": frozenset({
         "compare_commits", "get_authenticated_user", "get_branch", "get_commit", "get_commit_status",
@@ -633,7 +633,7 @@ _MCP_READ_ONLY_ACTIONS_BY_SERVER: dict[str, frozenset[str]] = {
     }),
     "linkedin": frozenset({
         "get_my_posts", "get_organization", "get_post_comments", "get_post_reactions", "get_post_stats",
-        "get_profile", "list_org_posts", "list_organizations",
+        "get_profile", "list_org_posts", "list_organizations", "list_recent_post_comments",
     }),
     "lark": frozenset({
         "get_chat", "get_document", "get_document_content", "list_bitable_fields",
@@ -689,7 +689,6 @@ _MCP_READ_ONLY_ACTIONS_BY_SERVER: dict[str, frozenset[str]] = {
         "get_catalog_object", "get_customer", "get_inventory", "get_order", "list_customers",
         "list_locations", "search_catalog_items", "search_orders",
     }),
-    "stripe": _OFFICIAL_REMOTE_MCP_DEFINITIONS["stripe"].read_only_actions,
     "tavily": frozenset({"extract", "search"}),
     "telegram": frozenset({"get_me"}),
     "tiktok": frozenset({
@@ -738,6 +737,8 @@ _MCP_MUTATION_ACTIONS = {
 }
 _READ_ONLY_TOOLS = {
     "read_context_archive",
+    "read_step_recovery",
+    "stop_step_needs_person",
     "resident_maintenance_status",
     "website_content",
     "analyze_audio",
@@ -817,7 +818,11 @@ _READ_ONLY_TOOLS = {
     "wait_media_jobs",
     "weather_search",
     "app_pattern_project_tree",
+    "app_pattern_content_calendar",
+    "app_pattern_record_collection",
     "app_read_context",
+    # Records the question's answer buttons on the draft transcript only.
+    "ws_ask_user",
     "ws_get_draft",
     "ws_lint_draft",
     "ws_read_source",
@@ -884,6 +889,8 @@ _FIXED_TOOL_ACTIONS: dict[str, RuntimeApprovalAction] = {
     "record_youtube_workspace_metrics": _fixed_action("workspace.knowledge.update", "medium", "record YouTube metrics", "knowledge", "modify"),
     "configure_workspace_stat": _fixed_action("workspace.stat.create", "medium", "configure Workspace statistic", "workspace_stat", "create"),
     "collect_workspace_stats": _fixed_action("workspace.stat.update", "medium", "collect Workspace statistics", "workspace_stat", "modify"),
+    "record_workspace_stat_observations": _fixed_action("workspace.stat.record", "medium", "record Workspace statistics", "workspace_stat", "modify"),
+    "delete_workspace_stats": _fixed_action("workspace.stat.delete", "high", "delete Workspace statistics", "workspace_stat", "delete"),
     "render_frame_samples": _fixed_action("workspace.file.create", "medium", "render frame samples", "file", "create"),
     "sandbox_cancel": _fixed_action("sandbox.cancel", "medium", "cancel sandbox command", "sandbox", "cancel"),
     "sandbox_respond": _fixed_action("sandbox.respond", "low", "respond to sandbox command", "sandbox", "execute"),
@@ -904,7 +911,12 @@ _FIXED_TOOL_ACTIONS: dict[str, RuntimeApprovalAction] = {
     "ws_attach_knowledge": _fixed_action("workspace.operation.draft", "medium", "attach Workspace knowledge", "workspace_operation", "modify"),
     "ws_commit_basics": _fixed_action("workspace.operation.draft", "medium", "update Workspace draft", "workspace_operation", "modify"),
     "ws_design_app_view": _fixed_action("workspace.operation.draft", "medium", "design Workspace app view", "workspace_operation", "modify"),
+    "ws_design_workflows": _fixed_action("workspace.operation.draft", "medium", "design Workspace workflows", "workspace_operation", "modify"),
+    "ws_commit_build_spec": _fixed_action("workspace.operation.draft", "medium", "commit Workspace build spec", "workspace_operation", "modify"),
+    "ws_design_parts": _fixed_action("workspace.operation.draft", "medium", "design Workspace parts", "workspace_operation", "modify"),
+    "ws_apply_blueprint": _fixed_action("workspace.operation.draft", "medium", "apply Blueprint to Workspace draft", "workspace_operation", "modify"),
     "ws_accept_app_view": _fixed_action("workspace.operation.draft", "medium", "accept Workspace app view", "workspace_operation", "modify"),
+    "ws_accept_parts": _fixed_action("workspace.operation.draft", "medium", "accept Workspace part designs", "workspace_operation", "modify"),
     "app_submit_candidate": _fixed_action("workspace.operation.draft", "medium", "submit Workspace app design", "workspace_operation", "modify"),
     "ws_flag_missing_integration": _fixed_action("workspace.operation.draft", "medium", "update Workspace integration requirement", "workspace_operation", "modify"),
     "ws_mark_ready": _fixed_action("workspace.operation.draft", "medium", "mark Workspace draft ready", "workspace_operation", "modify"),
@@ -914,6 +926,8 @@ _FIXED_TOOL_ACTIONS: dict[str, RuntimeApprovalAction] = {
     "ws_propose_goal": _fixed_action("workspace.operation.draft", "medium", "update Workspace goal", "workspace_operation", "modify"),
     "ws_propose_rule": _fixed_action("workspace.operation.draft", "medium", "update Workspace rule", "workspace_operation", "modify"),
     "ws_propose_service": _fixed_action("workspace.operation.draft", "medium", "update Workspace service", "workspace_operation", "modify"),
+    "ws_propose_record_collection": _fixed_action("workspace.operation.draft", "medium", "update Workspace workflow", "workspace_operation", "modify"),
+    "ws_propose_source_watch": _fixed_action("workspace.operation.draft", "medium", "update Workspace workflow", "workspace_operation", "modify"),
     "ws_propose_stat": _fixed_action("workspace.operation.draft", "medium", "update Workspace statistic", "workspace_operation", "modify"),
     "ws_propose_workflow": _fixed_action("workspace.operation.draft", "medium", "update Workspace workflow", "workspace_operation", "modify"),
     "ws_remove": _fixed_action("workspace.operation.draft", "medium", "remove Workspace draft item", "workspace_operation", "modify"),
@@ -974,6 +988,8 @@ _MANOR_ACTION_MAP = {
     "toggle_scheduled_job": ("workspace.automation.update", "medium", "toggle automation", "automation", "modify"),
     "run_scheduled_job_now": ("workspace.automation.run", "medium", "run automation", "automation", "execute"),
     "delete_document": ("workspace.file.delete", "high", "delete workspace document", "file", "delete"),
+    "list_always_allow": ("workspace.approval_rule.list", "low", "list always-allowed actions", "approval_rule", "read"),
+    "stop_always_allow": ("workspace.approval_rule.revoke", "low", "stop always allowing an action", "approval_rule", "modify"),
 }
 _SCHEDULED_JOB_ACTION_MAP = {
     "create_scheduled_job": ("workspace.automation.create", "high", "create automation", "automation", "create"),
@@ -1061,6 +1077,8 @@ _WORKSPACE_OPERATION_READ_ACTIONS = {
     "get_current",
     "validate_draft",
     "preview_diff",
+    "app_audience",
+    "test_app",
 }
 _WORKSPACE_OPERATION_ACTION_MAP = {
     "create_draft": ("workspace.operation.draft", "medium", "create workspace operation draft", "workspace_operation", "create"),
@@ -1292,7 +1310,7 @@ def _classify_known_runtime_tool_action(
         params = raw_params if isinstance(raw_params, dict) else {}
         action_name = str(args.get("action") or "").strip()
         # hold_for_approval only adds approvals to this conversation.
-        if action_name in {"search", "list_knowledge", "read_delegation_result", "hold_for_approval"}:
+        if action_name in {"search", "list_knowledge", "list_attention", "read_delegation_result", "hold_for_approval"}:
             return None
         if action_name == "operation":
             return _classify_workspace_operation_action(params)
@@ -1345,6 +1363,7 @@ def _classify_known_runtime_tool_action(
         "test_workflow_node": ("workspace.workflow.run", "high", "test workflow node", "execute"),
         "cancel_workflow_run": ("workspace.workflow.run", "medium", "cancel workflow run", "modify"),
         "resume_workflow_run": ("workspace.workflow.run", "high", "resume workflow run", "execute"),
+        "retry_workflow_run": ("workspace.workflow.run", "high", "retry workflow run", "execute"),
     }
     if name in workflow_actions:
         key, risk, title, operation = workflow_actions[name]
@@ -1363,6 +1382,7 @@ def _classify_known_runtime_tool_action(
                     "start_workspace_flow",
                     "cancel_workflow_run",
                     "resume_workflow_run",
+                    "retry_workflow_run",
                 }
                 else None
             ),
@@ -1430,6 +1450,10 @@ _CONTROL_REASONS = {
         "Record a Goal measurement for the current Workspace run. "
         "The handler validates entity and Workspace scope; this is not an external action."
     ),
+    "remember": (
+        "Save what the person said to a memory file. The handler checks who may write each "
+        "layer; memory is context, never a rule, approval or governance change."
+    ),
 }
 
 # Control tools a Runtime host arms for one concrete loop as dynamic
@@ -1473,6 +1497,8 @@ _NON_ACTION_CAPABILITY_BY_TOOL = {
     "list_skills": "runtime.discovery",
     "get_skill_details": "runtime.discovery",
     "read_context_archive": "runtime.discovery",
+    "read_step_recovery": "runtime.discovery",
+    "stop_step_needs_person": "runtime.discovery",
     "web_search": "web.safe_search",
     "web_fetch": "web.safe_search",
     "browse_web": "web.safe_search",
@@ -1937,6 +1963,7 @@ def _runtime_tool_is_explicitly_read_only(
             "get_goal_status",
             "get_stat_status",
             "visualize_ledgers",
+            "list_attention",
             "read_delegation_result",
             "hold_for_approval",
         }
@@ -2153,7 +2180,7 @@ def _classify_mcp_tool_action(tool_name: str, args: dict[str, Any]) -> RuntimeAp
             return RuntimeApprovalAction("action", f"social_post.{suffix}", risk, f"{suffix} social content", "external_account", operation)
 
     if server in {"gmail", "outlook", "email"}:
-        if server == "email" and action == "save_attachment_to_workspace":
+        if action == "save_attachment_to_workspace":
             return RuntimeApprovalAction(
                 "action",
                 "workspace.knowledge.update",
@@ -2497,6 +2524,7 @@ async def resolve_runtime_workspace_file_scope(
         workflow_run_id=(output_scope.workflow_run_id if output_scope and not workspace_shared else None),
         workflow_lineage_root_run_id=(output_scope.workflow_lineage_root_run_id if output_scope and not workspace_shared else None),
         entity_root=get_entity_root(normalized_entity_id),
+        workflow_project_root=(output_scope.workflow_project_root if output_scope and not workspace_shared else None),
     )
     if normalized_tool == "archive_file_collection":
         collection = args.get("collection")

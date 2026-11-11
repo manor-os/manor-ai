@@ -7,7 +7,6 @@ import PageHeader from "../components/ui/PageHeader";
 import SearchInput from "../components/ui/SearchInput";
 import Modal from "../components/ui/Modal";
 import EmptyState from "../components/ui/EmptyState";
-import InlineTips from "../components/ui/InlineTips";
 import Button from "../components/ui/Button";
 import Input from "../components/ui/Input";
 import Textarea from "../components/ui/Textarea";
@@ -135,7 +134,7 @@ export default function Messages() {
           meta={
             threadsLoading
               ? <SkeletonLine width={130} height={14} />
-              : `${allThreads.length} ${t("page.messages.conversations_count")}`
+              : allThreads.length > 0 ? `${allThreads.length} ${t("page.messages.conversations_count")}` : undefined
           }
           actions={
             <button onClick={() => setShowCompose(true)} className="btn-manor" style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -167,7 +166,7 @@ export default function Messages() {
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
           <div>
-            <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: "#44403c", marginBottom: 4 }}>{t("page.messages.recipient")}</label>
+            <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: "var(--text-default)", marginBottom: 4 }}>{t("page.messages.recipient")}</label>
             <select
               value={composeRecipient}
               onChange={(e) => setComposeRecipient(e.target.value)}
@@ -201,13 +200,13 @@ export default function Messages() {
       </Modal>
 
       {/* Split Layout */}
-      <div style={{ flex: 1, display: "flex", flexWrap: "wrap", gap: 16, padding: "16px clamp(12px, 3vw, 24px) clamp(12px, 3vw, 24px)", minHeight: 0 }}>
+      <div className="messages-split" style={{ flex: 1, display: "flex", flexWrap: "wrap", gap: 0, padding: "16px clamp(12px, 3vw, 24px) clamp(12px, 3vw, 24px)", minHeight: 0 }}>
         {/* Conversation Sidebar */}
         <div
-          className="glass-panel"
+          className="messages-list-pane"
           style={{ width: "min(100%, 320px)", flex: "1 1 280px", display: "flex", flexDirection: "column", overflow: "hidden" }}
         >
-          <div style={{ padding: 12, borderBottom: "1px solid rgba(28,25,23,0.06)" }}>
+          <div style={{ padding: 12, borderBottom: "0.5px solid rgba(29, 29, 31,0.06)" }}>
             <SearchInput value={search} onChange={setSearch} placeholder={t("page.messages.search_conversations")} />
           </div>
           <div style={{ flex: 1, overflowY: "auto" }}>
@@ -224,7 +223,7 @@ export default function Messages() {
                     width: "100%",
                     textAlign: "left",
                     padding: "12px 16px",
-                    borderBottom: "1px solid rgba(28,25,23,0.06)",
+                    borderBottom: "0.5px solid rgba(29, 29, 31,0.06)",
                     transition: "background 0.2s",
                     background: selectedThread === thread.id ? "rgba(79,125,117,0.08)" : "transparent",
                     border: "none",
@@ -261,19 +260,19 @@ export default function Messages() {
                             textOverflow: "ellipsis",
                             whiteSpace: "nowrap",
                             fontWeight: thread.unread ? 700 : 600,
-                            color: thread.unread ? "#292524" : "#44403c",
+                            color: thread.unread ? "#2c2c2e" : "#48484a",
                           }}
                         >
                           {thread.participant_name}
                         </span>
                         {thread.last_message_at && (
-                          <span style={{ fontSize: 11, color: "#a8a29e", flexShrink: 0, marginLeft: 8 }}>
+                          <span style={{ fontSize: 11, color: "var(--text-muted)", flexShrink: 0, marginLeft: 8 }}>
                             {new Date(thread.last_message_at).toLocaleDateString(undefined, { timeZone: getPreferredTimeZone() })}
                           </span>
                         )}
                       </div>
                       {thread.last_message && (
-                        <p style={{ fontSize: 12, color: "#a8a29e", margin: "2px 0 0 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{thread.last_message}</p>
+                        <p style={{ fontSize: 12, color: "var(--text-muted)", margin: "2px 0 0 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{thread.last_message}</p>
                       )}
                     </div>
                     {thread.unread && (
@@ -292,7 +291,7 @@ export default function Messages() {
                 </button>
               ))
             ) : (
-              <div style={{ padding: 24, textAlign: "center", fontSize: 13, color: "#a8a29e" }}>
+              <div style={{ padding: 24, textAlign: "center", fontSize: 13, color: "var(--text-muted)" }}>
                 {search ? t("page.messages.no_conversations_found") : t("page.messages.no_messages_yet")}
               </div>
             )}
@@ -301,13 +300,13 @@ export default function Messages() {
 
         {/* Message Thread */}
         <div
-          className="glass-panel"
+          className="messages-thread-pane"
           style={{ flex: "999 1 320px", minWidth: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}
         >
           {selectedThread && currentThread ? (
             <>
               {/* Thread Header */}
-              <div style={{ padding: "12px 20px", borderBottom: "1px solid rgba(28,25,23,0.06)", display: "flex", alignItems: "center", gap: 12 }}>
+              <div style={{ padding: "12px 20px", borderBottom: "0.5px solid rgba(29, 29, 31,0.06)", display: "flex", alignItems: "center", gap: 12 }}>
                 <div
                   style={{
                     width: 32,
@@ -325,7 +324,7 @@ export default function Messages() {
                 >
                   {currentThread.participant_name.charAt(0).toUpperCase()}
                 </div>
-                <span style={{ fontSize: 14, fontWeight: 700, color: "#292524" }}>{currentThread.participant_name}</span>
+                <span style={{ fontSize: 14, fontWeight: 700, color: "var(--text-strong)" }}>{currentThread.participant_name}</span>
               </div>
 
               {/* Messages */}
@@ -367,7 +366,7 @@ export default function Messages() {
                           background: msg.is_own
                             ? "#436b65"
                             : "rgba(255,255,255,0.8)",
-                          color: msg.is_own ? "#fff" : "#44403c",
+                          color: msg.is_own ? "#fff" : "#48484a",
                           border: msg.is_own
                             ? "none"
                             : "1px solid rgba(231,229,228,0.5)",
@@ -378,7 +377,7 @@ export default function Messages() {
                           style={{
                             fontSize: 11,
                             marginTop: 4,
-                            color: msg.is_own ? "rgba(255,255,255,0.6)" : "#a8a29e",
+                            color: msg.is_own ? "rgba(255,255,255,0.6)" : "#aeaeb2",
                           }}
                         >
                           {new Date(msg.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", timeZone: getPreferredTimeZone() })}
@@ -387,7 +386,7 @@ export default function Messages() {
                     </div>
                   ))
                 ) : (
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", fontSize: 13, color: "#a8a29e" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", fontSize: 13, color: "var(--text-muted)" }}>
                     {t("page.messages.no_messages_thread")}
                   </div>
                 )}
@@ -395,7 +394,7 @@ export default function Messages() {
               </div>
 
               {/* Reply Input */}
-              <div style={{ padding: 16, borderTop: "1px solid rgba(28,25,23,0.06)" }}>
+              <div style={{ padding: 16, borderTop: "0.5px solid rgba(29, 29, 31,0.06)" }}>
                 <div style={{ display: "flex", gap: 12 }}>
                   <input
                     value={messageInput}
@@ -426,13 +425,12 @@ export default function Messages() {
             <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
               <EmptyState
                 icon={
-                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#d6d3d1" strokeWidth={1.5}>
+                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#d1d1d6" strokeWidth={1.5}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M20.25 8.511c.884.284 1.5 1.128 1.5 2.097v4.286c0 1.136-.847 2.1-1.98 2.193-.34.027-.68.052-1.02.072v3.091l-3-3c-1.354 0-2.694-.055-4.02-.163a2.115 2.115 0 01-.825-.242m9.345-8.334a2.126 2.126 0 00-.476-.095 48.64 48.64 0 00-8.048 0c-1.131.094-1.976 1.057-1.976 2.192v4.286c0 .837.46 1.58 1.155 1.951m9.345-8.334V6.637c0-1.621-1.152-3.026-2.76-3.235A48.455 48.455 0 0011.25 3c-2.115 0-4.198.137-6.24.402-1.608.209-2.76 1.614-2.76 3.235v6.226c0 1.621 1.152 3.026 2.76 3.235.577.075 1.157.14 1.74.194V21l4.155-4.155" />
                   </svg>
                 }
                 title={t("page.messages.select_conversation")}
                 description={t("page.messages.choose_or_compose")}
-                action={<InlineTips surface="inbox" placement="empty_state" />}
               />
             </div>
           )}

@@ -16,7 +16,6 @@ from packages.core.blueprints.installer import (
 )
 from packages.core.blueprints.upgrade import (
     BlueprintUpgradePlanChangedError,
-    RESTORE_POINT_KEY,
     apply,
     revert,
 )
@@ -28,6 +27,7 @@ from packages.core.services.channel_bindings import (
     load_channel_binding_for_config,
 )
 from packages.core.services.workspace_readiness import evaluate_workspace_blocking_setup
+from test_blueprint_upgrade_and_revert import stored_restore_point
 from test_blueprint_installer_workflows import _base_payload
 from test_blueprint_review_regressions import channel_fixture
 from test_blueprint_upgrade_and_revert import _workspace
@@ -148,12 +148,12 @@ async def test_channel_only_upgrade_and_revert_restore_live_contract(db_session,
     result = await _upgrade(db_session, workspace, account, current)
     assert result["can_revert"] is True
     assert any(item["kind"] == "channel" for item in result["updated"])
-    point = copy.deepcopy(workspace.settings[BLUEPRINT_SETTINGS_KEY][RESTORE_POINT_KEY])
+    point = copy.deepcopy(await stored_restore_point(db_session, workspace))
     # The receipt must survive a real JSON round trip and a no-op confirmation.
     await db_session.refresh(workspace)
     repeated = await _upgrade(db_session, workspace, account, current)
     assert repeated["can_revert"] is True
-    assert workspace.settings[BLUEPRINT_SETTINGS_KEY][RESTORE_POINT_KEY] == point
+    assert await stored_restore_point(db_session, workspace) == point
 
     result = await revert(db_session, workspace=workspace, by_user_id=account.owner_user_id)
     assert any(item["kind"] == "channel" for item in result["reverted"])
@@ -212,7 +212,7 @@ async def test_channel_revert_fails_closed_after_later_changes(db_session, chang
     binding = await load_channel_binding_for_config(db_session, account)
     payload["contract"]["channels"][0]["label"] = "Upgraded channel"
     await _upgrade(db_session, workspace, account, payload)
-    point = copy.deepcopy(workspace.settings[BLUEPRINT_SETTINGS_KEY][RESTORE_POINT_KEY])
+    point = copy.deepcopy(await stored_restore_point(db_session, workspace))
     if changed == "config":
         binding.config = {**binding.config, "language": "es"}
     elif changed == "owner":
@@ -239,4 +239,4 @@ async def test_channel_revert_fails_closed_after_later_changes(db_session, chang
 
     with pytest.raises(BlueprintUpgradePlanChangedError):
         await revert(db_session, workspace=workspace, by_user_id=account.owner_user_id)
-    assert workspace.settings[BLUEPRINT_SETTINGS_KEY][RESTORE_POINT_KEY] == point
+    assert await stored_restore_point(db_session, workspace) == point

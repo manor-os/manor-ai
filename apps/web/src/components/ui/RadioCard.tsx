@@ -15,7 +15,7 @@
  *   >
  *     <VisibilityIcon visibility="workspace" />
  *     <span>Workspace</span>
- *     <span style={{ marginLeft: "auto", color: "#a8a29e" }}>hint</span>
+ *     <span style={{ marginLeft: "auto", color: "var(--text-muted)" }}>hint</span>
  *   </RadioCard>
  */
 
@@ -165,7 +165,7 @@ export default function RadioCard({
           height: 16,
           borderRadius: "50%",
           flexShrink: 0,
-          border: selected ? "5px solid #436b65" : "1.5px solid #d6d3d1",
+          border: selected ? "5px solid #436b65" : "1.5px solid #d1d1d6",
           background: selected ? "#fff" : "transparent",
           boxSizing: "border-box",
           transition: "all 0.12s",

@@ -110,6 +110,7 @@ async def _archive_file_collection(entity_id: str = "", user_id: str = "", **kwa
             db, entity_id=entity_id, workspace_id=context.workspace_id, user_id=context.user_id,
             workflow_run_id=context.workflow_run_id,
             workflow_lineage_root_run_id=context.workflow_lineage_root_run_id,
+            workflow_project_root=context.workflow_project_root,
             collection=kwargs.get("collection"), write_guard=guard,
         )
     return json.dumps(payload, ensure_ascii=False)

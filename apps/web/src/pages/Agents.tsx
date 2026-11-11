@@ -1,5 +1,5 @@
 import { invalidateCatalogQueries } from "../lib/catalogInvalidation";
-import React, { useEffect, useState, useRef } from "react";
+import React, { lazy, Suspense, useEffect, useState, useRef } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api, type AgentDeploymentResponse } from "../lib/api";
@@ -78,7 +78,7 @@ function agentConnectionInfo(agent: Record<string, any>): {
     };
   }
   return {
-    label: "Manor Hosted",
+    label: t("ui.manor_hosted"),
     detail: "Default connection",
     bg: "#f1f6f3",
     fg: "#3f7361",
@@ -88,7 +88,7 @@ function agentConnectionInfo(agent: Record<string, any>): {
 
 /* ── Fallback avatar colours ── */
 const FALLBACK_COLORS = [
-  { bg: "#efedea", fg: "#57534e" },
+  { bg: "#efedea", fg: "#6e6e73" },
   { bg: "#e3e9f1", fg: "#3f57a0" },
   { bg: "#f3e5ed", fg: "#be185d" },
   { bg: "#ece9f5", fg: "#6443a0" },
@@ -309,7 +309,7 @@ function ImportAgentsDialog({
       }
     >
       <div style={{ display: "grid", gap: 14 }}>
-        <p style={{ margin: 0, color: "#78716c", fontSize: 13, lineHeight: 1.55 }}>
+        <p style={{ margin: 0, color: "var(--text-muted)", fontSize: 13, lineHeight: 1.55 }}>
           {t("page.agents.import_agents_desc")}
         </p>
         <label style={{
@@ -331,12 +331,12 @@ function ImportAgentsDialog({
             <IconUpload size={15} />
             {fileName || t("page.agents.choose_agents_json")}
           </span>
-          <span style={{ color: "#78716c", fontSize: 12 }}>
+          <span style={{ color: "var(--text-muted)", fontSize: 12 }}>
             {t("page.agents.choose_agents_json_hint")}
           </span>
         </label>
         {rows.length > 0 && (
-          <div style={{ border: "1px solid #e7e5e4", borderRadius: 12, overflow: "hidden" }}>
+          <div style={{ border: "0.5px solid #e5e5ea", borderRadius: 12, overflow: "hidden" }}>
             {rows.slice(0, 8).map((row, idx) => (
               <div
                 key={`${row.payload.name}-${idx}`}
@@ -346,11 +346,11 @@ function ImportAgentsDialog({
                   justifyContent: "space-between",
                   gap: 10,
                   padding: "9px 11px",
-                  borderTop: idx === 0 ? "none" : "1px solid #f5f5f4",
+                  borderTop: idx === 0 ? "none" : "1px solid #f5f5f7",
                   fontSize: 12,
                 }}
               >
-                <span style={{ color: row.valid ? "#292524" : "#b91c1c", fontWeight: 700, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                <span style={{ color: row.valid ? "#2c2c2e" : "#b91c1c", fontWeight: 700, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {row.payload.name || t("page.agents.untitled_import")}
                 </span>
                 <span style={{ color: row.valid ? "#436b65" : "#b91c1c", flexShrink: 0 }}>
@@ -359,7 +359,7 @@ function ImportAgentsDialog({
               </div>
             ))}
             {rows.length > 8 && (
-              <div style={{ padding: "8px 11px", color: "#78716c", fontSize: 12 }}>
+              <div style={{ padding: "8px 11px", color: "var(--text-muted)", fontSize: 12 }}>
                 {t("page.agents.import_more_agents").replace("{count}", String(rows.length - 8))}
               </div>
             )}
@@ -396,7 +396,10 @@ function agentWorkspaceItems(deployments?: AgentDeploymentResponse[]) {
   return Array.from(byWorkspace.values());
 }
 
-export default function Agents() {
+const AgentDetail = lazy(() => import("./AgentDetail"));
+
+/** `embedded`: shown inside Settings › AI, so the header stays in the panel. */
+export default function Agents({ embedded = false }: { embedded?: boolean } = {}) {
   const queryClient = useQueryClient();
   const catalogScope = useCatalogScope();
   const toast = useToastStore();
@@ -410,6 +413,7 @@ export default function Agents() {
 
   const [tab, setTab] = useState<Tab>("my");
   const [showImportModal, setShowImportModal] = useState(false);
+  const [marketSearch, setMarketSearch] = useState("");
   const [mySearch, setMySearch] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [hoveredAction, setHoveredAction] = useState<string | null>(null);
@@ -561,6 +565,10 @@ export default function Agents() {
       getAgentDescription(a).toLowerCase().includes(q)
     );
   });
+  const requestedAgentId = searchParams.get("agent");
+  const selectedAgentId: string | null = visibleMyAgents.some((agent: any) => agent.id === requestedAgentId)
+    ? requestedAgentId
+    : visibleMyAgents[0]?.id ?? null;
   let pageSubtitle = t("page.agents.manage_your_ai_agents");
   let emptyMyAgentsDescription = t("page.agents.no_my_agents_desc_oss");
 
@@ -579,7 +587,7 @@ export default function Agents() {
       {/* Header */}
       <PageHeader
         title={t("nav.agents")}
-        subtitle={pageSubtitle}
+        subtitle={embedded ? undefined : pageSubtitle}
         tabs={(
           <TabSwitcher
             tabs={tabs}
@@ -589,14 +597,15 @@ export default function Agents() {
             className="agents-view-tabs"
           />
         )}
-        toolbar={tab === "my" ? (
+        // One search in the header for both tabs; the marketplace has no hero.
+        toolbar={(
           <SmartToolbar
-            searchValue={mySearch}
-            onSearchChange={setMySearch}
+            searchValue={tab === "my" ? mySearch : marketSearch}
+            onSearchChange={tab === "my" ? setMySearch : setMarketSearch}
             searchPlaceholder={t("page.agents.search_agents")}
             className="w-full sm:w-64"
           />
-        ) : undefined}
+        )}
         actions={tab === "my" ? (
           <Dropdown
             align="right"
@@ -614,7 +623,36 @@ export default function Agents() {
       />
 
       {/* ═══ MY AGENTS TAB ═══ */}
-      {tab === "my" && (
+      {tab === "my" && embedded && !myLoading && visibleMyAgents.length > 0 && (
+        <div className="agents-master-detail">
+          <nav className="agents-master-list" aria-label={t("nav.agents")}>
+            {visibleMyAgents.map((agent: any) => (
+              <button
+                key={agent.id}
+                type="button"
+                className={`agents-master-row${selectedAgentId === agent.id ? " is-active" : ""}`}
+                aria-current={selectedAgentId === agent.id ? "true" : undefined}
+                onClick={() => {
+                  const next = new URLSearchParams(searchParams);
+                  next.set("agent", agent.id);
+                  setSearchParams(next, { replace: true });
+                }}
+              >
+                <AgentAvatar name={agent.name} avatarUrl={agent.avatar_url} seed={agentAvatarSeed(agent)} size={26} />
+                <span>{agent.name}</span>
+              </button>
+            ))}
+          </nav>
+          <div className="agents-master-detail-pane">
+            {selectedAgentId && (
+              <Suspense fallback={null}>
+                <AgentDetail key={selectedAgentId} agentId={selectedAgentId} />
+              </Suspense>
+            )}
+          </div>
+        </div>
+      )}
+      {tab === "my" && !(embedded && !myLoading && visibleMyAgents.length > 0) && (
         <div style={{ flex: 1, overflowY: "auto", padding: 0 }}>
           {myLoading ? (
             <div
@@ -650,7 +688,7 @@ export default function Agents() {
                   }}
                 >
                   <EmptyState
-                    icon={<IconAgent size={32} style={{ color: "#d6d3d1" }} />}
+                    icon={<IconAgent size={32} style={{ color: "var(--text-faint)" }} />}
                     title={
                       mySearch.trim()
                         ? t("page.agents.no_matching_agents")
@@ -739,18 +777,16 @@ export default function Agents() {
                         ),
                         body: (
                           <>
-                            <p style={{ margin: 0, color: "#44403c" }}>{description}</p>
+                            <p style={{ margin: 0, color: "var(--text-default)" }}>{description}</p>
                             <div
                               style={{
                                 fontSize: 10,
                                 fontWeight: 700,
-                                color: "#a8a29e",
-                                textTransform: "uppercase",
-                                letterSpacing: "0.06em",
+                                color: "var(--text-faint)",
                                 margin: "16px 0 8px",
                               }}
                             >
-                              Workspaces
+                              {t("ui.workspaces")}
                             </div>
                             {workspaceItems.length > 0 ? (
                               <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
@@ -763,8 +799,8 @@ export default function Agents() {
                                       gap: 5,
                                       padding: "3px 9px",
                                       borderRadius: 8,
-                                      background: "#f5f5f4",
-                                      color: "#57534e",
+                                      background: "var(--surface-muted)",
+                                      color: "var(--text-muted)",
                                       fontSize: 11,
                                       fontWeight: 600,
                                     }}
@@ -777,7 +813,7 @@ export default function Agents() {
                                         background:
                                           workspace.status === "active"
                                             ? "#4f9c84"
-                                            : "#d6d3d1",
+                                            : "#d1d1d6",
                                       }}
                                     />
                                     {workspace.name}
@@ -785,14 +821,14 @@ export default function Agents() {
                                 ))}
                               </div>
                             ) : (
-                              <div style={{ fontSize: 12, color: "#a8a29e", fontWeight: 600 }}>
-                                Not assigned to a workspace
+                              <div style={{ fontSize: 12, color: "var(--text-muted)", fontWeight: 600 }}>
+                                {t("ui.not_assigned_to_a_workspace")}
                               </div>
                             )}
                           </>
                         ),
                         primaryAction: {
-                          label: "Manage",
+                          label: t("ui.manage"),
                           onClick: () => {
                             closeDetail();
                             navigate(`/agents/${agent.id}`);
@@ -863,18 +899,16 @@ export default function Agents() {
               flexWrap: "wrap",
               gap: 6,
               padding: "8px 12px",
-              background: "#fafaf9",
+              background: "var(--surface-muted)",
               borderRadius: 10,
-              border: "1px solid rgba(28,25,23,0.06)",
+              border: "0.5px solid rgba(29, 29, 31,0.06)",
             }}
           >
             <span
               style={{
                 fontSize: 11,
                 fontWeight: 700,
-                color: "#78716c",
-                textTransform: "uppercase",
-                letterSpacing: "0.08em",
+                color: "var(--text-muted)",
               }}
             >
               {t("page.agents.insert")}
@@ -892,14 +926,14 @@ export default function Agents() {
                 }
                 style={{
                   padding: "3px 10px",
-                  background: "#fff",
-                  color: "#44403c",
+                  background: "var(--surface-panel)",
+                  color: "var(--text-muted)",
                   fontSize: 11,
                   fontWeight: 700,
                   borderRadius: 6,
                   cursor: "pointer",
-                  border: "1px solid rgba(28,25,23,0.06)",
-                  fontFamily: "monospace",
+                  border: "0.5px solid rgba(29, 29, 31,0.06)",
+                  fontFamily: "var(--font-mono)",
                 }}
               >
                 {v}
@@ -926,8 +960,8 @@ export default function Agents() {
                 fontSize: 11,
                 color:
                   improvingPrompt || !editPromptText.trim()
-                    ? "#a8a29e"
-                    : "#57534e",
+                    ? "#aeaeb2"
+                    : "#6e6e73",
                 background: "none",
                 border: "none",
                 cursor:
@@ -952,7 +986,7 @@ export default function Agents() {
             placeholder={t("page.agents.enter_system_prompt")}
             className="manor-input"
             style={{
-              fontFamily: "monospace",
+              fontFamily: "var(--font-mono)",
               fontSize: 12.5,
               lineHeight: 1.6,
               resize: "vertical",
@@ -963,7 +997,7 @@ export default function Agents() {
           {!!promptAgent?.system_prompt && (
             <div
               style={{
-                border: "1px solid #f5f5f4",
+                border: "1px solid #f5f5f7",
                 borderRadius: 10,
                 overflow: "hidden",
               }}
@@ -975,23 +1009,23 @@ export default function Agents() {
                   justifyContent: "space-between",
                   alignItems: "center",
                   padding: "10px 14px",
-                  background: "#fafaf9",
+                  background: "var(--surface-muted)",
                   cursor: "pointer",
                   fontSize: 12,
                   fontWeight: 700,
-                  color: "#78716c",
+                  color: "var(--text-muted)",
                 }}
               >
                 <span>{t("page.agents.view_original_template_prompt")}</span>
                 <span>{showOriginalPrompt ? "▲" : "▼"}</span>
               </div>
               {showOriginalPrompt && (
-                <div style={{ padding: "12px 14px", background: "#fff" }}>
+                <div style={{ padding: "12px 14px", background: "var(--surface-panel)" }}>
                   <pre
                     style={{
-                      fontFamily: "monospace",
+                      fontFamily: "var(--font-mono)",
                       fontSize: 11.5,
-                      color: "#78716c",
+                      color: "var(--text-muted)",
                       whiteSpace: "pre-wrap",
                       wordBreak: "break-word",
                       margin: 0,
@@ -1084,8 +1118,8 @@ function actionBtnStyle(
     ? isDanger
       ? "#ddafac"
       : accentColor
-    : "#f5f5f4";
-  const color = isHovered ? (isDanger ? "#d65f59" : accentColor) : "#a8a29e";
+    : "#f5f5f7";
+  const color = isHovered ? (isDanger ? "#d65f59" : accentColor) : "#aeaeb2";
   const shadow = isHovered
     ? isDanger
       ? "0 0 0 3px rgba(214,95,89,0.15)"
@@ -1095,7 +1129,7 @@ function actionBtnStyle(
     width: 34,
     height: 34,
     borderRadius: "50%",
-    background: isHovered ? "#fff" : "#fafaf9",
+    background: isHovered ? "#fff" : "#fafafa",
     border: `1px solid ${borderColor}`,
     color,
     fontSize: 14,

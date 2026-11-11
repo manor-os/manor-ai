@@ -1,0 +1,21 @@
+/* The one connection row: an integration's logo, name and what it is for, and Connect. */
+.integration-connect-list { display: grid; margin: 0; padding: 0; list-style: none; }
+.integration-connect-list > .integration-connect-row + .integration-connect-row { border-top: 0.5px solid rgba(29, 29, 31, 0.06); }
+html[data-theme="dark"] .integration-connect-list > .integration-connect-row + .integration-connect-row { border-top-color: rgba(255, 255, 255, 0.1); }
+
+.integration-connect-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; min-height: 52px; padding: 8px 0; }
+.integration-connect-row > button { flex: none; }
+.integration-connect-row__icon {
+  display: grid; flex: none; place-items: center; width: 30px; height: 30px;
+  border-radius: 8px; background: var(--surface-muted); color: var(--text-default);
+}
+.integration-connect-row__text { display: grid; flex: 1 1 0; min-width: 0; gap: 2px; }
+.integration-connect-row__text strong { overflow: hidden; color: var(--text-strong); font-size: 14px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.integration-connect-row__text small { overflow: hidden; color: var(--text-muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.integration-connect-row__steps { flex: 1 0 100%; padding: 0 0 4px 42px; font-size: 12.5px; }
+.integration-connect-row__steps .text-sm { font-size: 12.5px; line-height: 1.55; }
+.integration-connect-row__done {
+  display: inline-flex; flex: none; align-items: center; gap: 6px; padding: 2px 8px 2px 7px; border-radius: 999px;
+  background: var(--chip-neutral-bg); color: var(--chip-neutral-fg); font-size: 11px; font-weight: 500; white-space: nowrap;
+}
+.integration-connect-row__done::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }

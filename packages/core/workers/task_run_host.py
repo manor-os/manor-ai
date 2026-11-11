@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 from sqlalchemy import select
 
-from packages.core.constants.task import TaskRuntimeKind, TaskStatus
+from packages.core.constants.task import TaskLogType, TaskRuntimeKind, TaskStatus
+from packages.core.constants.task_actors import TaskActor
 from packages.core.models.base import generate_ulid
+from packages.core.models.runtime_run import RuntimeOutboxEvent
 from packages.core.models.task import Task
 from packages.core.models.task_coordinator import (
     TaskCoordinatorEngine,
@@ -25,8 +28,10 @@ from packages.core.models.task_coordinator import (
     TaskCoordinatorRun,
 )
 from packages.core.models.workspace import Workspace
+from packages.core.services import durable_run
 from packages.core.services.durable_run import holds_current_wake
 from packages.core.services.task_coordinator_wakeup import (
+    TASK_COORDINATOR_RUN_SPEC,
     TaskCoordinatorClaim,
     claim_task_coordinator_wake,
     renew_task_coordinator_claim,
@@ -36,6 +41,7 @@ from packages.core.services.task_execution import (
     task_execution_intent_generation,
 )
 from packages.core.services.task_execution_origin import task_has_manual_execution
+from packages.core.services.task_service import add_task_log
 from packages.core.services.workspace_access import lock_workspace_access_boundary
 from packages.core.services.workspace_autonomy import workspace_allows_manual_work
 from packages.core.services.workspace_readiness import (
@@ -111,6 +117,7 @@ async def admit_and_claim(
     engine: str,
     lease_seconds: float,
     session_factory: SessionFactory,
+    no_runner_max_attempts: int | None = None,
 ) -> tuple[TaskCoordinatorClaim | None, str]:
     """Admit Workspace -> Task, then claim this exact wake for ``engine``.
 
@@ -123,11 +130,7 @@ async def admit_and_claim(
         if task is None:
             return None, reason
         execution = await resolve_task_execution(db, task, lock_subscriptions=True)
-        if execution.runtime_kind is not TaskRuntimeKind.COORDINATED_PLAN or execution.coordinator is None:
-            return None, "factory_selection_unavailable"
-        run = (await db.execute(
-            select(TaskCoordinatorRun).where(TaskCoordinatorRun.task_id == task_id)
-        )).scalar_one_or_none()
+        run = await durable_run.lock_run(db, TASK_COORDINATOR_RUN_SPEC, task_id)
         if (
             run is None
             or getattr(run, "lifecycle_generation", None)
@@ -136,6 +139,33 @@ async def admit_and_claim(
             return None, "stale_task_lifecycle"
         if run_engine(run) != engine:
             return None, "engine_mismatch"
+        if execution.runtime_kind is not TaskRuntimeKind.COORDINATED_PLAN or execution.coordinator is None:
+            if no_runner_max_attempts is not None:
+                # Factory admission, Task -> Run -> Outbox locks and exact-wake
+                # fencing must share this transaction. A previous failed
+                # admission cannot authorize stopping a newer wake or owner.
+                claim, _ = await durable_run.claim_run_wake(
+                    db, TASK_COORDINATOR_RUN_SPEC,
+                    key=task_id, event_id=event_id, wake_generation=wake_generation,
+                    claim_token=generate_ulid(), lease_seconds=lease_seconds,
+                )
+                if claim is not None:
+                    event = await db.get(RuntimeOutboxEvent, event_id)
+                    if event.attempt_count >= no_runner_max_attempts:
+                        now = datetime.now(timezone.utc)
+                        task.status = TaskStatus.BLOCKED.value
+                        task.status_changed_at = now
+                        run.phase = TaskCoordinatorPhase.FAILED.value
+                        durable_run.clear_run_claim_and_wake(run)
+                        event.delivered_at = now
+                        event.last_error = "no_runner"
+                        await add_task_log(
+                            db, task_id, TaskLogType.AI_EXECUTION_FAILED,
+                            "No active Agent in this Workspace can run this Task. Assign one and retry it.",
+                            actor=TaskActor.SYSTEM, metadata={"error": "no_runner", "engine": engine},
+                        )
+                        await db.commit()
+            return None, "factory_selection_unavailable"
         claim, reason = await claim_task_coordinator_wake(
             db,
             task_id=task_id,

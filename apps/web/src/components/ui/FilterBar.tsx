@@ -48,72 +48,56 @@ interface FilterSelectProps<T extends string> {
 export function FilterBar({
   children,
   activeCount = 0,
-  label = "Filters",
+  label,
   trailing,
   style,
 }: FilterBarProps) {
+  // Filters stay folded behind one button; any active filter keeps them open
+  // so what narrows the list is always visible.
+  const [expanded, setExpanded] = useState(false);
+  const open = expanded || activeCount > 0;
   return (
     <div
+      className="filter-bar"
       style={{
         display: "flex",
         alignItems: "center",
-        gap: 8,
+        gap: 6,
         flexWrap: "wrap",
-        marginBottom: 14,
+        marginBottom: 12,
         padding: 0,
         ...style,
       }}
     >
-      <div
-        style={{
-          display: "inline-flex",
-          alignItems: "center",
-          gap: 6,
-          height: 36,
-          padding: 0,
-          color: "#78716c",
-          fontSize: 12,
-          fontWeight: 750,
-          whiteSpace: "nowrap",
-        }}
+      <button
+        type="button"
+        className={`filter-bar-toggle ${open ? "is-open" : ""}`}
+        aria-expanded={open}
+        onClick={() => setExpanded((value) => !value)}
       >
-        <IconFilter size={14} />
-        {label}
-        {activeCount > 0 && (
-          <span
-            style={{
-              minWidth: 18,
-              height: 18,
-              padding: "0 6px",
-              borderRadius: 999,
-              background: "#e5eeeb",
-              color: "#436b65",
-              fontSize: 10,
-              lineHeight: "18px",
-              textAlign: "center",
-            }}
-          >
-            {activeCount}
-          </span>
-        )}
-      </div>
-      <div
-        style={{
-          display: "inline-flex",
-          alignItems: "center",
-          gap: 8,
-          flexWrap: "wrap",
-          minWidth: 0,
-        }}
-      >
-        {children}
-      </div>
+        <IconFilter size={13} />
+        {label ?? t("component.filter_bar.filters")}
+        {activeCount > 0 && <span className="filter-bar-count">{activeCount}</span>}
+      </button>
+      {open && (
+        <div
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            flexWrap: "wrap",
+            minWidth: 0,
+          }}
+        >
+          {children}
+        </div>
+      )}
       {trailing && (
         <div
           style={{
             display: "flex",
             alignItems: "center",
-            gap: 8,
+            gap: 6,
             marginLeft: "auto",
           }}
         >
@@ -246,25 +230,17 @@ export function FilterSelect<T extends string>({
           alignItems: "center",
           columnGap: 7,
           width: "100%",
-          height: 36,
+          height: 30,
           boxSizing: "border-box",
           padding: "0 10px",
           overflow: "hidden",
-          borderRadius: 12,
-          border: open
-            ? "1px solid rgba(95,146,138,0.46)"
-            : isActive
-              ? "1px solid rgba(130,173,164,0.62)"
-              : "1px solid rgba(214,211,209,0.9)",
-          background: open
-            ? "rgba(242,246,245,0.96)"
-            : isActive
-              ? "rgba(242,246,245,0.72)"
-              : "rgba(255,255,255,0.86)",
-          boxShadow: open
-            ? "0 0 0 3px rgba(95,146,138,0.10), 0 8px 22px rgba(28,25,23,0.06)"
-            : "0 5px 18px rgba(28,25,23,0.04)",
-          color: "#57534e",
+          borderRadius: 999,
+          border: 0,
+          background: open || isActive
+            ? "rgba(118,118,128,0.16)"
+            : "rgba(118,118,128,0.08)",
+          boxShadow: "none",
+          color: "var(--text-muted)",
           cursor: "pointer",
           textAlign: "left",
           transition:
@@ -276,9 +252,9 @@ export function FilterSelect<T extends string>({
             display: "inline-flex",
             alignItems: "center",
             gap: 4,
-            color: isActive ? "#436b65" : "#78716c",
-            fontSize: 11,
-            fontWeight: 750,
+            color: "var(--text-muted)",
+            fontSize: 12,
+            fontWeight: 400,
             flexShrink: 0,
             minWidth: 0,
             overflow: "hidden",
@@ -288,7 +264,7 @@ export function FilterSelect<T extends string>({
           {Icon && (
             <Icon
               size={12}
-              style={{ color: isActive ? "#436b65" : "#7f8ea3", flexShrink: 0 }}
+              style={{ color: "var(--text-muted)", flexShrink: 0 }}
             />
           )}
           {label}
@@ -300,9 +276,9 @@ export function FilterSelect<T extends string>({
             gap: 6,
             minWidth: 0,
             overflow: "hidden",
-            color: isActive ? "#436b65" : "#57534e",
+            color: "var(--text-strong)",
             fontSize: 12,
-            fontWeight: isActive ? 760 : 680,
+            fontWeight: isActive ? 600 : 400,
           }}
         >
           {showSelectedIcon && isActive && selectedOption?.icon && (
@@ -339,7 +315,7 @@ export function FilterSelect<T extends string>({
           <IconChevronDown
             size={12}
             style={{
-              color: open ? "#436b65" : "#a8a29e",
+              color: open ? "#436b65" : "#aeaeb2",
               transition: "transform 0.15s ease",
               transform: open ? "rotate(180deg)" : "none",
             }}
@@ -364,7 +340,7 @@ export function FilterSelect<T extends string>({
             background: useChipMenu ? "transparent" : "rgba(255,255,255,0.97)",
             boxShadow: useChipMenu
               ? "none"
-              : "0 14px 34px rgba(28,25,23,0.12), 0 1px 0 rgba(255,255,255,0.9) inset",
+              : "0 14px 34px rgba(29, 29, 31,0.12), 0 1px 0 rgba(255,255,255,0.9) inset",
             backdropFilter: useChipMenu ? "none" : "blur(18px)",
             animation: "dialog-in 0.12s ease-out",
           }}
@@ -381,9 +357,9 @@ export function FilterSelect<T extends string>({
                   height: 30,
                   padding: "0 9px",
                   borderRadius: 8,
-                  border: "1px solid rgba(28,25,23,0.06)",
-                  background: "#fafaf9",
-                  color: "#44403c",
+                  border: "0.5px solid rgba(29, 29, 31,0.06)",
+                  background: "var(--surface-muted)",
+                  color: "var(--text-muted)",
                   fontSize: 12,
                   fontWeight: 600,
                   outline: "none",
@@ -397,7 +373,7 @@ export function FilterSelect<T extends string>({
             <div
               style={{
                 padding: "12px 10px",
-                color: "#a8a29e",
+                color: "var(--text-faint)",
                 fontSize: 12,
                 fontWeight: 650,
                 textAlign: "center",
@@ -439,10 +415,10 @@ export function FilterSelect<T extends string>({
                       background: isSelected
                         ? "rgba(229,238,235,0.92)"
                         : "rgba(255,255,255,0.96)",
-                      color: isSelected ? "#436b65" : "#57534e",
+                      color: isSelected ? "#436b65" : "#6e6e73",
                       boxShadow: isSelected
                         ? "0 5px 16px rgba(95,146,138,0.12)"
-                        : "0 5px 14px rgba(28,25,23,0.08)",
+                        : "0 5px 14px rgba(29, 29, 31,0.08)",
                       cursor: "pointer",
                       fontSize: 12,
                       fontWeight: isSelected ? 760 : 620,
@@ -517,7 +493,7 @@ export function FilterSelect<T extends string>({
                     background: isSelected
                       ? "rgba(242,246,245,0.92)"
                       : "transparent",
-                    color: isSelected ? "#436b65" : "#44403c",
+                    color: isSelected ? "#436b65" : "#48484a",
                     cursor: "pointer",
                     fontSize: 13,
                     fontWeight: isSelected ? 760 : 560,
@@ -527,7 +503,7 @@ export function FilterSelect<T extends string>({
                   onMouseEnter={(event) => {
                     event.currentTarget.style.background = isSelected
                       ? "rgba(229,238,235,0.72)"
-                      : "#fafaf9";
+                      : "#fafafa";
                   }}
                   onMouseLeave={(event) => {
                     event.currentTarget.style.background = isSelected

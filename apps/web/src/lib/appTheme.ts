@@ -66,6 +66,15 @@ function rgba(hex: string, alpha: number): string {
   return `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${alpha})`;
 }
 
+/** The accent's hue for covers without a picture; a grey accent has none, so they keep their title's colours. */
+function accentHue([r, g, b]: Rgb): number | null {
+  const [max, min] = [Math.max(r, g, b), Math.min(r, g, b)];
+  const delta = max - min;
+  if (delta < 24) return null;
+  const sector = max === r ? ((g - b) / delta + 6) % 6 : max === g ? (b - r) / delta + 2 : (r - g) / delta + 4;
+  return Math.round(sector * 60);
+}
+
 /** Custom properties for the App root; empty for the platform's own look. */
 export function appThemeStyle(theme: AppTheme | null | undefined, appearanceDark: boolean): Record<string, string> {
   if (!theme) return {};
@@ -82,6 +91,12 @@ export function appThemeStyle(theme: AppTheme | null | undefined, appearanceDark
       "--accent-soft-border": rgba(accent, dark ? 0.28 : 0.22),
       "--accent-ring": rgba(accent, 0.24),
     });
+    const hue = accentHue(parseHex(theme.accent)!);
+    if (hue !== null) {
+      style["--app-cover-hue"] = String(hue);
+      style["--app-cover-accent"] = String((hue + 346) % 360);
+      style["--app-cover-saturation"] = "48%";
+    }
     if (theme.surface === "tinted") {
       style["--app-surface-tint"] = rgba(accent, dark ? 0.1 : 0.06);
     }

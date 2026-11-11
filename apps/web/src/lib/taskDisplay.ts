@@ -524,9 +524,26 @@ export function formatUserFacingStructuredText(value?: unknown): string {
   return formatUserFacingText(String(value || ""));
 }
 
+const COMPLETION_REPORT_KEYS = new Set(["summary", "deliverables", "acceptance"]);
+
+// With no declared result schema, the loop stores its own completion report
+// under `result`. Files and exceptions have their own sections on the page.
+function isCompletionReport(output: Record<string, unknown>): boolean {
+  const result = output.result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) return false;
+  const report = result as Record<string, unknown>;
+  return typeof output.summary === "string"
+    && report.summary === output.summary
+    && Array.isArray(report.deliverables)
+    && Array.isArray(report.acceptance)
+    && Object.keys(report).every((key) => COMPLETION_REPORT_KEYS.has(key));
+}
+
 export function formatTaskOutputSummary(output?: Record<string, unknown> | null): string {
   if (!output) return "";
+  const completionReport = isCompletionReport(output);
   for (const key of ["result", "results", "summary", "result_summary", "message", "text"]) {
+    if (key === "result" && completionReport) continue;
     // A formal business payload is not a short log preview: files or one
     // summary field must not hide its other delivered fields. The executor
     // can save both result and a prose summary; use prose only as a fallback.

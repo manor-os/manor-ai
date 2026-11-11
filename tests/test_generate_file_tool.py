@@ -4388,20 +4388,37 @@ async def test_generated_audio_label_follows_its_bytes_when_no_format_was_reques
     assert url.startswith("data:audio/mpeg;base64,")
 
 
-def test_generated_audio_cost_prefers_gateway_cost_and_counts_speech_characters():
+def test_generated_audio_cost_bills_the_official_unit_not_the_gateway_cost():
+    # The gateway's 0.05 is not billed while Lyria's official per-song price exists.
     assert extended_tools._generated_audio_cost_usd(
         "google/lyria-3-clip-preview", purpose="music", prompt="x", provider_cost_usd=0.05,
-    ) == 0.05
+    ) == (0.04, "official_asset")
     assert extended_tools._generated_audio_cost_usd(
         "google/lyria-3-pro-preview", purpose="music", prompt="x",
-    ) == 0.08
+    ) == (0.08, "official_asset")
     # ElevenLabs v4 is $0.00008 per character; Flash v2.5 half that.
-    assert extended_tools._generated_audio_cost_usd(
+    cost, basis = extended_tools._generated_audio_cost_usd(
         "elevenlabs/eleven-v4", purpose="narration", prompt="a" * 1000,
-    ) == pytest.approx(0.08)
+    )
+    assert (cost, basis) == (pytest.approx(0.08), "official_characters")
+    # OpenAI tts-1-hd is $30 per 1M characters, not a flat cent.
+    cost, _basis = extended_tools._generated_audio_cost_usd(
+        "openai/tts-1-hd", purpose="speech", prompt="a" * 4000,
+    )
+    assert cost == pytest.approx(0.12)
+    # Gemini speech: 24 kHz 16-bit PCM, 10 s = 250 audio tokens at $20/M.
+    cost, basis = extended_tools._generated_audio_cost_usd(
+        "google/gemini-3.1-flash-tts-preview", purpose="speech", prompt="",
+        audio_bytes=b"\0" * 480_000, audio_format="pcm",
+    )
+    assert (cost, basis) == (pytest.approx(250 * 20 / 1_000_000), "official_rate_measured_seconds")
+    # Unpriced: the gateway cost is a flagged fallback, and nothing at all is unpriced.
     assert extended_tools._generated_audio_cost_usd(
-        "elevenlabs/eleven-flash-v2.5", purpose="speech", prompt="a" * 250,
-    ) == pytest.approx(0.01)
+        "acme/voice", purpose="speech", prompt="x", provider_cost_usd=0.02,
+    ) == (0.02, "gateway_cost_fallback")
+    assert extended_tools._generated_audio_cost_usd(
+        "acme/voice", purpose="speech", prompt="x",
+    ) == (None, "unpriced")
 
 
 @pytest.mark.asyncio

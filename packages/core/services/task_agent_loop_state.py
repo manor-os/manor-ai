@@ -49,6 +49,10 @@ ROUND_JOURNAL_KEY = "round_journal"
 # registered slot (guarded in test_run_state_roundtrip).
 TASK_LOOP_EPHEMERAL_STATE_KEYS = frozenset({
     "version", "yield", "phase_running", "last_checkpoint", "resumed_wait",
+    # When this wake's brief was built: later Task changes are delivered to the run.
+    "brief_built_at",
+    # The Workspace governance revision of this wake's prompt: a later one is delivered.
+    "rules_revision",
     ROUND_JOURNAL_KEY,
 })
 

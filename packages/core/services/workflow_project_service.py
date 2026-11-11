@@ -1,6 +1,7 @@
 """Concurrency-safe persistence for state shared by related workflow runs."""
 from __future__ import annotations
 
+import hashlib
 import re
 import unicodedata
 from datetime import UTC, datetime, timedelta
@@ -11,6 +12,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.workflow import WORKFLOW_RUN_OPEN_STATUSES
 from packages.core.models.base import generate_ulid
 from packages.core.models.workflow import WorkflowProject, WorkflowRun
 from packages.core.services.project_references import preserve_pinned_references
@@ -25,7 +27,51 @@ class WorkflowProjectNotFound(LookupError):
     """Raised when a project is absent or outside the caller's entity."""
 
 
+class WorkflowProjectKeyTaken(ValueError):
+    """Raised when ``create`` names a business key another project already holds."""
+
+    def __init__(self, existing: WorkflowProject):
+        self.existing = existing
+        super().__init__(
+            f'A {existing.project_type.replace("_", " ")} project "{existing.project_key}" '
+            f"already exists in this Workspace (stage: {existing.current_stage}). "
+            "Start the run with a different value for its key, or make this step "
+            "claim the existing project instead of creating one."
+        )
+
+
 _UNSET = object()
+
+# ``WorkflowProject.project_key`` is a String(200).
+PROJECT_KEY_MAX_LENGTH = 200
+
+
+def bounded_project_key(project_key: str) -> str:
+    """The key as stored: a longer one (a whole brief or email) keeps its start and a digest of the rest.
+
+    The same text always gives the same key, so a repeat still finds its project.
+    """
+    if len(project_key) <= PROJECT_KEY_MAX_LENGTH:
+        return project_key
+    digest = hashlib.sha256(project_key.encode("utf-8")).hexdigest()[:16]
+    return f"{project_key[:PROJECT_KEY_MAX_LENGTH - len(digest) - 1].rstrip()}~{digest}"
+
+# A project in one of these stages is over: the scheduled work it owns stops
+# (see ``retire_owned_work_if_ended``). Other stages, "completed" included, may
+# keep follow-up work such as collecting results after the last delivery.
+PROJECT_END_STAGES = frozenset({"ended", "cancelled"})
+
+
+async def retire_owned_work_if_ended(db: AsyncSession, project: WorkflowProject) -> None:
+    """Stop the jobs an ended or cancelled project owns, in the caller's transaction."""
+    if project.current_stage not in PROJECT_END_STAGES:
+        return
+    from packages.core.services.scheduler_service import retire_project_owned_jobs
+
+    await retire_project_owned_jobs(
+        db, entity_id=project.entity_id, workspace_id=project.workspace_id, project_id=project.id,
+        causation_id=project.last_run_id,
+    )
 
 
 def _state_value(state: dict, path: str) -> Any:
@@ -221,7 +267,52 @@ async def complete_workflow_project_lease(
     _set_state_value(state, lease_path, {})
     row.state, row.current_stage, row.last_run_id, row.revision = state, stage, run_id, row.revision + 1
     await db.flush()
+    await retire_owned_work_if_ended(db, row)
     return row
+
+
+async def release_failed_run_project_leases(
+    db: AsyncSession, *, run_id: str, entity_id: str, workspace_id: str, lease_paths: set[str],
+) -> list[str]:
+    """Give back each project a failed run leased, restoring the stage it waited in.
+
+    ``lease_due`` records that stage as ``pending_stage`` on the lease, so the
+    release clears the lease and sets the project back to it. A later run, or a
+    retry of this one, can then lease the project again. Projects that are no
+    longer leased by this run (already released, re-leased, or deleted) are left
+    alone, so a repeated call changes nothing.
+    """
+    candidate_ids = (await db.execute(select(WorkflowProject.id).where(
+        WorkflowProject.entity_id == entity_id,
+        WorkflowProject.workspace_id == workspace_id,
+        WorkflowProject.current_stage == "leased",
+    ))).scalars().all()
+    released = []
+    for project_id in candidate_ids:
+        row = await db.scalar(select(WorkflowProject).where(
+            WorkflowProject.id == project_id,
+            WorkflowProject.entity_id == entity_id,
+            WorkflowProject.workspace_id == workspace_id,
+            WorkflowProject.current_stage == "leased",
+        ).with_for_update().execution_options(populate_existing=True))
+        if row is None:
+            continue
+        state = deepcopy(row.state or {})
+        for lease_path in sorted(lease_paths):
+            lease = _state_value(state, lease_path)
+            if (not isinstance(lease, dict) or lease.get("run_id") != run_id
+                    or not isinstance(lease.get("pending_stage"), str)
+                    or lease["pending_stage"] in {"", "leased"}):
+                continue
+            _set_state_value(state, lease_path, {})
+            row.state, row.current_stage, row.last_run_id, row.revision = (
+                state, lease["pending_stage"], run_id, row.revision + 1,
+            )
+            released.append(project_id)
+            break
+    if released:
+        await db.flush()
+    return released
 
 
 async def create_workflow_project(
@@ -237,6 +328,8 @@ async def create_workflow_project(
     last_run_id: str | None = None,
     project_key: str | None = None,
 ) -> WorkflowProject:
+    if project_key is not None:
+        project_key = bounded_project_key(project_key)
     project = WorkflowProject(
         id=generate_ulid(),
         entity_id=entity_id,
@@ -250,8 +343,26 @@ async def create_workflow_project(
         last_run_id=last_run_id,
         created_by=created_by,
     )
-    db.add(project)
-    await db.flush()
+    # The SAVEPOINT keeps a duplicate business key from poisoning the
+    # caller's transaction (a workflow run records its failure on it).
+    try:
+        async with db.begin_nested():
+            db.add(project)
+            await db.flush()
+    except IntegrityError:
+        if project_key is None:
+            raise
+        existing = (await db.execute(
+            select(WorkflowProject).where(
+                WorkflowProject.entity_id == entity_id,
+                WorkflowProject.workspace_id == workspace_id,
+                WorkflowProject.project_type == project_type,
+                WorkflowProject.project_key == project_key,
+            )
+        )).scalar_one_or_none()
+        if existing is None:
+            raise
+        raise WorkflowProjectKeyTaken(existing) from None
     return project
 
 
@@ -275,7 +386,7 @@ async def claim_workflow_project(
     concurrency boundary; the SAVEPOINT keeps a losing insert from poisoning
     the caller's transaction.
     """
-    normalized_key = str(project_key or "").strip()
+    normalized_key = bounded_project_key(str(project_key or "").strip())
     if not normalized_key:
         raise ValueError("Workflow project claim requires project_key")
 
@@ -309,6 +420,38 @@ async def claim_workflow_project(
     return project, True
 
 
+async def open_run_project_marks(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    run_id: str | None = None,
+) -> dict[str, str]:
+    """Each project an open Flow run last wrote, by its id and its folder, mapped to that run.
+
+    The run's later steps and approval own that work: text naming either mark is
+    about that project. ``run_id`` narrows it to one run's own projects.
+    """
+    query = (
+        select(WorkflowProject.id, WorkflowProject.state, WorkflowRun.id)
+        .join(WorkflowRun, WorkflowRun.id == WorkflowProject.last_run_id)
+        .where(
+            WorkflowRun.entity_id == entity_id,
+            WorkflowRun.workspace_id == workspace_id,
+            WorkflowRun.status.in_(WORKFLOW_RUN_OPEN_STATUSES),
+        )
+    )
+    if run_id:
+        query = query.where(WorkflowRun.id == run_id)
+    marks: dict[str, str] = {}
+    for project_id, state, owner_run_id in (await db.execute(query)).all():
+        folder = str((state or {}).get("project_root") or "").strip().strip("/") if isinstance(state, dict) else ""
+        for mark in (project_id, folder):
+            if mark:
+                marks[mark] = owner_run_id
+    return marks
+
+
 async def get_workflow_project(
     db: AsyncSession,
     *,
@@ -328,6 +471,91 @@ async def get_workflow_project(
     if project is None:
         raise WorkflowProjectNotFound(project_id)
     return project
+
+
+class WorkflowProjectInUse(RuntimeError):
+    """Raised when a project to delete is still owned by another open Flow run."""
+
+
+# Child kinds one delete may also remove, so one call cannot sweep a Workspace.
+DELETE_CHILD_KINDS_MAX = 5
+
+
+async def delete_workflow_project(
+    db: AsyncSession,
+    *,
+    project_id: str,
+    entity_id: str,
+    workspace_id: str,
+    project_type: str,
+    children: list[tuple[str, str]] = (),
+    run_id: str | None = None,
+    expected_child_ids: list[str] | None = None,
+) -> list[str]:
+    """Permanently delete a project, its listed child projects and the jobs they own.
+
+    ``children`` names each child kind as (project_type, state key holding the
+    parent's id). Every row is locked before its owner is checked, so a run
+    that starts on one meanwhile waits for this delete or is refused by it. A
+    project another open run last wrote (a post being published) is not
+    deleted; the caller's own run does not count. ``expected_child_ids`` is the
+    set the caller listed and cleaned up files for: if the children differ, the
+    delete is refused, so nothing is removed that the caller did not clean up.
+    Run history, files and Stats stay with their own owners. Returns the
+    deleted project ids; the caller commits, and a refusal changes nothing.
+    """
+    from sqlalchemy import delete as sql_delete
+
+    from packages.core.models.scheduler import ScheduledJob
+    from packages.core.models.workflow import WorkflowActionGrant
+    from packages.core.services.scheduler_service import delete_scheduled_job
+
+    project = (await db.execute(select(WorkflowProject).where(
+        WorkflowProject.id == project_id,
+        WorkflowProject.entity_id == entity_id,
+        WorkflowProject.workspace_id == workspace_id,
+    ).with_for_update())).scalar_one_or_none()
+    if project is None:
+        raise WorkflowProjectNotFound(project_id)
+    if project.project_type != project_type:
+        raise ValueError("Workflow project type does not match")
+    rows = [project]
+    for child_type, parent_key in list(children)[:DELETE_CHILD_KINDS_MAX]:
+        rows += list((await db.execute(select(WorkflowProject).where(
+            WorkflowProject.entity_id == entity_id,
+            WorkflowProject.workspace_id == workspace_id,
+            WorkflowProject.project_type == child_type,
+            WorkflowProject.state[parent_key].as_string() == project.id,
+        ).with_for_update())).scalars())
+    ids = [row.id for row in rows]
+    if expected_child_ids is not None and {row.id for row in rows[1:]} != set(expected_child_ids):
+        raise WorkflowProjectInUse(
+            "the projects under this one changed since they were listed; nothing was deleted, try again"
+        )
+    busy = (await db.execute(select(WorkflowProject.id).join(
+        WorkflowRun, WorkflowRun.id == WorkflowProject.last_run_id,
+    ).where(
+        WorkflowProject.id.in_(ids),
+        WorkflowRun.status.in_(WORKFLOW_RUN_OPEN_STATUSES),
+        *([WorkflowRun.id != run_id] if run_id else []),
+    ))).scalars().all()
+    if busy:
+        raise WorkflowProjectInUse(
+            f"{len(busy)} of these projects are still being worked on by another run; try again when it finishes"
+        )
+    jobs = (await db.execute(select(ScheduledJob.id).where(
+        ScheduledJob.entity_id == entity_id,
+        ScheduledJob.workspace_id == workspace_id,
+        ScheduledJob.owner_project_id.in_(ids),
+    ))).scalars().all()
+    for job_id in jobs:
+        await delete_scheduled_job(db, job_id, entity_id, allow_agent_initiative_driver=True)
+    await db.execute(sql_delete(WorkflowActionGrant).where(
+        WorkflowActionGrant.entity_id == entity_id, WorkflowActionGrant.project_id.in_(ids),
+    ))
+    await db.execute(sql_delete(WorkflowProject).where(WorkflowProject.id.in_(ids)))
+    await db.flush()
+    return ids
 
 
 async def patch_workflow_project(
@@ -394,4 +622,6 @@ async def patch_workflow_project(
         .where(WorkflowProject.id == updated_id)
         .execution_options(populate_existing=True)
     )).scalar_one()
+    if current_stage is not None:
+        await retire_owned_work_if_ended(db, project)
     return project

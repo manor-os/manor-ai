@@ -27,7 +27,7 @@ function InterfacePreview({ mode }: { mode: InterfaceMode }) {
       ))}
       <circle cx="18" cy="195" r="6" className="guide-preview-control" />
       <rect x="29" y="193" width="10" height="3" rx="1.5" className="guide-preview-line" />
-      <text x="64" y="24" className="guide-preview-heading">Workspace</text>
+      <text x="64" y="24" className="guide-preview-heading">{t("ui.workspace")}</text>
       <circle cx="308" cy="20" r="2" className="guide-preview-line" />
       {professional && (
         <g className="guide-preview-tabs">

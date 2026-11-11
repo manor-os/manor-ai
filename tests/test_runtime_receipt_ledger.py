@@ -508,6 +508,7 @@ async def test_delegation_publishes_the_child_ledger_with_run_prefix(client, db_
     assert result["status"] == "completed"
     run_id = result["run_id"]
     assert sink and all(item["call_id"].startswith(f"{run_id}/") for item in sink)
+    assert sink.settled  # every child it started is accounted for
     parent = RuntimeToolEvidence()
     parent.observe_tool_result("workspace_agent", "d-1", json.dumps(result), {"action": "delegate_service"})
     parent.merge_child_observations("d-1", sink)
@@ -748,13 +749,24 @@ async def _delegate_with_fake_loop(client, db_session, monkeypatch, fake_loop, *
 
     monkeypatch.setattr("packages.core.ai.context.build_agent_context", fake_context)
     monkeypatch.setattr("packages.core.ai.runtime.harness.runtime_execute_chat_agent_loop", fake_loop)
+    from packages.core.ai.runtime.tool_evidence import runtime_split_children_settled
+
     with runtime_child_evidence_scope() as sink:
         result = json.loads(await _workspace_agent_handler(
             entity_id=workspace["entity_id"], workspace_id=workspace["id"],
             conversation_id=conversation_id, user_id="receipt-user", action="delegate_service",
             params={"service_key": "writer", "prompt": "Write the report."},
         ))
-    return result, sink
+    children, settled = runtime_split_children_settled(sink)
+    return result, _ChildSink(children, settled=settled)
+
+
+class _ChildSink(list):
+    """The children a delegation handed over, and whether it settled its call."""
+
+    def __init__(self, items, *, settled: bool):
+        super().__init__(items)
+        self.settled = settled
 
 
 def _child_loop_result(child_state, **overrides):
@@ -863,12 +875,14 @@ def test_action_observation_records_classifier_facts_and_a_ledger_effect():
     assert observation["effect"] == "action"
     assert observation["action_key"] == "workspace.task.create"
     assert observation["resource_kind"] == "workspace_task"
+    # The approval category says whether the call reached outside the Workspace.
+    assert observation["action_category"] == "workspace"
     # Compact: titles are derived at output time, never stored per call.
     assert "action_title" not in observation
     state = ledger.checkpoint_state()
     assert state["effects"] == [{
         "action_key": "workspace.task.create", "resource_kind": "workspace_task",
-        "operation": "create", "count": 1,
+        "operation": "create", "category": "workspace", "count": 1,
     }]
     assert state["effects_omitted"] == 0
 
@@ -895,7 +909,7 @@ def test_classifier_facts_are_host_only():
     assert observation["effect"] == "action" and observation["action_operation"] == "create"
 
     view = runtime_model_view_of_observation(observation)
-    assert not {"effect", "action_key", "resource_kind", "action_operation"} & set(view)
+    assert not {"effect", "action_key", "resource_kind", "action_operation", "action_category"} & set(view)
     assert view["operation"] == "workspace_agent.create_task" and view["effect_state"] == "confirmed"
 
 
@@ -1338,3 +1352,124 @@ def test_a_handler_settled_failure_is_none_or_confirmed_and_never_from_json():
     # The same text as plain JSON (a provider, a checkpoint) is an uncertain failure.
     ledger.observe_tool_result("bash", "b-2", refused, {"command": "python -c 1"})
     assert [c["call_id"] for c in ledger.unconfirmed_calls] == ["b-2"]
+
+
+# A delegation settles its call through its children's ledgers: its reply's
+# status (a child that ended partial or blocked) is never an effect of its own.
+
+def _read_only_child() -> RuntimeToolEvidence:
+    child = RuntimeToolEvidence()
+    child.observe_tool_result("search_documents", "c-1", json.dumps({"results": []}), {"query": "deck"})
+    return child
+
+
+PARTIAL_REPLY = json.dumps({"delegated": True, "status": "partial", "content": "Draft below."})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settled", [True, False])
+async def test_loop_reads_a_settled_delegation_from_its_children_not_its_reply(settled):
+    """Prod 2026-10-30: a Task drafting an email was blocked because a
+    research delegation that only read ended "partial"."""
+    from packages.core.ai.runtime.tool_evidence import (
+        runtime_publish_child_evidence,
+        runtime_publish_children_settled,
+    )
+
+    calls = {"n": 0}
+
+    async def model(messages, _tools, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "", [{"id": "d-1", "name": "delegate_like", "arguments": {}}], {}
+        return "done", None, {}
+
+    async def executor(name, args):
+        runtime_publish_child_evidence([
+            {**item, "call_id": f"run/{item['call_id']}"} for item in _child_evidence(_read_only_child())
+        ])
+        if settled:
+            runtime_publish_children_settled()
+        return PARTIAL_REPLY
+
+    ledger = RuntimeToolEvidence()
+    with patch("packages.core.ai.agentic_loop.runtime_execute_agentic_round_tool_completion", AsyncMock(side_effect=model)):
+        await agentic_loop(
+            system_prompt="s", user_message="u", tools=[_fn("delegate_like")],
+            tool_executor=executor, tool_evidence=ledger, max_rounds=3,
+        )
+
+    state = ledger.checkpoint_state()
+    if settled:
+        assert state["unconfirmed_calls"] == []
+        assert state["effect_state"] == "none"
+    else:  # without host proof the reply still decides, as before
+        assert [c["call_id"] for c in state["unconfirmed_calls"]] == ["d-1"]
+
+
+def test_a_settled_delegation_stays_unconfirmed_through_an_uncertain_child():
+    from packages.core.ai.runtime.tool_evidence import runtime_publish_child_floor, runtime_child_evidence_scope
+
+    child = _read_only_child()
+    child.observe_tool_result("generate_file", "c-bad", json.dumps({"status": "error", "error": "x"}), {"kind": "document"})
+    published = _delegate_through_the_real_publisher(child)
+    with runtime_child_evidence_scope() as unknown:
+        runtime_publish_child_floor("run-2")  # a child whose ledger is unknown
+
+    parent = RuntimeToolEvidence()
+    parent.observe_tool_result("delegate_to_agent", "d-1", PARTIAL_REPLY, {}, settled_by_children=True)
+    parent.merge_child_observations("d-1", published + unknown, observe=False)
+    state = parent.checkpoint_state()
+    # Listed by the child call and the unknown child, never the delegation.
+    assert [c["call_id"] for c in state["unconfirmed_calls"]] == ["d-1/run-1/c-bad", "d-1/run-2/~effect_floor"]
+    assert state["effect_state"] == "unconfirmed"
+
+
+@pytest.mark.asyncio
+async def test_a_refused_delegation_settles_with_nothing_run():
+    from packages.core.ai.runtime.tool_evidence import runtime_child_evidence_scope, runtime_split_children_settled
+    from packages.core.ai.tools.workspace_agent_tools import _delegate_to_agent_handler
+
+    with runtime_child_evidence_scope() as sink:
+        result = json.loads(await _delegate_to_agent_handler(entity_id="e", workspace_id="w", tasks=[]))
+    assert result["error"] == "invalid_tasks"
+    assert runtime_split_children_settled(sink) == ([], True)
+
+
+@pytest.mark.asyncio
+async def test_a_child_left_unaccounted_or_a_raising_call_never_settles():
+    from packages.core.ai.runtime import workspace_delegation_actions as delegation
+    from packages.core.ai.runtime.tool_evidence import runtime_child_evidence_scope, runtime_split_children_settled
+
+    async def unaccounted():
+        delegation._mark_delegation_unaccounted()
+        return PARTIAL_REPLY
+
+    async def raising():
+        raise RuntimeError("boom")
+
+    with runtime_child_evidence_scope() as sink:
+        await delegation.runtime_settled_delegation(unaccounted())
+        with pytest.raises(RuntimeError):
+            await delegation.runtime_settled_delegation(raising())
+    assert runtime_split_children_settled(sink) == ([], False)
+
+
+@pytest.mark.asyncio
+async def test_a_real_delegation_settles_and_accounts_a_crashed_child_loop(client, db_session, monkeypatch):
+    async def crashed_loop(**_kwargs):
+        raise RuntimeError("child loop crashed mid-round")
+
+    result, sink = await _delegate_with_fake_loop(
+        client, db_session, monkeypatch, crashed_loop, username="ledger_crashed_child",
+    )
+
+    assert result["error"] == "workspace_service_delegation_failed"
+    assert sink.settled is True
+    parent = RuntimeToolEvidence()
+    parent.observe_tool_result(
+        "workspace_agent", "d-1", json.dumps(result), {"action": "delegate_service"}, settled_by_children=True,
+    )
+    parent.merge_child_observations("d-1", sink, observe=False)
+    # What the crashed child ran is unknown: the floor, not a clean settle.
+    assert parent.checkpoint_state()["effect_state"] == "unconfirmed"

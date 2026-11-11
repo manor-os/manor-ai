@@ -21,6 +21,10 @@ NOW = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
 
 
+YOUTUBE = "https://www.youtube.com/watch?v=lqNJoA3h2jo"
+TIKTOK = "https://www.tiktok.com/@jrmusic/video/7431234567890123456"
+
+
 def profile(**kwargs):
     return prepare_collection({"mode": "profile", "profile_url": "@Example", **kwargs}, now=NOW)
 
@@ -256,7 +260,10 @@ async def test_json_numeric_budget_never_exceeds_decimal_quote(monkeypatch, cap)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mutation", ["actor", "extra_input", "second_profile", "paid_option", "long_window"])
+@pytest.mark.parametrize(
+    "mutation",
+    ["actor", "extra_input", "second_profile", "paid_option", "long_window", "metrics_paid_option", "metrics_actor"],
+)
 async def test_forged_spec_is_rejected_without_start(monkeypatch, mutation):
     requests, _ = install_http(monkeypatch, lambda request: pytest.fail("Unexpected HTTP"))
     spec = copy.deepcopy(profile())
@@ -269,6 +276,13 @@ async def test_forged_spec_is_rejected_without_start(monkeypatch, mutation):
     elif mutation == "paid_option":
         spec = reel()
         spec["actor_input"]["includeSharesCount"] = True
+    elif mutation == "metrics_paid_option":
+        spec = prepare_collection({"mode": "post_metrics", "post_urls": [TIKTOK]}, now=NOW)
+        spec["actor_input"]["shouldDownloadVideos"] = True
+    elif mutation == "metrics_actor":
+        # YouTube links cannot be sent to the TikTok Actor's input contract.
+        spec = prepare_collection({"mode": "post_metrics", "post_urls": [YOUTUBE]}, now=NOW)
+        spec["actor_id"] = "clockworks~tiktok-scraper"
     else:
         spec["window"]["start"] = "2000-01-01T00:00:00Z"
     with pytest.raises(ApifyError):
@@ -439,6 +453,20 @@ async def test_get_abort_items_use_official_contract_and_preserve_error_rows(mon
 
 
 @pytest.mark.asyncio
+async def test_a_status_check_can_wait_for_the_run_to_finish(monkeypatch):
+    calls, requests, options = install_mcp(monkeypatch, lambda *_: receipt(status="SUCCEEDED"))
+    assert (await ApifyClient("token").get_run("Run123", wait_seconds=45))["status"] == "SUCCEEDED"
+    assert calls == [{"name": "get-actor-run", "arguments": {"runId": "Run123", "waitSecs": 45}}]
+    # The HTTP request outlasts the provider's wait instead of cutting it off.
+    assert all(option["timeout"] > 45 for option in options)
+    sent = len(requests)
+    for wait in (46, -1, 1.5, True):
+        with pytest.raises(ApifyError):
+            await ApifyClient("token").get_run("Run123", wait_seconds=wait)
+    assert len(requests) == sent
+
+
+@pytest.mark.asyncio
 async def test_abort_followup_failure_does_not_claim_confirmed_cancellation(monkeypatch):
     def respond(_request, message):
         if message["params"]["name"] == "abort-actor-run":
@@ -573,6 +601,27 @@ def test_selected_reel_cannot_return_a_different_reel():
     assert result["coverage"]["invalid_item_count"] == 1
 
 
+def test_a_shared_post_link_reads_that_one_post():
+    """/p/ share links name Posts and Reels alike; post mode reads exactly that one, tracking stripped."""
+    spec = prepare_collection({"mode": "post", "post_url": "https://www.instagram.com/p/DeIvJAMIBQd/?utm_source=ig_web_copy_link"},
+                              now=NOW)
+    assert spec["actor_id"] == "apify~instagram-scraper" and spec["window"] is None
+    assert spec["actor_input"] == {"directUrls": ["https://www.instagram.com/p/DeIvJAMIBQd/"], "resultsType": "posts",
+                                   "resultsLimit": 1, "addParentData": False}
+    result = normalize_items(spec, [{"shortCode": "DeIvJAMIBQd", "productType": "clips", "type": "Video",
+                                     "caption": "Wolves at work", "likesCount": 10, "timestamp": "2026-10-15T19:00:02Z"}])
+    assert [(item["shortcode"], item["media_type"], item["caption"]) for item in result["items"]] == [
+        ("DeIvJAMIBQd", "reel", "Wolves at work")]
+    assert "result_limit_reached" not in result["coverage"]["reasons"]
+    other = normalize_items(spec, [{"url": "https://www.instagram.com/p/Unrelated/", "caption": "other"}])
+    assert other["items"] == [] and other["coverage"]["invalid_item_count"] == 1
+    for bad in ({"mode": "post", "post_url": "https://instagram.com/natgeo/"},
+                {"mode": "post", "post_url": "https://instagram.com/p/ABC/", "results_limit": 2},
+                {"mode": "post", "reel_url": "https://instagram.com/reel/ABC/"}):
+        with pytest.raises(ApifyError):
+            prepare_collection(bad, now=NOW)
+
+
 @pytest.mark.parametrize("limit", [0, -1, 201, True, 2.5, "10"])
 @pytest.mark.asyncio
 async def test_dataset_limits_fail_before_http(monkeypatch, limit):
@@ -580,3 +629,89 @@ async def test_dataset_limits_fail_before_http(monkeypatch, limit):
     with pytest.raises(ApifyError):
         await ApifyClient("token").get_items("Data123", limit=limit)
     assert not requests
+
+
+@pytest.mark.parametrize(
+    "links,actor,expected_input",
+    [
+        (
+            ["https://youtu.be/lqNJoA3h2jo?si=share", "https://m.youtube.com/shorts/lqNJoA3h2jo",
+             "https://www.youtube.com/watch?v=Zx9_8-7wQ1A&t=42s"],
+            "streamers~youtube-scraper",
+            {"startUrls": [{"url": YOUTUBE}, {"url": "https://www.youtube.com/watch?v=Zx9_8-7wQ1A"}],
+             "maxResults": 2, "transcriptionAndSubtitle": "NONE", "aiVideoDescription": False, "aiVideoSummary": False},
+        ),
+        (
+            ["https://www.tiktok.com/@JRMusic/video/7431234567890123456?is_from_webapp=1&sender_device=pc"],
+            "clockworks~tiktok-scraper",
+            {"postURLs": [TIKTOK], "shouldDownloadVideos": False, "shouldDownloadCovers": False,
+             "shouldDownloadSlideshowImages": False, "shouldDownloadAvatars": False,
+             "shouldDownloadMusicCovers": False, "scrapeRelatedVideos": False, "scrapeAdditionalAuthorMeta": False,
+             "downloadSubtitlesOptions": "NEVER_DOWNLOAD_SUBTITLES", "commentsPerPost": 0},
+        ),
+    ],
+)
+def test_post_metrics_batches_canonical_links_without_paid_addons(links, actor, expected_input):
+    spec = prepare_collection({"mode": "post_metrics", "post_urls": links}, now=NOW)
+    assert spec["actor_id"] == actor and spec["window"] is None
+    assert spec["actor_input"] == expected_input
+    assert spec["results_limit"] == len(expected_input.get("startUrls") or expected_input.get("postURLs"))
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"mode": "post_metrics", "post_urls": [YOUTUBE, TIKTOK]},
+        {"mode": "post_metrics", "post_urls": ["https://vm.tiktok.com/ZMabc123/"]},
+        {"mode": "post_metrics", "post_urls": ["https://www.youtube.com/@jrmusic"]},
+        {"mode": "post_metrics", "post_urls": ["https://www.youtube.com/watch?v=short"]},
+        {"mode": "post_metrics", "post_urls": ["http://www.youtube.com/watch?v=lqNJoA3h2jo"]},
+        {"mode": "post_metrics", "post_urls": ["https://example.com/watch?v=lqNJoA3h2jo"]},
+        {"mode": "post_metrics", "post_urls": [YOUTUBE] * 21},
+        {"mode": "post_metrics", "post_urls": []},
+        {"mode": "post_metrics", "post_urls": [YOUTUBE], "results_limit": 1},
+    ],
+)
+def test_post_metrics_rejects_mixed_platforms_and_unresolvable_links(args):
+    with pytest.raises(ApifyError):
+        prepare_collection(args, now=NOW)
+
+
+@pytest.mark.asyncio
+async def test_tiktok_budget_below_actor_minimum_never_starts(monkeypatch):
+    spec = prepare_collection({"mode": "post_metrics", "post_urls": [TIKTOK]}, now=NOW)
+    requests, _ = install_http(monkeypatch, lambda request: pytest.fail("Unexpected HTTP"))
+    with pytest.raises(ApifyError):
+        await ApifyClient("token").start(spec, max_cost_usd="0.49")
+    assert not requests
+    calls, _, _ = install_mcp(monkeypatch, lambda *_: receipt())
+    await ApifyClient("token").start(spec, max_cost_usd="0.50")
+    assert calls[0]["arguments"]["actor"] == "clockworks/tiktok-scraper"
+    assert calls[0]["arguments"]["callOptions"]["maxItems"] == 1
+
+
+def test_post_metrics_keep_requested_posts_and_report_missing_links():
+    spec = prepare_collection({"mode": "post_metrics", "post_urls": [
+        YOUTUBE, "https://www.youtube.com/shorts/Zx9_8-7wQ1A"]}, now=NOW)
+    result = normalize_items(spec, [
+        {"url": "https://www.youtube.com/watch?v=lqNJoA3h2jo", "viewCount": 1520, "likes": None,
+         "commentsCount": 0, "date": "2026-10-30T10:00:00Z", "channelName": "JR Music", "title": "Single"},
+        {"url": "https://www.youtube.com/watch?v=Unrequest01", "viewCount": 9},
+    ])
+    assert result["items"] == [{
+        "platform": "youtube", "post_id": "lqNJoA3h2jo", "permalink": YOUTUBE, "creator": "JR Music",
+        "published_at": "2026-10-30T10:00:00Z", "media_type": "video", "caption": "Single",
+        # Hidden likes stay unknown; a displayed 0 stays a measured 0.
+        "metrics": {"views": 1520, "likes": None, "comments": 0, "shares": None},
+    }]
+    coverage = result["coverage"]
+    assert coverage["missing_post_urls"] == ["https://www.youtube.com/watch?v=Zx9_8-7wQ1A"]
+    assert coverage["invalid_item_count"] == 1 and coverage["status"] == "partial"
+    assert "result_limit_reached" not in coverage["reasons"]
+
+    tiktok = normalize_items(prepare_collection({"mode": "post_metrics", "post_urls": [TIKTOK]}, now=NOW), [
+        {"webVideoUrl": TIKTOK.replace("@jrmusic", "@JRMusic"), "playCount": 300, "diggCount": 25,
+         "commentCount": 3, "shareCount": 2, "collectCount": 1, "createTimeISO": "2026-10-30T11:00:00.000Z",
+         "authorMeta": {"name": "jrmusic"}, "text": "New single"}])
+    assert tiktok["items"][0]["metrics"] == {"views": 300, "likes": 25, "comments": 3, "shares": 2, "saves": 1}
+    assert tiktok["coverage"]["missing_post_urls"] == []

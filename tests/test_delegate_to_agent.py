@@ -219,3 +219,144 @@ async def test_workspace_chat_assembly_offers_the_workspace_agents(client, db_se
     assert set(schema["parameters"]["properties"]["tasks"]["items"]["properties"]["agent"]["enum"]) == {
         "Writer", "Video Operator (douyin)", "Video Operator (xhs)",
     }
+
+
+async def _single_agent_workspace(db, entity_id):
+    workspace = Workspace(id=generate_ulid(), entity_id=entity_id, name="Solo", status="active")
+    agent = Agent(id=generate_ulid(), entity_id=entity_id, name="Writer", status="active")
+    db.add_all([workspace, agent])
+    if await db.get(Agent, MANOR_AGENT_ID) is None:
+        db.add(Agent(id=MANOR_AGENT_ID, name="Manor AI", status="active"))
+    await db.flush()
+    db.add(AgentSubscription(id=generate_ulid(), entity_id=entity_id, workspace_id=workspace.id, agent_id=agent.id))
+    await db.commit()
+    return workspace, agent
+
+
+@pytest.mark.asyncio
+async def test_a_lone_agent_can_ask_manor_ai_without_it_joining_the_workspace(client, db_session, monkeypatch):
+    from sqlalchemy import select
+
+    from packages.core.ai.tools import workspace_agent_tools
+
+    entity_id = await _entity(client, "delegate_manor_review")
+    workspace, agent = await _single_agent_workspace(db_session, entity_id)
+    other = {"type": "function", "function": {"name": "read_file"}}
+    generic = delegation.delegate_to_agent_schema()
+
+    tools = await delegation.runtime_specialize_delegate_to_agent(
+        db_session, [other, generic], entity_id=entity_id, workspace_id=workspace.id, agent_id=agent.id,
+    )
+    assert tools[1]["function"]["parameters"]["properties"]["tasks"]["items"]["properties"]["agent"]["enum"] == [
+        "Manor AI",
+    ]
+    # Manor AI does not ask itself.
+    as_manor = await delegation.runtime_specialize_delegate_to_agent(
+        db_session, [other, generic], entity_id=entity_id, workspace_id=workspace.id, agent_id=MANOR_AGENT_ID,
+    )
+    assert as_manor[1]["function"]["parameters"]["properties"]["tasks"]["items"]["properties"]["agent"]["enum"] == [
+        "Writer",
+    ]
+
+    delegate = AsyncMock(return_value=json.dumps({"delegated": True}))
+    monkeypatch.setattr(workspace_agent_tools, "runtime_workspace_delegate_service_action", delegate)
+    result = await workspace_agent_tools._delegate_to_agent_handler(
+        entity_id=entity_id, user_id="user-1", workspace_id=workspace.id, conversation_id="conv-1",
+        agent="Manor AI", task="Review this video against its brief.", _agent_id_from_context=agent.id,
+    )
+    assert json.loads(result) == {"delegated": True}
+
+    # A lone task names Manor AI; its child resolves the identity when it starts.
+    assert delegate.await_args.kwargs["params"]["agent_id"] == MANOR_AGENT_ID
+    # Parallel tasks are pinned first, to the same identity.
+    batch = await delegation.runtime_delegation_batch(
+        entity_id=entity_id, workspace_id=workspace.id,
+        tasks=[{"agent": "Manor AI", "task": "Review this video against its brief."}],
+        shared={}, caller_agent_id=agent.id,
+    )
+    assert batch.error is None and batch.items[0]["agent_id"] == MANOR_AGENT_ID
+    subscription_id = batch.items[0]["params"]["agent_subscription_id"]
+    manor = await db_session.get(AgentSubscription, subscription_id)
+    assert manor.agent_id == MANOR_AGENT_ID and manor.workspace_id is None
+    members = (await db_session.execute(
+        select(AgentSubscription.agent_id).where(AgentSubscription.workspace_id == workspace.id)
+    )).scalars().all()
+    assert members == [agent.id]
+
+
+@pytest.mark.asyncio
+async def test_manor_ai_only_reads_when_it_reviews(client, db_session, monkeypatch):
+    from types import SimpleNamespace
+
+    from packages.core.ai import context
+    from packages.core.ai.runtime.approval_classifier import _runtime_tool_is_explicitly_read_only
+    from packages.core.ai.runtime.envelope import RuntimeEnvelope, runtime_effective_tool_scope
+    from packages.core.ai.runtime.human_input import REQUEST_INPUT_TOOL_NAME
+    from packages.core.ai.runtime.principals import RuntimePrincipal
+    from packages.core.ai.runtime.profiles import RuntimeProfile
+    from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.constants.runtime_principal import RuntimePrincipalKind
+
+    entity_id = await _entity(client, "delegate_manor_reads")
+    workspace, agent = await _single_agent_workspace(db_session, entity_id)
+    write_tool = {"type": "function", "function": {"name": "write_file"}}
+
+    async def build_context(*_args, **kwargs):
+        return SimpleNamespace(
+            tools=[write_tool],
+            allowed_tool_names={"write_file", "search_tools"},
+            extra_system_prompt=kwargs["extra_system_prompt"],
+            runtime_envelope=RuntimeEnvelope(
+                surface=ChatSurface.WORKSPACE_CHAT,
+                principal=RuntimePrincipal(kind=RuntimePrincipalKind.AGENT),
+                profile=RuntimeProfile.WORKSPACE_OPERATOR,
+                tool_names=("write_file", "search_tools"),
+                allowed_tool_names=("write_file", "search_tools"),
+                mcp_scope_unrestricted=True,
+            ),
+        )
+
+    monkeypatch.setattr(context, "build_agent_context", build_context)
+
+    async def setup(**raw_params):
+        return await delegation.runtime_delegated_child_setup(
+            db_session, entity_id=entity_id, workspace_id=workspace.id, user_id="user-1",
+            conversation_id=None, task_id="task-1", step_id="step-1",
+            raw_params={"prompt": "Review it.", **raw_params}, prompt="Review it.", caller_agent_id=agent.id,
+        )
+
+    review = await setup(agent_id=MANOR_AGENT_ID)
+    assert review.error is None
+    names = set(delegation.MANOR_REVIEW_TOOL_NAMES)
+    assert {tool["function"]["name"] for tool in review.tools} == names
+    assert set(review.allowed_tool_names) == names and REQUEST_INPUT_TOOL_NAME not in names
+    assert review.max_rounds <= delegation.MANOR_REVIEW_MAX_ROUNDS
+    assert all(_runtime_tool_is_explicitly_read_only(name, {}) for name in names)
+    # What execution actually enforces, not just what the model is shown.
+    scope = runtime_effective_tool_scope(runtime_envelope=review.ctx.runtime_envelope)
+    assert scope.allowed_tool_names == frozenset(names)
+    assert review.ctx.runtime_envelope.mcp_scope_unrestricted is False
+    assert "pass or fail" in review.ctx.extra_system_prompt
+
+    # The pinned identity a parallel call resolves again gets the same limits.
+    pinned = await setup(agent_subscription_id=review.sub.id)
+    assert pinned.error is None and set(pinned.allowed_tool_names) == names
+
+    # Only this entity's shared Manor AI identity is reachable that way.
+    other_entity = await _entity(client, "delegate_manor_other")
+    foreign = AgentSubscription(id=generate_ulid(), entity_id=other_entity, agent_id=MANOR_AGENT_ID)
+    personal = AgentSubscription(
+        id=generate_ulid(), entity_id=entity_id, agent_id=MANOR_AGENT_ID, owner_user_id="user-2", name="Personal",
+    )
+    db_session.add_all([foreign, personal])
+    await db_session.commit()
+    for subscription in (foreign, personal):
+        refused = await setup(agent_subscription_id=subscription.id)
+        assert json.loads(refused.error)["error"] == "workspace_service_agent_not_found"
+
+    # A name-based lookup must honor cancellation just as its pinned id does.
+    review.sub.status = "cancelled"
+    await db_session.commit()
+    for selector in ({"agent_id": MANOR_AGENT_ID}, {"agent_subscription_id": review.sub.id}):
+        refused = await setup(**selector)
+        assert json.loads(refused.error)["error"] == "workspace_service_agent_not_found"

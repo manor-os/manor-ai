@@ -16,7 +16,8 @@ def test_runtime_status_from_stop_reason():
     assert runtime_status_from_stop_reason("error", has_content=True) == "partial"
 
 
-def test_memory_candidate_from_user_guidance():
+def test_user_guidance_leaves_no_memory_candidate():
+    # remember writes it at chat time; nothing waits for review.
     drafts = build_chat_learning_candidate_drafts(
         user_message="以后发 post 必须先给我审核批准。",
         assistant_content="我会先准备草稿。",
@@ -24,11 +25,7 @@ def test_memory_candidate_from_user_guidance():
         status="succeeded",
         stop_reason="completed",
     )
-    memory = [d for d in drafts if d.candidate_type == "memory"]
-    assert len(memory) == 1
-    assert memory[0].scope == "user"
-    assert memory[0].payload["memory_type"] == "instruction"
-    assert "审核" in memory[0].payload["content"]
+    assert not [d for d in drafts if d.candidate_type == "memory"]
 
 
 def test_agent_profile_candidate_from_role_guidance():

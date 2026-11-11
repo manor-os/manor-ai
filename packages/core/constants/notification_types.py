@@ -2,7 +2,7 @@
 
 Producers across the codebase already call ``notify()`` /
 ``create_notification()`` with various ``type`` strings (``task_assigned``,
-``task_failed``, ``video``, ``system_health``, …). The routing layer needs a
+``task_failed``, ``video``, ``workspace_digest``, …). The routing layer needs a
 canonical list so:
 
   - the user preference UI can render a matrix of (event_kind × channel)
@@ -139,6 +139,27 @@ EVENT_CATALOG: list[EventDescriptor] = [
         "label": "Task SLA breach",
         "description": "A task crossed its SLA deadline.",
     },
+    {
+        "kind": "task_overdue",
+        "category": "task",
+        "severity": "info",
+        "label": "Task past its deadline",
+        "description": "A task you are on passed its deadline and is not finished.",
+    },
+    {
+        "kind": "task_comment_mention",
+        "category": "task",
+        "severity": "info",
+        "label": "Mentioned in a task comment",
+        "description": "Someone mentioned you in a comment on a task.",
+    },
+    {
+        "kind": "workflow",
+        "category": "task",
+        "severity": "info",
+        "label": "Workflow notification",
+        "description": "A Workflow's notify step sent you an update.",
+    },
     # Calendar / bookings
     {
         "kind": "booking_confirmed",
@@ -177,14 +198,30 @@ EVENT_CATALOG: list[EventDescriptor] = [
         "label": "Agent message",
         "description": "An agent posted a message addressed to you.",
     },
-    # System
     {
-        "kind": "system_health",
-        "category": "system",
-        "severity": "warn",
-        "label": "System health alert",
-        "description": "A platform-level health check raised an alert.",
+        "kind": "proposal",
+        "category": "agent",
+        "severity": "info",
+        "label": "Strategist proposal",
+        "description": "The Workspace Strategist proposed work for you to review, or started work you pre-approved.",
+        # Stays on the bell unless the person chooses more channels.
+        "default_channels": ["inapp"],
     },
+    {
+        "kind": "agent_initiative_update",
+        "category": "agent",
+        "severity": "info",
+        "label": "Agent initiative update",
+        "description": "A proactive check you set up for an agent found something to tell you.",
+    },
+    {
+        "kind": "channel_inbound_message",
+        "category": "agent",
+        "severity": "info",
+        "label": "Message from a contact",
+        "description": "Someone wrote in through a connected channel, such as email or a chat app.",
+    },
+    # System
     {
         "kind": "workspace_setup_required",
         "category": "system",
@@ -198,6 +235,13 @@ EVENT_CATALOG: list[EventDescriptor] = [
         "severity": "warn",
         "label": "Connected account needs attention",
         "description": "A connected account stopped working and the agents that use it are affected.",
+    },
+    {
+        "kind": "integration_session_expired",
+        "category": "system",
+        "severity": "warn",
+        "label": "Connected session expired",
+        "description": "A signed-in browser session an integration uses expired and needs reconnecting.",
     },
     {
         "kind": "workspace_digest",
@@ -219,6 +263,13 @@ EVENT_CATALOG: list[EventDescriptor] = [
         "severity": "warn",
         "label": "Automation paused",
         "description": "An automation was paused after repeated failures.",
+    },
+    {
+        "kind": "workspace_update_available",
+        "category": "system",
+        "severity": "info",
+        "label": "Workspace updates",
+        "description": "The provider of a Workspace delivered to you sent a new version.",
     },
     {
         "kind": "system",

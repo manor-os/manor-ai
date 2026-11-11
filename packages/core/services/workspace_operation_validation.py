@@ -200,6 +200,11 @@ async def validate_operation_channel_references(
     return errors
 
 
+#: Warning code for an integration a draft adds or restores that its author
+#: has not connected yet. Never an error: the draft applies with it pending
+#: and the Workspace asks to connect it (``ask_to_connect_pending_integrations``).
+INTEGRATION_PENDING_CONNECTION = "integration_pending_connection"
+
 _ARRAY_INDEX = re.compile(r"\[\d+\]")
 _PATH_SEGMENT = re.compile(r"^([^\[]*)((?:\[\d+\])*)$")
 
@@ -208,7 +213,6 @@ _PATH_SEGMENT = re.compile(r"^([^\[]*)((?:\[\d+\])*)$")
 # every draft until fixed, whether or not this draft introduced them.
 NEVER_INHERITED_ERROR_CODES = frozenset({
     "foreign_entity_agent",
-    "integration_not_connected",
     "unavailable_workflow",
     "unavailable_app_target",
     "unavailable_channel_config",

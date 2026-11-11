@@ -316,3 +316,50 @@ async def transcode_audio_bytes(
         converted = repair_streamed_wav_header(converted)
     validate_generated_audio_bytes(converted, target)
     return converted
+
+
+async def speech_audio_bytes(
+    audio_bytes: bytes,
+    *,
+    start_seconds: float = 0.0,
+    end_seconds: float | None = None,
+    timeout_seconds: float = 180.0,
+) -> bytes:
+    """The span a speech-to-text upload needs: mono 16 kHz speech MP3 from ``start_seconds``.
+
+    Recognisers hear speech and singing at 16 kHz mono, so a 39 MB studio WAV
+    of a whole song becomes about 1.3 MB, and a 15 s excerpt under 100 KB, well
+    inside an STT provider's upload limit. The span is seeked on the input, so
+    a late excerpt does not decode the song before it.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise AudioConversionError("FFmpeg is required to prepare audio for transcription.")
+    start = max(0.0, float(start_seconds or 0.0))
+    window = ["-t", f"{float(end_seconds) - start:.3f}"] if end_seconds is not None else []
+    if window and float(end_seconds) <= start:
+        raise AudioConversionError("The transcription window must end after it starts.")
+    with tempfile.TemporaryDirectory(prefix="speech-audio-") as tmp_dir:
+        # A file, not a pipe: ffmpeg can only seek a span in a file it can read back.
+        source = os.path.join(tmp_dir, "source")
+        with open(source, "wb") as handle:
+            handle.write(audio_bytes)
+        process = await asyncio.create_subprocess_exec(
+            ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
+            *(["-ss", f"{start:.3f}"] if start else []), "-i", source, *window,
+            "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "48k", "-f", "mp3", "pipe:1",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            converted, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            process.kill()
+            await process.communicate()
+            raise AudioConversionError(
+                f"Preparing audio for transcription timed out after {timeout_seconds:.0f} seconds."
+            ) from exc
+    if process.returncode != 0 or not converted:
+        detail = stderr.decode("utf-8", errors="replace")[-2000:]
+        raise AudioConversionError(f"FFmpeg could not prepare the audio for transcription: {detail}")
+    return converted

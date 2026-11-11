@@ -648,9 +648,13 @@ async def test_serve_by_slug_host(client, published):
 
 
 @pytest.mark.asyncio
-async def test_published_html_injects_site_bridge_and_runtime(client, published):
+async def test_published_html_injects_site_bridge_and_runtime(client, published, monkeypatch):
+    from packages.core.config import get_settings
+
     _, site = published
     host = {"host": f"{site['slug']}.{SITES_DOMAIN}"}
+    monkeypatch.setattr(get_settings(), "APP_URL", "https://app.example.com/workspaces")
+    monkeypatch.setattr(get_settings(), "PUBLIC_BASE_URL", "https://app.example.com")
 
     page = await client.get("/api/v1/site-host/", headers=host)
     assert page.status_code == 200
@@ -662,6 +666,9 @@ async def test_published_html_injects_site_bridge_and_runtime(client, published)
         "content-security-policy"
     ]
     assert "default-src 'none'" not in page.headers["content-security-policy"]
+    # Only the Manor app may frame a site (chat preview); no blanket DENY on top.
+    assert "frame-ancestors https://app.example.com;" in page.headers["content-security-policy"]
+    assert "x-frame-options" not in page.headers
 
     runtime = await client.get(
         "/api/v1/site-host/__manor/runtime.js", headers=host,
@@ -1490,3 +1497,12 @@ async def test_not_found_visits_are_reported_apart_from_page_views(client, sites
     assert analytics["not_found_views"] == 2
     assert analytics["top_pages"] == [{"path": "/about", "views": 1}]
     assert analytics["top_missing_pages"] == [{"path": "/old-page", "views": 2}]
+
+
+def test_site_frame_ancestors_fail_closed_without_an_app_origin(monkeypatch):
+    from apps.api.routers.sites import _site_content_security_policy
+    from packages.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "APP_URL", "")
+    monkeypatch.setattr(get_settings(), "PUBLIC_BASE_URL", "not a url")
+    assert "frame-ancestors 'none';" in _site_content_security_policy()

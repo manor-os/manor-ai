@@ -7,8 +7,9 @@ import type { WorkflowRunAction } from "./workflowRunDisplay";
 /** A Workflow review in Workspace Chat: the deliverables, then Accept or a
  * change request whose note reaches the run. The review is read from Workflow
  * history when the message only points there. */
-export default function WorkflowReviewChatCard({ workspaceId, action, disabled, currentUserName, onResolve }: {
+export default function WorkflowReviewChatCard({ workspaceId, action, disabled, currentUserName, promptShown, onResolve }: {
   workspaceId: string;
+  promptShown?: boolean;
   action: WorkflowRunAction;
   disabled?: boolean;
   currentUserName?: string;
@@ -38,6 +39,7 @@ export default function WorkflowReviewChatCard({ workspaceId, action, disabled, 
       resolved={false}
       resolution={null}
       currentUserName={currentUserName}
+      promptShown={promptShown}
       disabled={disabled}
       onResolve={(choice, note, payload) => onResolve(choice, note, payload)}
     />

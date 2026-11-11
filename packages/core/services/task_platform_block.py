@@ -32,6 +32,23 @@ async def report_task_platform_block(
     Task and code, so a re-woken Task does not page twice.
     """
     logger.error("Task %s blocked by internal issue %s: %s", task_id, code, cause)
+    from packages.core.services.platform_faults import report_platform_fault
+
+    await report_platform_fault(
+        target=f"task:{task_id}",
+        code=code,
+        summary=cause,
+        context={
+            "task_id": task_id,
+            "entity_id": entity_id,
+            "workspace_id": workspace_id,
+            **{
+                key: details[key]
+                for key in ("plan_id", "platform_error", "tool", "operation")
+                if isinstance(details, dict) and details.get(key)
+            },
+        },
+    )
 
 
 __all__ = [

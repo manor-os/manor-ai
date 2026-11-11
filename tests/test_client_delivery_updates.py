@@ -6,7 +6,8 @@ from sqlalchemy import select
 from packages.core.models.staff import Staff, StaffRole
 from packages.core.models.user import UserMembership
 from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
-from packages.core.models.workspace import WorkspaceStaff
+from packages.core.models.client_delivery import ClientWorkspaceDelivery
+from packages.core.models.workspace import Workspace, WorkspaceStaff
 from tests.test_client_workspace_delivery import register
 
 
@@ -212,3 +213,99 @@ async def test_each_published_update_is_a_release_the_customer_can_name(client, 
     await db_session.refresh(history)
     assert workspace.settings["_blueprint"]["package"]["version"] == "1.0.0"
     assert history.reverted_at is not None
+
+
+async def _release_file(client, headers, source, label):
+    """The source's Blueprint as a teammate or staging would hand it over, one step renamed."""
+    exported = await client.post(f"/api/v1/workspaces/{source}/export-blueprint-payload", headers=headers, json={})
+    assert exported.status_code == 200, exported.text
+    payload = exported.json()
+    intake = next(flow for flow in payload["recipe"]["workflows"] if flow["name"] == "Intake")
+    intake["steps"][-1]["name"] = label
+    return payload
+
+
+async def _send_file(client, headers, cid, delivery, payload, **form):
+    import json
+
+    return await client.post(
+        f"/api/v1/clients/{cid}/deliveries/{delivery}/publish-update-file", headers=headers,
+        files={"file": ("blueprint.json", json.dumps(payload).encode(), "application/json")},
+        data={key: str(value).lower() if isinstance(value, bool) else value for key, value in form.items()},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_blueprint_built_elsewhere_reaches_the_customer_through_the_same_upgrade(client, db_session):
+    # Catches: a file update that bypasses the release history, a preview that
+    # sends, and a file update that touches the provider's source Workspace.
+    ph, _provider, rh, cid, delivery, source, flows, target, copies = await _delivered(client, db_session)
+    payload = await _release_file(client, ph, source, "Done on staging")
+
+    preview = await _send_file(client, ph, cid, delivery, payload, dry_run=True)
+    assert preview.status_code == 200, preview.text
+    body = preview.json()
+    assert body["dry_run"] is True and body["would_publish"] is True and body["published"] is False
+    assert body["version"] == "1.0.1" and body["level"] == "patch" and body["content_version"] == "1.0.0"
+    assert any(key.startswith("workflow:") for key in body["components"]["changed"])
+    workspace = (await client.get(f"/api/v1/workspaces/{target}", headers=rh)).json()
+    assert workspace["blueprint_update"]["status"] != "update_available"
+
+    sent = await _send_file(client, ph, cid, delivery, payload, release_notes="Tested on staging")
+    assert sent.status_code == 200, sent.text
+    assert sent.json()["published"] is True and sent.json()["content_version"] == "1.0.1"
+
+    plan = (await client.get(f"/api/v1/workspaces/{target}/blueprint/upgrade/v3", headers=rh)).json()
+    applied = await client.post(f"/api/v1/workspaces/{target}/blueprint/upgrade/v3", headers=rh, json={
+        "expected_blueprint_fingerprint": plan["blueprint_fingerprint"],
+        "expected_plan_fingerprint": plan["plan_fingerprint"],
+        "configuration_resolutions": [
+            {"key": item["key"], "resolution": "use_blueprint"} for item in plan["items"] if item["action"] != "unchanged"
+        ],
+    })
+    assert applied.status_code == 200, applied.text
+    await db_session.refresh(copies["Intake"])
+    assert copies["Intake"].steps[-1]["name"] == "Done on staging"
+    source_flow = await db_session.get(WorkflowDefinition, flows["Intake"])
+    await db_session.refresh(source_flow)
+    assert source_flow.steps[-1]["name"] == "Done"
+
+
+@pytest.mark.asyncio
+async def test_a_file_from_another_workspace_or_with_files_before_acceptance_is_refused(client, db_session, monkeypatch):
+    from packages.core.blueprints.package import asset_from_bytes
+    from packages.core.services import client_delivery
+
+    ph, provider, _rh, cid, delivery, source, _flows, target, _copies = await _delivered(client, db_session)
+    payload = await _release_file(client, ph, source, "Done")
+    unrelated = {**payload, "recipe": {**payload["recipe"], "workflows": [
+        {**flow, "slug": f"other-{index}", "component_id": f"other-{index}", "name": f"Other {index}"}
+        for index, flow in enumerate(payload["recipe"]["workflows"])
+    ]}}
+    refused = await _send_file(client, ph, cid, delivery, unrelated, dry_run=True)
+    assert refused.status_code == 422 and "different Workspace" in refused.text
+
+    # A package's files go into the customer's team, where their Workspace reads them.
+    stored = {}
+
+    async def fake_store(entity_id, assets):
+        stored["entity_id"] = entity_id
+        return {asset.sha256: f"/api/v1/fs/{entity_id}/marketplace/blueprint-assets/{asset.sha256}.png" for asset in assets}
+
+    monkeypatch.setattr("packages.core.blueprints.package.store_assets", fake_store)
+    asset = asset_from_bytes(b"png", name="cover.png", mime_type="image/png")
+    with_file = await _release_file(client, ph, source, "Done with cover")
+    with_file["manifest"]["cover_image_url"] = asset.placeholder
+    user = await db_session.get(type(provider), provider.id)
+    target_entity = (await db_session.get(Workspace, target)).entity_id
+    result = await client_delivery.publish_update(
+        db_session, user=user, client_id=cid, delivery_id=delivery, payload=with_file, assets=[asset],
+    )
+    assert result["published"] is True and stored["entity_id"] == target_entity
+
+    row = await db_session.get(ClientWorkspaceDelivery, delivery)
+    row.target_workspace_id = None
+    with pytest.raises(ValueError, match="not accepted the delivery yet"):
+        await client_delivery.publish_update(
+            db_session, user=user, client_id=cid, delivery_id=delivery, payload=with_file, assets=[asset],
+        )

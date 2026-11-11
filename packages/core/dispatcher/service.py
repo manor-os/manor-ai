@@ -2626,11 +2626,18 @@ class Dispatcher:
             db=db,
         )
         # Quarantine workers that fail repeatedly — keeps a buggy
-        # external worker from holding the queue hostage.
+        # external worker from holding the queue hostage. A targeted-only
+        # worker takes only the steps aimed at it, so it holds no queue: its
+        # failures go back to whoever aimed them, and quarantining it would
+        # only cut them off from their own machine.
         worker = (await db.execute(select(Worker).where(Worker.id == lease.worker_id))).scalar_one_or_none()
         if worker is not None and _counts_towards_worker_quarantine(stored_error):
             worker.consecutive_failures = (worker.consecutive_failures or 0) + 1
-            if worker.kind != "internal" and worker.consecutive_failures >= 5:
+            if (
+                worker.kind != "internal"
+                and not (worker.capabilities or {}).get("targeted_only")
+                and worker.consecutive_failures >= 5
+            ):
                 worker.status = WorkerStatus.QUARANTINED.value
                 db.add(
                     WorkerActivityLog(

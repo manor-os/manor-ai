@@ -346,7 +346,7 @@ export function statusBadgeType(
 
 /** Format integer cents as a dollar string. usd-only in v1. */
 export function formatPriceUsd(cents?: number | null): string {
-  return `$${((cents ?? 0) / 100).toFixed(2)}`;
+  return `$${((cents ?? 0) / 100).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 /** True when a blueprint carries a nonzero marketplace price. */

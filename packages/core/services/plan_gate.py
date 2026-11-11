@@ -210,11 +210,16 @@ async def check(
     *,
     use_cache: bool = True,
     workspace_id: str | None = None,
+    amount: float = 0,
 ) -> GateResult:
     """Check if entity can use/create a resource under their plan.
 
     Works anywhere: FastAPI deps, service layer, Celery tasks.
     OSS mode always returns allowed=True.
+
+    ``amount`` is what the caller is about to add (for ``storage_mb``, the MB
+    a planned output will take): the entity is refused when ``current +
+    amount`` would exceed the limit. Without it, reaching the limit refuses.
 
     For ``ai_budget_usd`` with a ``workspace_id`` the Workspace's payer is
     checked: the provider during a client delivery trial. A refusal of the
@@ -238,7 +243,8 @@ async def check(
                 result = replace(result, message=TRIAL_CREDIT_MESSAGE, kind="trial_credit")
             return result
 
-    cacheable = use_cache and resource != "ai_budget_usd"
+    # A positive result for one amount says nothing about a larger one.
+    cacheable = use_cache and resource != "ai_budget_usd" and not amount
 
     # Cache lookup — positive results only, TTL gated.
     key = _cache_key(entity_id, resource)
@@ -273,7 +279,7 @@ async def check(
 
     current = await count_fn(db, entity_id)
 
-    if current >= limit:
+    if (current + amount > limit) if amount else current >= limit:
         label = _LABELS.get(resource, resource)
         if resource == "ai_budget_usd":
             from packages.core.services.billing_service import CREDITS_PER_USD

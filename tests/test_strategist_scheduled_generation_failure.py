@@ -139,3 +139,40 @@ def test_credit_exhaustion_after_top_up_retry_keeps_existing_terminal_settlement
         run_id="run", job_id_str="job", result=None, error="credits_exhausted: credits exhausted",
     )
     boundary.notification.assert_awaited_once_with("credits_exhausted: credits exhausted")
+
+
+@pytest.mark.parametrize("error", ["proposal_llm_unavailable: provider down", "credits_exhausted: out of credit"])
+def test_terminal_review_failure_never_posts_a_retry_card(monkeypatch, error):
+    # A technical failure is the platform's (ops is told, the next review
+    # recovers); only running out of credit is said in chat, with no Retry.
+    from packages.core.services import platform_faults
+    from packages.core.workspace_chat import service as chat_service
+
+    report = AsyncMock(return_value=True)
+    post = AsyncMock()
+    workspace = SimpleNamespace(id="ws", entity_id="ent", deleted_at=None)
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: workspace)),
+        commit=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def session():
+        yield db
+
+    monkeypatch.setattr(platform_faults, "report_platform_fault", report)
+    monkeypatch.setattr(chat_service, "post_message", post)
+    monkeypatch.setattr("packages.core.database.create_worker_session", lambda: session)
+
+    asyncio.run(ai_tasks._handle_strategist_terminal_failure(
+        workspace_id="ws", trigger="scheduled", error_msg=error, run_id="run", job_id_str="job",
+    ))
+
+    if error.startswith("credits_exhausted"):
+        report.assert_not_awaited()
+        post.assert_awaited_once()
+        assert "pending_action" not in post.await_args.kwargs
+    else:
+        post.assert_not_awaited()
+        report.assert_awaited_once()
+        assert report.await_args.kwargs["code"] == "strategist_review_failed"

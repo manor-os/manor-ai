@@ -126,7 +126,7 @@ export default function OAuthClientsPanel({
       <GlassCard>
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
           <thead>
-            <tr style={{ background: "#fafaf9", borderBottom: "1px solid rgba(28,25,23,0.06)" }}>
+            <tr style={{ background: "var(--surface-muted)", borderBottom: "0.5px solid rgba(29, 29, 31,0.06)" }}>
               <th style={th}>{t("page.api_keys.provider")}</th>
               <th style={th}>{t("component.oauth_clients_panel.client_id")}</th>
               <th style={th}>{t("component.oauth_clients_panel.secret")}</th>
@@ -137,7 +137,7 @@ export default function OAuthClientsPanel({
           </thead>
           <tbody>
             {isLoading && (
-              <tr><td colSpan={6} style={{ padding: 32, textAlign: "center", color: "#a8a29e" }}>
+              <tr><td colSpan={6} style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>
                 {t("component.oauth_clients_panel.loading")}</td></tr>
             )}
             {clients?.map((c) => {
@@ -148,13 +148,13 @@ export default function OAuthClientsPanel({
                   key={c.server_key}
                   ref={(node) => { rowRefs.current[c.server_key] = node; }}
                   style={{
-                    borderBottom: "1px solid #f5f5f4",
-                    background: focused ? "#fafaf9" : "transparent",
+                    borderBottom: "1px solid #f5f5f7",
+                    background: focused ? "#fafafa" : "transparent",
                   }}
                 >
                   <td style={td}>
-                    <div style={{ fontWeight: 600, color: "#1c1917" }}>{c.name}</div>
-                    <div style={{ fontSize: 11, color: "#a8a29e", fontFamily: "ui-monospace, monospace" }}>
+                    <div style={{ fontWeight: 600, color: "var(--text-strong)" }}>{c.name}</div>
+                    <div style={{ fontSize: 11, color: "var(--text-muted)", fontFamily: "var(--font-mono)" }}>
                       {c.server_key}
                     </div>
                     {c.redirect_uri && (
@@ -163,8 +163,8 @@ export default function OAuthClientsPanel({
                         title={t("component.oauth_clients_panel.copy_redirect_uri")}
                         style={{
                           fontSize: 10,
-                          color: "#78716c",
-                          fontFamily: "ui-monospace, monospace",
+                          color: "var(--text-muted)",
+                          fontFamily: "var(--font-mono)",
                           marginTop: 4,
                           cursor: "pointer",
                           wordBreak: "break-all",
@@ -175,18 +175,18 @@ export default function OAuthClientsPanel({
                       </div>
                     )}
                     {focused && (
-                      <div style={{ fontSize: 10, color: "#78716c", marginTop: 4 }}>
+                      <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 4 }}>
                         {t("component.oauth_clients_panel.selected_from_integrations")}</div>
                     )}
                   </td>
-                  <td style={{ ...td, fontFamily: "ui-monospace, monospace", fontSize: 11, color: "#57534e" }}>
+                  <td style={{ ...td, fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text-muted)" }}>
                     {(() => {
                       const displayClientId = formatClientIdForDisplay(c);
                       if (displayClientId) return displayClientId;
                       if (c.source === "env") {
-                        return <span style={{ color: "#a8a29e" }}>{t("component.oauth_clients_panel.system_default_hidden")}</span>;
+                        return <span style={{ color: "var(--text-muted)" }}>{t("component.oauth_clients_panel.system_default_hidden")}</span>;
                       }
-                      return <span style={{ color: "#d6d3d1" }}>—</span>;
+                      return <span style={{ color: "var(--text-faint)" }}>—</span>;
                     })()}
                   </td>
                   <td style={td}>
@@ -207,7 +207,7 @@ export default function OAuthClientsPanel({
                       ? <Chip size="sm" variant="green">{t("component.oauth_clients_panel.configured")}</Chip>
                       : <Chip size="sm" variant="slate">{t("component.oauth_clients_panel.not_configured")}</Chip>}
                     {health === "loading" && (
-                      <div style={{ fontSize: 10, color: "#a8a29e", marginTop: 4 }}>{t("component.oauth_clients_panel.probing")}</div>
+                      <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 4 }}>{t("component.oauth_clients_panel.probing")}</div>
                     )}
                     {health && health !== "loading" && (
                       <div style={{ fontSize: 10, marginTop: 4, color: health.ok ? "#44895f" : "#c14a44" }}>
@@ -251,7 +251,7 @@ export default function OAuthClientsPanel({
         </table>
       </GlassCard>
 
-      <div style={{ fontSize: 11, color: "#a8a29e", marginTop: 12, lineHeight: 1.6 }}>
+      <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 12, lineHeight: 1.6 }}>
         <strong>{t("component.oauth_clients_panel.how_sources_work")}</strong> {t("component.oauth_clients_panel.startup_reads")}<code style={codeStyle}>{t("component.oauth_clients_panel.client_id_2")}</code> /
         <code style={codeStyle}>{t("component.oauth_clients_panel.client_secret")}</code> {t("component.oauth_clients_panel.and_seeds_them_into_db_source")}<code style={codeStyle}>env</code>{t("component.oauth_clients_panel.saving_here_overrides_them_source")}<code style={codeStyle}>override</code>{t("component.oauth_clients_panel.until_reset")}</div>
 
@@ -313,7 +313,7 @@ function EditModal({
               gap: 6,
               fontSize: 12,
               fontWeight: 600,
-              color: "#78716c",
+              color: "var(--text-muted)",
               textDecoration: "none",
               width: "fit-content",
             }}
@@ -321,12 +321,12 @@ function EditModal({
             {t("component.oauth_clients_panel.provider_docs")}<IconExternalLink size={13} />
           </a>
         )}
-        <p style={{ fontSize: 12, color: "#78716c", margin: 0, lineHeight: 1.5 }}>
+        <p style={{ fontSize: 12, color: "var(--text-muted)", margin: 0, lineHeight: 1.5 }}>
           {needsSecret ? <>
             {t("component.oauth_clients_panel.create_oauth_apps_in_the_provider_console_first_paypal")}<code style={codeStyle}>{client.client_id_env_var}</code> /
             <code style={codeStyle}>{client.client_secret_env_var}</code> {t("component.oauth_clients_panel.env_vars_for_this_provider_until_you_reset")}
           </> : t("page.integrations.public_oauth_client_hint")}</p>
-        <p style={{ fontSize: 11, color: "#a8a29e", margin: 0, lineHeight: 1.55 }}>
+        <p style={{ fontSize: 11, color: "var(--text-muted)", margin: 0, lineHeight: 1.55 }}>
           {t("component.oauth_clients_panel.after_saving_go_to_integrations_connect_for_this_provi")}</p>
         <Field label={t("component.oauth_clients_panel.client_id")} required>
           <input
@@ -372,25 +372,25 @@ function Field({
 }) {
   return (
     <div>
-      <label style={{ display: "block", fontSize: 11, fontWeight: 700, color: "#57534e", marginBottom: 4, letterSpacing: "0.04em", textTransform: "uppercase" }}>
+      <label style={{ display: "block", fontSize: 11, fontWeight: 700, color: "var(--text-muted)", marginBottom: 4, }}>
         {label}{required && <span style={{ color: "#c14a44", marginLeft: 2 }}>*</span>}
       </label>
       {children}
-      {hint && <div style={{ fontSize: 11, color: "#a8a29e", marginTop: 4 }}>{hint}</div>}
+      {hint && <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 4 }}>{hint}</div>}
     </div>
   );
 }
 
 const th: CSSProperties = {
   padding: "10px 14px", textAlign: "left", fontSize: 11, fontWeight: 700,
-  color: "#57534e", textTransform: "uppercase", letterSpacing: "0.04em",
+  color: "var(--text-muted)",
 };
 const td: CSSProperties = { padding: "12px 14px", verticalAlign: "top" };
 const input: CSSProperties = {
   width: "100%", padding: "8px 10px", fontSize: 13,
-  border: "1px solid rgba(28,25,23,0.06)", borderRadius: 8, fontFamily: "ui-monospace, monospace",
+  border: "0.5px solid rgba(29, 29, 31,0.06)", borderRadius: 8, fontFamily: "var(--font-mono)",
 };
 const codeStyle: CSSProperties = {
-  background: "#f5f5f4", padding: "1px 5px", margin: "0 2px",
-  borderRadius: 4, fontFamily: "ui-monospace, monospace", fontSize: 10,
+  background: "var(--surface-muted)", padding: "1px 5px", margin: "0 2px",
+  borderRadius: 4, fontFamily: "var(--font-mono)", fontSize: 10,
 };

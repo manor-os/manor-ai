@@ -403,6 +403,188 @@ async def test_configured_studio_export_install_roundtrip(db_session, spec, mode
     assert _checker("compare_roundtrip").compare(payload, exported) == []
 
 
+@pytest.mark.parametrize("mode", [InstallMode.SIMULATE, InstallMode.LIVE])
+async def test_gif_studio_configure_install_roundtrip(db_session, isolated_test_redis, mode):
+    from scripts.blueprints import gif_studio
+
+    entities = [Entity(id=generate_ulid(), name=name, plan_id="plan_enterprise",
+                       settings={"approval_defaults": account_defaults()}) for name in ("GIF source", "GIF installer")]
+    db_session.add_all(entities)
+    await db_session.flush()
+    source, payload = await gif_studio.configure_and_export(db_session, entity_id=entities[0].id)
+    published = json.loads((ROOT / f"packages/core/blueprints/configs/creative/{gif_studio.SLUG}.json").read_text())
+    assert payload == published
+    assert payload["embedded"]["agents"][0]["tool_bindings"] == list(gif_studio.AGENT_TOOLS)
+    assert "generate_file" in payload["contract"]["requires"]["tools"]
+    assert _checker("check_blueprint").check(payload) == []
+    assert source.id not in json.dumps(payload) and entities[0].id not in json.dumps(payload)
+    assert not payload["recipe"]["scheduled_jobs"] and not payload["recipe"].get("task_templates")
+    assert not payload["recipe"]["workflows"]
+
+    installed = await install_blueprint(db_session, entity_id=entities[1].id, payload=payload,
+                                        mode=mode, blueprint_slug=gif_studio.SLUG)
+    assert not installed.todos
+    assert not installed.workflow_binding_ids
+    target = await db_session.get(Workspace, installed.workspace_id)
+    assert not target.heartbeat_enabled
+    assert bool(target.settings.get("sandbox")) == (mode == InstallMode.SIMULATE)
+    assert target.operating_model["app_view"]["hero"] == f"service:{gif_studio.SERVICE_KEY}"
+    exported = await export_workspace(db_session, target.id, title=gif_studio.TITLE,
+                                      context=ExportContext(include_knowledge_packs=False))
+    assert _checker("compare_roundtrip").compare(payload, exported) == []
+    checks = [item["payload"]["check"] for item in target.settings["_blueprint"]["live_setup_requirements"]
+              if item["kind"] == "post_install_check"]
+    assert checks == payload["policy"]["post_install_checks"]
+
+
+def test_gif_style_cards_have_their_pictures_in_the_web_assets():
+    from packages.core.blueprints.builtin_app_views import GIF_STYLES
+
+    for _, _, picture, _ in GIF_STYLES:
+        assert (ROOT / "apps/web/public" / picture.lstrip("/")).is_file(), picture
+
+
+async def test_installed_gif_studio_agent_generates_retained_gifs_and_serves_original_bytes(
+    client, db_session, isolated_test_redis, monkeypatch, tmp_path,
+):
+    """Only provider I/O is faked; the generate_file call the Agent makes, file writes, Documents and delivery are real."""
+    import base64
+    import httpx
+    from auth_helpers import register_user_and_get_token
+    from approval_settings_test_utils import action_rule, set_workspace_test_approval
+    from packages.core.ai.tools import extended_tools, generate_file_tool
+    from packages.core.config import get_settings
+    from packages.core.models.document import Document
+    from scripts.blueprints import gif_studio
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "DEPLOYMENT_MODE", "oss")
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    account = (await register_user_and_get_token(client, {
+        "username": "gif-studio-test", "email": "gif-studio@example.test",
+        "password": "TestPassword123!", "entity_name": "GIF Studio test",
+    })).json()
+    entity_id, user_id = account["entity_id"], account["user_id"]
+    headers = {"Authorization": f"Bearer {account['access_token']}"}
+    payload = json.loads((ROOT / f"packages/core/blueprints/configs/creative/{gif_studio.SLUG}.json").read_text())
+    installed = await install_blueprint(db_session, entity_id=entity_id, user_id=user_id,
+                                        payload=payload, mode=InstallMode.LIVE, blueprint_slug=gif_studio.SLUG)
+    assert not installed.todos
+    await set_workspace_test_approval(db_session, entity_id=entity_id,
+        workspace_id=installed.workspace_id, actor_id=user_id,
+        user_rules=[action_rule("workspace.file.create")])
+    await db_session.commit()
+
+    gif = io.BytesIO()
+    frames = [Image.new("RGB", (32, 32), color) for color in ("coral", "gold", "teal")]
+    frames[0].save(gif, format="GIF", save_all=True, append_images=frames[1:], duration=200, loop=0)
+    gif_bytes = gif.getvalue()
+    requests = []
+    original_post = httpx.AsyncClient.post
+
+    async def provider_post(self, url, *args, **kwargs):
+        if str(url) != "https://api.openai.com/v1/images/generations":
+            return await original_post(self, url, *args, **kwargs)
+        requests.append(kwargs["json"])
+        return httpx.Response(200, request=httpx.Request("POST", url), json={
+            "data": [{"b64_json": base64.b64encode(gif_bytes).decode()}],
+            "usage": {"input_tokens": 20, "output_tokens": 100,
+                      "input_tokens_details": {"text_tokens": 20, "image_tokens": 0}},
+        })
+
+    async def credentials(*args, **kwargs):
+        return "sk-" + "test" * 10, "https://api.openai.com/v1", True
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", provider_post)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", credentials)
+
+    async def agent_generates(version: int) -> str:
+        # The arguments the Agent sends for one version, as its prompt specifies them.
+        return await generate_file_tool._generate_file_handler(
+            entity_id=entity_id, user_id=user_id, conversation_id="conversation",
+            workspace_id=installed.workspace_id, kind="image",
+            prompt="A coral cat waves and returns to its starting pose.",
+            name=f"gifs/waving-cat-v{version}.gif", storage_scope="workspace",
+            params={"model": gif_studio.MODEL, "output_format": "gif", "frame_count": 3,
+                    "frame_duration_ms": 200, "size": "512x512", "quality": "medium",
+                    "save_to_knowledge": True})
+
+    receipts = []
+    for version in (1, 2):
+        result = json.loads(await agent_generates(version))
+        doc = await db_session.get(Document, result["document_id"])
+        assert result["output_format"] == "gif" and result["frame_count"] == 3, result
+        assert doc.mime_type == "image/gif" and doc.file_type == "gif"
+        assert doc.metadata_["origin"]["workspace_id"] == installed.workspace_id
+        assert (tmp_path / entity_id / doc.fs_path).read_bytes() == gif_bytes
+        for endpoint in ("preview/content", "download"):
+            response = await client.get(f"/api/v1/documents/{doc.id}/{endpoint}", headers=headers)
+            assert response.status_code == 200, response.text
+            assert response.headers["content-type"].startswith("image/gif")
+            assert response.content == gif_bytes
+        receipts.append((doc.id, doc.fs_path))
+        await db_session.commit()
+
+    assert len(requests) == 2
+    assert all(r["model"] == gif_studio.MODEL.split("/", 1)[1] and r["output_format"] == "gif" for r in requests)
+    assert receipts[0][0] != receipts[1][0] and receipts[0][1] != receipts[1][1]
+    assert all((tmp_path / entity_id / path).read_bytes() == gif_bytes for _, path in receipts)
+
+
+async def test_gif_studio_tool_refuses_a_static_image_as_a_gif(client, db_session, isolated_test_redis, monkeypatch, tmp_path):
+    """A provider answer with one frame is not an animation: no Document is kept for the Studio."""
+    import base64
+    import httpx
+    from auth_helpers import register_user_and_get_token
+    from packages.core.ai.tools import extended_tools, generate_file_tool
+    from packages.core.config import get_settings
+    from packages.core.models.document import Document
+    from scripts.blueprints import gif_studio
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "DEPLOYMENT_MODE", "oss")
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    account = (await register_user_and_get_token(client, {
+        "username": "gif-static-test", "email": "gif-static@example.test",
+        "password": "TestPassword123!", "entity_name": "GIF static test",
+    })).json()
+    entity_id, user_id = account["entity_id"], account["user_id"]
+    payload = json.loads((ROOT / f"packages/core/blueprints/configs/creative/{gif_studio.SLUG}.json").read_text())
+    installed = await install_blueprint(db_session, entity_id=entity_id, user_id=user_id,
+                                        payload=payload, mode=InstallMode.LIVE, blueprint_slug=gif_studio.SLUG)
+    await db_session.commit()
+
+    still = io.BytesIO()
+    Image.new("RGB", (32, 32), "coral").save(still, format="GIF")
+    original_post = httpx.AsyncClient.post
+
+    async def provider_post(self, url, *args, **kwargs):
+        if str(url) != "https://api.openai.com/v1/images/generations":
+            return await original_post(self, url, *args, **kwargs)
+        return httpx.Response(200, request=httpx.Request("POST", url), json={
+            "data": [{"b64_json": base64.b64encode(still.getvalue()).decode()}],
+            "usage": {"input_tokens": 20, "output_tokens": 100,
+                      "input_tokens_details": {"text_tokens": 20, "image_tokens": 0}},
+        })
+
+    async def credentials(*args, **kwargs):
+        return "sk-" + "test" * 10, "https://api.openai.com/v1", True
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", provider_post)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", credentials)
+    result = json.loads(await generate_file_tool._generate_file_handler(
+        entity_id=entity_id, user_id=user_id, conversation_id="conversation",
+        workspace_id=installed.workspace_id, kind="image", prompt="A coral cat waves.",
+        name="gifs/waving-cat-v1.gif", storage_scope="workspace",
+        params={"model": gif_studio.MODEL, "output_format": "gif", "frame_count": 3, "frame_duration_ms": 200,
+                "size": "512x512", "quality": "medium", "save_to_knowledge": True}))
+    assert "error" in result and "document_id" not in result
+    assert (await db_session.scalars(select(Document).where(
+        Document.entity_id == entity_id))).all() == []
+
+
 def test_registered_tools_have_scoped_write_authorization():
     from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
     from packages.core.ai.runtime.authorization_receipts import WorkspaceFileAuthorizationResourceFactory

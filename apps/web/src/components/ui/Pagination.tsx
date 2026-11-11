@@ -30,7 +30,7 @@ export default function Pagination({ page, totalPages, onPageChange, className =
 
       {pages.map((p, i) =>
         p === "..." ? (
-          <span key={`ellipsis-${i}`} style={{ width: 32, textAlign: "center", color: "#a8a29e", fontSize: 13 }}>
+          <span key={`ellipsis-${i}`} style={{ width: 32, textAlign: "center", color: "var(--text-muted)", fontSize: 13 }}>
             ...
           </span>
         ) : (
@@ -40,7 +40,7 @@ export default function Pagination({ page, totalPages, onPageChange, className =
             style={{
               ...btnBase,
               ...(p === page
-                ? { background: "#1c1917", color: "#fff", fontWeight: 700 }
+                ? { background: "#1d1d1f", color: "#fff", fontWeight: 700 }
                 : {}),
             }}
             onMouseEnter={p !== page ? hoverIn : undefined}
@@ -81,7 +81,7 @@ const btnBase: React.CSSProperties = {
   borderRadius: 10,
   border: "none",
   background: "transparent",
-  color: "#57534e",
+  color: "var(--text-muted)",
   fontSize: 13,
   fontWeight: 600,
   cursor: "pointer",
@@ -96,7 +96,7 @@ const disabledStyle: React.CSSProperties = {
 };
 
 function hoverIn(e: React.MouseEvent<HTMLButtonElement>) {
-  e.currentTarget.style.background = "#f5f5f4";
+  e.currentTarget.style.background = "#f5f5f7";
 }
 function hoverOut(e: React.MouseEvent<HTMLButtonElement>) {
   e.currentTarget.style.background = "transparent";

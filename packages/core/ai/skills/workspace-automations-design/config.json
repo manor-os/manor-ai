@@ -1,0 +1,28 @@
+{
+  "id": "workspace-automations-design",
+  "name": "workspace-automations-design",
+  "display_name": "Workspace Automations design",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Design what a Workspace runs on a clock: the schedules its Workflows need and every routine the person named, from checked cadence options. Guides the Automations designer.",
+  "category": "workspace-design",
+  "output_format": "guidance",
+  "tags": [
+    "workspace-operations",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "search": {
+    "terms": [
+      "automation design",
+      "automations designer",
+      "routines the person named",
+      "cadence options"
+    ],
+    "examples": [
+      "design the automations of a workspace",
+      "guidance for the automations designer cadence options",
+      "turn the routines the person named into schedules"
+    ]
+  }
+}

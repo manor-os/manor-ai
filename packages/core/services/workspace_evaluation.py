@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.execution import (
@@ -28,11 +28,13 @@ from packages.core.constants.execution import (
     without_rolled_up_coordinator_children,
 )
 from packages.core.budget import get_budget_status
+from packages.core.models.billing import CreditUsageLog
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.goal import Goal, GoalMeasurement, GoalTaskLink
 from packages.core.models.runtime_learning import AgentLearningCandidate, RuntimeEvidence
 from packages.core.models.task import Task
 from packages.core.models.usage import TokenUsageLog, ToolCallLog
+from packages.core.models.workflow import WorkflowRun
 from packages.core.models.workspace import Workspace
 from packages.core.services.credit_service import usd_to_credits
 from packages.core.services.workspace_health_metrics import (
@@ -43,6 +45,7 @@ from packages.core.services.workspace_health_metrics import (
     platform_stopped_task_ids,
     step_outcome,
     task_outcome,
+    workflow_run_outcome,
 )
 
 
@@ -80,10 +83,12 @@ async def build_workspace_evaluation(
     tasks = await _load_recent_tasks(db, workspace, since)
     plans = await _load_recent_plans(db, workspace, since)
     steps = await _load_recent_steps(db, workspace, since)
+    runs = await _load_recent_workflow_runs(db, workspace, since)
     evidence = await _load_recent_evidence(db, workspace, since)
     history = await _load_evaluation_history(db, workspace, since)
     candidates = await _load_recent_learning_candidates(db, workspace, since)
     token_logs = await _load_token_logs(db, workspace, since)
+    charged_credits = await _load_charged_credits(db, workspace, since)
     tool_logs = await _load_tool_logs(db, workspace, since)
     measurements = await _load_goal_measurements(db, [g.id for g in goals], since)
     goal_links = await _load_goal_task_links(db, [g.id for g in goals])
@@ -93,13 +98,14 @@ async def build_workspace_evaluation(
     stopped = await platform_stopped_task_ids(
         db, [t.id for t in tasks if task_outcome(t.status) == FAILED]
     )
-    execution = _build_execution_health(tasks, plans, steps, platform_stopped=stopped)
+    execution = _build_execution_health(tasks, plans, steps, runs=runs, platform_stopped=stopped)
     cost = _build_cost_efficiency(
         steps=steps,
         token_logs=token_logs,
         evidence=evidence,
+        charged_credits=charged_credits,
         budget=budget.__dict__ if budget else None,
-        completed_task_count=execution["completed_task_count"],
+        completed_task_count=execution["completed_task_count"] + execution["completed_workflow_run_count"],
         goal_progress_points=goal_impact["aggregate"]["progress_points"],
     )
     time_efficiency = _build_time_efficiency(tasks, plans, steps)
@@ -119,6 +125,7 @@ async def build_workspace_evaluation(
         "learning": learning,
     }
     overall = _build_overall(dimensions)
+    recommendations = _build_recommendations(dimensions, overall)
 
     snapshot = {
         "workspace_id": workspace.id,
@@ -131,12 +138,15 @@ async def build_workspace_evaluation(
         },
         "overall": overall,
         "dimensions": dimensions,
-        "recommendations": _build_recommendations(dimensions, overall),
+        "recommendations": [text for _code, text in recommendations],
+        # Stable ids for the same advice, so a viewer can show it in their language.
+        "recommendation_codes": [code for code, _text in recommendations],
         "evidence_summary": {
             "goal_count": len(goals),
             "task_count": len(tasks),
             "plan_count": len(plans),
             "step_count": len(steps),
+            "workflow_run_count": len(runs),
             "runtime_evidence_count": len(evidence),
             "learning_candidate_count": len(candidates),
             "token_log_count": len(token_logs),
@@ -284,6 +294,33 @@ async def _load_recent_steps(db: AsyncSession, workspace: Workspace, since: date
     # workspace evaluation, so treating them as ordinary steps double-counts
     # cost and inflates execution/governance health metrics.
     return without_rolled_up_coordinator_children(steps)
+
+
+async def _load_recent_workflow_runs(db: AsyncSession, workspace: Workspace, since: datetime) -> list[Any]:
+    # Workflow runs keep their steps in the run row, not in execution_steps,
+    # so a Workspace that works through workflows is judged on its runs.
+    return list((await db.execute(
+        select(WorkflowRun.id, WorkflowRun.status).where(
+            WorkflowRun.workspace_id == workspace.id,
+            WorkflowRun.entity_id == workspace.entity_id,
+            or_(
+                WorkflowRun.created_at >= since,
+                WorkflowRun.started_at >= since,
+                WorkflowRun.completed_at >= since,
+            ),
+        )
+    )).all())
+
+
+async def _load_charged_credits(db: AsyncSession, workspace: Workspace, since: datetime) -> int:
+    # The billing ledger, whoever paid: a client trial is charged to the
+    # provider but is still this Workspace's cost.
+    return int((await db.execute(
+        select(func.coalesce(func.sum(CreditUsageLog.total_credit), 0)).where(
+            CreditUsageLog.workspace_id == workspace.id,
+            CreditUsageLog.created_at >= since,
+        )
+    )).scalar_one() or 0)
 
 
 async def _load_recent_evidence(db: AsyncSession, workspace: Workspace, since: datetime) -> list[RuntimeEvidence]:
@@ -476,6 +513,7 @@ def _build_execution_health(
     plans: list[ExecutionPlan],
     steps: list[ExecutionStep],
     *,
+    runs: Collection[Any] = (),
     platform_stopped: Collection[str] = frozenset(),
 ) -> dict[str, Any]:
     task_status = Counter(t.status or "unknown" for t in tasks)
@@ -493,18 +531,26 @@ def _build_execution_health(
     done_steps = step_outcomes[SUCCEEDED]
     failed_steps = step_outcomes[FAILED]
     waiting_steps = step_status.get("waiting_human", 0)
+    run_outcomes = Counter(workflow_run_outcome(r.status) for r in runs)
+    completed_runs = run_outcomes[SUCCEEDED]
+    failed_runs = run_outcomes[FAILED]
 
     # A proposed Task (outcome None) is not work: it is neither open nor
     # part of the completion rate.
     work_count = len(tasks) - task_outcomes[None]
     task_completion_rate = completed_tasks / work_count if work_count else None
+    run_success_rate = completed_runs / len(runs) if runs else None
+    # Tasks and workflow runs are both units of work; judge them together.
+    units = work_count + len(runs)
+    work_completion_rate = (completed_tasks + completed_runs) / units if units else None
     step_done_rate = done_steps / len(steps) if steps else None
     dependency_errors = _dependency_errors(steps)
 
-    if tasks or steps:
-        task_part = (task_completion_rate if task_completion_rate is not None else 0.6) * 35
+    failures = failed_tasks + failed_steps + failed_runs
+    if tasks or steps or runs:
+        task_part = (work_completion_rate if work_completion_rate is not None else 0.6) * 35
         step_part = (step_done_rate if step_done_rate is not None else 0.6) * 35
-        failure_penalty = min(30, (failed_tasks + failed_steps) * 8)
+        failure_penalty = min(30, failures * 8)
         waiting_penalty = min(10, waiting_steps * 2)
         dependency_penalty = min(20, len(dependency_errors) * 5)
         score = _clamp_score(task_part + step_part + 30 - failure_penalty - waiting_penalty - dependency_penalty)
@@ -515,8 +561,13 @@ def _build_execution_health(
         "score": score,
         "summary": (
             f"{completed_tasks}/{len(tasks)} tasks completed; "
-            f"{done_steps}/{len(steps)} steps done; {failed_tasks + failed_steps} failures"
+            f"{completed_runs}/{len(runs)} workflow runs succeeded; "
+            f"{done_steps}/{len(steps)} steps done; {failures} failures"
         ),
+        "workflow_run_count": len(runs),
+        "completed_workflow_run_count": completed_runs,
+        "failed_workflow_run_count": failed_runs,
+        "workflow_run_success_rate": run_success_rate,
         "task_count": len(tasks),
         "completed_task_count": completed_tasks,
         "open_task_count": open_tasks,
@@ -540,15 +591,19 @@ def _build_cost_efficiency(
     steps: list[ExecutionStep],
     token_logs: list[TokenUsageLog],
     evidence: list[RuntimeEvidence],
+    charged_credits: int,
     budget: dict[str, Any] | None,
     completed_task_count: int,
     goal_progress_points: float,
 ) -> dict[str, Any]:
+    # The estimated provider cost misses media charges and prices calls made
+    # on the company's own keys, so the credits come from the billing ledger;
+    # the estimate stays for the per-source breakdown below.
     step_usd = sum(_cost_usd(s.cost) for s in steps)
     token_usd = sum(float(t.cost_usd or 0) for t in token_logs)
     evidence_usd = sum(_runtime_evidence_cost_usd(ev) for ev in evidence)
     window_usd = step_usd + token_usd + evidence_usd
-    window_credits = usd_to_credits(window_usd)
+    window_credits = int(charged_credits)
 
     monthly_spent = int((budget or {}).get("monthly_spent_credits") or 0)
     monthly_budget = (budget or {}).get("monthly_budget_credits")
@@ -821,7 +876,9 @@ def _build_overall(dimensions: dict[str, dict[str, Any]]) -> dict[str, Any]:
         execution["completed_task_count"] > 0,
         execution["failed_task_count"] > 0,
         execution["step_count"] > 0,
+        execution["workflow_run_count"] > 0,
         float(cost.get("window_usd") or 0) > 0,
+        int(cost.get("window_credits") or 0) > 0,
     ))
     if not has_observed_evidence:
         return {
@@ -849,33 +906,39 @@ def _build_overall(dimensions: dict[str, dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _build_recommendations(dimensions: dict[str, dict[str, Any]], overall: dict[str, Any]) -> list[str]:
-    recs: list[str] = []
+def _build_recommendations(
+    dimensions: dict[str, dict[str, Any]], overall: dict[str, Any],
+) -> list[tuple[str, str]]:
+    recs: list[tuple[str, str]] = []
     goal = dimensions["goal_impact"]
     if not goal["aggregate"]["goal_count"]:
-        recs.append("Define measurable workspace goals before asking agents to optimize work.")
+        recs.append(("define_goals", "Define measurable workspace goals before asking agents to optimize work."))
     elif (goal.get("score") or 0) < 50:
-        recs.append("Refresh goal measurements and link active tasks to the goals they move.")
+        recs.append(("refresh_goal_measurements", "Refresh goal measurements and link active tasks to the goals they move."))
 
     cost = dimensions["cost_efficiency"]
     if cost.get("budget_pct_used") is not None and cost["budget_pct_used"] >= 0.8:
-        recs.append("Review budget burn before starting the next autonomous work wave.")
+        recs.append(("review_budget_burn", "Review budget burn before starting the next autonomous work wave."))
 
     execution = dimensions["execution_health"]
-    if execution.get("failed_task_count") or execution.get("dependency_errors"):
-        recs.append("Fix failed tasks or broken DAG dependencies before creating more work.")
+    if (
+        execution.get("failed_task_count")
+        or execution.get("failed_workflow_run_count")
+        or execution.get("dependency_errors")
+    ):
+        recs.append(("fix_failures", "Fix failed tasks, failed workflow runs or broken DAG dependencies before creating more work."))
 
     feedback = dimensions["user_feedback"]
     if feedback.get("signal_count", 0) == 0:
-        recs.append("Collect explicit approval/rejection feedback so workspace quality can be calibrated.")
+        recs.append(("collect_feedback", "Collect explicit approval/rejection feedback so workspace quality can be calibrated."))
 
     learning = dimensions["learning"]
     proposed = learning.get("candidate_status_counts", {}).get("proposed", 0)
     if proposed:
-        recs.append("Review proposed learning candidates so recurring feedback becomes memory, rules, or skills.")
+        recs.append(("review_learning", "Review proposed learning candidates so recurring feedback becomes memory, rules, or skills."))
 
     if not recs and overall.get("score") is not None and overall["score"] >= 80:
-        recs.append("Continue the current operating loop; monitor goal pace and cost after the next batch.")
+        recs.append(("continue_loop", "Continue the current operating loop; monitor goal pace and cost after the next batch."))
     return recs[:6]
 
 

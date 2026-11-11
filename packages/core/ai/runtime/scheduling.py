@@ -413,7 +413,12 @@ async def runtime_list_scheduled_jobs_action(
             else {scope[0] if scope else str(workspace_id)}
         )
         if scope:
-            readable_workspace_ids &= {scope[0]}
+            # None means tenant-wide read: the chat's own Workspace is readable.
+            readable_workspace_ids = (
+                {scope[0]}
+                if readable_workspace_ids is None
+                else readable_workspace_ids & {scope[0]}
+            )
         listed_workspace_id = scope[0] if scope else (str(workspace_id) if not user_id and workspace_id else None)
         pinned = await _collaborator_job_workspace(db, entity_id=entity_id, user_id=user_id, workspace_id=workspace_id)
         if pinned is not None:

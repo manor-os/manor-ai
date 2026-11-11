@@ -111,7 +111,7 @@ export function InvokeModal({ skill, open, onClose }: InvokeModalProps) {
       <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
         {!!description && (
           <p
-            style={{ fontSize: 12, color: "#a8a29e", fontWeight: 500, margin: 0 }}
+            style={{ fontSize: 12, color: "var(--text-muted)", fontWeight: 500, margin: 0 }}
           >
             {description}
           </p>
@@ -138,9 +138,7 @@ export function InvokeModal({ skill, open, onClose }: InvokeModalProps) {
                       style={{
                         fontSize: 11,
                         fontWeight: 700,
-                        color: "#57534e",
-                        textTransform: "uppercase" as const,
-                        letterSpacing: "0.04em",
+                        color: "var(--text-muted)",
                       }}
                     >
                       {key}
@@ -151,7 +149,7 @@ export function InvokeModal({ skill, open, onClose }: InvokeModalProps) {
                         style={{
                           marginLeft: 6,
                           fontWeight: 500,
-                          color: "#a8a29e",
+                          color: "var(--text-faint)",
                           textTransform: "none" as const,
                           letterSpacing: 0,
                         }}
@@ -175,7 +173,7 @@ export function InvokeModal({ skill, open, onClose }: InvokeModalProps) {
                         style={{
                           fontSize: 12,
                           padding: 8,
-                          border: "1px solid rgba(28,25,23,0.06)",
+                          border: "0.5px solid rgba(29, 29, 31,0.06)",
                           borderRadius: 6,
                           fontFamily: "inherit",
                           resize: "vertical",
@@ -195,14 +193,14 @@ export function InvokeModal({ skill, open, onClose }: InvokeModalProps) {
                         style={{
                           fontSize: 13,
                           padding: "6px 10px",
-                          border: "1px solid rgba(28,25,23,0.06)",
+                          border: "0.5px solid rgba(29, 29, 31,0.06)",
                           borderRadius: 6,
                         }}
                       />
                     )}
                     {fSchema.description && !isLong && (
                       <span
-                        style={{ fontSize: 11, color: "#a8a29e", lineHeight: 1.4 }}
+                        style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.4 }}
                       >
                         {fSchema.description}
                       </span>
@@ -246,10 +244,8 @@ export function InvokeModal({ skill, open, onClose }: InvokeModalProps) {
                 display: "block",
                 fontSize: 12,
                 fontWeight: 700,
-                color: "#57534e",
+                color: "var(--text-muted)",
                 marginBottom: 6,
-                textTransform: "uppercase" as const,
-                letterSpacing: "0.05em",
               }}
             >
               {t("page.invoke_modal.response")}
@@ -258,12 +254,12 @@ export function InvokeModal({ skill, open, onClose }: InvokeModalProps) {
               style={{
                 width: "100%",
                 padding: 14,
-                background: "#fafaf9",
-                border: "1px solid #f5f5f4",
+                background: "var(--surface-muted)",
+                border: "1px solid #f5f5f7",
                 borderRadius: 12,
                 fontSize: 12,
-                fontFamily: "monospace",
-                color: "#57534e",
+                fontFamily: "var(--font-mono)",
+                color: "var(--text-muted)",
                 overflow: "auto",
                 maxHeight: 200,
                 whiteSpace: "pre-wrap",

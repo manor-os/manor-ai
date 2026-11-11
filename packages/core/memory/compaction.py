@@ -2,7 +2,9 @@
 
 Checkpoints and tool/assistant prose are never extraction inputs. Receipts live
 with the original messages, so failed extraction can retry after compaction and
-successful empty decisions survive process restarts. No Context Window imports.
+successful empty decisions survive process restarts. Admitted entries are
+written to the memory layer files through remember, with its permission checks
+and audit rows. No Context Window imports.
 """
 from __future__ import annotations
 
@@ -12,11 +14,10 @@ import logging
 
 from sqlalchemy import and_, or_, select, text
 
-from packages.core.memory.dedup import existing_memories
+from packages.core.memory.dedup import existing_memories, find_duplicate
 from packages.core.memory.manager import run_memory_skill
 from packages.core.memory.policy import content_fingerprint
 from packages.core.models.task import Conversation, Message
-from packages.core.models.runtime_learning import AgentLearningCandidate
 from packages.core.models.user import User, UserMembership
 from packages.core.models.workspace import Workspace
 
@@ -94,18 +95,33 @@ def _mark(message, key, status):
     message.meta = meta
 
 
+def _layers(ctx) -> list[str]:
+    personal = ["profile", "preferences", "private"]
+    return ["workspace", *personal] if ctx.workspace_id else personal
+
+
+async def _write_scope(db, ctx):
+    from packages.core.memory.layer_prompt import speaker_is_collaborator
+    from packages.core.memory.layers import MemoryTurnScope
+
+    if not ctx.workspace_id:
+        return MemoryTurnScope(False, True, ctx.user_id, None)
+    collaborator = await speaker_is_collaborator(db, entity_id=ctx.entity_id, user_id=ctx.user_id)
+    return MemoryTurnScope(False, False, ctx.user_id, ctx.workspace_id, collaborator)
+
+
 async def prepare_compaction_memory(ctx, history, archive_id=None):
     return await prepare_chat_memory(ctx, history, archive_id=archive_id)
 
 
 async def prepare_chat_memory(ctx, history, *, archive_id=None, source="context_compaction",
                               source_message_ids=None, require_autonomous_runtime=False):
-    """Submit reviewable candidates; never auto-apply rules or grant authority."""
+    """Write durable memories the speaker stated; never rules or authority."""
     from packages.core.database import async_session
-    from packages.core.services.runtime_learning import (
-        LearningCandidateDraft, _upsert_learning_candidate, record_runtime_evidence,
-        runtime_learning_enabled,
+    from packages.core.memory.remember import (
+        LAYER_TARGETS, SECTIONS, MemoryWriteRefused, layer_entries, remember_memory, stage_memory_writes,
     )
+    from packages.core.services.runtime_learning import record_runtime_evidence, runtime_learning_enabled
     key = _receipt_key(ctx)
     texts = _human_texts(history)
     scope = dict(entity_id=ctx.entity_id, workspace_id=ctx.workspace_id, agent_id=ctx.agent_id)
@@ -156,31 +172,23 @@ async def prepare_chat_memory(ctx, history, *, archive_id=None, source="context_
             if len(pending) < 80 and size + length <= 60_000:
                 pending.append(item)
                 size += length
-        existing = await existing_memories(
+        legacy = await existing_memories(
             db, entity_id=ctx.entity_id, workspace_id=ctx.workspace_id,
             user_id=ctx.user_id if not ctx.workspace_id else None,
             agent_id=ctx.agent_id if not ctx.workspace_id else None,
         )
-        # Pending proposals also count for duplicate detection, without being
-        # presented to the main agent as already-approved facts.
-        proposals = (await db.scalars(select(AgentLearningCandidate).where(
-            AgentLearningCandidate.entity_id == ctx.entity_id,
-            AgentLearningCandidate.workspace_id == ctx.workspace_id,
-            AgentLearningCandidate.user_id == ctx.user_id,
-            AgentLearningCandidate.agent_id == ctx.agent_id,
-            AgentLearningCandidate.candidate_type == "memory",
-            AgentLearningCandidate.status.in_(["proposed", "accepted"]),
-        ).order_by(AgentLearningCandidate.created_at.desc()).limit(40))).all()
-        comparison_size = sum(len(m["content"]) for m in existing)
-        for proposal in proposals:
-            if comparison_size + len(proposal.summary) <= 12_000:
-                existing.append({"id": proposal.id, "content": proposal.summary, "status": proposal.status})
-                comparison_size += len(proposal.summary)
+        existing, comparison_size = [], 0
+        current = layer_entries(ctx.entity_id, _layers(ctx), user_id=ctx.user_id, workspace_id=ctx.workspace_id)
+        for item in current + legacy:
+            if comparison_size + len(item["content"]) <= 12_000:
+                existing.append(item)
+                comparison_size += len(item["content"])
         await db.commit()
     if not pending:
         return stats
     decision = await run_memory_skill(
-        "extract", {"messages": pending, "source_message_ids": [m["id"] for m in pending], "existing": existing},
+        "extract", {"messages": pending, "source_message_ids": [m["id"] for m in pending],
+                    "existing": existing, "layers": _layers(ctx)},
         **scope, user_id=ctx.user_id,
     )
     async with async_session() as db:
@@ -206,49 +214,50 @@ async def prepare_chat_memory(ctx, history, *, archive_id=None, source="context_
         evidence = await record_runtime_evidence(
             db, **scope, user_id=ctx.user_id, conversation_id=ctx.conversation_id,
             evidence_type="memory_compaction" if source == "context_compaction" else "memory_extraction", source=source,
-            summary="Reviewed original human messages for durable memory candidates",
+            summary="Reviewed original human messages for durable memory",
             details={"archive_id": archive_id, "source_message_ids": list(eligible)},
         )
         if evidence is None:
             return stats
+        write_scope = await _write_scope(db, ctx)
         written = 0
-        for entry in decision["entries"]:
-            source_id = entry["source_message_id"]
-            if source_id not in snapshot:
-                raise ValueError("Memory evidence is outside the supplied messages")
-            if source_id not in eligible:
-                continue
-            memory_type = entry["scope"] if ctx.workspace_id else {
-                "guidance": "instruction", "decision": "context", "learning": "context",
-            }.get(entry["scope"], entry["scope"])
-            # Recheck active storage at admission, even after a worker cache hit.
-            # Concurrent/manual writes cannot create another identical proposal.
-            from packages.core.memory.dedup import find_duplicate
-            duplicate = await find_duplicate(
-                db, entity_id=ctx.entity_id, workspace_id=ctx.workspace_id,
-                user_id=ctx.user_id if not ctx.workspace_id else None,
-                agent_id=ctx.agent_id if not ctx.workspace_id else None,
-                scope=entry["scope"] if ctx.workspace_id else None,
-                memory_type=memory_type, content=entry["body"],
-            )
-            if duplicate:
-                continue
-            candidate, created = await _upsert_learning_candidate(
-                db, LearningCandidateDraft(
-                    candidate_type="memory", scope="workspace" if ctx.workspace_id else "user",
-                    title=entry["title"], summary=entry["body"], confidence=entry["confidence"],
-                    payload={"content": entry["body"], "memory_type": memory_type, "memory_scope": entry["scope"],
-                             "source_message_id": source_id, "archive_id": archive_id},
-                    dedupe_key=f"compact:{entry['scope']}:{content_fingerprint(entry['body'])}",
-                ), **scope, user_id=ctx.user_id, evidence_id=evidence.id,
-            )
-            written += int(created)
-            if candidate:
-                stats["candidate_ids"].append(candidate.id)
-        for row in eligible.values():
-            _mark(row, key, "done")
-        await db.commit()
-    logger.info("[context-memory] conversation=%s reviewed=%s candidates=%s archive=%s",
+        async with stage_memory_writes(db, ctx.entity_id) as staged_files:
+            for entry in decision["entries"]:
+                source_id = entry["source_message_id"]
+                if source_id not in snapshot:
+                    raise ValueError("Memory evidence is outside the supplied messages")
+                if source_id not in eligible:
+                    continue
+                # The legacy memory store still reaches prompts; do not repeat it.
+                memory_type = entry["scope"] if ctx.workspace_id else {
+                    "guidance": "instruction", "decision": "context", "learning": "context",
+                }.get(entry["scope"], entry["scope"])
+                if await find_duplicate(
+                    db, entity_id=ctx.entity_id, workspace_id=ctx.workspace_id,
+                    user_id=ctx.user_id if not ctx.workspace_id else None,
+                    agent_id=ctx.agent_id if not ctx.workspace_id else None,
+                    scope=entry["scope"] if ctx.workspace_id else None,
+                    memory_type=memory_type, content=entry["body"],
+                ):
+                    continue
+                try:
+                    saved = await remember_memory(
+                        db, write_scope, entity_id=ctx.entity_id, target=LAYER_TARGETS[entry.get("layer") or "private"], action="add",
+                        content=entry["body"], section=SECTIONS[entry["scope"]],
+                        conversation_id=ctx.conversation_id, agent_id=ctx.agent_id,
+                        source=source, created_by="extractor", staged_files=staged_files,
+                        evidence={"source_message_id": source_id, "archive_id": archive_id,
+                                  "evidence_id": evidence.id, "memory_type": memory_type},
+                    )
+                except MemoryWriteRefused as refused:
+                    logger.info("[context-memory] entry from %s not written: %s", source_id, refused)
+                    continue
+                if saved["status"] == "saved":
+                    written += 1
+                    stats["candidate_ids"].append(saved["write_id"])
+            for row in eligible.values():
+                _mark(row, key, "done")
+    logger.info("[context-memory] conversation=%s reviewed=%s written=%s archive=%s",
                 ctx.conversation_id, len(eligible), written, archive_id)
     stats.update(messages=len(eligible), extracted=written, pending=stats["pending"] - len(eligible))
     return stats

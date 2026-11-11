@@ -178,6 +178,7 @@ async def test_repeated_compaction_then_durable_input_pause_and_resume(client, m
             "id": "scenario-ask", "name": "request_input",
             "arguments": {
                 "question": "请选择草稿", "options": ["草稿A", "草稿B"],
+                "recommended": "草稿B", "recommendation_reason": "草稿B 符合 8000 元预算。",
                 "justification": {
                     "kind": "human_decision",
                     "why_human_required": "只有用户能选择最终草稿。",

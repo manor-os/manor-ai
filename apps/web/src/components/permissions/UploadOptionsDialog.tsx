@@ -18,6 +18,7 @@ import RadioCard from "../ui/RadioCard";
 import Toggle from "../ui/Toggle";
 import ClassificationBadge from "./ClassificationBadge";
 import VisibilityIcon from "./VisibilityIcon";
+import { IconPaperclip } from "../icons";
 
 export interface UploadOptionsValue {
   visibility: Visibility;
@@ -157,14 +158,15 @@ export default function UploadOptionsDialog({
         {/* File summary */}
         <div style={{
           padding: "10px 12px", background: "rgba(245,245,244,0.6)",
-          borderRadius: 8, fontSize: 12, color: "#57534e",
+          borderRadius: 8, fontSize: 12, color: "var(--text-muted)",
+          display: "flex", alignItems: "center", gap: 6,
         }}>
-          📎 {filesLabel}
+          <IconPaperclip size={14} /> {filesLabel}
         </div>
 
         {/* Visibility */}
         <fieldset style={{ border: "none", padding: 0, margin: 0 }}>
-          <legend style={{ fontSize: 12, fontWeight: 600, color: "#57534e", marginBottom: 8 }}>
+          <legend style={{ fontSize: 12, fontWeight: 600, color: "var(--text-muted)", marginBottom: 8 }}>
             {t("permissions.upload.section.visibility")}
           </legend>
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }} role="radiogroup" aria-label={t("permissions.upload.section.visibility")}>
@@ -179,11 +181,11 @@ export default function UploadOptionsDialog({
                   title={disabled ? t("permissions.upload.cap_disabled_title", { cap: visibilityCap! }) : opt.hint}
                   ariaLabel={opt.label}
                 >
-                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 13, color: "#292524" }}>
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 13, color: "var(--text-strong)" }}>
                     <VisibilityIcon visibility={opt.value} size={13} />
                     {opt.label}
                   </span>
-                  <span style={{ fontSize: 11, color: "#a8a29e", marginLeft: "auto" }}>{opt.hint}</span>
+                  <span style={{ fontSize: 11, color: "var(--text-muted)", marginLeft: "auto" }}>{opt.hint}</span>
                 </RadioCard>
               );
             })}
@@ -192,7 +194,7 @@ export default function UploadOptionsDialog({
 
         {/* Classification */}
         <fieldset style={{ border: "none", padding: 0, margin: 0 }}>
-          <legend style={{ fontSize: 12, fontWeight: 600, color: "#57534e", marginBottom: 8 }}>
+          <legend style={{ fontSize: 12, fontWeight: 600, color: "var(--text-muted)", marginBottom: 8 }}>
             {t("permissions.upload.section.classification")}
           </legend>
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }} role="radiogroup" aria-label={t("permissions.upload.section.classification")}>
@@ -211,7 +213,7 @@ export default function UploadOptionsDialog({
                   ariaLabel={opt.label}
                 >
                   <ClassificationBadge level={opt.value} size="sm" />
-                  <span style={{ fontSize: 11, color: "#a8a29e", marginLeft: "auto" }}>{opt.hint}</span>
+                  <span style={{ fontSize: 11, color: "var(--text-muted)", marginLeft: "auto" }}>{opt.hint}</span>
                 </RadioCard>
               );
             })}
@@ -251,8 +253,8 @@ export default function UploadOptionsDialog({
             size="sm"
             aria-label={t("permissions.upload.client_visible_label")}
           />
-          <span style={{ fontSize: 13, color: "#292524" }}>{t("permissions.upload.client_visible_label")}</span>
-          <span style={{ fontSize: 11, color: "#a8a29e", marginLeft: "auto" }}>{t("permissions.upload.client_visible_hint")}</span>
+          <span style={{ fontSize: 13, color: "var(--text-strong)" }}>{t("permissions.upload.client_visible_label")}</span>
+          <span style={{ fontSize: 11, color: "var(--text-muted)", marginLeft: "auto" }}>{t("permissions.upload.client_visible_hint")}</span>
         </div>
       </div>
     </Modal>

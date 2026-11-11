@@ -14,9 +14,37 @@ export function titleHues(title: string): [number, number] {
   return [hash % 360, (hash % 360 + 40 + (hash >> 9) % 80) % 360];
 }
 
+/**
+ * A run that ends on a WorkflowProject step returns the project record (its id,
+ * revision, key, schema version, folder). The result reads as the project: its
+ * name and its own fields. Anything else is returned as it is.
+ */
+export function workflowProjectResultView(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (!["project_id", "project_type", "project_key"].every((key) => key in record)) return null;
+  const state = record.state && typeof record.state === "object" && !Array.isArray(record.state)
+    ? record.state as Record<string, unknown> : {};
+  const fields = Object.fromEntries(Object.entries(state).filter(([key]) => key !== "project_root" && !key.startsWith("_")));
+  return { ...fields, title: String(state.title || state.name || record.project_key || "") };
+}
+
 /** The short run status the Workspace App shows on a flow page and in its outputs. */
 export function runStatusLabel(status: string, businessOutcome?: string | null): string {
   return t(workflowRunStatusPresentation({ status: status as WorkflowRunView["status"], businessOutcome: businessOutcome || undefined }).stateKey);
+}
+
+/**
+ * How a result being made is going, in its run page's words: "Generating · Shots"
+ * while it works in a production stage. A run paused only for background work
+ * is still working; one waiting on the person says so.
+ */
+export function makingLabel(run: { status: string; needs_you?: boolean; stage?: string }): string {
+  const background = run.status === "paused" && !run.needs_you;
+  if ((run.status === "running" || background) && run.stage) {
+    return `${t("component.run_production.working")} · ${run.stage}`;
+  }
+  return runStatusLabel(background ? "pending" : run.status);
 }
 
 const METRIC_PHASE_TONES: Record<string, "active" | "failed" | "attention"> = {

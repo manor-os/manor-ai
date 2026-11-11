@@ -192,7 +192,7 @@ async def extract_memories_endpoint(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Extract reviewable candidates; response status is proposed, not active."""
+    """Extract durable memories from the conversation; they are written at once."""
     from packages.core.memory.compaction import MemoryScopeDenied
 
     if body.user_id is not None and body.user_id != user.id:
@@ -205,8 +205,8 @@ async def extract_memories_endpoint(
     except MemoryScopeDenied as exc:
         raise HTTPException(403, str(exc)) from exc
     await db.commit()
-    # Preserve the existing response fields; IDs refer explicitly to learning
-    # candidates until the normal review/application flow creates a memory.
+    # Preserve the existing response fields; IDs refer to the memory write's
+    # audit row, which records the layer file before and after.
     return [MemoryResponse(
         id=c.id, entity_id=c.entity_id, agent_id=c.agent_id, user_id=c.user_id,
         memory_type=c.payload["memory_type"], content=c.summary, status=c.status,

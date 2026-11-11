@@ -1,7 +1,7 @@
 .workspace-app-settings { max-width: 1320px; margin: 0 auto; padding: 8px 4px 36px; container-type: inline-size; }
 .workspace-app-settings__heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin: 6px 4px 28px; }
-.workspace-app-settings__eyebrow, .workspace-app-settings__preview-label { color: var(--text-muted); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-.workspace-app-settings__heading h2 { margin: 7px 0 5px; color: var(--text-strong); font-size: clamp(24px, 2.2vw, 32px); line-height: 1.2; letter-spacing: -.035em; }
+.workspace-app-settings__preview-label { color: var(--text-muted); font-size: 12px; font-weight: 400; }
+.workspace-app-settings__heading h2 { margin: 0; color: var(--text-strong); font-size: 20px; font-weight: 600; line-height: 1.3; }
 .workspace-app-settings__heading p { margin: 0; color: var(--text-muted); font-size: 13px; line-height: 1.5; }
 .workspace-app-settings__open { display: inline-flex; align-items: center; gap: 7px; flex: 0 0 auto; padding: 10px 13px; border-radius: 10px; background: var(--surface-panel); box-shadow: var(--shadow-sm); color: var(--text-default); font-size: 12px; font-weight: 650; text-decoration: none; }
 .workspace-app-settings__open:hover { background: var(--glass-card-hover); }
@@ -42,7 +42,7 @@
 .workspace-app-settings__target-note { margin: 0; color: var(--text-muted); font-size: 11px; font-weight: 400; }
 .workspace-app-settings__target-help { display: inline-flex; align-items: center; gap: 4px; margin: 8px 0 0 2px; color: var(--accent); font-size: 11px; text-decoration: none; }
 .workspace-app-settings__more-links { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 16px; color: var(--text-muted); font-size: 11px; }
-.workspace-app-settings__more-links a { padding: 5px 8px; border: 1px solid var(--border-subtle); border-radius: 999px; color: var(--text-default); text-decoration: none; }
+.workspace-app-settings__more-links a { padding: 5px 8px; border: 0.5px solid var(--border-subtle); border-radius: 999px; color: var(--text-default); text-decoration: none; }
 .workspace-app-settings__more-links a:hover { background: var(--surface-muted); }
 .workspace-app-settings__cover-preview { display: flex; align-items: center; gap: 12px; margin-top: 13px; }
 .workspace-app-settings__cover-preview img { width: 72px; height: 52px; object-fit: cover; border-radius: 10px; }
@@ -55,7 +55,7 @@
 .workspace-app-settings__theme-accent input[type="color"] { width: 36px; height: 30px; padding: 0; border: 0; border-radius: var(--radius-control); background: transparent; cursor: pointer; }
 .workspace-app-settings__theme-accent small { color: var(--text-muted); font-size: 11px; font-weight: 400; }
 @container (max-width: 520px) { .workspace-app-settings__theme { grid-template-columns: 1fr; } }
-.workspace-app-settings__form-editor { display: grid; gap: 11px; margin-top: 14px; padding-top: 13px; border-top: 1px solid var(--border-subtle); }
+.workspace-app-settings__form-editor { display: grid; gap: 11px; margin-top: 14px; padding-top: 13px; border-top: 0.5px solid var(--border-subtle); }
 .workspace-app-settings__form-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .workspace-app-settings__form-head strong { color: var(--text-strong); font-size: 12px; }
 .workspace-app-settings__form-head button, .workspace-app-settings__form-options > button { border: 0; background: none; color: var(--text-default); font-size: 11px; cursor: pointer; }
@@ -99,7 +99,7 @@
 .workspace-app-settings__state { color: var(--text-muted); font-size: 13px; }
 .workspace-app-data-settings { display: grid; gap: 14px; min-width: 0; }
 .workspace-app-data-settings__components { display: grid; gap: 10px; }
-.workspace-app-data-settings__component { display: grid; gap: 24px; padding: 20px 0; border-top: 1px solid var(--border-subtle); }
+.workspace-app-data-settings__component { display: grid; gap: 24px; padding: 20px 0; border-top: 0.5px solid var(--border-subtle); }
 .workspace-app-data-settings__component:first-child { border-top: 0; padding-top: 0; }
 .workspace-app-data-settings__component > header, .workspace-app-data-settings__tab-head, .workspace-app-data-settings__block-controls { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
 .workspace-app-data-settings__component > header > div:first-child { display: grid; min-width: 0; gap: 2px; }
@@ -109,7 +109,7 @@
 .workspace-app-data-settings__copy { display: grid; gap: 16px; }
 .workspace-app-data-settings__copy label { display: grid; min-width: 0; gap: 6px; color: var(--text-default); font-size: 12px; font-weight: 600; }
 .workspace-app-data-settings__copy .manor-input, .workspace-app-data-settings__tab .manor-input, .workspace-app-data-settings__block-copy .manor-input { width: 100%; min-width: 0; font-size: 13px; }
-.workspace-app-data-settings__copy select { width: 100%; min-height: 38px; padding: 8px 10px; border: 1px solid var(--border-subtle); border-radius: var(--radius-control); background: var(--surface-panel); color: var(--text-default); font: inherit; }
+.workspace-app-data-settings__copy select { width: 100%; min-height: 38px; padding: 8px 10px; border: 0.5px solid var(--border-subtle); border-radius: var(--radius-control); background: var(--surface-panel); color: var(--text-default); font: inherit; }
 .workspace-app-data-settings fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
 .workspace-app-data-settings legend { margin-bottom: 10px; color: var(--text-default); font-size: 12px; font-weight: 600; }
 .workspace-app-data-settings__layout { display: flex; flex-wrap: wrap; gap: 12px 24px; }
@@ -119,12 +119,12 @@
 .workspace-app-data-settings__toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-default); cursor: pointer; }
 .workspace-app-data-settings__tabs { display: grid; gap: 10px; margin-top: 14px; }
 .workspace-app-data-settings__tab-add { display: flex; gap: 6px; align-items: center; }
-.workspace-app-data-settings__tab-add select, .workspace-app-data-settings__block-controls select { min-width: 0; max-width: 170px; min-height: 30px; padding: 4px 7px; border: 1px solid var(--border-subtle); border-radius: var(--radius-control); background: var(--surface-panel); color: var(--text-default); font: inherit; font-size: 11px; }
-.workspace-app-data-settings__tab { display: grid; gap: 4px; padding: 7px 0; border-top: 1px solid var(--border-subtle); }
+.workspace-app-data-settings__tab-add select, .workspace-app-data-settings__block-controls select { min-width: 0; max-width: 170px; min-height: 30px; padding: 4px 7px; border: 0.5px solid var(--border-subtle); border-radius: var(--radius-control); background: var(--surface-panel); color: var(--text-default); font: inherit; font-size: 11px; }
+.workspace-app-data-settings__tab { display: grid; gap: 4px; padding: 7px 0; border-top: 0.5px solid var(--border-subtle); }
 .workspace-app-data-settings__tab-head { justify-content: flex-start; }
 .workspace-app-data-settings__tab-head > span { margin-left: auto; }
 .workspace-app-data-settings__blocks { display: grid; gap: 2px; }
-.workspace-app-data-settings__block { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 12px 0; border-top: 1px solid var(--border-subtle); }
+.workspace-app-data-settings__block { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 12px 0; border-top: 0.5px solid var(--border-subtle); }
 .workspace-app-data-settings__block-copy { display: grid; min-width: 0; gap: 5px; }
 .workspace-app-data-settings__block-controls { justify-content: flex-start; }
 .workspace-app-data-settings__media { grid-column: 1 / -1; display: grid; gap: 8px; padding-top: 2px; }
@@ -132,14 +132,14 @@
 .workspace-app-data-settings__media > div, .workspace-app-data-settings__media > label { display: grid; grid-template-columns: minmax(0, 1fr) minmax(130px, .6fr) auto; align-items: center; gap: 8px; min-width: 0; color: var(--text-default); font-size: 12px; }
 .workspace-app-data-settings__media > label { grid-template-columns: auto minmax(0, 1fr); }
 .workspace-app-data-settings__media span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.workspace-app-data-settings__media select { min-width: 0; min-height: 32px; padding: 5px 8px; border: 1px solid var(--border-subtle); border-radius: var(--radius-control); background: var(--surface-panel); color: var(--text-default); font: inherit; font-size: 12px; }
+.workspace-app-data-settings__media select { min-width: 0; min-height: 32px; padding: 5px 8px; border: 0.5px solid var(--border-subtle); border-radius: var(--radius-control); background: var(--surface-panel); color: var(--text-default); font: inherit; font-size: 12px; }
 .workspace-app-data-settings__text-button { min-height: 32px; padding: 4px 6px; border: 0; background: transparent; font: inherit; font-size: 12px; color: var(--text-muted); cursor: pointer; }
 .workspace-app-data-settings__text-button:hover { color: var(--text-strong); }
 .workspace-app-data-settings__text-button:disabled { opacity: .5; cursor: default; }
 .workspace-app-data-settings__disclosure { min-width: 0; }
 .workspace-app-data-settings__disclosure summary { padding: 8px 0; color: var(--text-default); font-size: 12px; cursor: pointer; }
 .workspace-app-data-settings__disclosure[open] > .workspace-app-data-settings__copy { margin: 12px 0; }
-.workspace-app-data-settings__hidden-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-top: 1px solid var(--border-subtle); }
+.workspace-app-data-settings__hidden-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-top: 0.5px solid var(--border-subtle); }
 .workspace-app-data-settings__hidden-item > div { display: grid; gap: 3px; color: var(--text-default); font-size: 13px; }
 .workspace-app-data-settings :is(summary, select):focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .workspace-app-data-settings__notice { margin: 0; }

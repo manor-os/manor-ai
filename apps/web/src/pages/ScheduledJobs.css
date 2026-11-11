@@ -1,0 +1,367 @@
+.scheduled-job-card--disabled {
+  opacity: 0.78;
+}
+
+.scheduled-job-row:hover {
+  background: rgba(250, 250, 249, 0.5);
+}
+
+.scheduled-job-title {
+  color: var(--text-strong);
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.scheduled-job-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.scheduled-job-error-summary {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+  margin-top: 5px;
+  color: var(--editor-danger-text);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.scheduled-job-error-summary > span:first-child {
+  flex-shrink: 0;
+  font-weight: 700;
+}
+
+.scheduled-job-error-message {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scheduled-job-actions {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 4px;
+}
+
+.scheduled-automation-list-header,
+.scheduled-automation-grid {
+  display: grid;
+  grid-template-columns:
+    38px
+    minmax(260px, 1fr)
+    minmax(150px, 220px)
+    72px
+    250px
+    14px;
+  align-items: center;
+  column-gap: 12px;
+}
+
+.scheduled-automation-grid {
+  padding: 12px 14px;
+}
+
+.scheduled-automation-icon-cell {
+  grid-column: 1;
+}
+
+.scheduled-job-info {
+  min-width: 0;
+}
+
+.scheduled-job-last-run {
+  color: var(--text-subtle);
+  font-size: 10px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.scheduled-automation-controls {
+  min-width: 0;
+  justify-content: flex-end;
+}
+
+.scheduled-automation-linked-slot {
+  display: inline-flex;
+  width: 76px;
+  flex-shrink: 0;
+  justify-content: flex-end;
+}
+
+.scheduled-automation-expand {
+  justify-self: end;
+}
+
+.scheduled-automation-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 4px 2px 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+@media (max-width: 720px) {
+.scheduled-automation-grid {
+    grid-template-areas:
+      "icon info expand"
+      ". executor executor"
+      ". last controls";
+    grid-template-columns: 38px minmax(0, 1fr) auto;
+    align-items: start;
+    row-gap: 8px;
+  }
+.scheduled-automation-icon-cell {
+    grid-area: icon;
+  }
+.scheduled-job-info {
+    grid-area: info;
+  }
+.scheduled-job-last-run {
+    grid-area: last;
+    align-self: center;
+  }
+.scheduled-job-separator {
+    display: none;
+  }
+.scheduled-automation-controls {
+    grid-area: controls;
+    width: auto;
+    padding-left: 0;
+  }
+.scheduled-automation-expand {
+    grid-area: expand;
+  }
+.scheduled-automation-linked-slot {
+    width: auto;
+  }
+.scheduled-automation-pagination {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
+html[data-theme="dark"] .scheduled-job-card {
+  color: #ffffff;
+}
+
+html[data-theme="dark"] .scheduled-job-card--disabled {
+  opacity: 0.9;
+}
+
+html[data-theme="dark"] .scheduled-job-row:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+html[data-theme="dark"] .scheduled-job-title,
+html[data-theme="dark"] .scheduled-job-agent-name {
+  color: #ffffff !important;
+}
+
+html[data-theme="dark"] .scheduled-job-meta,
+html[data-theme="dark"] .scheduled-job-last-run {
+  color: rgba(255, 255, 255, 0.72) !important;
+}
+
+html[data-theme="dark"] .scheduled-job-error-summary {
+  color: #e06a64;
+}
+
+html[data-theme="dark"] .scheduled-job-kind {
+  background: rgba(125, 218, 205, 0.1) !important;
+  color: var(--accent) !important;
+}
+
+html[data-theme="dark"] .scheduled-job-separator {
+  color: rgba(255, 255, 255, 0.18) !important;
+}
+
+html[data-theme="dark"] .scheduled-job-agent-chip {
+  background: rgba(255, 255, 255, 0.06) !important;
+  border-color: rgba(255, 255, 255, 0.13) !important;
+}
+
+.scheduled-automation-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.scheduled-automation-list .scheduled-automation-grid {
+  grid-template-columns: 38px minmax(0, 1fr) auto 14px;
+  grid-template-areas:
+    "icon info controls expand"
+    "icon foot controls expand";
+  column-gap: 12px;
+  row-gap: 2px;
+  width: auto !important;
+  min-width: 0 !important;
+}
+
+.scheduled-automation-list .scheduled-automation-icon-cell { grid-area: icon; align-self: center; }
+
+.scheduled-automation-list .scheduled-job-info { grid-area: info; }
+
+.scheduled-automation-list .scheduled-automation-controls { grid-area: controls; align-self: center; width: auto; min-width: 0; }
+
+.scheduled-automation-list .scheduled-automation-expand { grid-area: expand; align-self: center; }
+
+.scheduled-automation-list .scheduled-job-kind,
+.scheduled-automation-list .workspace-workflow-automation-kind {
+  display: none !important;
+}
+
+.scheduled-automation-foot {
+  grid-area: foot;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.scheduled-automation-foot .scheduled-job-last-run {
+  display: inline;
+  width: auto;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.scheduled-automation-list .scheduled-automation-controls > .btn-manor-ghost,
+.scheduled-automation-list .scheduled-automation-controls > .workspace-workflow-automation-action { order: 1; }
+
+.scheduled-automation-list .scheduled-automation-controls > button[role="switch"] { order: 2; margin-left: 4px; }
+
+@media (max-width: 720px) {
+.scheduled-automation-list .scheduled-automation-grid {
+    grid-template-columns: 38px minmax(0, 1fr) 14px;
+    grid-template-areas:
+      "icon info expand"
+      "icon foot expand"
+      ". controls controls";
+  }
+}
+
+.scheduled-automation-list .scheduled-job-card {
+  position: relative;
+  border: none !important;
+  border-radius: 14px !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.scheduled-automation-list .scheduled-job-card + .scheduled-job-card::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 14px;
+  left: 14px;
+  height: 0.5px;
+  background: var(--border-subtle);
+}
+
+.scheduled-automation-list .scheduled-job-card:hover {
+  background: rgba(118, 118, 128, 0.08) !important;
+  transform: none;
+}
+
+.scheduled-automation-list .scheduled-job-kind,
+.scheduled-automation-list .workspace-workflow-automation-kind {
+  padding: 0 !important;
+  border: none !important;
+  background: transparent !important;
+  color: var(--text-muted) !important;
+  font-weight: 400 !important;
+}
+
+.scheduled-automation-list .scheduled-job-separator {
+  display: none;
+}
+
+.scheduled-automation-list .scheduled-automation-icon-cell {
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.scheduled-automation-list .scheduled-job-title {
+  color: var(--text-strong) !important;
+  font-weight: 500 !important;
+}
+
+.scheduled-automation-list .scheduled-job-meta,
+.scheduled-automation-list .scheduled-job-meta .mono {
+  font-family: inherit;
+  color: var(--text-muted);
+}
+
+.scheduled-automation-list .scheduled-automation-controls .btn-manor-ghost,
+.scheduled-automation-list .scheduled-automation-controls .workspace-workflow-automation-action {
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.scheduled-automation-list .scheduled-job-card:hover .scheduled-automation-controls .btn-manor-ghost,
+.scheduled-automation-list .scheduled-job-card:hover .scheduled-automation-controls .workspace-workflow-automation-action,
+.scheduled-automation-list .scheduled-automation-controls :focus-visible {
+  opacity: 1;
+}
+
+@media (hover: none) {
+.scheduled-automation-list .scheduled-automation-controls .btn-manor-ghost,
+  .scheduled-automation-list .scheduled-automation-controls .workspace-workflow-automation-action {
+    opacity: 1;
+  }
+}
+
+.scheduled-automation-list--grouped .scheduled-automation-grid {
+  grid-template-columns: minmax(0, 1fr) auto 14px;
+  grid-template-areas:
+    "info controls expand"
+    "foot controls expand";
+}
+
+.scheduled-automation-list--grouped .scheduled-automation-icon-cell { display: none !important; }
+
+.scheduled-automation-list--grouped .scheduled-job-card { border-radius: 0 !important; }
+
+/* A row says what it is and how it last went; everything else opens with it. */
+.scheduled-automation-list--grouped .scheduled-automation-foot { display: none; }
+.scheduled-automation-list--grouped .scheduled-automation-grid { padding: 9px 14px; align-items: center; grid-template-areas: "info controls expand"; }
+.scheduled-job-title-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.scheduled-automation-list--grouped .scheduled-job-title { overflow: hidden; color: var(--text-strong); font-size: 14px; font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
+/* One line: the schedule and workflow give way first, so how it last went always shows. */
+.scheduled-automation-list--grouped .scheduled-job-meta { display: flex; flex-wrap: nowrap; min-width: 0; margin-top: 1px; color: var(--text-muted); font-size: 13px; white-space: nowrap; }
+.scheduled-automation-list--grouped .scheduled-job-meta > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.scheduled-automation-list--grouped .scheduled-job-meta > span:nth-child(2) { flex-shrink: 1000; }
+.scheduled-automation-list--grouped .scheduled-job-meta > span:last-child { flex: none; }
+.scheduled-automation-list--grouped .scheduled-job-meta > span + span::before { content: "\00a0·\00a0"; }
+.scheduled-job-last-run { color: inherit; font-size: inherit; }
+.scheduled-job-error-summary { color: var(--editor-danger-text, #a23e38); font-size: inherit; }
+.scheduled-automation-list--grouped .scheduled-job-error-summary { display: block; margin-top: 0; line-height: inherit; }
+.scheduled-job-error-detail { margin: 10px 0 0; color: var(--text-muted); font-size: 13px; line-height: 1.5; }
+.scheduled-group-link { color: inherit; text-decoration: none; }
+.scheduled-group-link:hover { color: var(--text-strong); }
+.scheduled-run-detail { margin: 2px 0 8px 18px; padding: 10px 12px; border-radius: 10px; background: var(--surface-panel); box-shadow: 0 0 0 0.5px var(--border-subtle); font-size: 13px; }
+.scheduled-run-outcome { margin: 0; color: var(--text-strong); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.scheduled-run-outcome.is-empty { color: var(--text-muted); }
+.scheduled-run-technical { margin-top: 8px; color: var(--text-muted); }
+.scheduled-run-technical > summary { cursor: pointer; font-size: 13px; }
+/* Phones have no hover: a row's actions appear once it is opened, so the text keeps its width. */
+@media (hover: none), (max-width: 720px) {
+  .scheduled-automation-list--grouped .scheduled-job-row[aria-expanded="false"] .scheduled-job-actions > button { display: none; }
+  .scheduled-automation-list--grouped .scheduled-job-row[aria-expanded="true"] {
+    grid-template-columns: minmax(0, 1fr) 14px;
+    grid-template-areas: "info expand" "controls controls";
+    row-gap: 6px;
+  }
+  .scheduled-automation-list--grouped .scheduled-job-row[aria-expanded="true"] .scheduled-job-actions { justify-content: flex-end; }
+}

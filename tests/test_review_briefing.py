@@ -28,7 +28,7 @@ from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.base import generate_ulid
 from packages.core.models.consolidation_report import ConsolidationReport
 from packages.core.models.review_run import ReviewRun
-from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition, WorkflowRun
+from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition, WorkflowProject, WorkflowRun
 from packages.core.models.workspace import Workspace
 from packages.core.review import begin_review
 from packages.core.review.briefing import (
@@ -482,6 +482,13 @@ async def test_workflow_runs_include_state_results_and_latest_retry(db_session):
         ]
     )
     await db_session.flush()
+    # The running video owns its project and folder; a finished run's project is not held.
+    video = WorkflowProject(entity_id=ENTITY_ID, workspace_id=workspace.id, project_type="video", created_by="u",
+                            state={"project_root": "projects/why-farm"}, last_run_id=running_id)
+    db_session.add_all([video, WorkflowProject(
+        entity_id=ENTITY_ID, workspace_id=workspace.id, project_type="video", created_by="u",
+        state={"project_root": "projects/cities"}, last_run_id=completed_id)])
+    await db_session.flush()
     # Freeze a review window after the terminal runs settled.
     await _emit(
         db_session,
@@ -510,6 +517,8 @@ async def test_workflow_runs_include_state_results_and_latest_retry(db_session):
     assert running.scheduled_job_id == "daily-video-7am"
     assert running.workflow_slug == "create-stickman-video"
     assert running.blueprint_slug == "faceless-stickman-video-studio"
+    assert (running.project_id, running.project_type, running.project_folder) == (video.id, "video", "projects/why-farm")
+    assert by_id[completed_id].project_id is None
 
     completed = by_id[completed_id]
     assert completed.business_outcome == "published"
@@ -534,6 +543,8 @@ async def test_workflow_runs_include_state_results_and_latest_retry(db_session):
     rendered = render_briefing_markdown(briefing)
     assert "## Workflow runs" in rendered
     assert "[running] flow=create-stickman-video" in rendered
+    assert f"owns project={video.id} (video) folder=projects/why-farm" in rendered
+    assert "projects/cities" not in rendered
     assert "business_outcome=published" in rendered
     assert "https://youtu.be/abc123" in rendered
     assert "Chrome is not connected" in rendered

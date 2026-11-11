@@ -105,6 +105,9 @@ export const REALTIME_RESYNC_QUERY_ROOTS: ReadonlySet<string> = new Set([
   "workspace-pending-attention",
   "workspace-attention-message",
   "workflow-run",
+  "workflow-run-history-control",
+  "workspace-app-view",
+  "workspace-app-section",
   "workflow-runs",
   "workspace-workflow-runs",
   "workspace-chat-workflow-run-family",
@@ -118,7 +121,6 @@ export const REALTIME_RESYNC_QUERY_ROOTS: ReadonlySet<string> = new Set([
   "chat-room-reply-approvals",
   "approvals",
   "approval-command",
-  "dashboard-stats",
 ]);
 
 export function invalidateRealtimeQueries(

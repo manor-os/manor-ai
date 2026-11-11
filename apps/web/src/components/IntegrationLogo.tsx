@@ -22,7 +22,7 @@ export default function IntegrationLogo({
 }) {
   const brand = resolveIntegrationBrand(provider);
   const [failedSrc, setFailedSrc] = useState<string>();
-  const color = brand?.color || "#78716c";
+  const color = brand?.color || "#8e8e93";
   const rgb = color.slice(1).match(/../g)?.map(value => parseInt(value, 16)) || [120, 113, 108];
   const brightness = (rgb[0] * 299 + rgb[1] * 587 + rgb[2] * 114) / 1000;
   const icon = brand?.icon;

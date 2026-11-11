@@ -31,7 +31,7 @@ export default function ManorAvatar({
         minWidth: size,
         minHeight: size,
         borderRadius: radius,
-        background: "#1c1917",
+        background: "#1d1d1f",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",

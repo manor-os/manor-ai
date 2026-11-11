@@ -99,28 +99,24 @@ function ratioValue(ratio: string): number {
   return width && height ? width / height : 1;
 }
 
-/** A track to listen to: its name over its waveform; the file loads when the reviewer presses play. */
+/** A track to listen to: its name over its waveform; it streams once the reviewer presses play. */
 function ReviewTrack({ artifact }: { artifact: ReviewArtifactReference }) {
   const [requested, setRequested] = useState(false);
   const media = useQuery({
     queryKey: ["workflow-review-track", artifact.documentId],
-    queryFn: () => api.documents.previewBlob(artifact.documentId!, { cache: true }),
+    // It plays while it downloads; the waveform is read from the same address behind it.
+    queryFn: () => api.documents.streamUrl(artifact.documentId!),
     enabled: requested,
     staleTime: Infinity,
     retry: false,
   });
-  const [src, setSrc] = useState<string | null>(null);
-  useEffect(() => {
-    if (!media.data) return;
-    const url = URL.createObjectURL(media.data);
-    setSrc(url);
-    return () => URL.revokeObjectURL(url);
-  }, [media.data]);
   const label = artifact.label || t("component.workflow_review.recording");
   const state = media.isFetching ? "loading" : media.isError ? "failed" : "idle";
   return <figure className="workflow-review-track">
     <figcaption><span className="workflow-review-track__icon" aria-hidden="true"><IconMusicNote size={16} /></span><strong title={label}>{label}</strong></figcaption>
-    {media.data && src ? <AudioWaveform src={src} data={media.data} label={label} autoPlay /> : (
+    {/* Only a press here plays it: coming back to a track already loaded (another tab, the card
+        settling after a decision) shows it paused. */}
+    {media.data ? <AudioWaveform src={media.data} label={label} autoPlay={requested} /> : (
       <button type="button" className={`workflow-review-track__start is-${state}`} onClick={() => setRequested(true)}
         aria-label={t("component.workflow_review.play", { name: label })} aria-busy={media.isFetching} disabled={media.isFetching}>
         <span className="audio-waveform__play" aria-hidden="true">
@@ -137,7 +133,7 @@ function ReviewTrack({ artifact }: { artifact: ReviewArtifactReference }) {
 // A still waveform shown before the track loads; the real one replaces it.
 const TRACK_BARS = Array.from({ length: 64 }, (_, index) => Math.round(28 + 52 * Math.abs(Math.sin(index * 0.55) * Math.cos(index * 0.17))));
 
-/** A recording plays in place; its bytes load only when the reviewer presses play. */
+/** A recording plays in place, streaming once the reviewer presses play. */
 export function ReviewPlayer({ artifact }: { artifact: ReviewArtifactReference }) {
   if (artifact.kind === "audio") return <ReviewTrack artifact={artifact} />;
   return <ReviewVideo artifact={artifact} />;
@@ -150,7 +146,8 @@ function ReviewVideo({ artifact }: { artifact: ReviewArtifactReference }) {
   const portrait = Boolean(ratio && ratioValue(ratio) < 1);
   const media = useQuery({
     queryKey: ["workflow-review-media", artifact.documentId],
-    queryFn: () => api.documents.preview(artifact.documentId!, { cache: true }),
+    // The player starts on the first slice and fetches the rest as it plays.
+    queryFn: () => api.documents.streamUrl(artifact.documentId!),
     enabled: requested,
     staleTime: Infinity,
     retry: false,
@@ -158,8 +155,8 @@ function ReviewVideo({ artifact }: { artifact: ReviewArtifactReference }) {
   const label = artifact.label || t("component.workflow_review.recording");
   if (media.data) {
     return artifact.kind === "video"
-      ? <video className={`workflow-review-player${portrait ? " is-portrait" : ""}`} src={media.data} controls autoPlay playsInline aria-label={label} />
-      : <figure className="workflow-review-audio"><figcaption>{label}</figcaption><audio src={media.data} controls autoPlay /></figure>;
+      ? <video className={`workflow-review-player${portrait ? " is-portrait" : ""}`} src={media.data} controls autoPlay={requested} playsInline aria-label={label} />
+      : <figure className="workflow-review-audio"><figcaption>{label}</figcaption><audio src={media.data} controls autoPlay={requested} /></figure>;
   }
   const state = media.isFetching ? "loading" : media.isError ? "failed" : "idle";
   return (
@@ -188,23 +185,38 @@ function ReviewVideo({ artifact }: { artifact: ReviewArtifactReference }) {
 // Markdown rendering loads only when a review holds written work.
 const ChatMarkdown = lazy(() => import("../ChatMarkdown"));
 
-/** A written deliverable (a storyboard, captions, a script) is read in place. */
-export function ReviewText({ artifact }: { artifact: ReviewArtifactReference }) {
+// A written file longer than this opens as its first lines.
+const PREVIEW_CHARACTERS = 480;
+const PREVIEW_LINES = 8;
+
+/** A written deliverable (a storyboard, captions, a script) is read in place.
+ *  As a preview (a review in a conversation) a long one shows its first lines
+ *  and opens in full on request; its file card stays below it. */
+export function ReviewText({ artifact, preview = false }: { artifact: ReviewArtifactReference; preview?: boolean }) {
+  const [expanded, setExpanded] = useState(false);
   const text = useQuery({
     queryKey: ["workflow-review-text", artifact.documentId],
     queryFn: async () => (await api.documents.previewBlob(artifact.documentId!, { cache: true })).text(),
     staleTime: Infinity,
     retry: false,
   });
+  const long = preview && Boolean(text.data)
+    && (text.data!.length > PREVIEW_CHARACTERS || text.data!.split("\n").length > PREVIEW_LINES);
   return (
     <section className="workflow-review-text" aria-label={artifact.label}>
       {text.data
-        ? <div className="workflow-review-text__body">
+        ? <div className={`workflow-review-text__body${long ? (expanded ? " is-expanded" : " is-collapsed") : ""}`}>
           <Suspense fallback={<pre className="workflow-review-write">{text.data}</pre>}>
-            <ChatMarkdown content={text.data} enableFileCards={false} />
+            <ChatMarkdown content={text.data} enableFileCards={false} preserveReferences />
           </Suspense>
         </div>
         : <p className="workflow-review-text__state">{text.isError ? t("component.workflow_review.play_failed") : t("component.workflow_review.loading")}</p>}
+      {long && (
+        <Button variant="ghost" size="sm" className="workflow-review-text__more" aria-expanded={expanded}
+          onClick={() => setExpanded((current) => !current)}>
+          {t(expanded ? "chat.show_less" : "chat.show_more")}
+        </Button>
+      )}
       <InlineFileReferenceCard reference={artifact.reference} label={artifact.label} compact />
     </section>
   );
@@ -246,7 +258,7 @@ export default function ReviewDeliverables({ artifacts, pages, compact = false }
         ))}
       </div>}
       {zoom !== null && zoomItems[zoom] && <ReviewZoom items={zoomItems} index={zoom} onIndex={setZoom} onClose={() => setZoom(null)} />}
-      {texts.map((artifact) => <ReviewText key={artifact.key} artifact={artifact} />)}
+      {texts.map((artifact) => <ReviewText key={artifact.key} artifact={artifact} preview={compact} />)}
       {files.length > 0 && <div className="chat-workflow-review-artifacts">
         {files.map((artifact) => <InlineFileReferenceCard key={artifact.key} reference={artifact.reference} label={artifact.label} compact />)}
       </div>}

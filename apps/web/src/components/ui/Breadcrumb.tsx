@@ -24,7 +24,7 @@ export default function Breadcrumb({ items }: BreadcrumbProps) {
                 height="14"
                 viewBox="0 0 24 24"
                 fill="none"
-                stroke="#a8a29e"
+                stroke="#aeaeb2"
                 strokeWidth={2}
                 strokeLinecap="round"
                 strokeLinejoin="round"

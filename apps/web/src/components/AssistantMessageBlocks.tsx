@@ -1,6 +1,6 @@
 import ChatMarkdown from "./ChatMarkdown";
 import CollapsibleSentMessage from "./chat/CollapsibleSentMessage";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { CSSProperties } from "react";
 import type {
   AssistantBlock,
@@ -42,6 +42,7 @@ import {
   coalesceWorkspaceLedgerQueryBlocks,
   isWorkspaceLedgerOverview,
   isWorkspaceLedgerQueryVisualization,
+  omitEmptyLedgerResults,
   workspaceLedgerOverviewFrameHeights,
   workspaceLedgerQueryFrameHeights,
 } from "../lib/workspaceLedgerVisualization";
@@ -50,8 +51,15 @@ import ToolActivityGroup from "./ui/ToolActivityGroup";
 import { summarizeToolActivity } from "../lib/toolActivitySummary";
 import AgentActivityOrb, { agentActivityLabel, inferAgentActivity } from "./ui/AgentActivityOrb";
 import InteractiveResponseSurface from "./InteractiveResponseSurface";
+import ResponseCard from "./chat/ResponseCard";
+import { RESPONSE_CARD_TEMPLATE_IDS } from "../lib/responseCards";
 import Button from "./ui/Button";
 import { IconInfo } from "./icons";
+
+function isResponseCardBlock(block: AssistantBlock): boolean {
+  return block.type === "surface" && block.render.kind === "template"
+    && RESPONSE_CARD_TEMPLATE_IDS.has(block.render.template_id);
+}
 
 export type AssistantPendingActionKind = "approval" | "input" | null;
 
@@ -151,6 +159,7 @@ function CollapsibleFinalMarkdown({
         streaming={streaming}
         returnTo={returnTo}
         enableFileCards={enableFileCards}
+        showFilesInPlace={!isUser}
       />
     </CollapsibleSentMessage>
   );
@@ -361,7 +370,7 @@ function processVerb(step: AssistantProcessStep) {
         action: action.replace(/_/g, " "),
       });
     }
-    return t("component.assistant_process.tool.manor.action", { action: "Manor" });
+    return t("component.assistant_process.tool.manor.generic");
   }
   if (name.startsWith("mcp__")) {
     return mcpProcessVerb(name, args, genericTarget);
@@ -985,6 +994,9 @@ function AssistantProcessBlock({
   const hasNotRunApproval = [...approvalGateStatuses.values()].includes("not_run");
   const hasRecoveredError = displaySteps.some((step) => step.status === "error" && step.recovered_by_step_id && !isWebsiteAccessDenied(step));
   const [expandedOverride, setExpandedOverride] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (block.lifecycle_status === "failed") setExpandedOverride(null);
+  }, [block.lifecycle_status]);
   const subAgentRunByStep = useMemo(
     () => matchSubAgentRuns(steps, subAgentRuns),
     [steps, subAgentRuns],
@@ -1143,7 +1155,7 @@ function AssistantProcessBlock({
   );
 
   return (
-    <section className="assistant-process-flow" role={!isLiveTurn && processFailed ? "alert" : undefined}>
+    <section className="assistant-process-flow" role={!isLiveTurn && processFailed && lifecycle !== "failed" ? "alert" : undefined}>
       {timeline.length > 0 ? <button
         className="assistant-process-flow-header"
         type="button"
@@ -1248,7 +1260,19 @@ export default function AssistantMessageBlocks({
   const activeQueueStatus = hasLiveProcess ? queueStatus : undefined;
   const content = isUser ? rawContent : stripInternalProtocolText(rawContent);
   const blocks = useMemo(() => {
-    const sanitized = sanitizeAssistantBlocks(rawBlocks);
+    const sanitized = isUser
+      ? sanitizeAssistantBlocks(rawBlocks)
+      : omitEmptyLedgerResults(sanitizeAssistantBlocks(rawBlocks), content || "");
+    if (!isUser && sanitized.some((block) => block.type === "process" && block.lifecycle_status === "failed")) {
+      // Put the terminal explanation before inspectable activity, including
+      // older failed snapshots that only carried the explanation in content.
+      const finalText = sanitized.filter((block): block is Extract<AssistantBlock, { type: "text" }> =>
+        block.type === "text" && block.phase === "final" && Boolean(block.text.trim()),
+      ).map((block) => block.text).join("\n\n");
+      return [{ id: `${keyPrefix}-failure`, type: "text" as const, phase: "final" as const,
+        text: finalText || content || t("lib.chat_stream.request_failed_with_detail").split("\n\n", 1)[0] },
+      ...sanitized.filter((block) => block.type === "process")];
+    }
     if (!isUser && !sanitized.some((block) => block.type === "process")
       && (hasLiveProcess || pendingActionKind || sanitized.length || content)) {
       // Live placeholders and legacy prose share the same presentation. An
@@ -1268,6 +1292,7 @@ export default function AssistantMessageBlocks({
   }, [rawBlocks, content, activeQueueStatus, hasLiveProcess, pendingActionKind, isUser, keyPrefix]);
 
   if (!Array.isArray(blocks) || blocks.length === 0) return null;
+  const failed = blocks.some((block) => block.type === "process" && block.lifecycle_status === "failed");
 
   const {
     authoritativeContent,
@@ -1281,7 +1306,7 @@ export default function AssistantMessageBlocks({
     progressByStepSeq,
     trailingProgressText,
     shouldSuppressFinalText,
-  } = projectAssistantText(content, blocks, streaming);
+  } = projectAssistantText(failed ? "" : content, blocks, streaming);
   const firstProcessIndex = blocks.findIndex((block) => block.type === "process");
   const lastProcessIndex = blocks.reduce((last, block, index) => block.type === "process" ? index : last, -1);
 
@@ -1333,6 +1358,11 @@ export default function AssistantMessageBlocks({
       {blocks.map((block, index) => {
         if (block.type === "text") {
           if (!block.text) return null;
+          if (failed) return (
+            <div key={block.id || `${keyPrefix}-failure`} role="alert">
+              <ChatMarkdown content={formatUserFacingStructuredText(block.text)} returnTo={returnTo} enableFileCards={enableFileCards} />
+            </div>
+          );
           if (firstProcessIndex < 0 && block.phase === "opening" && streaming && !hasFinalOutput) {
             return (
               <div key={block.id || `${keyPrefix}-opening-${index}`} className={`assistant-process-commentary${streaming ? " assistant-process-commentary--live" : ""}`}>
@@ -1363,6 +1393,8 @@ export default function AssistantMessageBlocks({
             />
           );
         }
+        // Cards follow the reply's words, below, wherever their tool ran.
+        if (isResponseCardBlock(block)) return null;
         if (block.type === "surface") {
           return (
             <InteractiveResponseSurface
@@ -1433,6 +1465,9 @@ export default function AssistantMessageBlocks({
           enableFileCards={enableFileCards}
         />
       )}
+      {blocks.map((block, index) => isResponseCardBlock(block)
+        ? <ResponseCard key={block.id || `${keyPrefix}-card-${index}`} surface={block as AssistantResponseSurfaceBlock} />
+        : null)}
     </>
   );
 }

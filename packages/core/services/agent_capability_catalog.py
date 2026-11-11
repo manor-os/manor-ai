@@ -7,6 +7,7 @@ names or a different resource with a similar slug.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Iterable
@@ -49,6 +50,13 @@ class AgentCapabilitySelectionError(ValueError):
     """Raised before any Agent row is written when a selection is invalid."""
 
 
+# Enough of a description to tell whether a candidate may be relevant; the
+# final review reads the longer one.
+_SCAN_DESCRIPTION_CHARS = 120
+# One server's or Skill's action names say what it does long before this many.
+_REVIEW_ACTION_NAMES = 40
+
+
 @dataclass(frozen=True)
 class AgentCapabilityCandidate:
     catalog_id: str
@@ -87,6 +95,30 @@ class AgentCapabilityCandidate:
                 payload["effect"] = effect
         elif self.actions:
             payload["actions"] = list(self.actions)
+        return payload
+
+    def scan_dict(self) -> dict[str, Any]:
+        """What a recall scan needs to tell whether this candidate may be relevant."""
+        return {
+            "id": self.catalog_id,
+            "name": self.name,
+            "description": self.description[:_SCAN_DESCRIPTION_CHARS],
+        }
+
+    def review_dict(self) -> dict[str, Any]:
+        """``prompt_dict`` without what a least-privilege review cannot act on.
+
+        It selects the candidate, not its actions, so a long action list only
+        has to show what the candidate covers, and a setup reason changes nothing.
+        """
+        payload = self.prompt_dict()
+        payload.pop("setup_required_reason", None)
+        if "actions" in payload:
+            payload["actions"] = [
+                str(action.get("name")) for action in self.actions[:_REVIEW_ACTION_NAMES]
+            ]
+            if len(self.actions) > _REVIEW_ACTION_NAMES:
+                payload["actions_total"] = len(self.actions)
         return payload
 
 
@@ -139,6 +171,86 @@ class AgentCapabilityCatalog:
 
     def prompt_payload(self) -> list[dict[str, Any]]:
         return [candidate.prompt_dict() for candidate in self.candidates]
+
+    def selectable_candidates(self) -> tuple[AgentCapabilityCandidate, ...]:
+        """What a matcher may choose from.
+
+        A Skill whose dependencies are not offered here (its provider is still
+        coming soon) can only fail when the Agent is saved, so it is left out,
+        as runtime discovery leaves it out. It stays in ``candidates``: an exact
+        binding, such as a Blueprint's, still resolves against it.
+        """
+        native_tools, mcp_tools = self._dependency_index()
+        return tuple(
+            candidate for candidate in self.candidates
+            if not candidate.metadata.get("grouped")
+            and (candidate.kind is not AgentCapabilityKind.SKILL or all(
+                dependency in native_tools or len(mcp_tools.get(dependency, ())) == 1
+                for dependency in _unique_strings(candidate.metadata.get("declared_tools") or ())
+            ))
+        )
+
+    def _dependency_index(self) -> tuple[
+        dict[str, AgentCapabilityCandidate],
+        dict[str, list[tuple[AgentCapabilityCandidate, str]]],
+    ]:
+        """The native tools and the exact MCP actions a Skill's dependency can name."""
+        native_tools = {
+            candidate.ref: candidate for candidate in self.candidates
+            if candidate.kind is AgentCapabilityKind.TOOL
+            and not candidate.ref.startswith("mcp__")
+        }
+        mcp_tools: dict[str, list[tuple[AgentCapabilityCandidate, str]]] = {}
+        for candidate in self.candidates:
+            if candidate.kind is not AgentCapabilityKind.MCP_ACTION:
+                continue
+            provider = canonical_provider_key(candidate.metadata.get("server_key") or candidate.ref)
+            for operation in candidate.actions:
+                tool_name = str(operation.get("tool_name") or "").strip()
+                action = str(operation.get("name") or "").strip()
+                parts = tool_name.split("__", 2)
+                if (
+                    len(parts) == 3 and parts[0] == "mcp"
+                    and canonical_provider_key(parts[1]) == provider
+                    and action == parts[2] and action
+                    and candidate.metadata.get("action", action) == action
+                ):
+                    mcp_tools.setdefault(tool_name, []).append((candidate, action))
+        return native_tools, mcp_tools
+
+    def scan_payload(self) -> list[dict[str, Any]]:
+        """The selectable catalog in few tokens, for the semantic recall rounds.
+
+        An MCP server's actions share one row of exact ids: they are most of
+        the catalog, their ids already name them, and the final review reads
+        the recalled ones in full.
+        """
+        rows: list[dict[str, Any]] = []
+        servers: dict[str, dict[str, Any]] = {}
+        for candidate in self.selectable_candidates():
+            if candidate.kind is not AgentCapabilityKind.MCP_ACTION or not candidate.metadata.get("action"):
+                rows.append(candidate.scan_dict())
+                continue
+            server = servers.get(candidate.ref)
+            if server is None:
+                server = servers[candidate.ref] = {"server": candidate.ref, "action_ids": []}
+                rows.append(server)
+            server["action_ids"].append(candidate.catalog_id)
+        return rows
+
+    def review_payload(self, catalog_ids: Iterable[str]) -> list[dict[str, Any]]:
+        """The recalled candidates in full, in catalog order, for the final review.
+
+        A recalled BusinessCapability brings its tools along, so the review can
+        keep the ones the Agent needs instead of granting the whole bundle.
+        """
+        recalled = set(catalog_ids)
+        by_id = self.by_id
+        for catalog_id in tuple(recalled):
+            candidate = by_id.get(catalog_id)
+            if candidate is not None and candidate.kind is AgentCapabilityKind.BUSINESS_CAPABILITY:
+                recalled.update(f"tool:{name}" for name in candidate.metadata.get("tool_names") or ())
+        return [candidate.review_dict() for candidate in self.candidates if candidate.catalog_id in recalled]
 
     def workspace_payload(self) -> dict[str, list[dict[str, Any]]]:
         return {
@@ -217,27 +329,7 @@ class AgentCapabilityCatalog:
         # A newly selected Skill includes only its exact, currently visible
         # dependencies. This is a configuration plan, not a runtime grant or a
         # repair of previously saved Agent bindings/revocations.
-        native_tools = {
-            candidate.ref: candidate for candidate in self.candidates
-            if candidate.kind is AgentCapabilityKind.TOOL
-            and not candidate.ref.startswith("mcp__")
-        }
-        mcp_tools: dict[str, list[tuple[AgentCapabilityCandidate, str]]] = {}
-        for candidate in self.candidates:
-            if candidate.kind is not AgentCapabilityKind.MCP_ACTION:
-                continue
-            provider = canonical_provider_key(candidate.metadata.get("server_key") or candidate.ref)
-            for operation in candidate.actions:
-                tool_name = str(operation.get("tool_name") or "").strip()
-                action = str(operation.get("name") or "").strip()
-                parts = tool_name.split("__", 2)
-                if (
-                    len(parts) == 3 and parts[0] == "mcp"
-                    and canonical_provider_key(parts[1]) == provider
-                    and action == parts[2] and action
-                    and candidate.metadata.get("action", action) == action
-                ):
-                    mcp_tools.setdefault(tool_name, []).append((candidate, action))
+        native_tools, mcp_tools = self._dependency_index()
 
         def add_dependency(dependency: str, skill: AgentCapabilityCandidate | None = None) -> None:
             native = native_tools.get(dependency)
@@ -316,7 +408,8 @@ class AgentCapabilityCatalog:
             matches = [
                 candidate.catalog_id
                 for candidate in self.candidates
-                if candidate.kind is kind and candidate.ref == value
+                # An exact Skill binding is the whole Skill, never one of its groups.
+                if candidate.kind is kind and candidate.ref == value and not candidate.metadata.get("group")
             ]
             if matches:
                 requested.extend(matches)
@@ -642,8 +735,22 @@ class AgentCapabilityCatalogFactory:
                 description=str(skill.description or ""),
                 readiness=skill_status,
                 actions=tuple({"name": name} for name in (skill.tools or [])),
-                metadata={"slug": skill.slug, "declared_tools": tuple(skill.tools or ()), **first_setup},
+                metadata={"slug": skill.slug, "declared_tools": tuple(skill.tools or ()), **first_setup,
+                          **({"grouped": True} if skill_tool_groups(skill) else {})},
             ))
+            # A Skill grouped by job (publish, reply, report) is matched one group at a time, so an
+            # Agent gets the actions its work needs; the whole Skill stays for exact bindings.
+            for key, group in skill_tool_groups(skill).items():
+                candidates.append(AgentCapabilityCandidate(
+                    catalog_id=f"skill:{skill.id}#{key}",
+                    kind=AgentCapabilityKind.SKILL,
+                    ref=skill.id,
+                    name=f"{skill.display_name or skill.name} · {group['label']}",
+                    description=group["description"] or str(skill.description or ""),
+                    readiness=skill_status,
+                    actions=tuple({"name": name} for name in group["tools"]),
+                    metadata={"slug": skill.slug, "declared_tools": group["tools"], "group": key, **first_setup},
+                ))
             for provider in required_providers:
                 skills_by_provider.setdefault(canonical_provider_key(provider), []).append({
                     "id": skill.id,
@@ -795,6 +902,25 @@ async def materialize_agent_capability_plan(
         "skills": bound_skills,
         "mcp_servers": bound_mcp,
     }
+
+
+def skill_tool_groups(skill: Any) -> dict[str, dict[str, Any]]:
+    """A Skill's tools grouped by job, from its config: ``{key: {label, description, tools}}``.
+
+    Only tools the Skill declares count; a group with none is left out.
+    """
+    config = getattr(skill, "config", None)
+    groups = config.get("groups") if isinstance(config, dict) else None
+    declared = set(getattr(skill, "tools", None) or ())
+    out: dict[str, dict[str, Any]] = {}
+    for key, group in (groups.items() if isinstance(groups, dict) else ()):
+        if not isinstance(group, dict) or not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", str(key)):
+            continue
+        tools = tuple(name for name in _unique_strings(group.get("tools") or ()) if name in declared)
+        if tools:
+            out[str(key)] = {"label": str(group.get("label") or key), "description": str(group.get("description") or ""),
+                             "tools": tools}
+    return out
 
 
 def _unique_strings(values: Iterable[object]) -> list[str]:

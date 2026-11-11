@@ -70,7 +70,7 @@ def _view(row: ApifyCollection) -> dict:
         "status": row.status, "provider_status": row.provider_status,
         "billing_status": row.billing_status,
         "credential_scope": row.credential_scope,
-        "mode": row.spec["mode"], "results_limit": row.spec["results_limit"],
+        "mode": row.spec["mode"], "platform": row.spec.get("platform", "instagram"), "results_limit": row.spec["results_limit"],
         "window": row.spec.get("window"),
         "max_cost_usd": str(row.max_cost_usd), "max_credits": row.max_credits,
         "quote_expires_at": row.quote_expires_at.isoformat(),
@@ -145,7 +145,7 @@ async def quote_collection(*, entity_id: str, user_id: str, workspace_id: str | 
                            credential_scope: str, account_id: str | None, arguments: dict,
                            max_cost_usd: str = "1.00", agent_id: str | None = None,
                            conversation_id: str | None = None) -> dict:
-    from packages.core.services.apify_client import prepare_collection
+    from packages.core.services.apify_client import minimum_charge_usd, prepare_collection
     cap = _decimal(max_cost_usd)
     configured_max = _decimal(os.getenv("APIFY_MAX_RUN_COST_USD", "5.00"))
     if cap is None or cap <= 0 or configured_max is None or configured_max <= 0 or cap > min(configured_max, Decimal("5")):
@@ -155,6 +155,9 @@ async def quote_collection(*, entity_id: str, user_id: str, workspace_id: str | 
         raise ApifyCollectionError("invalid_budget", "Use at most nine decimal places for the collection budget.")
     now = _now()
     spec = prepare_collection(arguments, now=now)
+    minimum = minimum_charge_usd(spec)
+    if minimum is not None and cap < minimum:
+        raise ApifyCollectionError("invalid_budget", f"This collection's Actor needs a budget of at least {minimum} USD.")
     pricing = _pricing(credential_scope)
     scope = dict(entity_id=entity_id, user_id=user_id, workspace_id=workspace_id,
                  credential_scope=credential_scope, account_id=account_id)
@@ -299,7 +302,7 @@ async def start_collection(*, entity_id: str, user_id: str, workspace_id: str | 
             return _view(row)
 
 
-async def _reconcile(collection_id: str, token: str, *, cancel: bool = False) -> dict:
+async def _reconcile(collection_id: str, token: str, *, cancel: bool = False, wait_seconds: int = 0) -> dict:
     from packages.core.services.apify_client import ApifyClient
     async with async_session() as db:
         row = await _locked(db, collection_id)
@@ -320,7 +323,8 @@ async def _reconcile(collection_id: str, token: str, *, cancel: bool = False) ->
         await db.commit()
     try:
         client = ApifyClient(token)
-        run = await client.get_run(run_id)
+        # The claim outlasts the longest wait, so a concurrent check never reads a half-applied run.
+        run = await client.get_run(run_id, wait_seconds=0 if should_abort else wait_seconds)
         if should_abort and run.get("status") not in _TERMINAL:
             run = await client.abort_run(run_id)
         async with async_session() as db:
@@ -351,14 +355,14 @@ async def _reconcile(collection_id: str, token: str, *, cancel: bool = False) ->
 
 async def get_collection(*, entity_id: str, user_id: str, workspace_id: str | None,
                          credential_scope: str, account_id: str | None, collection_id: str,
-                         token: str, include_items: bool = True) -> dict:
+                         token: str, include_items: bool = True, wait_seconds: int = 0) -> dict:
     scope = dict(entity_id=entity_id, user_id=user_id, workspace_id=workspace_id,
                  credential_scope=credential_scope, account_id=account_id)
     async with async_session() as db:
         await _authorize(db, **scope, write=False)
         await _owned(db, collection_id, scope)
         await db.commit()
-    result = await _reconcile(collection_id, token)
+    result = await _reconcile(collection_id, token, wait_seconds=wait_seconds)
     if include_items:
         from packages.core.services.apify_client import ApifyClient, normalize_items
         async with async_session() as db:

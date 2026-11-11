@@ -106,7 +106,10 @@ def _asks(question: str, heard: dict, key: str) -> list:
         return f"{key.title()} used the answer.", None
 
     return [
-        ("", [_call("ask", "request_input", {"question": question, "justification": JUSTIFICATION})]),
+        ("", [_call("ask", "request_input", {
+            "question": question, "justification": JUSTIFICATION,
+            "recommended": "Yes", "recommendation_reason": "It matches the brief.",
+        })]),
         finish,
     ]
 
@@ -376,7 +379,7 @@ async def test_an_approved_child_action_runs_exactly_once(workspace_harness):
     card = (await h.db.execute(select(Message).where(
         Message.response_surface_event_id == f"task-runtime-hitl:{hitl_id}",
     ))).scalar_one()
-    assert card.content.startswith("Asked by Writer, an agent working on this Task")
+    assert card.content.startswith("Asked by Writer, an agent working on ")
     assert card.meta["requested_by_agent"] == "Writer" and card.meta["run_id"] == writer.id
     assert card.author_subscription_id == writer.agent_subscription_id
 
@@ -865,3 +868,25 @@ def test_a_child_tag_is_signed_with_its_root_and_cannot_be_retargeted():
     request.context = {loop_hitl.TASK_AGENT_LOOP_HITL_CONTEXT_KEY: root_tag}
     assert loop_hitl.verified_request_tag(request) == root_tag
     assert loop_hitl.tag_run_kind(root_tag) == loop_hitl.RUN_KIND_ROOT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_type,details,owner,expected", [
+    ("general", {}, "Nova", "Nova is working on “Three Instagram captions” and needs your approval to continue."),
+    ("general", {}, None, "The agent working on “Three Instagram captions” needs your approval to continue."),
+    ("scheduled", {}, "Nova", "The scheduled run of “Three Instagram captions” needs your approval before it can continue."),
+    ("general", {"scheduled_job_id": "job"}, "Nova", "The scheduled run of “Three Instagram captions” needs your approval"),
+    ("general", {"workflow_run_id": "run"}, "Nova", "The workflow working on “Three Instagram captions” needs your approval"),
+])
+async def test_an_approval_card_names_where_the_work_came_from(task_type, details, owner, expected):
+    """Only work that was scheduled calls itself scheduled."""
+    from packages.core.services.task_runtime_approvals import _task_approval_lead
+
+    task = SimpleNamespace(
+        title="Three Instagram captions", task_type=task_type, details=details,
+        owner_subscription_id="sub" if owner else None,
+    )
+    db = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(name=owner)))
+    lead = await _task_approval_lead(db, task, delegated_agent="")
+    assert lead.startswith(expected)
+    assert "scheduled agent" not in lead

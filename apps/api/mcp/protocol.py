@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, Iterable, Optional
 
 from apps.api.mcp.manor_api import ManorApiError
 from apps.api.mcp.registry import Tool, ToolContext, ToolError, ToolImage
+from packages.core.services.oauth_provider_service import MCP_SCOPE, mcp_token_scopes
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +64,7 @@ async def _available(tool: Tool, ctx: ToolContext) -> bool:
 
 def _granted_scopes(claims: dict) -> set[str]:
     # A token from before scopes existed was granted "mcp" only.
-    return set(claims.get("scp") or ["mcp"])
+    return mcp_token_scopes(claims)
 
 
 class McpDispatcher:
@@ -72,6 +74,20 @@ class McpDispatcher:
     @property
     def tools(self) -> dict[str, Tool]:
         return self._tools
+
+    def beyond_scope(self, message: Any, ctx: ToolContext) -> Optional[str]:
+        """The tool a ``tools/call`` names that the token's scope does not reach, if any.
+
+        Checked before any message runs, so the endpoint can answer with the
+        HTTP step-up challenge instead of a partial batch.
+        """
+        if not isinstance(message, dict) or message.get("method") != "tools/call":
+            return None
+        params = message.get("params")
+        tool = self._tools.get(params.get("name")) if isinstance(params, dict) else None
+        if tool is None or tool.allowed(ctx):
+            return None
+        return tool.name
 
     async def handle(self, message: Any, ctx: ToolContext) -> Optional[dict]:
         """One JSON-RPC message → its response, or None for a notification."""
@@ -101,7 +117,7 @@ class McpDispatcher:
             return _result(message_id, {})
         if method == "tools/list":
             return _result(message_id, {"tools": [
-                tool.descriptor() for tool in self._tools.values() if await _available(tool, ctx)
+                tool.descriptor() for tool in self._tools.values() if tool.allowed(ctx) and await _available(tool, ctx)
             ]})
         if method == "tools/call":
             tool = self._tools.get(params.get("name"))
@@ -121,16 +137,29 @@ class McpDispatcher:
         tool = self._tools.get(params.get("name"))
         if tool is None:
             return _text_result(f"unknown tool: {params.get('name')}", is_error=True)
+        if not tool.allowed(ctx):  # the endpoint refuses these first; never run one
+            return _text_result(f"{tool.name} needs the '{MCP_SCOPE}' scope", is_error=True)
         arguments = params.get("arguments") or {}
         if not isinstance(arguments, dict):
             return _text_result("arguments must be an object", is_error=True)
+        started = time.monotonic()
+        outcome = "ok"
         try:
             value = await tool.handler(ctx, arguments)
             return _image_result(value) if isinstance(value, ToolImage) else _text_result(value)
         except ToolError as e:
+            outcome = "tool_error"
             return _text_result(str(e), is_error=True)
         except ManorApiError as e:
+            outcome = f"api_error:{e.status_code}"
             return _text_result({"status": e.status_code, "error": e.detail}, is_error=True)
         except Exception:
+            outcome = "internal_error"
             logger.exception("MCP tool %s failed", tool.name)
             return _text_result(f"{tool.name} failed with an internal error", is_error=True)
+        finally:
+            # Which client did what, never with what arguments.
+            logger.info(
+                "MCP tool call azp=%s tool=%s duration_ms=%d outcome=%s",
+                ctx.claims.get("azp") or "-", tool.name, (time.monotonic() - started) * 1000, outcome,
+            )

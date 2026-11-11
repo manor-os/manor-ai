@@ -1308,18 +1308,28 @@ class RuntimeToolAuthorizationReceiptFactory:
         )
 
 
-async def runtime_workflow_receipt_is_executable(receipt: RuntimeToolAuthorizationReceipt | None) -> bool:
-    """Recheck delegated Workflow state immediately before invoking any tool handler."""
+async def runtime_workflow_receipt_block_result(receipt: RuntimeToolAuthorizationReceipt | None) -> str | None:
+    """Recheck delegated Workflow state immediately before invoking any tool handler.
+
+    ``None`` lets the tool run; otherwise the tool result that stops it, naming
+    why — the Workflow's origin, or the Workspace setup it still needs.
+    """
     if receipt is None or receipt.workflow_run_id is None:
-        return True
+        return None
     from packages.core.database import async_session
-    from packages.core.governance.service import workflow_run_is_executable
+    from packages.core.governance.service import workflow_run_execution_block
 
     async with async_session() as db:
-        return await workflow_run_is_executable(
+        block = await workflow_run_execution_block(
             db, entity_id=receipt.entity_id, workspace_id=receipt.workspace_id,
             user_id=receipt.user_id, workflow_run_id=receipt.workflow_run_id,
         )
+    if block is None:
+        return None
+    return json.dumps(
+        {"error": block.code, **({"reason": block.reason} if block.reason else {}), "action_executed": False},
+        ensure_ascii=False,
+    )
 
 
 class RuntimeAuthorizationLeaseState(str, Enum):

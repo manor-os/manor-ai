@@ -17,6 +17,7 @@ Public API:
   create_draft_shell     -- persist the resumable draft before any LLM work
   start_draft           -- create empty draft + first assistant turn
   process_draft_message -- one user turn -> updated draft + visible reply
+  resume_requested_turn -- answer a turn whose process died (recovery sweep)
   apply_blueprint       -- pre-fill draft fields from a marketplace blueprint
   finalize_draft        -- create the real workspace and mark draft finalized
   get_draft             -- read access for the API
@@ -24,6 +25,7 @@ Public API:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import json
 import logging
@@ -33,7 +35,9 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import Text, and_, func, literal, or_, select, update
+from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -43,9 +47,11 @@ from packages.core.services.workspace_draft_sources import (
 )
 
 from packages.core.constants.blueprints import BlueprintStatus
+from packages.core.i18n import t, text_locale
 from packages.core.constants.workspace_drafts import (
     CREATION_PREFERENCES_FIELD,
     CURRENT_WORKSPACE_DRAFT_SCHEMA_VERSION,
+    STAFF_REQUEST_TEXT_FIELD,
     WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD,
     uses_ui_runtime_mode,
 )
@@ -96,6 +102,34 @@ class WorkspaceDraftMaterializationError(ValueError):
     """A resource failure after provisioning whose savepoint has rolled back."""
 
 
+DRAFT_BUSY_RETRY_SECONDS = 15
+
+
+class WorkspaceDraftBusyError(ValueError):
+    """Another Architect turn (or draft write) holds the draft; retry when it ends."""
+
+    def __init__(self, message: str = "The Architect is still working on this draft. Try again when it finishes."):
+        super().__init__(message)
+
+
+def _is_lock_not_available(exc: BaseException) -> bool:
+    """Postgres lock_timeout (SQLSTATE 55P03), however the driver wraps it."""
+    seen: set[int] = set()
+    stack = [exc]
+    while stack:
+        current = stack.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if str(getattr(current, "sqlstate", None) or getattr(current, "pgcode", None) or "") == "55P03":
+            return True
+        stack.extend(
+            nested for nested in (getattr(current, "orig", None), current.__cause__, current.__context__)
+            if isinstance(nested, BaseException)
+        )
+    return False
+
+
 def opening_user_message(initial_brief: Optional[str]) -> str:
     return (initial_brief or "").strip() or "begin"
 
@@ -125,18 +159,42 @@ async def get_draft(
         query = query.with_for_update()
     if populate_existing:
         query = query.execution_options(populate_existing=True)
-    result = await db.execute(query)
+    try:
+        result = await db.execute(query)
+    except DBAPIError as exc:
+        # Another transaction (a finalize, an older synchronous turn) kept the
+        # row lock past lock_timeout: the draft is busy, not broken.
+        if for_update and _is_lock_not_available(exc):
+            raise WorkspaceDraftBusyError() from exc
+        raise
     return result.scalar_one_or_none()
 
 
 # An Architect turn spans many model rounds (minutes). It owns its draft
-# through this claim, renewed whenever it re-locks the row, instead of an open
-# transaction: a transaction would keep the row lock, a pooled connection and
-# the process's database admission permit through every model call.
+# through this claim, renewed whenever it re-locks the row and by a heartbeat
+# while it waits on the model, instead of an open transaction: a transaction
+# would keep the row lock, a pooled connection and the process's database
+# admission permit through every model call. An expired claim therefore means
+# its process is gone (e.g. a release restarted the pod).
 TURN_CLAIM_FIELD = "_architect_turn"
-TURN_CLAIM_TTL_SECONDS = 300.0
+TURN_CLAIM_TTL_SECONDS = 120.0
+TURN_CLAIM_RENEW_SECONDS = 30.0
 TURN_CLAIM_WAIT_SECONDS = 600.0
 _TURN_CLAIM_POLL_SECONDS = 0.5
+# The message a turn answers, saved (with the user's message in the
+# transcript) before the turn starts and removed with its reply. A request
+# whose claim expired lost its process: the recovery sweep runs it again.
+TURN_REQUEST_FIELD = "_architect_turn_request"
+TURN_RECOVERY_ATTEMPTS = 3
+# A recovery handed to a worker is not handed off again for this long.
+TURN_RECOVERY_HANDOFF_SECONDS = 300.0
+# A lost turn requested longer ago than this is not run again: nobody is
+# waiting on it, and it would spend the user's tokens unattended. It leaves the
+# user's message unanswered for them to continue by sending another. Long
+# enough for a release to interrupt a turn near the recovery task's 30-minute
+# limit, and then its recovery.
+TURN_RECOVERY_MAX_AGE_SECONDS = 3600.0
+_TURN_RECOVERY_BATCH = 50
 
 
 def _turn_claim_active(claim: Any, now: float) -> bool:
@@ -146,6 +204,40 @@ def _turn_claim_active(claim: Any, now: float) -> bool:
         return float(claim.get("expires_at") or 0) > now
     except (TypeError, ValueError):
         return False
+
+
+def turn_in_progress(draft: WorkspaceDraft) -> bool:
+    """Whether a live Architect turn owns the draft right now."""
+    return _turn_claim_active((draft.fields or {}).get(TURN_CLAIM_FIELD), time.time())
+
+
+def _turn_request_expired(request: dict, now: float) -> bool:
+    try:
+        requested_at = float(request.get("requested_at") or 0)
+    except (TypeError, ValueError):
+        requested_at = 0.0
+    return requested_at <= now - TURN_RECOVERY_MAX_AGE_SECONDS
+
+
+def turn_working(draft: WorkspaceDraft) -> bool:
+    """Whether the Architect is answering: a live turn, or one being recovered."""
+    if turn_in_progress(draft):
+        return True
+    request = (draft.fields or {}).get(TURN_REQUEST_FIELD)
+    return isinstance(request, dict) and not _turn_request_expired(request, time.time())
+
+
+async def turn_continues(db: AsyncSession, *, draft_id: str, user_message: str) -> bool:
+    """Whether ``user_message`` is saved as a turn that is being answered or run again."""
+    draft = await db.get(WorkspaceDraft, draft_id)
+    if draft is None or draft.status not in {"active", "ready"}:
+        return False
+    request = (draft.fields or {}).get(TURN_REQUEST_FIELD)
+    return (
+        isinstance(request, dict)
+        and request.get("message") == user_message
+        and not _turn_request_expired(request, time.time())
+    )
 
 
 class DraftTurn:
@@ -182,23 +274,30 @@ class DraftTurn:
         draft.fields = fields
         flag_modified(draft, "fields")
 
-    async def claim(self) -> WorkspaceDraft:
-        deadline = time.monotonic() + TURN_CLAIM_WAIT_SECONDS
+    async def claim(self, *, wait_seconds: float = TURN_CLAIM_WAIT_SECONDS) -> WorkspaceDraft:
+        """Own the draft, waiting up to ``wait_seconds`` for a running turn
+        (0 = fail fast) before raising ``WorkspaceDraftBusyError``."""
+        deadline = time.monotonic() + wait_seconds
         while True:
-            draft = await self._load()
-            if draft is None:
-                raise ValueError("Draft not found")
-            if draft.status not in {"active", "ready"}:
-                raise ValueError(f"Draft is {draft.status} and cannot be changed")
-            if not _turn_claim_active((draft.fields or {}).get(TURN_CLAIM_FIELD), time.time()):
-                self._stamp(draft)
-                self.claimed = True
-                return draft
-            # Another turn is running (e.g. the opening stream this resumed
-            # stream must replay). Wait for it without a transaction.
-            await self.db.commit()
+            try:
+                draft = await self._load()
+            except WorkspaceDraftBusyError:
+                # Another transaction holds the row lock past lock_timeout.
+                await self.db.rollback()
+            else:
+                if draft is None:
+                    raise ValueError("Draft not found")
+                if draft.status not in {"active", "ready"}:
+                    raise ValueError(f"Draft is {draft.status} and cannot be changed")
+                if not _turn_claim_active((draft.fields or {}).get(TURN_CLAIM_FIELD), time.time()):
+                    self._stamp(draft)
+                    self.claimed = True
+                    return draft
+                # Another turn is running (e.g. the opening stream this resumed
+                # stream must replay). Wait for it without a transaction.
+                await self.db.commit()
             if time.monotonic() >= deadline:
-                raise ValueError("The Architect is still working on this draft. Try again shortly.")
+                raise WorkspaceDraftBusyError()
             await asyncio.sleep(_TURN_CLAIM_POLL_SECONDS)
 
     async def lock(self) -> WorkspaceDraft:
@@ -218,6 +317,45 @@ class DraftTurn:
     async def release(self) -> None:
         """Commit this turn's draft writes; no transaction stays open."""
         await self.db.commit()
+
+    @contextlib.asynccontextmanager
+    async def keepalive(self):
+        """Renew the claim while the turn waits on the model, so it expires
+        only when this process is gone."""
+        task = asyncio.create_task(self._renew_claim())
+        try:
+            yield
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def _renew_claim(self) -> None:
+        from packages.core import database
+        from packages.core.services.workflow_run_execution_claim import DATABASE_LEASE_CONTROL_INFO_KEY
+
+        while True:
+            await asyncio.sleep(TURN_CLAIM_RENEW_SECONDS)
+            try:
+                async with database.async_session() as db:
+                    # A claim renewal fences the turn holding this process's
+                    # admission permits; it must not queue behind them.
+                    db.info[DATABASE_LEASE_CONTROL_INFO_KEY] = True
+                    await db.execute(
+                        update(WorkspaceDraft)
+                        .where(
+                            WorkspaceDraft.id == self.draft_id,
+                            WorkspaceDraft.fields[TURN_CLAIM_FIELD]["id"].astext == self.claim_id,
+                        )
+                        .values(fields=func.jsonb_set(
+                            WorkspaceDraft.fields,
+                            literal([TURN_CLAIM_FIELD, "expires_at"], ARRAY(Text)),
+                            func.to_jsonb(time.time() + TURN_CLAIM_TTL_SECONDS),
+                        ))
+                    )
+                    await db.commit()
+            except Exception:  # noqa: BLE001 - the next renewal retries; lock() re-stamps too
+                logger.warning("Could not renew Architect turn claim for draft %s", self.draft_id, exc_info=True)
 
     def finish(self, draft: WorkspaceDraft) -> None:
         """Drop the claim in the turn's final write (the caller commits it)."""
@@ -282,6 +420,7 @@ async def start_draft(
     entity_id: str,
     user_id: str,
     initial_brief: Optional[str] = None,
+    staff_request_text: Optional[str] = None,
     stream_handler: Optional[Any] = None,
     on_tool_start: Optional[Any] = None,
     on_tool_end: Optional[Any] = None,
@@ -300,6 +439,11 @@ async def start_draft(
         initial_brief=initial_brief,
         document_ids=document_ids,
     )
+    # Chat tool arguments can summarize the request. Only the original text
+    # supplied by the caller can support a staff assignment.
+    staff_evidence = initial_brief if staff_request_text is None else staff_request_text
+    if staff_evidence and staff_evidence.strip():
+        draft.fields = {**draft.fields, STAFF_REQUEST_TEXT_FIELD: staff_evidence.strip()}
 
     opening = opening_user_message(initial_brief)
     visible = await _architect_turn(
@@ -389,28 +533,37 @@ async def process_draft_message(
     entity_id: str,
     user_message: str,
     user_id: str,
+    staff_request_text: Optional[str] = None,
     stream_handler: Optional[Any] = None,
     on_tool_start: Optional[Any] = None,
     on_tool_end: Optional[Any] = None,
     dedupe_opening: bool = False,
     document_ids: Optional[list[str]] = None,
+    claim_wait_seconds: float = TURN_CLAIM_WAIT_SECONDS,
+    mcp_client: bool = False,
 ) -> Tuple[str, WorkspaceDraft]:
     """Process one user turn against a persisted draft via the architect.
 
     The draft is never locked across model calls. The turn claims the draft
-    (waiting for another live turn), commits, runs the Architect with every
-    tool write in its own short locked transaction, then re-locks to record
-    the transcript and readiness. The caller commits that final write.
-    Tool writes already committed stay applied if the turn later fails.
+    (waiting up to ``claim_wait_seconds`` for another live turn, else
+    ``WorkspaceDraftBusyError``), records the user's message and the turn
+    request, commits, runs the Architect with every tool write in its own
+    short locked transaction, then re-locks to record the reply and
+    readiness. The caller commits that final write. Tool writes already
+    committed stay applied if the turn later fails, and a turn that ends
+    without its reply is run again by the recovery sweep.
+    ``mcp_client`` tells the Architect the user is an agent on Manor's MCP
+    tools, which has no creation panel to point at.
     """
     turn = DraftTurn(db, draft_id=draft_id, entity_id=entity_id, user_id=user_id)
-    draft = await turn.claim()
+    draft = await turn.claim(wait_seconds=claim_wait_seconds)
     try:
         # Opening streams are resumable.  If the first connection committed
         # its turn but the browser missed the terminal SSE frame, replay the
         # committed assistant text instead of spending another architect turn
         # or appending a duplicate opening exchange.  The claim serializes
         # this check with an opening stream that is still finishing.
+        previous_reply = ""
         if dedupe_opening:
             previous_reply = next(
                 (
@@ -421,12 +574,21 @@ async def process_draft_message(
                 ),
                 "",
             )
-            if previous_reply:
-                turn.finish(draft)
-                if stream_handler is not None:
-                    await stream_handler("text_delta", {"content": previous_reply})
-                return previous_reply, draft
+        # Whoever sends again the message a recovery just answered never saw
+        # that answer (the claim held them while it ran): it is their reply.
+        if not previous_reply and not document_ids:
+            previous_reply = _take_recovered_reply(draft, user_message)
+        if previous_reply:
+            turn.finish(draft)
+            # Load the server-set updated_at now, not lazily after commit.
+            await db.flush()
+            await db.refresh(draft)
+            if stream_handler is not None:
+                await stream_handler("text_delta", {"content": previous_reply})
+            return previous_reply, draft
 
+        # A question from a turn that never finished must not ride on this one.
+        _take_pending_question(draft)
         added_sources = await register_draft_sources(
             db,
             draft=draft,
@@ -435,33 +597,236 @@ async def process_draft_message(
             message=user_message,
             document_ids=list(document_ids or []),
         )
-        await turn.release()
+        request = _request_turn(
+            draft, user_message, note=sources_transcript_note(added_sources), mcp_client=mcp_client,
+            staff_request_text=user_message if staff_request_text is None else staff_request_text,
+        )
+        return await _run_requested_turn(
+            db, turn, draft, request,
+            stream_handler=stream_handler,
+            on_tool_start=on_tool_start,
+            on_tool_end=on_tool_end,
+        )
+    except BaseException:
+        await turn.abandon()
+        raise
+
+
+def _request_turn(
+    draft: WorkspaceDraft, user_message: str, *, note: str, mcp_client: bool, staff_request_text: str,
+) -> dict:
+    """Record the user's message before the turn runs, so a turn that loses
+    its process can be answered later. Sending the unanswered message again
+    (a resumed opening, a resend) continues that turn instead of repeating it."""
+    messages = list(draft.messages or [])
+    pending = (draft.fields or {}).get(TURN_REQUEST_FIELD)
+    if (
+        isinstance(pending, dict)
+        and pending.get("message") == user_message
+        and 0 <= int(pending.get("history_len") or 0) <= len(messages)
+        and not any(m.get("role") == "assistant" for m in messages[int(pending.get("history_len") or 0):])
+    ):
+        history_len = int(pending.get("history_len") or 0)
+    else:
+        history_len = len(messages)
+        if user_message.strip().lower() != "begin":
+            messages.append({
+                "role": "user",
+                "content": f"{user_message}\n{note}" if note else user_message,
+                STAFF_REQUEST_TEXT_FIELD: staff_request_text,
+            })
+            draft.messages = messages
+            flag_modified(draft, "messages")
+    return {
+        "id": uuid.uuid4().hex,
+        "message": user_message,
+        # The turn's history ends before its own message.
+        "history_len": history_len,
+        "mcp_client": bool(mcp_client),
+        "requested_at": time.time(),
+        "recoveries": 0,
+    }
+
+
+async def _run_requested_turn(
+    db: AsyncSession,
+    turn: DraftTurn,
+    draft: WorkspaceDraft,
+    request: dict,
+    *,
+    stream_handler: Optional[Any] = None,
+    on_tool_start: Optional[Any] = None,
+    on_tool_end: Optional[Any] = None,
+) -> Tuple[str, WorkspaceDraft]:
+    """Run a claimed turn for ``request`` and record its reply."""
+    fields = dict(draft.fields or {})
+    fields[TURN_REQUEST_FIELD] = request
+    draft.fields = fields
+    flag_modified(draft, "fields")
+    await turn.release()
+    async with turn.keepalive():
         visible = await _architect_turn(
             db,
             draft=draft,
-            entity_id=entity_id,
+            entity_id=draft.entity_id,
             user_id=draft.user_id,
-            user_message=user_message,
+            user_message=str(request.get("message") or ""),
+            history_len=int(request.get("history_len") or 0),
             stream_handler=stream_handler,
             on_tool_start=on_tool_start,
             on_tool_end=on_tool_end,
             turn=turn,
+            **({"mcp_client": True} if request.get("mcp_client") else {}),
         )
-        draft = await turn.lock()
-        note = sources_transcript_note(added_sources)
-        _record_visible_messages(
-            draft,
-            f"{user_message}\n{note}" if note else user_message,
-            visible,
+    draft = await turn.lock()
+    note = _app_gap_note(draft)
+    if note:
+        visible = f"{visible}\n\n{note}" if visible else note
+        if stream_handler is not None:
+            await stream_handler("text_delta", {"content": f"\n\n{note}"})
+    _record_reply(draft, visible, recovered=bool(request.get("recoveries")))
+    _drop_turn_request(draft)
+    turn.finish(draft)
+    await _refresh_missing_from_lint(db, draft)
+    await db.flush()
+    await db.refresh(draft)
+    return visible, draft
+
+
+def _take_recovered_reply(draft: WorkspaceDraft, user_message: str) -> str:
+    """The reply a recovered turn gave this same message, handed out once."""
+    messages = list(draft.messages or [])
+    if len(messages) < 2 or not messages[-1].get("recovered") or messages[-2].get("role") != "user":
+        return ""
+    asked = str(messages[-2].get("content") or "")
+    if asked != user_message and not asked.startswith(f"{user_message}\n"):
+        return ""
+    reply = dict(messages[-1])
+    reply.pop("recovered")
+    draft.messages = [*messages[:-1], reply]
+    flag_modified(draft, "messages")
+    return str(reply.get("content") or "")
+
+
+def _app_gap_note(draft: WorkspaceDraft) -> Optional[str]:
+    """What the person hears, once, when their Workspace starts without its own App page."""
+    from packages.core.services.workspace_part_designers import APP_GAP_TOLD_FIELD, app_design_gave_up
+
+    fields = dict(draft.fields or {})
+    if draft.applied_blueprint_id or fields.get(APP_GAP_TOLD_FIELD) or not app_design_gave_up(fields):
+        return None
+    fields[APP_GAP_TOLD_FIELD] = True
+    draft.fields = fields
+    flag_modified(draft, "fields")
+    asked = next((str(message.get("content") or "") for message in reversed(draft.messages or [])
+                  if message.get("role") == "user"), "")
+    return t("workspace_draft.app_gap", locale=text_locale(asked))
+
+
+def _drop_turn_request(draft: WorkspaceDraft) -> None:
+    fields = dict(draft.fields or {})
+    if fields.pop(TURN_REQUEST_FIELD, None) is not None:
+        draft.fields = fields
+        flag_modified(draft, "fields")
+
+
+async def resume_requested_turn(db: AsyncSession, *, draft_id: str) -> bool:
+    """Answer the message of a turn that ended without its reply.
+
+    Its process died (a release restarted the pod) or the turn failed. Runs
+    only when no live turn owns the draft; tool writes the lost turn already
+    committed stay, and the Architect continues from them. The caller
+    commits. Returns whether a turn ran.
+    """
+    owner = (await db.execute(
+        select(WorkspaceDraft.entity_id, WorkspaceDraft.user_id).where(WorkspaceDraft.id == draft_id)
+    )).first()
+    if owner is None or not owner.user_id:
+        return False
+    turn = DraftTurn(db, draft_id=draft_id, entity_id=owner.entity_id, user_id=owner.user_id)
+    try:
+        draft = await turn.claim(wait_seconds=0)
+    except (WorkspaceDraftBusyError, ValueError):
+        # A live turn owns it, or the draft was finalized or abandoned.
+        await db.rollback()
+        return False
+    try:
+        request = (draft.fields or {}).get(TURN_REQUEST_FIELD)
+        if not isinstance(request, dict):
+            turn.finish(draft)
+            return False
+        recoveries = int(request.get("recoveries") or 0)
+        if recoveries >= TURN_RECOVERY_ATTEMPTS:
+            logger.warning(
+                "Architect turn for draft %s did not finish after %d recoveries; leaving it unanswered",
+                draft_id, recoveries,
+            )
+            _drop_turn_request(draft)
+            turn.finish(draft)
+            return False
+        # The sweep checked before handing off; the task may have sat in the
+        # queue since (the environment slept or its workers were down).
+        if _turn_request_expired(request, time.time()):
+            logger.info("Not recovering Architect turn for draft %s: requested too long ago", draft_id)
+            _drop_turn_request(draft)
+            turn.finish(draft)
+            return False
+        # A question from the lost turn must not ride on this one.
+        _take_pending_question(draft)
+        logger.info("Recovering interrupted Architect turn for draft %s (attempt %d)", draft_id, recoveries + 1)
+        await _run_requested_turn(
+            db, turn, draft, {**request, "handed_off_at": None, "recoveries": recoveries + 1},
         )
-        turn.finish(draft)
-        await _refresh_missing_from_lint(db, draft)
-        await db.flush()
-        await db.refresh(draft)
-        return visible, draft
+        return True
     except BaseException:
         await turn.abandon()
         raise
+
+
+async def hand_off_interrupted_turns(db: AsyncSession, *, now: Optional[float] = None) -> list[str]:
+    """Drafts whose turn request has no live claim: their process is gone.
+
+    Marks each as handed off so the next sweep does not hand it off again
+    while a worker picks it up. The caller commits, then runs
+    :func:`resume_requested_turn` for each id. A request past
+    ``TURN_RECOVERY_MAX_AGE_SECONDS`` is dropped instead, with its expired
+    claim so a process that wakes up afterwards stops at its next draft write.
+    """
+    now = time.time() if now is None else now
+    drafts = (await db.execute(
+        select(WorkspaceDraft)
+        .where(
+            WorkspaceDraft.status.in_(("active", "ready")),
+            WorkspaceDraft.fields.has_key(TURN_REQUEST_FIELD),
+        )
+        .order_by(WorkspaceDraft.updated_at)
+        .limit(_TURN_RECOVERY_BATCH)
+        .with_for_update(skip_locked=True)
+    )).scalars().all()
+    handed_off: list[str] = []
+    for draft in drafts:
+        fields = dict(draft.fields or {})
+        request = fields.get(TURN_REQUEST_FIELD)
+        if not isinstance(request, dict) or _turn_claim_active(fields.get(TURN_CLAIM_FIELD), now):
+            continue
+        if _turn_request_expired(request, now):
+            logger.info("Not recovering Architect turn for draft %s: requested too long ago", draft.id)
+            fields.pop(TURN_REQUEST_FIELD)
+            fields.pop(TURN_CLAIM_FIELD, None)
+            draft.fields = fields
+            flag_modified(draft, "fields")
+            continue
+        try:
+            last_handoff = float(request.get("handed_off_at") or 0)
+        except (TypeError, ValueError):
+            last_handoff = 0.0
+        if last_handoff > now - TURN_RECOVERY_HANDOFF_SECONDS:
+            continue
+        fields[TURN_REQUEST_FIELD] = {**request, "handed_off_at": now}
+        draft.fields = fields
+        flag_modified(draft, "fields")
+        handed_off.append(draft.id)
+    return handed_off
 
 
 # ---------------------------------------------------------------------------
@@ -480,16 +845,19 @@ async def _architect_turn(
     on_tool_end: Optional[Any] = None,
     repair_service_keys: tuple[str, ...] | None = None,
     turn: DraftTurn | None = None,
+    mcp_client: bool = False,
+    history_len: Optional[int] = None,
 ) -> str:
     """Invoke the typed-tool architect for one turn. Mutations land on
     ``draft.fields`` via tool calls; this returns the visible reply.
 
     With ``turn``, no transaction is held between tool calls; without it the
-    caller's transaction (and draft lock) spans the turn, as before."""
+    caller's transaction (and draft lock) spans the turn, as before.
+    ``history_len`` ends the history before a turn's already recorded message."""
 
     history = [
         {"role": m.get("role"), "content": m.get("content")}
-        for m in (draft.messages or [])
+        for m in list(draft.messages or [])[:history_len]
         if m.get("role") in ("user", "assistant")
     ]
     return await runtime_run_workspace_architect_turn(
@@ -504,20 +872,46 @@ async def _architect_turn(
         on_tool_end=on_tool_end,
         **({"repair_service_keys": repair_service_keys} if repair_service_keys is not None else {}),
         **({"turn": turn} if turn is not None else {}),
+        **({"mcp_client": True} if mcp_client else {}),
     )
+
+
+def _take_pending_question(draft: WorkspaceDraft) -> Optional[dict]:
+    """Remove the turn's ``ws_ask_user`` question from the draft fields."""
+    from packages.core.ai.tools.workspace_arch_tools import PENDING_QUESTION_FIELD
+
+    fields = dict(draft.fields or {})
+    question = fields.pop(PENDING_QUESTION_FIELD, None)
+    if PENDING_QUESTION_FIELD in (draft.fields or {}):
+        draft.fields = fields
+        flag_modified(draft, "fields")
+    return question if isinstance(question, dict) else None
 
 
 def _record_visible_messages(draft: WorkspaceDraft, user_message: str, assistant_reply: str) -> None:
     """Append the user's text + the architect's visible reply to the
     draft's transcript so the next turn carries conversational context.
     Tool round-trips are deliberately omitted -- they're an internal
-    implementation detail and would balloon the transcript."""
-    msgs = list(draft.messages or [])
+    implementation detail and would balloon the transcript. A question the
+    architect asked with ``ws_ask_user`` rides on its reply, so the chat
+    shows its answer buttons (recommended first)."""
     if user_message and user_message.strip().lower() not in ("begin",):
-        msgs.append({"role": "user", "content": user_message})
-    if assistant_reply:
-        msgs.append({"role": "assistant", "content": assistant_reply})
-    draft.messages = msgs
+        draft.messages = [*(draft.messages or []), {"role": "user", "content": user_message}]
+        flag_modified(draft, "messages")
+    _record_reply(draft, assistant_reply)
+
+
+def _record_reply(draft: WorkspaceDraft, assistant_reply: str, *, recovered: bool = False) -> None:
+    """Append the architect's visible reply, with its open question."""
+    question = _take_pending_question(draft)
+    if not assistant_reply:
+        return
+    reply: dict = {"role": "assistant", "content": assistant_reply}
+    if question:
+        reply["question"] = question
+    if recovered:
+        reply["recovered"] = True
+    draft.messages = [*(draft.messages or []), reply]
     flag_modified(draft, "messages")
 
 
@@ -688,9 +1082,11 @@ async def _refresh_missing_from_lint(
             resolve_install_variables({"contract": {"variables": declarations}}, values)
         except InstallError:
             missing.add("blueprint_personalization")
+    # An Agent's setup gates its execution, not creation, whichever writer
+    # left out blocks_creation.
     if any(
         bool(item.get("required", True))
-        and bool(item.get("blocks_creation", True))
+        and bool(item.get("blocks_creation", item.get("source") != "agent_design"))
         for item in fields.get("flagged_integrations") or []
         if isinstance(item, dict)
     ):
@@ -1191,6 +1587,15 @@ async def apply_blueprint(
         value = operating_model.get(list_key)
         if isinstance(value, list) and value:
             fields[list_key] = copy.deepcopy(value)
+            if list_key == "services":
+                # The installer accepts a service declared by ``key`` (and
+                # writes that spelling itself); Draft fields key services by
+                # ``service_key`` only.
+                for service in fields[list_key]:
+                    if isinstance(service, dict) and not service.get("service_key"):
+                        legacy_key = service.pop("key", None)
+                        if legacy_key:
+                            service["service_key"] = legacy_key
             if list_key == "rules":
                 # A template must not inherit a previous rule's user-confirmed
                 # hard-block receipt, even if its key and contents match.
@@ -1498,8 +1903,8 @@ async def finalize_draft(
         raise ValueError("Draft was abandoned and cannot be finalized")
     # A live Architect turn no longer holds the row lock between its writes;
     # do not materialize a half-applied turn.
-    if _turn_claim_active((draft.fields or {}).get(TURN_CLAIM_FIELD), time.time()):
-        raise ValueError("The Architect is still working on this draft. Try again when it finishes.")
+    if turn_in_progress(draft):
+        raise WorkspaceDraftBusyError()
     issues: list[dict[str, Any]] = []
     lint_verified = await _refresh_missing_from_lint(db, draft, issues_out=issues)
     if not lint_verified:
@@ -1678,10 +2083,13 @@ async def finalize_draft(
         if isinstance(item, dict)
     }
     if scheduled_job_keys:
+        # Local eval 2026-11-03: job lumen_product_posts and automation
+        # product_posts shared no name, so a second job ran the same slot as a generated
+        # skill, outside the Workflow and its approval.
         session.fields["automations"] = [
             item for item in session.fields.get("automations") or []
             if not isinstance(item, dict)
-            or str(item.get("automation_key") or "").strip() not in scheduled_job_keys
+            or not {str(item.get(key) or "").strip() for key in ("automation_key", "job_id")} & scheduled_job_keys
         ]
     # Keep shell provisioning and portable resources atomic even for a caller
     # that catches this error and commits its outer transaction for another

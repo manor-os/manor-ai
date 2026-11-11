@@ -282,9 +282,15 @@ async def record_selection_errors(
     """``{input key: message}`` for selected keys the source does not offer.
 
     An empty selection is always accepted: an optional input left blank lets
-    the Workflow treat it as "all matching records".
+    the Workflow treat it as "all matching records". Workspace records picked
+    with ``workflow_project_select`` are checked the same way.
     """
-    errors: dict[str, str] = {}
+    from packages.core.services.workflow_project_select import project_selection_errors
+
+    run_inputs = list(run_inputs)
+    errors: dict[str, str] = await project_selection_errors(
+        db, run_inputs, values, entity_id=entity_id, workspace_id=workspace_id,
+    )
     for item in run_inputs:
         key = str(item.get("key") or "")
         if item.get("hidden") or key not in values:

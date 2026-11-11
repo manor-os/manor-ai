@@ -95,6 +95,12 @@ def prepare_runtime_media_output_plan(
     ):
         raise ValueError("Composed video output belongs to another Workspace")
     directory = spec.default_directory if spec else {"image": "images", "audio": "audio", "video": "videos"}[kind]
+    extensions = spec.media_extensions if spec else MEDIA_OUTPUT_EXTENSIONS[kind]
+    if kind == "image" and spec is None:
+        # Animation is an explicit output request. Keep existing still-image
+        # grants unchanged and authorize only the requested GIF destination.
+        output_format = str(params.get("output_format", arguments.get("output_format")) or "png").strip().lower()
+        extensions = (".gif",) if output_format == "gif" else tuple(ext for ext in extensions if ext != ".gif")
     targets = tuple(
         build_generated_media_target(
             prompt=str(arguments.get("prompt") or "").strip(),
@@ -103,7 +109,7 @@ def prepare_runtime_media_output_plan(
             default_dir=workspace_artifact_default_dir(artifact_base_dir, directory),
             entity_root=entity_root,
         )
-        for ext in (spec.media_extensions if spec else MEDIA_OUTPUT_EXTENSIONS[kind])
+        for ext in extensions
     )
     companions = ()
     if spec is not None and spec.video_edit_recipe:

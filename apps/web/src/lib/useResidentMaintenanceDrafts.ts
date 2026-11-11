@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { createPublicChatRequestFence, type PublicChatRequestFence } from "./publicChatRequestFence";
+import { createPublicChatReadCoalescer, createPublicChatRequestFence, type PublicChatRequestFence } from "./publicChatRequestFence";
+import { usePageVisible } from "./usePageVisible";
 import { isResidentDraft, isResidentDraftCollection, residentCreateIsActive, type ResidentDraft, type ResidentDraftCollection, type ResidentDraftFields } from "./residentMaintenanceDrafts";
 
 type Notice = "cancelled" | "error" | "conflict" | "save_failed" | "outcome_unknown" | null;
@@ -16,11 +17,15 @@ export function useResidentMaintenanceDrafts({ token, sessionId, readReady, fenc
   const [uncertain, setUncertain] = useState<Set<string>>(new Set());
   const uncertainDrafts = useRef(new Map<string, ResidentDraft>());
   const localFence = useRef(createPublicChatRequestFence()).current;
+  const reads = useRef(createPublicChatReadCoalescer()).current;
   const busy = useRef(false);
   const loadSequence = useRef(0);
   const page = useRef(0);
+  const lastRefreshKey = useRef(refreshKey);
+  const lastBackgroundReadAt = useRef(0);
   const callbacks = useRef({ onReadInvalid }); callbacks.current = { onReadInvalid };
   const key = readReady && token && sessionId ? `${token}:${sessionId}` : "";
+  const pageVisible = usePageVisible();
   const endpoint = `/api/v1/public/chat/${encodeURIComponent(token || "")}/resident`;
   const collection = key && snapshot?.key === key ? snapshot.data : null;
   const active = !!collection && residentCreateIsActive(collection.create_access);
@@ -30,11 +35,11 @@ export function useResidentMaintenanceDrafts({ token, sessionId, readReady, fenc
     return { signal: AbortSignal.any([parent.signal, local.signal]), isCurrent: () => parent.isCurrent() && local.isCurrent(), release: () => { parent.release(); local.release(); } };
   }, [fence, localFence]);
   const clear = useCallback((next: Phase) => {
-    localFence.invalidate(); loadSequence.current++;
-    busy.current = false;
+    localFence.invalidate(); reads.invalidate(); loadSequence.current++;
+    busy.current = false; lastBackgroundReadAt.current = 0;
     uncertainDrafts.current.clear();
     setSnapshot(null); setUncertain(new Set()); setBusyDraftId(null); setLoading(false); setPhase(next);
-  }, [localFence]);
+  }, [localFence, reads]);
   const accessError = useCallback((status: number, code?: string) => {
     if (code === "resident_auth_required" || code === "resident_unavailable" || ((status === 401 || status === 403) && code !== "resident_create_auth_required")) {
       clear("unverified"); callbacks.current.onReadInvalid(code === "resident_unavailable"); return true;
@@ -44,41 +49,61 @@ export function useResidentMaintenanceDrafts({ token, sessionId, readReady, fenc
     return false;
   }, [clear]);
 
-  const load = useCallback(async (skip = page.current) => {
+  const load = useCallback((skip = page.current, background = false) => {
     if (!key || busy.current) return;
-    const request = begin(), sequence = ++loadSequence.current;
-    setLoading(true);
-    try {
-      const response = await fetch(`${endpoint}/maintenance/drafts?session_id=${encodeURIComponent(sessionId!)}&skip=${skip}&limit=20`, { credentials: "include", cache: "no-store", headers: headers(), signal: request.signal });
-      const data = await response.json().catch(() => null);
-      if (!request.isCurrent() || sequence !== loadSequence.current) return;
-      if (!response.ok || !isResidentDraftCollection(data)) {
-        if (!accessError(response.status, data?.detail?.code)) clear("unavailable");
-        return;
-      }
-      if (!residentCreateIsActive(data.create_access)) { clear("unverified"); return; }
-      page.current = skip;
-      for (const draft of data.items) {
-        if (draft.state !== "draft") uncertainDrafts.current.delete(draft.draft_id);
-      }
-      // An empty page is not proof that a timed-out confirmation did not submit.
-      const missingUncertain = [...uncertainDrafts.current.values()].filter(draft => !data.items.some(item => item.draft_id === draft.draft_id));
-      setSnapshot({ key, data: { ...data, items: [...data.items, ...missingUncertain] } }); setPhase("verified");
-      setUncertain(new Set(uncertainDrafts.current.keys()));
-    } catch { if (request.isCurrent() && sequence === loadSequence.current) clear("unavailable"); }
-    finally { if (request.isCurrent() && sequence === loadSequence.current) setLoading(false); request.release(); }
-  }, [key, begin, endpoint, sessionId, headers, accessError, clear]);
+    reads.request(async () => {
+      if (!key || busy.current || (background && document.visibilityState !== "visible")) return;
+      const request = begin(), sequence = ++loadSequence.current;
+      setLoading(true);
+      try {
+        const response = await fetch(`${endpoint}/maintenance/drafts?session_id=${encodeURIComponent(sessionId!)}&skip=${skip}&limit=20`, { credentials: "include", cache: "no-store", headers: headers(), signal: AbortSignal.any([request.signal, AbortSignal.timeout(15_000)]) });
+        const data = await response.json().catch(() => null);
+        if (!request.isCurrent() || sequence !== loadSequence.current) return;
+        if (!response.ok || !isResidentDraftCollection(data)) {
+          if (!accessError(response.status, data?.detail?.code)) clear("unavailable");
+          return;
+        }
+        if (!residentCreateIsActive(data.create_access)) { clear("unverified"); return; }
+        page.current = skip;
+        for (const draft of data.items) {
+          if (draft.state !== "draft") uncertainDrafts.current.delete(draft.draft_id);
+        }
+        // An empty page is not proof that a timed-out confirmation did not submit.
+        const missingUncertain = [...uncertainDrafts.current.values()].filter(draft => !data.items.some(item => item.draft_id === draft.draft_id));
+        setSnapshot({ key, data: { ...data, items: [...data.items, ...missingUncertain] } }); setPhase("verified");
+        setUncertain(new Set(uncertainDrafts.current.keys()));
+      } catch { if (request.isCurrent() && sequence === loadSequence.current) clear("unavailable"); }
+      finally { if (request.isCurrent() && sequence === loadSequence.current) setLoading(false); request.release(); }
+    });
+  }, [key, reads, begin, endpoint, sessionId, headers, accessError, clear]);
+  const loadBackground = useCallback((skip = page.current) => {
+    if (document.visibilityState !== "visible") return;
+    const now = Date.now();
+    if (now - lastBackgroundReadAt.current < 250) return;
+    lastBackgroundReadAt.current = now;
+    load(skip, true);
+  }, [load]);
 
   useEffect(() => {
     clear("checking"); busy.current = false; page.current = 0;
     if (!key) return;
-    void load(0);
-    const timer = setInterval(() => void load(), 10_000);
-    const focus = () => { if (document.visibilityState === "visible") void load(); };
+    const timer = setInterval(() => void loadBackground(), 30_000);
+    return () => { clearInterval(timer); reads.invalidate(); localFence.invalidate(); };
+  }, [key, loadBackground, clear, reads, localFence]);
+  useEffect(() => { if (key && pageVisible) void loadBackground(); }, [key, pageVisible, loadBackground]);
+  useEffect(() => {
+    if (lastRefreshKey.current === refreshKey) return;
+    lastRefreshKey.current = refreshKey;
+    // A chat turn may create a draft immediately after a focus read. Coalesce
+    // that newer read, but never discard it through the focus-event throttle.
+    if (key && pageVisible) void load(page.current, true);
+  }, [refreshKey, key, pageVisible, load]);
+  useEffect(() => {
+    if (!key || !pageVisible) return;
+    const focus = () => void loadBackground();
     window.addEventListener("focus", focus);
-    return () => { clearInterval(timer); window.removeEventListener("focus", focus); localFence.invalidate(); };
-  }, [key, load, clear, localFence]);
-  useEffect(() => { if (key) void load(); }, [refreshKey, key, load]);
+    return () => window.removeEventListener("focus", focus);
+  }, [key, pageVisible, loadBackground]);
   useEffect(() => {
     if (!collection?.create_access.expires_at) return;
     const timer = setTimeout(() => clear("unverified"), Math.max(0, Date.parse(collection.create_access.expires_at) - Date.now()));

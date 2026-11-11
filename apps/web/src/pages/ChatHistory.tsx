@@ -22,8 +22,10 @@ import AgentAvatar from "../components/ui/AgentAvatar";
 import ConfirmDialog from "../components/ui/ConfirmDialog";
 import EmptyState from "../components/ui/EmptyState";
 import TabSwitcher from "../components/ui/TabSwitcher";
-import PageHeader from "../components/ui/PageHeader";
-import { ChatMessagesSkeleton, SkeletonLine, SkeletonCircle } from "../components/ui/Skeleton";
+import { useSearchParams } from "react-router-dom";
+import Button from "../components/ui/Button";
+import { ConfigGroup, ConfigPage, ConfigRow } from "../components/ui/GroupedList";
+import { ChatMessagesSkeleton, PageLoading } from "../components/ui/Skeleton";
 import ChatMarkdown from "../components/ChatMarkdown";
 import CollapsibleSentMessage from "../components/chat/CollapsibleSentMessage";
 import { isRetryableAssistantMessage } from "../components/chat/ChatMessageActions";
@@ -31,8 +33,7 @@ import AssistantMessageBlocks from "../components/AssistantMessageBlocks";
 import CreditLimitNotice from "../components/ui/CreditLimitNotice";
 import ToolCallList from "../components/ui/ToolCallList";
 import {
-  IconClose, IconChat,
-  IconGlobe, IconEmail, IconTelegram, IconWhatsApp, IconWeChat, IconSMS, IconChatBubble, IconEdit,
+  IconGlobe, IconEmail, IconTelegram, IconWhatsApp, IconWeChat, IconSMS, IconChatBubble, IconChevronLeft,
 } from "../components/icons";
 import ManorAvatar from "../components/ui/ManorAvatar";
 import { MANOR_AGENT_NAME } from "../lib/constants";
@@ -96,7 +97,16 @@ function customerNameFromConversation(conversation: any) {
   return fromTitle || t("page.chat_history.customer");
 }
 
-/* ── Message detail panel (right side) ──────────────────────────── */
+function conversationTitle(conversation: any) {
+  const title = conversation.title || "";
+  if (isExternalConversationChannel(conversation.channel)) {
+    const prefix = `${conversation.channel}:`;
+    if (title.toLowerCase().startsWith(prefix.toLowerCase())) return customerNameFromConversation(conversation);
+  }
+  return title || t("page.chat_history.untitled");
+}
+
+/* ── Message detail panel ──────────────────────────── */
 
 interface DetailMessage {
   id: string;
@@ -116,11 +126,13 @@ function MessagePanel({
   agentInfo,
   onClose,
   onRename,
+  onDelete,
 }: {
   conversation: any;
   agentInfo?: { id?: string; name: string; avatar_url?: string } | null;
   onClose: () => void;
   onRename: (id: string, title: string) => void;
+  onDelete: () => void;
 }) {
   const currentUser = useAuthStore((s) => s.user);
   const [messages, setMessages] = useState<DetailMessage[]>([]);
@@ -200,79 +212,43 @@ function MessagePanel({
 
   return (
     <div className="chat-history-panel flex flex-col h-full">
-      {/* Header — like old repo: agent avatar + conversation title + agent name tag */}
-      <div className="chat-header chat-history-detail-header">
-        <div className="flex items-center gap-3 flex-1 min-w-0">
-          <div className="relative shrink-0">
-            {isManorDefault ? (
-              <ManorAvatar size={40} />
-            ) : (
-              <AgentAvatar name={assistantName} avatarUrl={agentInfo?.avatar_url} seed={agentInfo?.id} size={40} />
-            )}
-            {/* Channel badge overlay — like old repo */}
-            <div
-              className="chat-history-channel-badge absolute -bottom-0.5 -right-0.5 rounded-full flex items-center justify-center"
-              style={{
-                width: 18, height: 18,
-                background: meta.badgeColor,
-              }}
-            >
-              <meta.Icon size={9} style={{ color: "#fff" }} />
-            </div>
-          </div>
-          <div className="min-w-0 flex-1">
-            {editingTitle ? (
-              <input
-                autoFocus
-                value={titleDraft}
-                onChange={(e) => setTitleDraft(e.target.value)}
-                onBlur={commitTitle}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    commitTitle();
-                  }
-                  if (e.key === "Escape") {
-                    e.preventDefault();
-                    setTitleDraft(conversation.title || "");
-                    setEditingTitle(false);
-                  }
-                }}
-                className="chat-history-title-input text-[15px] font-semibold"
-                style={{
-                  width: "100%",
-                }}
-              />
-            ) : (
-              <div className="flex items-center gap-1.5 min-w-0">
-                <h2 className="chat-history-detail-title text-[15px] font-semibold truncate">
-                  {conversation.title || t("page.chat_history.untitled")}
-                </h2>
-                <button
-                  onClick={() => setEditingTitle(true)}
-                  className="chat-history-icon-button p-1 rounded-lg transition-all shrink-0"
-                  title={t("component.session_switcher.rename_chat")}
-                >
-                  <IconEdit size={13} />
-                </button>
-              </div>
-            )}
-            <div className="flex items-center gap-2 mt-0.5">
-              <span className="chat-history-agent-badge text-[11px] font-medium px-1.5 py-0.5 rounded">
-                {assistantName}
-              </span>
-              <span className="chat-history-detail-meta text-[11px]">
-                {conversation.message_count || 0} {t("page.chat_history.messages")}
-              </span>
-              <span className="chat-history-detail-meta text-[11px]">
-                {relativeTime(conversation.updated_at || conversation.created_at)}
-              </span>
-            </div>
-          </div>
-        </div>
-        <button onClick={onClose} className="chat-history-close-button p-2 rounded-xl transition-all">
-          <IconClose size={18} />
+      <div className="chat-history-detail-head">
+        <button type="button" className="chat-history-back" onClick={onClose}>
+          <IconChevronLeft size={14} />
+          {t("nav.chatHistory")}
         </button>
+        <div className="chat-history-detail-row">
+          {editingTitle ? (
+            <input
+              autoFocus
+              aria-label={t("component.session_switcher.rename_chat")}
+              value={titleDraft}
+              onChange={(e) => setTitleDraft(e.target.value)}
+              onBlur={commitTitle}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  commitTitle();
+                }
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  setTitleDraft(conversation.title || "");
+                  setEditingTitle(false);
+                }
+              }}
+              className="config-input chat-history-title-field"
+            />
+          ) : (
+            <h2 className="config-page-title chat-history-detail-title">{conversationTitle(conversation)}</h2>
+          )}
+          <span className="chat-history-detail-actions">
+            <Button variant="ghost" size="sm" onClick={() => setEditingTitle(true)}>{t("component.session_switcher.rename_chat")}</Button>
+            <Button variant="ghost" size="sm" onClick={onDelete}>{t("action.delete")}</Button>
+          </span>
+        </div>
+        <p className="chat-history-detail-meta">
+          {[assistantName, t(meta.labelKey), relativeTime(conversation.updated_at || conversation.created_at)].join(" · ")}
+        </p>
       </div>
 
       {/* Messages — old repo layout: user LEFT, agent RIGHT */}
@@ -346,6 +322,7 @@ function MessagePanel({
                           sourceMessageId={msg.id}
                           hitlRequests={msg.hitl_requests}
                           responseSurfaceSubmissionReceipts={responseSurfaceSubmissionReceipts}
+                          collapseLongFinal
                         />
                       </div>
                     )}
@@ -361,7 +338,9 @@ function MessagePanel({
                             <ChatMarkdown content={msg.content} isUser />
                           </CollapsibleSentMessage>
                         ) : (
-                          <ChatMarkdown content={msg.content} isUser={false} />
+                          <CollapsibleSentMessage text={msg.content} tone="assistant">
+                            <ChatMarkdown content={msg.content} isUser={false} showFilesInPlace />
+                          </CollapsibleSentMessage>
                         )}
                       </div>
                     )}
@@ -377,43 +356,25 @@ function MessagePanel({
   );
 }
 
-/* ── Skeleton ───────────────────────────────────────────────────── */
-
-function ConversationSkeleton() {
-  return (
-    <div className="flex flex-col gap-1">
-      {[1, 2, 3, 4, 5, 6].map((i) => (
-        <div key={i} className="flex items-center gap-3 px-4 py-3">
-          <SkeletonCircle size={36} />
-          <div className="flex-1 flex flex-col gap-1.5">
-            <SkeletonLine width="60%" height={13} />
-            <SkeletonLine width="40%" height={11} />
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-/* ── Main component — split layout ──────────────────────────────── */
-
 export default function ChatHistory() {
   const catalogScope = useCatalogScope();
   const queryClient = useQueryClient();
 
   const [search, setSearch] = useState("");
-  const [channelFilter, setChannelFilter] = useState("all");
+  const [searchParams] = useSearchParams();
+  const linkedChannel = searchParams.get("channel")?.toLowerCase();
+  const [channelFilter, setChannelFilter] = useState(linkedChannel || "all");
   const [selectedConvId, setSelectedConvId] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
-  const [editingConvId, setEditingConvId] = useState<string | null>(null);
-  const [titleDraft, setTitleDraft] = useState("");
 
   const wsId = useWorkspaceFilter((s) => s.activeWorkspaceId);
-  const wsFilter = wsId !== "all" ? wsId : undefined;
+  // A Workspace's entry point links here with its own Workspace.
+  const wsFilter = searchParams.get("workspace") || (wsId !== "all" ? wsId : undefined);
+  const requestChannel = channelFilter !== "all" && channelFilter === linkedChannel ? linkedChannel : undefined;
 
   const { data: conversations = [], isLoading } = useQuery({
-    queryKey: ["conversations", wsFilter],
-    queryFn: () => api.chat.listConversations(wsFilter),
+    queryKey: requestChannel ? ["conversations", wsFilter, requestChannel] : ["conversations", wsFilter],
+    queryFn: () => api.chat.listConversations(wsFilter, requestChannel),
   });
 
   /* Fetch agents to resolve avatars & names in the list */
@@ -443,25 +404,6 @@ export default function ChatHistory() {
     },
   });
 
-  const startRename = (id: string, title?: string) => {
-    setEditingConvId(id);
-    setTitleDraft(title || t("page.chat_history.untitled"));
-  };
-
-  const cancelRename = () => {
-    setEditingConvId(null);
-    setTitleDraft("");
-  };
-
-  const finishRename = () => {
-    if (!editingConvId) return;
-    const nextTitle = titleDraft.trim();
-    const conv = conversations.find((c) => c.id === editingConvId);
-    setEditingConvId(null);
-    if (!nextTitle || nextTitle === (conv?.title || t("page.chat_history.untitled"))) return;
-    renameMutation.mutate({ id: editingConvId, title: nextTitle });
-  };
-
   const renameConversation = (id: string, title: string) => {
     const nextTitle = title.trim();
     if (!nextTitle) return;
@@ -470,6 +412,13 @@ export default function ChatHistory() {
 
   /* Unique channels for tab switcher */
   const channelTabs = useMemo(() => {
+    if (requestChannel) {
+      const meta = getChannelMeta(requestChannel);
+      return [
+        { key: "all", label: t("page.chat_history.all") },
+        { key: requestChannel, label: t(meta.labelKey), icon: <meta.Icon size={13} /> },
+      ];
+    }
     const counts: Record<string, number> = {};
     conversations.forEach((c) => {
       const ch = c.channel || "web";
@@ -483,11 +432,11 @@ export default function ChatHistory() {
       tabs.push({ key: ch, label: t(meta.labelKey), icon: <meta.Icon size={13} />, count });
     });
     return tabs;
-  }, [conversations]);
+  }, [conversations, requestChannel]);
 
   const filtered = useMemo(() => {
     let list = [...conversations];
-    if (channelFilter !== "all") list = list.filter((c) => c.channel === channelFilter);
+    if (!requestChannel && channelFilter !== "all") list = list.filter((c) => c.channel === channelFilter);
     if (search.trim()) {
       const q = search.toLowerCase();
       list = list.filter(
@@ -503,179 +452,80 @@ export default function ChatHistory() {
       return db - da;
     });
     return list;
-  }, [conversations, channelFilter, search]);
+  }, [conversations, channelFilter, requestChannel, search]);
 
   const selectedConv = conversations.find((c) => c.id === selectedConvId);
 
-  /* ================================================================ */
-  /*  Render — full-height split layout                                */
-  /* ================================================================ */
+  const renderRows = (list: any[]) => list.map((conv) => {
+    const meta = getChannelMeta(conv.channel);
+    const convAgent = conv.agent_id ? agentMap[conv.agent_id] : null;
+    const external = isExternalConversationChannel(conv.channel);
+    return (
+      <ConfigRow
+        key={conv.id}
+        leading={convAgent
+          ? <AgentAvatar name={convAgent.name} avatarUrl={convAgent.avatar_url} seed={convAgent.id} size={28} />
+          : <ManorAvatar size={28} />}
+        label={conversationTitle(conv)}
+        note={[convAgent?.name || t("page.chat_history.manor_ai"), external ? t(meta.labelKey) : ""].filter(Boolean).join(" · ")}
+        meta={relativeTime(conv.updated_at || conv.created_at)}
+        chevron
+        onClick={() => setSelectedConvId(conv.id)}
+      />
+    );
+  });
+  const customerConversations = filtered.filter((c) => isExternalConversationChannel(c.channel));
+  const ownConversations = filtered.filter((c) => !isExternalConversationChannel(c.channel));
+  // Customers and your own chats are already apart; channels matter once there are several.
+  const showChannelTabs = channelFilter !== "all"
+    || new Set(conversations.filter((c) => isExternalConversationChannel(c.channel)).map((c) => c.channel)).size > 1;
 
   return (
-    <div className="chat-history-page flex h-full flex-col">
-      <div>
-        <PageHeader
-          title={t("nav.chatHistory")}
-          tabs={<TabSwitcher tabs={channelTabs} value={channelFilter} onChange={setChannelFilter} />}
-          toolbar={(
-            <SmartToolbar
-              searchValue={search}
-              onSearchChange={setSearch}
-              searchPlaceholder={t("page.chat_history.search_placeholder")}
-              className="w-full sm:w-64"
-            />
-          )}
+    <>
+      {selectedConv ? (
+        <MessagePanel
+          key={selectedConv.id}
+          conversation={selectedConv}
+          agentInfo={selectedConv.agent_id ? agentMap[selectedConv.agent_id] : null}
+          onClose={() => setSelectedConvId(null)}
+          onRename={renameConversation}
+          onDelete={() => setDeleteTarget(selectedConv.id)}
         />
-      </div>
-
-      <div className="flex flex-1 min-h-0">
-      {/* ============================================================ */}
-      {/* LEFT — Conversation list                                      */}
-      {/* ============================================================ */}
-      <div className="chat-history-list-panel chat-sidebar-left flex flex-col overflow-hidden" style={{ width: selectedConv ? 360 : "100%", maxWidth: selectedConv ? 360 : undefined, transition: "width 0.2s ease" }}>
-
-        {/* List */}
-        <div className="flex-1 overflow-y-auto px-3 pb-3">
-          {isLoading ? (
-            <ConversationSkeleton />
-          ) : filtered.length === 0 ? (
-            <div className="py-12">
-              <EmptyState
-                icon={<IconChatBubble size={40} />}
-                title={t("page.chat_history.no_conversations")}
-                description={t("page.chat_history.no_conversations_desc")}
-              />
-            </div>
-          ) : (
-            <div className="flex flex-col">
-              {filtered.map((conv) => {
-                const meta = getChannelMeta(conv.channel);
-                const isSelected = selectedConvId === conv.id;
-                const convAgent = conv.agent_id ? agentMap[conv.agent_id] : null;
-                const isEditing = editingConvId === conv.id;
-
-                return (
-                  <div
-                    key={conv.id}
-                    onClick={() => { if (!isEditing) setSelectedConvId(conv.id); }}
-                    className={`chat-history-row group flex items-center gap-3 px-4 py-3 cursor-pointer transition-colors${isSelected ? " chat-history-row--selected" : ""}`}
-                  >
-                    <div className="relative shrink-0">
-                      {convAgent ? (
-                        <AgentAvatar name={convAgent.name} avatarUrl={convAgent.avatar_url} seed={convAgent.id} size={40} />
-                      ) : (
-                        <ManorAvatar size={40} />
-                      )}
-                      {/* Channel badge overlay */}
-                      <div
-                        className="chat-history-channel-badge absolute -bottom-0.5 -right-0.5 rounded-full flex items-center justify-center"
-                        style={{
-                          width: 16, height: 16,
-                          background: meta.badgeColor,
-                        }}
-                      >
-                        <meta.Icon size={8} style={{ color: "#fff" }} />
-                      </div>
-                    </div>
-
-                    <div className="flex-1 min-w-0">
-                      {/* Title + time */}
-                      <div className="flex items-center gap-2">
-                        {isEditing ? (
-                          <input
-                            autoFocus
-                            value={titleDraft}
-                            onClick={(e) => e.stopPropagation()}
-                            onChange={(e) => setTitleDraft(e.target.value)}
-                            onBlur={finishRename}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") {
-                                e.preventDefault();
-                                finishRename();
-                              }
-                              if (e.key === "Escape") {
-                                e.preventDefault();
-                                cancelRename();
-                              }
-                            }}
-                            className="chat-history-title-input text-[13px] font-semibold flex-1"
-                            style={{
-                              minWidth: 0,
-                            }}
-                          />
-                        ) : (
-                          <p className={`chat-history-row-title text-[13px] font-semibold truncate flex-1${isSelected ? " chat-history-row-title--selected" : ""}`}>
-                            {conv.title || t("page.chat_history.untitled")}
-                          </p>
-                        )}
-                        <span className="chat-history-row-time text-[10px] shrink-0">
-                          {relativeTime(conv.updated_at || conv.created_at)}
-                        </span>
-                      </div>
-
-                      {/* Channel + agent name subtitle — like old repo */}
-                      <p className="chat-history-row-subtitle text-[11px] truncate mt-0.5">
-                        <span className="chat-history-channel-label" style={{ color: meta.badgeColor }}>{t(meta.labelKey)}</span>
-                        <span className="mx-1">·</span>
-                        {convAgent?.name || t("page.chat_history.manor_ai")}
-                      </p>
-                    </div>
-
-                    {/* Rename */}
-                    {!isEditing && (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          startRename(conv.id, conv.title);
-                        }}
-                        className="chat-history-row-action opacity-0 group-hover:opacity-100 p-1.5 rounded-lg transition-all shrink-0"
-                        title={t("component.session_switcher.rename_chat")}
-                      >
-                        <IconEdit size={12} />
-                      </button>
-                    )}
-
-                    {/* Delete */}
-                    <button
-                      onClick={(e) => { e.stopPropagation(); setDeleteTarget(conv.id); }}
-                      className="chat-history-row-action chat-history-row-action--danger opacity-0 group-hover:opacity-100 p-1.5 rounded-lg transition-all shrink-0"
-                    >
-                      <IconClose size={12} />
-                    </button>
-                  </div>
-                );
-              })}
+      ) : (
+        <ConfigPage title={t("nav.chatHistory")}>
+          {(showChannelTabs || conversations.length > 8) && (
+            <div className="chat-history-filters">
+              {showChannelTabs && <TabSwitcher tabs={channelTabs} value={channelFilter} onChange={setChannelFilter} />}
+              {conversations.length > 8 && (
+                <SmartToolbar
+                  searchValue={search}
+                  onSearchChange={setSearch}
+                  searchPlaceholder={t("page.chat_history.search_placeholder")}
+                  className="w-full sm:w-64"
+                />
+              )}
             </div>
           )}
-        </div>
-      </div>
-
-      {/* ============================================================ */}
-      {/* RIGHT — Message detail panel                                  */}
-      {/* ============================================================ */}
-      <div className="chat-history-detail-panel flex-1 flex flex-col overflow-hidden">
-        {selectedConv ? (
-          <MessagePanel
-            key={selectedConv.id}
-            conversation={selectedConv}
-            agentInfo={selectedConv.agent_id ? agentMap[selectedConv.agent_id] : null}
-            onClose={() => setSelectedConvId(null)}
-            onRename={renameConversation}
-          />
-        ) : (
-          <div className="flex items-center justify-center h-full">
-            <div className="text-center">
-              <div className="chat-history-empty-icon w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-4">
-                <IconChat size={28} />
-              </div>
-              <p className="chat-history-empty-title text-[15px] font-semibold">{t("page.chat_history.select_conversation")}</p>
-              <p className="chat-history-empty-copy text-sm mt-1">{t("page.chat_history.select_conversation_desc")}</p>
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Delete confirmation */}
+          {isLoading ? (
+            <PageLoading />
+          ) : filtered.length === 0 ? (
+            <EmptyState
+              icon={<IconChatBubble size={40} />}
+              title={t("page.chat_history.no_conversations")}
+              description={t("page.chat_history.no_conversations_desc")}
+            />
+          ) : (
+            <>
+              {customerConversations.length > 0 && (
+                <ConfigGroup title={t("page.chat_history.group_customers")}>{renderRows(customerConversations)}</ConfigGroup>
+              )}
+              {ownConversations.length > 0 && (
+                <ConfigGroup title={t("page.chat_history.group_yours")}>{renderRows(ownConversations)}</ConfigGroup>
+              )}
+            </>
+          )}
+        </ConfigPage>
+      )}
       <ConfirmDialog
         open={!!deleteTarget}
         onClose={() => setDeleteTarget(null)}
@@ -685,7 +535,6 @@ export default function ChatHistory() {
         confirmLabel={deleteMutation.isPending ? t("page.chat_history.deleting") : t("action.delete")}
         danger
       />
-      </div>
-    </div>
+    </>
   );
 }

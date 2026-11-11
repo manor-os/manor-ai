@@ -304,28 +304,64 @@ async def _find_by_label(
     return (await db.execute(stmt)).scalar_one_or_none()
 
 
+def _reconnect_question(row: IntegrationSession) -> dict:
+    """Reconnect on the provider's own setup page (no secrets in chat)."""
+    from packages.core.ai.pending_action import PendingAction
+    from packages.core.ai.runtime.integration_setup_links import runtime_integration_setup_link
+    from packages.core.services.decision_recommendation import recommendation
+
+    label = f"{row.provider}{f' ({row.label})' if row.label else ''}"
+    action = PendingAction.needs_login(
+        login_url=runtime_integration_setup_link(row.provider).get("setup_url") or "/integrations",
+        title=f"Reconnect {label}",
+        integration_hint=row.provider,
+        provider_key=row.provider,
+    ).to_dict()
+    action["option_details"] = {
+        "sign_in": {"label": "Reconnect", "label_code": "integration.reconnect"},
+        "skip": {"label": "Remind me later", "label_code": "integration.later"},
+    }
+    action["recommendation"] = recommendation("sign_in", reason_code="reconnect")
+    return action
+
+
 async def _post_repair_card(row: IntegrationSession, reason: str) -> None:
-    """Best-effort chat card prompting the operator to re-pair."""
+    """Ask the account's owners and admins to reconnect (best effort).
+
+    A session belongs to the account, not to a Workspace or a person, so
+    there is no conversation they would see it in. Each owner/admin gets it
+    in their notifications (and their channels), opening the provider's own
+    setup page: reconnecting is the recommended answer; nothing is asked or
+    entered in chat.
+    """
     try:
         from packages.core.database import async_session
-        from packages.core.workspace_chat import service as chat_service
-
-        body = (
-            f"🔌 **Session expired** — {row.provider}"
-            f"{f' ({row.label})' if row.label else ''} needs re-pairing. "
-            f"Reason: `{reason}`. "
-            f"Reply `/pair {row.provider}{f' {row.label}' if row.label else ''}` "
-            f"or open Settings → Integrations to re-link."
+        from packages.core.services.notification_workspace_callbacks import (
+            resolve_workspace_hitl_recipients,
         )
+        from packages.core.services.notify import notify
+
+        question = _reconnect_question(row)
+        label = f"{row.provider}{f' ({row.label})' if row.label else ''}"
         async with async_session() as db:
-            await chat_service.post_message(
-                db,
-                entity_id=row.entity_id,
-                workspace_id=None,
-                body=body,
-                message_kind="goal_alert",
-                author_kind="system",
+            recipients = await resolve_workspace_hitl_recipients(
+                db, entity_id=row.entity_id, workspace_id=None,
             )
-            await db.commit()
+        expired_at = row.expired_at.isoformat() if row.expired_at else ""
+        for user_id in recipients:
+            await notify(
+                entity_id=row.entity_id,
+                user_id=user_id,
+                type="integration_session_expired",
+                title=f"Reconnect {label}",
+                body=(
+                    f"The {label} session expired ({reason}). Reconnecting is recommended: "
+                    "you sign in on the provider's own page, so work that uses it can continue."
+                ),
+                link=str(question["login_url"]),
+                severity="warn",
+                meta={"pending_action": question},
+                idempotency_key=f"session-expired:{row.id}:{expired_at}:{user_id}",
+            )
     except Exception:
         logger.warning("repair card post failed", exc_info=True)

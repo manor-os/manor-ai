@@ -84,17 +84,6 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
      "QuickBooks Online — accounts, invoices, customers.",
      "builtin", "packages.core.ai.mcp.quickbooks", "oauth2",
      "com.intuit.quickbooks.accounting"),
-    # Stripe — uses the vendor-hosted MCP at mcp.stripe.com via OAuth.
-    # The legacy in-process api_key wrapper (packages/core/ai/mcp/stripe.py)
-    # is no longer surfaced in the catalog — kept on disk so any
-    # existing Integration rows continue to import without crashing,
-    # but new connects always go through OAuth.
-    (OfficialRemoteMCPProvider.STRIPE.value, "Stripe",
-     "Manage your Stripe payments, customers, subscriptions, invoices, "
-     "and disputes — agents can run charges, issue refunds, update "
-     "billing, and pull revenue reports.",
-     "http", OfficialRemoteMCPFactory.create(OfficialRemoteMCPProvider.STRIPE).endpoint,
-     "oauth2", "read_write"),
     # PayPal remote MCP — only path Manor offers for PayPal (no
     # in-process wrapper). Sandbox vs live OAuth and MCP endpoints are
     # selected from PAYPAL_ENVIRONMENT by OfficialRemoteMCPFactory.
@@ -184,8 +173,9 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
      "Free tier: 1000 calls/month — enough for most agent workloads.",
      "builtin", "packages.core.ai.mcp.tavily", "api_key", None),
     ("apify", "Apify",
-     "Search public Instagram creators and collect recent posts and Reels "
-     "through Apify's official MCP with a quoted budget and tracked status.",
+     "Search public Instagram creators, collect recent posts and Reels, and "
+     "read public Instagram, YouTube and TikTok post counts through Apify's "
+     "official MCP with a quoted budget and tracked status.",
      "builtin", "packages.core.ai.mcp.apify", "api_key", None),
     ("alpaca_market_data", "Alpaca Market Data",
      "Read-only US stock quotes, trades, snapshots, bars, and news. "

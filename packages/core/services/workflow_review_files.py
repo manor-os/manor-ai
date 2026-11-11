@@ -72,6 +72,153 @@ async def review_files_from_refs(db: Any, *, entity_id: str, refs: Iterable[Any]
     return files
 
 
+#: Wait results a person answered; the files before one were reviewed there.
+_HUMAN_WAIT_TYPES = frozenset({"approval", "input", "human_input"})
+_WAIT_REVIEW_FILE_LIMIT = 8
+
+
+def _step_files(result: dict, *, entity_id: str) -> list[dict]:
+    """What one finished step delivered, newest first.
+
+    The files its output hands over (its file links) when it names any:
+    drafts, other formats and working notes it only saved stay out of the
+    review. A step that names none shows what it saved (host receipts).
+    """
+    from packages.core.services.workflow_chat_projection import workflow_result_files
+
+    named = []
+    for item in workflow_result_files(result.get("output"), entity_id=entity_id):
+        ref = {"document_id": item.get("document_id"), "name": item.get("name"), "fs_path": item.get("fsPath")}
+        if ref["name"] == ref["document_id"]:
+            ref["name"] = None  # A link without a label is named by its Document.
+        ref = {key: value for key, value in ref.items() if value}
+        if ref.get("document_id") or ref.get("fs_path"):
+            named.append(ref)
+    # A step's own result fields (poster_document_id, asset_document_ids) name what it delivered.
+    output = result.get("output")
+    for key, value in (output.items() if isinstance(output, dict) else ()):
+        if str(key).endswith(("_document_id", "_document_ids")):
+            for item in value if isinstance(value, list) else [value]:
+                if isinstance(item, str) and _DOCUMENT_ID.fullmatch(item.strip()) and not any(
+                    ref.get("document_id") == item.strip() for ref in named
+                ):
+                    named.append({"document_id": item.strip()})
+    if named:
+        return named
+    return [
+        {key: item[key] for key in ("document_id", "name", "fs_path") if item.get(key)}
+        for item in reversed(result.get("saved_files") or [])
+        if isinstance(item, dict) and (item.get("document_id") or item.get("fs_path"))
+    ]
+
+
+def _step_file_refs(result: dict, *, entity_id: str) -> list[str]:
+    return [str(item.get("document_id") or item.get("fs_path")) for item in _step_files(result, entity_id=entity_id)]
+
+
+#: Steps whose output is what a person or an event supplied, never something the run made.
+_SUPPLIED_STEP_TYPES = frozenset({"trigger", "webhook"})
+
+
+def _completed_results_newest_first(run: Any, *, skip: str = "") -> list[dict]:
+    snapshot = run.definition_snapshot if isinstance(getattr(run, "definition_snapshot", None), dict) else {}
+    supplied = {
+        str(node.get("id")) for node in snapshot.get("nodes") or []
+        if isinstance(node, dict) and node.get("type") in _SUPPLIED_STEP_TYPES
+    }
+    step_results = run.step_results if isinstance(run.step_results, dict) else {}
+    results = [
+        result for sid, result in step_results.items()
+        if sid != skip and sid not in supplied and isinstance(result, dict) and result.get("status") == "completed"
+    ]
+    return sorted(results, key=lambda result: str(result.get("completed_at") or ""), reverse=True)
+
+
+def workflow_run_made_files(run: Any) -> list[dict]:
+    """The files a run's steps saved or handed over, newest first, once each.
+
+    What a run delivered when its result names no files: a run that ends on a
+    project record still leads with the documents it made.
+    """
+    entity_id = str(run.entity_id or "")
+    files: list[dict] = []
+    seen: set[str] = set()
+    for result in _completed_results_newest_first(run):
+        for item in _step_files(result, entity_id=entity_id):
+            key = str(item.get("document_id") or item.get("fs_path"))
+            if key not in seen:
+                seen.add(key)
+                files.append(item)
+    return files
+
+
+#: Text a step may hand over as a package that links its deliverables.
+_HANDOFF_TEXT_SUFFIXES = (".md", ".markdown", ".txt")
+
+
+async def _with_linked_files(
+    db: Any, files: list[dict], *, entity_id: str, saved_refs: set[str],
+) -> list[dict]:
+    """Each handoff document followed by the files it links, once each.
+
+    A step often names one package (``social-package.md``) whose links are the
+    finished images; the review shows those images, not the drafts beside them.
+    """
+    from packages.core.services.document_service import get_document_content
+    from packages.core.services.file_refs import reply_file_references
+
+    shown, seen = [], {item["document_id"] for item in files}
+    for item in files[:_WAIT_REVIEW_FILE_LIMIT]:
+        shown.append(item)
+        if item["document_id"] not in saved_refs and item.get("fs_path") not in saved_refs:
+            continue
+        if not str(item.get("name") or "").lower().endswith(_HANDOFF_TEXT_SUFFIXES):
+            continue
+        text = await get_document_content(db, item["document_id"], entity_id)
+        refs = [ref.document_id or ref.fs_path for ref in reply_file_references(text or "", entity_id=entity_id)
+                if ref.entity_id in {"", entity_id}]
+        for linked in await review_files_from_refs(db, entity_id=entity_id, refs=refs):
+            if linked["document_id"] in seen:
+                continue
+            if linked["document_id"] in saved_refs or linked.get("fs_path") in saved_refs:
+                seen.add(linked["document_id"])
+                shown.append(linked)
+    return shown
+
+
+async def workflow_wait_review_files(db: Any, run: Any, *, step_id: str) -> list[dict]:
+    """The files a wait that names none puts in front of the person.
+
+    What the run made since a person last answered it, newest first: an
+    approval reviews the work it approves, a confirmation sees the file it is
+    about. A wait right after another one reaches back to earlier work.
+    """
+    entity_id = str(run.entity_id or "")
+    recent: list[str] = []
+    earlier: list[str] = []
+    answered = False
+    results = _completed_results_newest_first(run, skip=step_id)
+    for result in results:
+        if str(result.get("wait_type") or "") in _HUMAN_WAIT_TYPES:
+            answered = True
+            continue
+        (earlier if answered else recent).extend(_step_file_refs(result, entity_id=entity_id))
+    files = await review_files_from_refs(db, entity_id=entity_id, refs=recent)
+    if not files:
+        files = await review_files_from_refs(db, entity_id=entity_id, refs=earlier)
+    # Only follow links between files the host recorded this run saving.
+    # A Markdown link alone does not authorize exposing another file's metadata.
+    saved_refs = {
+        str(item.get("document_id") or item.get("fs_path"))
+        for result in results
+        for item in result.get("saved_files") or ()
+        if isinstance(item, dict) and (item.get("document_id") or item.get("fs_path"))
+    }
+    return (await _with_linked_files(
+        db, files, entity_id=entity_id, saved_refs=saved_refs,
+    ))[:_WAIT_REVIEW_FILE_LIMIT]
+
+
 async def attach_review_document_ids(db: Any, *, entity_id: str, reviews: Iterable[Any]) -> None:
     """Fill ``document_id`` on reviewed files that name an active Document's path.
 

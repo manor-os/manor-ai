@@ -132,9 +132,9 @@ function _roleOptions(): { value: ShareRole; label: string; description?: string
 }
 
 const ANON_ROLES = [
-  { value: "view", label: "Viewer" },
-  { value: "comment", label: "Commenter" },
-  { value: "download", label: "Downloader" },
+  { value: "view", label: t("ui.viewer") },
+  { value: "comment", label: t("ui.commenter") },
+  { value: "download", label: t("ui.downloader") },
 ] as const;
 
 function _anonRoleOptions(): { value: string; label: string }[] {
@@ -369,7 +369,7 @@ export default function ShareDialog({
         <span
           style={{
             fontSize: 12,
-            color: "#a8a29e",
+            color: "var(--text-faint)",
             display: "inline-flex",
             alignItems: "center",
             gap: 4,
@@ -469,7 +469,7 @@ export default function ShareDialog({
             style={{
               marginTop: 18,
               paddingTop: 14,
-              borderTop: "1px solid rgba(28,25,23,0.06)",
+              borderTop: "0.5px solid rgba(29, 29, 31,0.06)",
               display: "flex",
               flexDirection: "column",
               gap: 10,
@@ -483,7 +483,7 @@ export default function ShareDialog({
                 style={{
                   margin: 0,
                   fontSize: 11,
-                  color: "#a8a29e",
+                  color: "var(--text-faint)",
                   lineHeight: 1.5,
                 }}
               >
@@ -673,7 +673,7 @@ function AddPeopleSection({
             alignItems: "center",
             gap: 8,
             fontSize: 12,
-            color: "#57534e",
+            color: "var(--text-muted)",
           }}
         >
           <Toggle
@@ -690,7 +690,7 @@ function AddPeopleSection({
             alignItems: "center",
             gap: 6,
             fontSize: 11,
-            color: "#a8a29e",
+            color: "var(--text-faint)",
             flex: 1,
             minWidth: 180,
           }}
@@ -759,7 +759,7 @@ function PendingChip({
         <div
           style={{
             fontSize: 11,
-            color: "#a8a29e",
+            color: "var(--text-faint)",
             overflow: "hidden",
             textOverflow: "ellipsis",
             whiteSpace: "nowrap",
@@ -847,7 +847,7 @@ function PeopleWithAccessSection({
         <p
           style={{
             fontSize: 12,
-            color: "#a8a29e",
+            color: "var(--text-faint)",
             margin: "10px 0 0",
             padding: "12px 0",
             textAlign: "center",
@@ -889,7 +889,7 @@ function PeopleWithAccessSection({
 // ── Section 3: General access ────────────────────────────────────────────
 
 const _TONE_COLOR: Record<GeneralAccessLine["tone"], string> = {
-  neutral: "#a8a29e",
+  neutral: "#aeaeb2",
   warning: "#7c4a2e",
   error: "#a23e38",
 };
@@ -1005,7 +1005,7 @@ function GeneralAccessSection({
             <span>{_lineText(copy.internal)}</span>
           </p>
           {!onVisibilityChange && (
-            <p style={{ fontSize: 11, color: "#a8a29e", margin: "4px 0 0", lineHeight: 1.5 }}>
+            <p style={{ fontSize: 11, color: "var(--text-muted)", margin: "4px 0 0", lineHeight: 1.5 }}>
               {t("permissions.share.visibility_readonly_hint")}
             </p>
           )}
@@ -1063,7 +1063,7 @@ function GeneralAccessSection({
         {_lineText(copy.link)}
       </p>
       {busy && (
-        <p style={{ fontSize: 11, color: "#a8a29e", margin: "6px 0 0" }}>
+        <p style={{ fontSize: 11, color: "var(--text-muted)", margin: "6px 0 0" }}>
           {t("permissions.share.general.applying")}
         </p>
       )}
@@ -1079,9 +1079,7 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
       style={{
         fontSize: 11,
         fontWeight: 700,
-        color: "#57534e",
-        textTransform: "uppercase",
-        letterSpacing: 0.4,
+        color: "var(--text-muted)",
       }}
     >
       {children}

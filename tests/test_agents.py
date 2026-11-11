@@ -680,6 +680,38 @@ async def test_delete_agent_rejects_active_workspace_mapping(client: AsyncClient
     assert deleted.status_code == 204
 
 
+@pytest.mark.asyncio
+async def test_trashed_workspace_mapping_does_not_block_agent_delete_and_restore_reports_it(
+    client: AsyncClient,
+):
+    headers = await _auth(client, "trashed_ws_agent_delete")
+    workspace_id, agent_id, service_key = await _create_mapped_agent_runtime(
+        client,
+        headers,
+        name="Trashed Workspace Agent",
+    )
+    trashed = await client.delete(f"/api/v1/workspaces/{workspace_id}", headers=headers)
+    assert trashed.status_code == 204, trashed.text
+
+    deleted = await client.delete(f"/api/v1/agents/{agent_id}", headers=headers)
+    assert deleted.status_code == 204, deleted.text
+
+    restored = await client.post(f"/api/v1/workspaces/{workspace_id}/restore", headers=headers)
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["unmapped_agents"] == [{
+        "agent_id": agent_id,
+        "agent_name": "Trashed Workspace Agent",
+        "service_key": service_key,
+    }]
+    assert all(
+        mapping["agent_id"] != agent_id
+        for mapping in restored.json()["operating_model"].get("agent_mappings", [])
+    )
+    mappings = await client.get(f"/api/v1/workspaces/{workspace_id}/agents", headers=headers)
+    assert mappings.status_code == 200, mappings.text
+    assert mappings.json() == []
+
+
 async def _register_test_worker(client: AsyncClient, headers: dict, name: str = "Hermes Runtime") -> str:
     resp = await client.post(
         "/api/v1/workers/register",

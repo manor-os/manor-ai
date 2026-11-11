@@ -36,7 +36,7 @@
 .approval-rule-targets > label { display: grid; gap: 5px; color: var(--text-muted); font-size: 11px; }
 .approval-rule-meta { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 6px; font-size: 11px; color: var(--text-muted); }
 .approval-rule-meta > span { margin-right: auto; }
-.approval-inherited-rule,.approval-exception { display: flex; align-items: center; gap: 12px; padding: 14px 0; border-top: 1px solid var(--border-subtle); font-size: 12px; }
+.approval-inherited-rule,.approval-exception { display: flex; align-items: center; gap: 12px; padding: 14px 0; border-top: 0.5px solid var(--border-subtle); font-size: 12px; }
 .approval-inherited-rule > div,.approval-exception > div { flex: 1; min-width: 0; }
 .approval-inherited-rule strong,.approval-exception strong { display: block; font-size: 13px; overflow-wrap: anywhere; font-weight: 600; }
 .approval-inherited-rule div > span,.approval-exception div > span { display: block; margin-top: 5px; font-size: 11px; color: var(--text-muted); }
@@ -44,13 +44,13 @@
 .approval-status > p { margin: 0 0 8px; }
 .approval-preview { margin: 4px 0 14px; }
 .approval-preview-results table { width: 100%; border-collapse: collapse; font-size: 12px; }
-.approval-preview-results th,.approval-preview-results td { padding: 10px 6px; text-align: left; border-bottom: 1px solid var(--border-subtle); overflow-wrap: anywhere; }
+.approval-preview-results th,.approval-preview-results td { padding: 10px 6px; text-align: left; border-bottom: 0.5px solid var(--border-subtle); overflow-wrap: anywhere; }
 .approval-preview-results th { color: var(--text-muted); font-size: 11px; font-weight: 600; }
 .approval-save-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; padding-top: 8px; }
 .approval-save-row > span { flex: 1; min-width: 0; font-size: 11px; line-height: 1.4; color: var(--text-muted); }
 .approval-save-row > div,.approval-pagination { display: flex; gap: 6px; flex-wrap: wrap; }
 .approval-save-row > div { margin-left: auto; justify-content: flex-end; gap: 8px; }
-.approval-exceptions { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border-subtle); }
+.approval-exceptions { margin-top: 24px; padding-top: 20px; border-top: 0.5px solid var(--border-subtle); }
 .approval-mode-trigger { display: inline-flex; flex: 0 1 auto; min-width: 0; align-items: center; justify-content: center; gap: 5px; padding: 5px 8px; min-height: 30px; max-width: 220px; border: 0; border-radius: 8px; background: transparent; font: inherit; font-size: 11px; color: var(--text-muted); cursor: pointer; }
 .approval-mode-trigger > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .approval-mode-trigger > svg { flex-shrink: 0; }

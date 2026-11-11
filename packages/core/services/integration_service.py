@@ -1105,6 +1105,12 @@ _CHANNEL_LABELS = {
 }
 
 
+def channel_display_name(channel_type: str | None) -> str:
+    """The channel's name as the Integrations page shows it ("Telegram")."""
+    key = str(channel_type or "").strip()
+    return _CHANNEL_LABELS.get(key.lower(), key.replace("_", " ").title() or "Channel")
+
+
 async def get_integration_inventory(
     db: AsyncSession,
     entity_id: str,

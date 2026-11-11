@@ -153,6 +153,7 @@ include = ["packages*", "apps*"]
 [tool.setuptools.package-data]
 "packages.core.ai.mcp" = ["manor_pms_tools.json"]
 "packages.core.memory" = ["skills/*/SKILL.md"]
+"packages.core.services" = ["data/*.json"]
 
 [tool.ruff]
 target-version = "py311"

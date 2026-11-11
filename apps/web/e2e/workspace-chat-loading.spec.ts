@@ -83,7 +83,7 @@ test("secondary reads wait for visible content and stats load only when opened",
   } finally { finishHistory(); finishApp(); }
 });
 
-test("a closed App stays idle after switching Workspace and can be reopened", async ({ page }) => {
+test("a closed App reads its view once to offer the switch and can be reopened", async ({ page }) => {
   const appRequests: string[] = [];
   await page.route("**/api/v1/**", (route) => {
     const path = new URL(route.request().url()).pathname;
@@ -93,13 +93,29 @@ test("a closed App stays idle after switching Workspace and can be reopened", as
   });
   await page.goto("/e2e/fixtures/workspace-app-pane.html");
   await expect(page.getByText("The App is ready", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Hide workspace app", exact: true }).click();
+  const display = page.locator(".workspace-app-display-switch");
+  await display.getByRole("button", { name: "Chat", exact: true }).click();
   await page.getByRole("button", { name: "Switch Workspace", exact: true }).click();
-  await expect.poll(() => appRequests.length).toBe(1);
+  await expect.poll(() => appRequests.length).toBe(2);
   await expect(page.locator('[data-pane-id="app"]')).toBeHidden();
-  await page.getByRole("button", { name: "Open workspace app", exact: true }).click();
+  await display.getByRole("button", { name: "Split", exact: true }).click();
   await expect(page.getByText("The App is ready", { exact: true })).toBeVisible();
   expect(appRequests).toHaveLength(2);
+});
+
+test("an App with nothing on it leaves only the chat, whatever view was saved", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("workspace-chat-app-display", "app"));
+  await page.route("**/api/v1/**", (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/app-view")) return route.fulfill({ json: { ...view, hero: null, actions: [] } });
+    if (path.endsWith("/chat/messages/page")) return route.fulfill({ json: history });
+    return route.fulfill({ json: [] });
+  });
+  await page.goto("/e2e/fixtures/workspace-app-pane.html");
+  await expect(page.locator(".workspace-chat-history-stage")).toBeVisible();
+  await expect(page.locator(".workspace-app-display-switch")).toHaveCount(0);
+  await expect(page.locator('[data-pane-id="app"]')).toBeHidden();
+  expect(await page.evaluate(() => localStorage.getItem("workspace-chat-app-display"))).toBe("app");
 });
 
 test("an App error releases secondary reads and can be retried", async ({ page }) => {

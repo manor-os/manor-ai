@@ -75,12 +75,12 @@ GENERATE_FILE_SCHEMA: dict[str, Any] = {
                 },
                 "source": {
                     "type": "object",
-                    "description": "Unchanged conversion only; no content/prompt/files/options/operations/template/expected_sha256. For PDF edits use prompt with current file path, without source.",
+                    "description": "Unchanged conversion only; no content/prompt/files/options/operations/template/expected_sha256. Images take {url}. For PDF edits use prompt with file path, no source.",
                     "properties": {
                         "path": {"type": "string"},
                         "expected_sha256": {"type": "string"},
+                        "url": {"type": "string"},
                     },
-                    "required": ["path", "expected_sha256"],
                     "additionalProperties": False,
                 },
                 "file_type": {

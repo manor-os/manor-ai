@@ -114,7 +114,6 @@ INTEGRATION_SKILL_ROUTES: dict[str, IntegrationSkillRoute] = {
             chrome_fallback=True,
         ),
         _route("quickbooks", "platform-commerce", "mcp_quickbooks", "quick books", chrome_fallback=True),
-        _route("stripe", "platform-commerce", "mcp_stripe", chrome_fallback=True),
         _route("paypal", "platform-commerce", "mcp_paypal", "pay pal", chrome_fallback=True),
         _route(
             "robinhood",
@@ -191,7 +190,10 @@ INTEGRATION_SKILL_ROUTES: dict[str, IntegrationSkillRoute] = {
         _route("replicate", "platform-media-research", "mcp_replicate", chrome_fallback=True),
         _route("elevenlabs", "platform-media-research", "mcp_elevenlabs", "eleven labs", chrome_fallback=True),
         _route("tavily", "platform-media-research", "mcp_tavily", chrome_fallback=True),
-        _route("apify", "platform-social", "mcp_apify", "instagram collection", "ig collection"),
+        _route(
+            "apify", "platform-social", "mcp_apify", "instagram collection", "ig collection",
+            "apify youtube", "apify tiktok",
+        ),
         _route(
             "alpaca_market_data",
             "platform-market-data",

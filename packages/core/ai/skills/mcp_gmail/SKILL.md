@@ -20,9 +20,10 @@ If a tool returns an auth error (token expired, insufficient scope, account not 
 
 Read / search:
 - `list_messages` — search with Gmail query syntax (required: `query`, e.g. `is:unread newer_than:7d`, `from:x@y.com`). Returns IDs only.
-- `get_message` — full headers + body by `message_id`.
-- `list_threads` / `get_thread` — work at thread granularity for conversations.
-- `download_attachment` — fetch an attachment by message + attachment id.
+- `get_message` — sender, recipients, subject, date, decoded body text and `attachments` by `message_id`. A long body arrives in pages: while `next_offset` is set, call again with `offset=<next_offset>` and read every page before summarizing, quoting or archiving the email.
+- `list_threads` / `get_thread` — a whole conversation; each message shows only its own text (quoted earlier replies removed) plus its attachments.
+- `save_attachment_to_workspace` — save one attachment (by `message_id` + the `attachment_id` listed on the message) to the Workspace and get its readable text and a document link. Use it whenever an attachment must be read or kept.
+- `download_attachment` — raw base64 bytes of one attachment; only when a later tool needs the bytes themselves.
 - `list_labels` / `get_profile` — labels and the connected address.
 
 Write / send (high-impact — see Guardrails):

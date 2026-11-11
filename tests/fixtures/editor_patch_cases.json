@@ -1,0 +1,216 @@
+[
+  {
+    "name": "replace unique",
+    "content": "alpha beta",
+    "op": {
+      "op": "replace",
+      "find": "beta",
+      "replace": "gamma"
+    },
+    "expected": "alpha gamma"
+  },
+  {
+    "name": "replace missing fails",
+    "content": "alpha",
+    "op": {
+      "op": "replace",
+      "find": "beta",
+      "replace": "x"
+    },
+    "fails": true
+  },
+  {
+    "name": "replace ambiguous fails",
+    "content": "a b a",
+    "op": {
+      "op": "replace",
+      "find": "a",
+      "replace": "x"
+    },
+    "fails": true
+  },
+  {
+    "name": "overlapping match is ambiguous",
+    "content": "aaa",
+    "op": {
+      "op": "replace",
+      "find": "aa",
+      "replace": "x"
+    },
+    "fails": true
+  },
+  {
+    "name": "replace all",
+    "content": "a b a",
+    "op": {
+      "op": "replace",
+      "find": "a",
+      "replace": "xy",
+      "all": true
+    },
+    "expected": "xy b xy"
+  },
+  {
+    "name": "delete unique",
+    "content": "a b",
+    "op": {
+      "op": "delete",
+      "find": " b"
+    },
+    "expected": "a"
+  },
+  {
+    "name": "delete all",
+    "content": "a-b-c",
+    "op": {
+      "op": "delete",
+      "find": "-",
+      "all": true
+    },
+    "expected": "abc"
+  },
+  {
+    "name": "insert before",
+    "content": "a b",
+    "op": {
+      "op": "insert_before",
+      "find": "b",
+      "text": "x "
+    },
+    "expected": "a x b"
+  },
+  {
+    "name": "insert after",
+    "content": "a b",
+    "op": {
+      "op": "insert_after",
+      "find": "a",
+      "text": " x"
+    },
+    "expected": "a x b"
+  },
+  {
+    "name": "insert ambiguous fails",
+    "content": "a a",
+    "op": {
+      "op": "insert_after",
+      "find": "a",
+      "text": "x"
+    },
+    "fails": true
+  },
+  {
+    "name": "append",
+    "content": "a",
+    "op": {
+      "op": "append",
+      "text": "b"
+    },
+    "expected": "ab"
+  },
+  {
+    "name": "prepend",
+    "content": "a",
+    "op": {
+      "op": "prepend",
+      "text": "b"
+    },
+    "expected": "ba"
+  },
+  {
+    "name": "range",
+    "content": "keep START old middle END keep",
+    "op": {
+      "op": "replace_range",
+      "find_start": "START",
+      "find_end": "END",
+      "replace": "new"
+    },
+    "expected": "keep new keep"
+  },
+  {
+    "name": "range end is searched after start",
+    "content": "END START old END tail",
+    "op": {
+      "op": "replace_range",
+      "find_start": "START",
+      "find_end": "END",
+      "replace": "new"
+    },
+    "expected": "END new tail"
+  },
+  {
+    "name": "range takes first end after start",
+    "content": "START a END b END",
+    "op": {
+      "op": "replace_range",
+      "find_start": "START",
+      "find_end": "END",
+      "replace": "new"
+    },
+    "expected": "new b END"
+  },
+  {
+    "name": "range ambiguous start fails",
+    "content": "START START END",
+    "op": {
+      "op": "replace_range",
+      "find_start": "START",
+      "find_end": "END",
+      "replace": "new"
+    },
+    "fails": true
+  },
+  {
+    "name": "range missing end fails",
+    "content": "START only",
+    "op": {
+      "op": "replace_range",
+      "find_start": "START",
+      "find_end": "END",
+      "replace": "new"
+    },
+    "fails": true
+  },
+  {
+    "name": "crlf is matched exactly",
+    "content": "a\r\nb\r\n",
+    "op": {
+      "op": "replace",
+      "find": "a\r\nb",
+      "replace": "c"
+    },
+    "expected": "c\r\n"
+  },
+  {
+    "name": "unknown op fails",
+    "content": "a",
+    "op": {
+      "op": "insert after",
+      "find": "a",
+      "text": "b"
+    },
+    "fails": true
+  },
+  {
+    "name": "empty find fails",
+    "content": "a",
+    "op": {
+      "op": "replace",
+      "find": "",
+      "replace": "b"
+    },
+    "fails": true
+  },
+  {
+    "name": "non-boolean all fails",
+    "content": "a",
+    "op": {
+      "op": "replace",
+      "find": "a",
+      "replace": "b",
+      "all": "yes"
+    },
+    "fails": true
+  }
+]

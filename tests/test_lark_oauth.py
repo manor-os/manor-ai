@@ -268,6 +268,7 @@ async def test_lark_admin_secret_and_user_tokens_remain_encrypted(lark_db, local
     sessions, service = lark_db
     monkeypatch.setattr(router, "lock_runtime_integration_account_scope", AsyncMock())
     monkeypatch.setattr(router, "normalize_runtime_integration_account_defaults", AsyncMock())
+    monkeypatch.setattr(router, "route_declared_channels_after_connect", AsyncMock())
     monkeypatch.setattr(health_check_task, "delay", lambda **_kwargs: None)
     async with sessions() as db:
         assert await save_oauth_config(db, "lark", client_id=CONFIG.client_id, client_secret=CONFIG.client_secret)

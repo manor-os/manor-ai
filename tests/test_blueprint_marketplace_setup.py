@@ -195,3 +195,22 @@ async def test_real_platform_copy_uses_own_source_identity_over_inherited_catalo
         assert not await ready(db_session, ws, todo)
 
 
+
+
+async def test_todos_sharing_one_evaluation_still_check_their_own_targets(db_session):
+    ws, _agent, _skill, _binding = await workspace_fixture(db_session)
+    reads: dict = {}
+
+    async def check(kind, payload):
+        return (await _blueprint_install_todo_result(
+            db_session, ws, {"kind": kind, "payload": payload},
+            integration_states={}, configured_channels=[], reads=reads,
+        ))["ready"]
+
+    callable_check = {"kind": "agent_callable"}
+    assert await check("post_install_check", {"check": {**callable_check, "service_key": "write"}})
+    assert not await check("post_install_check", {"check": {**callable_check, "service_key": "review"}})
+    assert await check("missing_agent", {"service_key": "write", "agent_slug": "author"})
+    assert not await check("missing_agent", {"service_key": "write", "agent_slug": "editor"})
+    assert not await check("post_install_check", {"check": {"kind": "workflow_present", "workflow_slug": "draft"}})
+    assert set(reads) == {"agent_deployments", "workflow_bindings"}

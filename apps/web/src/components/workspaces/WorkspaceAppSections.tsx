@@ -15,6 +15,8 @@ import {
   type WorkspaceStatDefinition,
 } from "../../lib/api";
 import { captureClientError } from "../../lib/clientErrors";
+import { displayReadInterval } from "../../lib/readRefreshPolicy";
+import { usePageVisible } from "../../lib/usePageVisible";
 import { viewerPathForDocumentId } from "../../lib/fileReferences";
 import { getPreferredTimeZone, relativeTime } from "../../lib/format";
 import { goalProgressPercent } from "../../lib/goalNumbers";
@@ -27,7 +29,8 @@ import { IconArrowRight, IconBell, IconChevronRight, IconMusicNote, IconPause, I
 import { useToastStore } from "../../stores/toast";
 import Button from "../ui/Button";
 import { useDocumentThumbnail } from "../ui/useDocumentThumbnail";
-import ConnectionRow from "./WorkspaceAppConnections";
+import IntegrationConnectRow from "../integrations/IntegrationConnectRow";
+import { useWorkspaceAppDraftId } from "./workspaceAppDraft";
 
 const WorkspaceAppDecisionDialog = lazy(() => import("./WorkspaceAppDecisionDialog"));
 import { openMetricDetail } from "./WorkspaceAppMetricDetail";
@@ -69,17 +72,20 @@ function normalizeSectionData(data: WorkspaceAppSectionData): WorkspaceAppSectio
 }
 
 /** One block's data query; blocks and the notices zone share its cache. */
-function sectionQueryOptions(workspaceId: string, section: WorkspaceAppSection, refetchInterval: (data: unknown) => number | false) {
+function sectionQueryOptions(workspaceId: string, section: WorkspaceAppSection, refetchInterval: (data: unknown) => number | false,
+  draftId: string | null, visible: boolean) {
   return {
-    queryKey: ["workspace-app-section", workspaceId, section.id, section.source, section.view, section.limit],
-    queryFn: async ({ signal }: { signal: AbortSignal }) => normalizeSectionData(await api.workspaces.appViewSection(workspaceId, section.id, signal)),
-    enabled: section.available,
-    refetchInterval: (query: { state: { data?: unknown } }) => refetchInterval(query.state.data),
+    queryKey: ["workspace-app-section", workspaceId, section.id, section.source, section.view, section.limit, draftId],
+    queryFn: async ({ signal }: { signal: AbortSignal }) => normalizeSectionData(await api.workspaces.appViewSection(workspaceId, section.id, signal, draftId)),
+    enabled: visible && section.available,
+    refetchInterval: (query: { state: { data?: unknown; status?: string; error?: unknown } }) => displayReadInterval(query.state, refetchInterval(query.state.data)),
+    retry: false,
+    refetchOnWindowFocus: "always" as const,
   };
 }
 
 function useSectionData(workspaceId: string, section: WorkspaceAppSection, refetchInterval: (data: unknown) => number | false) {
-  return useQuery(sectionQueryOptions(workspaceId, section, refetchInterval));
+  return useQuery(sectionQueryOptions(workspaceId, section, refetchInterval, useWorkspaceAppDraftId(), usePageVisible()));
 }
 
 function fileHref(file: WorkspaceAppOutputFile): string | null {
@@ -92,6 +98,11 @@ function runStatusTone(run: WorkspaceAppOutputRun): "active" | "done" | "attenti
   if (run.status === "paused" || (run.status === "completed" && run.business_outcome && run.business_outcome !== "completed")) return "attention";
   if (run.status === "completed") return "done";
   return "idle";
+}
+
+/** A finished result speaks for itself; only a state that needs noticing (running, waiting, failed) gets a chip. */
+function runSettled(run: WorkspaceAppOutputRun): boolean {
+  return run.status === "completed" && !run.business_outcome?.match(/needs_input|revision_required/);
 }
 
 function SectionHead({ title, detail, action }: { title: string; detail?: string | null; action?: ReactNode }) {
@@ -117,10 +128,11 @@ function OutputsSection({ workspaceId, section, runAction }: {
   const location = useLocation();
   const navigate = useNavigate();
   const flowsAccess = usePreviewFeatureAccess("flows");
-  // A run waiting for a person still changes when they answer, wherever they answer.
+  // Follow unsettled runs closely, but keep discovering runs started elsewhere
+  // even when this list is empty or every known result has finished.
   const query = useSectionData(workspaceId, section, (data) => {
     const items = (data as { items?: WorkspaceAppOutputRun[] } | undefined)?.items || [];
-    return items.some((run) => !TERMINAL_RUN_STATUSES.has(run.status)) ? 10_000 : false;
+    return items.some((run) => !TERMINAL_RUN_STATUSES.has(run.status)) ? 10_000 : 60_000;
   });
   const runs = (query.data?.block === "outputs" ? query.data.items : []) as WorkspaceAppOutputRun[];
   // A section is named by its config, else after the flow it is scoped to, so two output sections differ.
@@ -147,6 +159,7 @@ function OutputsSection({ workspaceId, section, runAction }: {
   }
   // The default page only shows outputs once the Workspace has produced some.
   if (!runs.length && section.implicit) return null;
+  const listed = runs.filter(listedOutput);
 
   const runState = { returnTo: `${location.pathname}${location.search}${location.hash}` };
   // Results come first: the gallery, unless someone chose the list.
@@ -168,9 +181,9 @@ function OutputsSection({ workspaceId, section, runAction }: {
   };
   return <section className="workspace-app-view__section workspace-app-section" aria-label={title}>
     {head}
-    {!runs.length ? <p className="workspace-app-section__note">{t("component.workspace_app_view.outputs_empty")}</p>
+    {!runs.length || (!gallery && !listed.length) ? <p className="workspace-app-section__note">{t("component.workspace_app_view.outputs_empty")}</p>
       : gallery ? <OutputsGallery runs={runs} openRun={openRun} />
-        : <ul className="workspace-app-outputs">{runs.map((run) => {
+        : <ul className="workspace-app-outputs">{listed.map((run) => {
           const tone = runStatusTone(run);
           // Name what came out; the action that made it is the byline.
           const action = run.title || section.source_title || t("component.workspace_app_view.outputs_run");
@@ -193,7 +206,7 @@ function OutputsSection({ workspaceId, section, runAction }: {
               )}>{label}</button>
                 : flowsAccess.enabled ? <Link to={workflowRunPath(run.workflow_id, run.run_id, workspaceId)} state={runState}>{label}</Link>
                   : <span className="workspace-app-outputs__open">{label}</span>}
-              <span className={`workspace-app-status workspace-app-status--${tone}`}>{runStatusLabel(run.status, run.business_outcome)}</span>
+              {!runSettled(run) && <span className={`workspace-app-status workspace-app-status--${tone}`}>{runStatusLabel(run.status, run.business_outcome)}</span>}
             </div>
             <RunStageProgress run={run} />
             {run.result_summary && run.result_summary !== name && <p className="workspace-app-outputs__summary">{run.result_summary}</p>}
@@ -286,6 +299,16 @@ function resultWithoutFiles(run: WorkspaceAppOutputRun): boolean {
     && Boolean(run.result_title || run.result_summary || (run.publications || []).length);
 }
 
+/**
+ * Whether the list shows a run: one in progress, waiting on the person, or
+ * finished with something to show. A failed or cancelled run is not a result
+ * (Needs you offers its retry), whatever its steps touched along the way.
+ */
+function listedOutput(run: WorkspaceAppOutputRun): boolean {
+  if (run.status === "failed" || run.status === "cancelled") return false;
+  return run.files.length > 0 || resultWithoutFiles(run);
+}
+
 /** Where a published result lives, on the tile of what was published. */
 function PublishedMarks({ run }: { run: WorkspaceAppOutputRun }) {
   const publications = run.publications || [];
@@ -320,8 +343,7 @@ function OutputsGallery({ runs, openRun }: {
       const running = ACTIVE_RUN_STATUSES.has(run.status);
       const headline = run.result_title || run.result_summary || (running ? run.progress?.current?.name : "") || run.title;
       const detail = run.result_title && run.result_summary !== run.result_title ? run.result_summary : null;
-      // A finished result speaks for itself; only a state that needs noticing gets a chip.
-      const settled = run.status === "completed" && !run.business_outcome?.match(/needs_input|revision_required/);
+      const settled = runSettled(run);
       const body = <>
         <span className="workspace-app-gallery__result">
           {!settled && <span className={`workspace-app-status workspace-app-status--${runStatusTone(run)}`}>{runStatusLabel(run.status, run.business_outcome)}</span>}
@@ -388,7 +410,8 @@ function GalleryAudioTile({ run, file, first }: { run: WorkspaceAppOutputRun; fi
     if (!file.document_id) return;
     setState("loading");
     try {
-      const element = new Audio(await api.documents.download(file.document_id, { cache: true }));
+      // It plays while it downloads.
+      const element = new Audio(await api.documents.streamUrl(file.document_id));
       element.onplay = () => setState("playing");
       element.onpause = () => setState("paused");
       element.onended = () => setState("paused");
@@ -404,16 +427,20 @@ function GalleryAudioTile({ run, file, first }: { run: WorkspaceAppOutputRun; fi
   const progress = time.length ? Math.min(100, time.at / time.length * 100) : 0;
   return <li>
     <div className="workspace-app-gallery__card workspace-app-gallery__card--audio">
-      <span className="workspace-app-gallery__glyph" aria-hidden="true"><IconMusicNote size={26} /></span>
+      <span className="workspace-app-gallery__glyph" aria-hidden="true"><IconMusicNote size={16} /></span>
       {first && <PublishedMarks run={run} />}
       {file.document_id && <button type="button" className="workspace-app-gallery__play" onClick={() => void toggle()}
         aria-label={t(state === "playing" ? "component.workspace_app_view.outputs_pause" : "component.workspace_app_view.outputs_play", { name: file.name })}
         aria-busy={state === "loading"}>
         {state === "playing" ? <IconPause size={16} /> : <IconPlay size={16} />}
       </button>}
+      {/* The clock sits under the button so the caption keeps the file's name. */}
+      {time.length > 0 && <span className="workspace-app-gallery__time" aria-hidden="true">
+        {formatPlayTime(time.at)} / {formatPlayTime(time.length)}
+      </span>}
       <span className="workspace-app-gallery__caption">
         {href ? <Link to={href} title={file.name}>{file.name}</Link> : <span>{file.name}</span>}
-        <small>{time.length ? `${formatPlayTime(time.at)} / ${formatPlayTime(time.length)}` : extension}</small>
+        {extension && <small>{extension}</small>}
       </span>
       <span className="workspace-app-gallery__played" aria-hidden="true"><i style={{ width: `${progress}%` }} /></span>
     </div>
@@ -510,9 +537,13 @@ function MetricTile({ metric, onOpen }: { metric: WorkspaceAppMetric; onOpen: (e
     : null;
   const pace = goal?.status === "achieved" ? "achieved" : goal?.pace_status && goal.pace_status !== "unknown" ? goal.pace_status : null;
   const paceTone = pace === "achieved" || pace === "on_track" || pace === "ahead" ? "done" : "attention";
+  // How far is left: up to a target above where it started, down to one below it.
+  const rising = goal && goal.target !== null ? goal.target >= (goal.baseline ?? 0) : true;
+  const remaining = goal && goal.target !== null && metric.value !== null && pace !== "achieved"
+    ? rising ? goal.target - metric.value : metric.value - goal.target : null;
   return <li>
     <button type="button" className="workspace-app-metric" onClick={onOpen} aria-haspopup="dialog">
-      <span className="workspace-app-metric__label">{metric.title}</span>
+      <span className="workspace-app-metric__label" title={metric.description || undefined}>{metric.title}</span>
       <span className="workspace-app-metric__reading">
         <strong className="workspace-app-metric__value">{formatWorkspaceStatValue(stat, metric.value)}</strong>
         <MetricChange series={metric.series} />
@@ -523,6 +554,7 @@ function MetricTile({ metric, onOpen }: { metric: WorkspaceAppMetric; onOpen: (e
         <small>
           {t("component.workspace_app_view.metrics_target", { target: formatWorkspaceStatValue(stat, goal.target) })}
           {percent !== null && ` · ${percent}%`}
+          {remaining !== null && remaining > 0 && ` · ${t("component.workspace_app_view.metrics_to_go", { amount: formatWorkspaceStatValue(stat, remaining) })}`}
           {pace && <> · <span className={`workspace-app-metric__pace workspace-app-metric__pace--${paceTone}`}>
             {t(`component.workspace_app_view.pace_${pace}`)}</span></>}
         </small>
@@ -654,13 +686,24 @@ function plainSummary(value: string | null | undefined): string {
     .trim();
 }
 
+/** A confirmation ("the file was delivered") is confirmed, not accepted. */
+function queuePrimaryLabel(option: string): string {
+  const normalized = option.toLowerCase().replace(/[-\s]+/g, "_");
+  if (normalized === "confirm") return t("component.workflow_run.action.confirm");
+  if (normalized === "done") return t("component.workflow_run.action.done");
+  return t("component.workflow_review.accept");
+}
+
 /** A pending decision. A workflow review can be accepted here, with a glimpse of
  * what is waiting; anything else, and every change request, opens its card in the App. */
 function DecisionRow({ item, workspaceId }: { item: WorkspaceAppQueueItem; workspaceId: string }) {
   const queryClient = useQueryClient();
   const toast = useToastStore();
+  const navigate = useNavigate();
+  const flowsAccess = usePreviewFeatureAccess("flows");
   const [opened, setOpened] = useState(false);
-  const open = () => setOpened(true);
+  const run = item.workflow_run;
+  const open = () => run ? navigate(workflowRunPath(run.workflow_id, run.run_id, workspaceId)) : setOpened(true);
   const accept = useMutation({
     mutationFn: () => api.workspaces.chat.resolveAction(workspaceId, item.message_id, item.primary_option!),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["workspace-app-section", workspaceId] }),
@@ -673,7 +716,7 @@ function DecisionRow({ item, workspaceId }: { item: WorkspaceAppQueueItem; works
   </Suspense>;
   if (!item.primary_option) {
     return <li className="workspace-app-notices__row">
-      <button type="button" onClick={open}>
+      <button type="button" onClick={open} disabled={Boolean(run) && !flowsAccess.enabled}>
         {/* An Agent asking about files shows a few of them; answering stays on its chat card. */}
         {previews.length > 0
           ? <span className="workspace-app-notices__previews" aria-hidden="true">
@@ -708,7 +751,7 @@ function DecisionRow({ item, workspaceId }: { item: WorkspaceAppQueueItem; works
     <span className="workspace-app-notices__actions">
       <Button size="sm" variant="primary" loading={accept.isPending} disabled={accept.isPending || accept.isSuccess}
         onClick={() => accept.mutate()}>
-        {t("component.workflow_review.accept")}
+        {queuePrimaryLabel(item.primary_option)}
       </Button>
       <Button size="sm" variant="outline" onClick={open}>
         {item.has_changes_option ? t("component.workspace_app_view.queue_review") : t("component.workspace_app_view.queue_open")}
@@ -763,9 +806,10 @@ const BLOCK_RENDERERS: Record<WorkspaceAppSectionBlock, BlockRenderer> = {
   connections: {
     kind: "notice",
     refetch: (data) => ((data as { items?: WorkspaceConnectionRequirement[] } | undefined)?.items || []).some((item) => item.required) ? 30_000 : false,
-    rows: (data, workspaceId) => data.block !== "connections" ? [] : data.items.map((requirement) => ({
+    // A platform with no channel to attach is optional context, not something the person owes.
+    rows: (data, workspaceId) => data.block !== "connections" ? [] : data.items.filter((requirement) => requirement.required || requirement.setup_kind !== "platform_access").map((requirement) => ({
       key: `connection:${requirement.key}`, urgent: requirement.required,
-      node: <ConnectionRow key={requirement.key} workspaceId={workspaceId} requirement={requirement} />,
+      node: <IntegrationConnectRow key={requirement.key} workspaceId={workspaceId} requirement={requirement} />,
     })),
   },
   queue: {
@@ -793,11 +837,13 @@ export function NoticesZone({ workspaceId, sections, canConnect }: {
   /** Connecting follows permission, not a running simulation that pauses actions. */
   canConnect: boolean;
 }) {
+  const visible = usePageVisible();
   const notices = sections.filter((section) => BLOCK_RENDERERS[section.block].kind === "notice"
     && (section.block !== "connections" || canConnect));
+  const draftId = useWorkspaceAppDraftId();
   const results = useQueries({ queries: notices.map((section) => {
     const renderer = BLOCK_RENDERERS[section.block] as Extract<BlockRenderer, { kind: "notice" }>;
-    return sectionQueryOptions(workspaceId, section, renderer.refetch);
+    return sectionQueryOptions(workspaceId, section, renderer.refetch, draftId, visible);
   }) });
   const [expanded, setExpanded] = useState(false);
   const [showOptional, setShowOptional] = useState(false);

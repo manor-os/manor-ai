@@ -187,11 +187,15 @@ RUN = "01M5EY2EGFM4DPCMJECTPJJP0J"
 @pytest.mark.parametrize("injected,user_id,archive", [
     # A user-run Workflow step: no conversation, Workflow binding key.
     ({"_workflow_run_id_from_context": RUN, "_workflow_lineage_root_run_id_from_context": RUN},
-     "user_media_qa", f"workflow/{RUN}"),
+     "user_media_qa", f"workflow/{RUN}/artifacts"),
+    # A Workflow step working on a WorkflowProject saves into the project's folder.
+    ({"_workflow_run_id_from_context": RUN, "_workflow_lineage_root_run_id_from_context": RUN,
+      "_workflow_project_root_from_context": "projects/onboarding-article"},
+     "user_media_qa", "projects/onboarding-article"),
     # A Task worker: no conversation, Task binding key.
-    ({"task_id": TASK}, "user_media_qa", f"tasks/{TASK}"),
+    ({"task_id": TASK}, "user_media_qa", f"tasks/{TASK}/artifacts"),
     # A user-less Task with a conversation: Task binding key, real conversation.
-    ({"task_id": TASK, "conversation_id": "conv_media_qa"}, None, f"tasks/{TASK}"),
+    ({"task_id": TASK, "conversation_id": "conv_media_qa"}, None, f"tasks/{TASK}/artifacts"),
 ])
 async def test_sandbox_save_result_receipt_matches_its_inner_write(media_storage, injected, user_id, archive):
     """The sandbox binding is the approval scope, never the receipt's conversation.
@@ -213,6 +217,7 @@ async def test_sandbox_save_result_receipt_matches_its_inner_write(media_storage
     }}
     with workspace_artifact_scope(WorkspaceArtifactScope(
         ENTITY, WORKSPACE, context.workflow_run_id, context.workflow_lineage_root_run_id,
+        workflow_project_root=context.workflow_project_root,
     )):
         scope = await resolve_runtime_workspace_file_scope(
             tool_name="sandbox", arguments=arguments, entity_id=ENTITY, workspace_id=WORKSPACE,
@@ -235,7 +240,7 @@ async def test_sandbox_save_result_receipt_matches_its_inner_write(media_storage
     assert request.approval_scope_id and request.approval_scope_id != context.conversation_id
     assert receipt.authorizes_workspace_file_mutation(
         capability_id="file.write", action_key="workspace.file.create",
-        paths=[f"Workspaces/_by_id/{FOLDER}/{archive}/artifacts/EP.05-n1-cues.json"],
+        paths=[f"Workspaces/_by_id/{FOLDER}/{archive}/EP.05-n1-cues.json"],
         entity_id=ENTITY, user_id=context.user_id, workspace_id=WORKSPACE,
         conversation_id=context.conversation_id, task_id=context.task_id,
     )
@@ -635,7 +640,7 @@ async def test_unscoped_media_approval_freezes_a_root_file(media_storage):
     assert receipt.media_output_plan.target_for_extension(".png").rel_path == "cover.png"
     with _authorized(request, receipt):
         url = await _save("cover", workspace_id=None, task_id=None)
-    assert url == entity_fs_open_url(ENTITY, f"cover.png")
+    assert url == entity_fs_open_url(ENTITY, "cover.png")
 
 
 @pytest.mark.asyncio
@@ -1023,7 +1028,7 @@ async def test_tokenless_media_approval_match_includes_frozen_output_plan(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mime, extension", [("image/png", "png"), ("image/jpeg", "jpg"), ("image/webp", "webp")])
+@pytest.mark.parametrize("mime, extension", [("image/png", "png"), ("image/jpeg", "jpg"), ("image/webp", "webp"), ("image/gif", "gif")])
 async def test_provider_image_format_selects_only_preapproved_exact_target(
     media_storage, mime, extension,
 ):
@@ -1036,16 +1041,20 @@ async def test_provider_image_format_selects_only_preapproved_exact_target(
     buffer = BytesIO()
     Image.new("RGB", (2, 2), "teal").save(buffer, format={"jpg": "JPEG"}.get(extension, extension.upper()))
     provider_bytes = buffer.getvalue()
-    request, receipt = await _approve("Hero_Asset")
+    request, receipt = await _approve("Hero_Asset", params={"output_format": "gif"} if extension == "gif" else None)
+    allowed = ("gif",) if extension == "gif" else ("png", "jpg", "webp")
     assert {target.rel_path for target in receipt.media_output_plan.targets} == {
-        f"{BASE}/images/hero-asset.{suffix}" for suffix in ("png", "jpg", "webp")
+        f"{BASE}/images/hero-asset.{suffix}" for suffix in allowed
     }
+    from packages.core.services.generated_media_naming import GeneratedMediaOutputPlan
+    assert GeneratedMediaOutputPlan.from_dict(receipt.media_output_plan.to_dict()).to_dict() == receipt.media_output_plan.to_dict()
     assert all(resource.match_kind is WorkspaceFileResourceMatchKind.EXACT for resource in receipt.file_resources)
     with _authorized(request, receipt):
         url = await _save("Hero_Asset", mime=mime, image_bytes=provider_bytes)
     assert url == entity_fs_open_url(ENTITY, f"{BASE}/images/hero-asset.{extension}")
     assert (media_storage / BASE / f"images/hero-asset.{extension}").read_bytes() == provider_bytes
-    for path in (f"{BASE}/images/arbitrary.png", f"{BASE}/images/hero-asset.gif"):
+    unauthorized_extension = "png" if extension == "gif" else "gif"
+    for path in (f"{BASE}/images/arbitrary.png", f"{BASE}/images/hero-asset.{unauthorized_extension}"):
         assert not receipt.authorizes_workspace_file_commit(
             entity_id=ENTITY, path=path, target_exists=False,
         )

@@ -37,6 +37,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from packages.core.blueprints.freshness import (
     BLUEPRINT_ID_KEY,
+    BLUEPRINT_SETTINGS_KEY,
     BLUEPRINT_VERSION_KEY,
     CONTENT_FINGERPRINT_KEY,
     blueprint_content_fingerprint,
@@ -497,6 +498,23 @@ def package_record(
     return record
 
 
+def settings_without_package_alias(settings: Any) -> Any:
+    """A Workspace's settings as its readers get them.
+
+    The install record's ``package.name`` is cosmetic, and a marketplace package's
+    alias holds its author's personal handle from when it was first released, which
+    a buyer has no business reading once the listing is under a company's name.
+    Nothing reads it back: ``ref`` is the identity, and it stays. The stored record
+    is left alone, because its alias can't be told apart from a current one.
+    """
+    record = settings.get(BLUEPRINT_SETTINGS_KEY) if isinstance(settings, dict) else None
+    package = record.get(PACKAGE_RECORD_KEY) if isinstance(record, dict) else None
+    if not isinstance(package, dict) or "name" not in package:
+        return settings
+    without_alias = {key: value for key, value in package.items() if key != "name"}
+    return {**settings, BLUEPRINT_SETTINGS_KEY: {**record, PACKAGE_RECORD_KEY: without_alias}}
+
+
 async def release_for_fingerprint(
     db,
     package_ref: str,
@@ -563,6 +581,15 @@ async def sync_installed_package(db, record: dict[str, Any]) -> None:
         and previous.get("ref") == ref
     ):
         record.pop(PACKAGE_RECORD_KEY, None)
+
+
+async def installed_release_payload(db, record: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The exact release an install runs (``base: exact``), or ``None``."""
+    package = record.get(PACKAGE_RECORD_KEY)
+    if not (isinstance(package, dict) and package.get("base") == BASE_EXACT and package.get("ref") and package.get("version")):
+        return None
+    release = await listed_release(db, str(package["ref"]), str(package["version"]))
+    return deepcopy(release.payload) if release is not None and isinstance(release.payload, dict) else None
 
 
 def installed_release_version(record: Mapping[str, Any]) -> str | None:

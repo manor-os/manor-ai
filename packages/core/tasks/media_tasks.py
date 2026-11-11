@@ -21,7 +21,7 @@ import httpx
 
 from packages.core.services.file_refs import parse_file_reference
 from packages.core.services.generated_file_refs import entity_fs_open_url
-from packages.core.services.workspace_layout import WorkspaceArtifactDir
+from packages.core.services.workspace_layout import WorkspaceArtifactDir, project_production_root
 from packages.core.tasks import video_adapters
 from packages.core.constants.media import (
     MEDIA_JOB_TERMINAL_STATUSES,
@@ -270,6 +270,37 @@ def process_video_job_task(job_id: str) -> dict:
 
 
 @celery_app.task(
+    name="media.generate_display_variants",
+    max_retries=0,
+    soft_time_limit=240,
+    time_limit=300,
+)
+def generate_display_variants_task(document_id: str) -> dict:
+    """Write and record a Document's versioned ``thumb`` for the manor-media origin."""
+    from packages.core.services.media_variants import generate_display_variants
+
+    try:
+        status = _run_async(generate_display_variants(document_id))
+    except Exception as exc:  # noqa: BLE001 - /thumbnail re-dispatches a lost run
+        logger.exception("media.generate_display_variants failed for %s", document_id)
+        return {"ok": False, "document_id": document_id, "error": str(exc)[:240]}
+    return {"ok": True, "document_id": document_id, "status": status}
+
+
+@celery_app.task(
+    name="media.backfill_display_variants",
+    max_retries=0,
+    soft_time_limit=60,
+    time_limit=90,
+)
+def backfill_display_variants_task() -> dict:
+    """Queue ``thumb`` runs for a few Documents written before display variants existed."""
+    from packages.core.services.media_variants import backfill_display_variants
+
+    return {"ok": True, "dispatched": _run_async(backfill_display_variants())}
+
+
+@celery_app.task(
     name="media.cleanup_media_references",
     max_retries=0,
     soft_time_limit=900,
@@ -502,6 +533,7 @@ def _job_key_scope(job):
         user_id=job.user_id,
         workspace_id=str(params.get("workspace_id") or "") or None,
         payer_entity_id=str(params.get("payer_entity_id") or "") or None,
+        task_id=_video_task_id(job),
     )
 
 
@@ -664,10 +696,15 @@ async def _finalize_video_job(job_id: str, result: dict[str, Any], *, force: boo
             return True
 
         params = dict(job.params or {})
+        # A request that reached its provider is recorded even when it fails.
+        reached_gateway = _job_reached_gateway(params, result)
         if "error" in result:
             job.status = MediaJobStatus.FAILED.value
             job.error = str(result.get("error") or "Unknown error")
             params["provider_poll_status"] = "failed"
+            if reached_gateway and not job.byok:
+                # Official tokens only; None when the provider reported none.
+                job.cost_usd, _ = _official_video_cost(job, result)
         else:
             job.status = MediaJobStatus.COMPLETED.value
             job.error = None
@@ -677,14 +714,18 @@ async def _finalize_video_job(job_id: str, result: dict[str, Any], *, force: boo
             if result.get("duration_seconds"):
                 job.duration_seconds = int(result["duration_seconds"])
                 params["duration"] = job.duration_seconds
-            job.cost_usd = 0 if job.byok else result.get("cost_usd")
-            job.credits = 0 if job.byok else result.get("credits")
+            from packages.core.services.usage_service import media_cost_credits
+
+            cost, _ = _official_video_cost(job, result)
+            job.cost_usd = 0 if job.byok else cost
+            job.credits = 0 if job.byok or cost is None else media_cost_credits(cost)
             params["provider_poll_status"] = "completed"
             if result.get("document_id"):
                 params["result_document_id"] = result["document_id"]
 
         try:
-            if not job.byok and job.status == MediaJobStatus.FAILED:
+            # A failed request the gateway served is settled after commit, below.
+            if not job.byok and job.status == MediaJobStatus.FAILED and not reached_gateway:
                 from packages.core.services.credit_reservations import release_reservation_by_source
 
                 await release_reservation_by_source(
@@ -700,18 +741,18 @@ async def _finalize_video_job(job_id: str, result: dict[str, Any], *, force: boo
         params["progress"] = _video_progress(
             "done" if job.status == MediaJobStatus.COMPLETED.value else "failed"
         )
+        if result.get("provider_usage"):
+            # The provider's usage as returned, so an audit can compare it with the bill.
+            params["provider_usage"] = result["provider_usage"]
         job.params = params
         job.completed_at = datetime.now(timezone.utc)
         await _wake_parked_task(db, job)
         await db.commit()
 
-        # Bill usage (only on success + platform key)
-        if job.status == MediaJobStatus.COMPLETED and not job.byok and job.cost_usd:
-            billed = await _bill_usage(job)
-            if billed:
-                await _consume_video_reservation(job.id, int(job.credits or 0) or None)
-        elif job.status == MediaJobStatus.COMPLETED and not job.byok:
-            await _release_video_reservation(job.id, "video completed without billable cost")
+        if job.byok:
+            await _record_own_key_video(job, result, reached_gateway=reached_gateway)
+        else:
+            await _settle_platform_video(job, result, reached_gateway=reached_gateway)
 
         if job.status == MediaJobStatus.COMPLETED:
             await _project_group_media_if_ready(job.id)
@@ -750,6 +791,9 @@ async def _remember_provider_poll(
                 "generation_id": generation_id or "",
                 "saved_at": datetime.now(timezone.utc).isoformat(),
             }
+            if generation_id:
+                # The gateway's handle for this request; reconciles the job with its billing.
+                params["generation_id"] = generation_id
             params["provider_poll_status"] = "pending"
             params["progress"] = _video_progress("generating")
             job.params = params
@@ -1017,7 +1061,7 @@ async def _resume_video_job_from_provider(job) -> dict[str, Any]:
 
     duration = normalize_video_duration(params.get("duration", job.duration_seconds or 5))
     resolution = normalize_video_resolution(model, params.get("resolution", "720p"))
-    return await _download_and_save(
+    downloaded = await _download_and_save(
         video_url,
         job.prompt,
         model,
@@ -1037,6 +1081,7 @@ async def _resume_video_job_from_provider(job) -> dict[str, Any]:
         has_video_input=bool(params.get("reference_video_urls")),
         **media_job_output_kwargs(params),
     )
+    return video_adapters.apply_provider_usage(downloaded, poll_result.get("provider_usage"))
 
 
 def _provider_error_message(data: Any) -> str:
@@ -1153,41 +1198,136 @@ async def _check_provider_poll_once(
     ).lower()
 
     provider_status = coerce_provider_media_status(status)
+    usage = video_adapters.provider_video_usage(data)
     if video_url and (not status or provider_status == MediaJobStatus.COMPLETED):
-        return {"video_url": video_url}
+        return {"video_url": video_url, **({"provider_usage": usage} if usage else {})}
     if provider == "openrouter" and provider_status == MediaJobStatus.COMPLETED:
         return {"video_url": video_url or _openrouter_video_content_url(data, request_url, base_url)}
     if provider_status == MediaJobStatus.COMPLETED:
-        return {"video_url": video_url} if video_url else {"error": "Provider completed without a video URL"}
+        if video_url:
+            return {"video_url": video_url, **({"provider_usage": usage} if usage else {})}
+        return video_adapters.apply_provider_usage({"error": "Provider completed without a video URL"}, usage)
     if provider_status == MediaJobStatus.FAILED:
-        return {"error": f"Provider failed: {_provider_error_message(data)}"}
+        return video_adapters.apply_provider_usage({"error": f"Provider failed: {_provider_error_message(data)}"}, usage)
 
     return {"status": "pending"}
 
 
-async def _bill_usage(job) -> bool:
-    """Record media usage for billing."""
+def _video_run_id(job) -> str | None:
+    """The Workflow run that owns a video job; its usage rows are tied to that run."""
+    params = getattr(job, "params", None) or {}
+    return str(params.get("workflow_run_id") or params.get("run_id") or "").strip() or None
+
+
+def _video_task_id(job) -> str | None:
+    """The Task that started a video job; its usage rows are tied to that Task."""
+    return str((getattr(job, "params", None) or {}).get("task_id") or "").strip() or None
+
+
+def _video_workspace_id(job) -> str | None:
+    return str((getattr(job, "params", None) or {}).get("workspace_id") or "").strip() or None
+
+
+def _video_token_cost(job, completion_tokens: float | None) -> float | None:
+    """USD for a clip's output tokens at the model's token price; None when unpriced or uncounted."""
+    from packages.core.services.model_pricing_gateway import video_cost_from_tokens
+
+    params = job.params or {}
+    resolution = normalize_video_resolution(job.model, params.get("resolution", "720p"))
+    return video_cost_from_tokens(
+        job.model,
+        completion_tokens,
+        resolution,
+        has_video_input=bool(params.get("reference_video_urls")),
+    )
+
+
+def _official_video_cost(job, result: dict[str, Any]) -> tuple[float | None, str]:
+    """A video job's USD cost, and how it was priced.
+
+    The provider's official output tokens at the model's token price come
+    first. A model with no token price, or a provider that reported no tokens,
+    falls back to the list price for the clip's duration. A failed request with
+    no tokens has no known cost. A gateway-reported cost is never billed; it
+    stays in ``provider_usage`` to reconcile against.
+    """
+    usage = result.get("provider_usage") or {}
+    cost = _video_token_cost(job, usage.get("completion_tokens"))
+    if cost is not None:
+        return cost, "official_tokens"
+    if "error" in result:
+        return None, "unknown"
+    return result.get("cost_usd"), str(result.get("pricing_source") or "estimated")
+
+
+def _job_reached_gateway(params: dict[str, Any], result: dict[str, Any]) -> bool:
+    """A request reached the gateway when it has a generation id or the provider returned usage."""
+    return bool(params.get("generation_id")) or bool(result.get("provider_usage"))
+
+
+async def _video_charge_exists(db, job_id: str) -> bool:
+    from sqlalchemy import select
+
+    from packages.core.models.billing import CreditUsageLog
+
+    return (await db.scalar(
+        select(CreditUsageLog.id).where(
+            CreditUsageLog.media_job_id == job_id,
+            CreditUsageLog.total_credit > 0,
+        ).limit(1)
+    )) is not None
+
+
+async def _bill_usage(
+    job,
+    *,
+    cost_usd: float | None,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    pricing_source: str | None,
+    byok_estimate_usd: float | None = None,
+) -> bool:
+    """Record a video call's usage, tied to the run that owns the job.
+
+    A platform job's cost is charged as credits. An own-key job's row carries
+    its tokens and an optional estimate, never a charge: the provider bills the
+    user, and ``record_media_usage`` writes it as BYOK.
+    """
     try:
+        from packages.core.constants.plans import is_cloud
         from packages.core.database import async_session
         from packages.core.services.usage_service import record_media_usage
-        workspace_id = (
-            str((getattr(job, "params", None) or {}).get("workspace_id") or "").strip()
-            or None
-        )
+        workspace_id = _video_workspace_id(job)
         async with async_session() as db:
+            if is_cloud() and not job.byok and cost_usd is not None and cost_usd > 0:
+                from sqlalchemy import select
+
+                from packages.core.models.media_job import MediaJob
+
+                # Finalization and recovery must check and charge under the same lock.
+                await db.execute(select(MediaJob.id).where(MediaJob.id == job.id).with_for_update())
+                if await _video_charge_exists(db, job.id):
+                    return True
             recorded = await record_media_usage(
                 db,
                 entity_id=job.entity_id,
                 kind="video",
                 model=job.model or "bytedance/seedance-2.0",
-                cost_usd=job.cost_usd,
+                cost_usd=cost_usd,
                 units=job.duration_seconds or 0,
                 workspace_id=workspace_id,
                 user_id=getattr(job, "user_id", None),
                 agent_id=getattr(job, "agent_id", None),
                 conversation_id=getattr(job, "conversation_id", None),
                 source="tool:video",
-                byok=job.byok,
+                byok=bool(job.byok),
+                operation_id=_video_run_id(job),
+                task_id=_video_task_id(job),
+                media_job_id=job.id,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                pricing_source=pricing_source,
+                byok_estimate_usd=byok_estimate_usd,
                 strict=True,
                 payer_entity_id=await _media_job_payer(db, job),
             )
@@ -1196,6 +1336,134 @@ async def _bill_usage(job) -> bool:
     except Exception:
         logger.warning("Video job %s billing failed", job.id, exc_info=True)
         return False
+
+
+async def _record_unknown_video_cost(job, *, pricing_source: str = "unknown") -> bool:
+    """Log a platform video call with no known cost: a failed gateway request, or an unpriced model."""
+    try:
+        from packages.core.database import async_session
+        from packages.core.services.usage_service import record_media_call_unknown_cost
+
+        workspace_id = _video_workspace_id(job)
+        async with async_session() as db:
+            recorded = await record_media_call_unknown_cost(
+                db,
+                entity_id=job.entity_id,
+                kind="video",
+                model=job.model or "bytedance/seedance-2.0",
+                media_job_id=job.id,
+                operation_id=_video_run_id(job),
+                task_id=_video_task_id(job),
+                workspace_id=workspace_id,
+                user_id=getattr(job, "user_id", None),
+                agent_id=getattr(job, "agent_id", None),
+                conversation_id=getattr(job, "conversation_id", None),
+                units=job.duration_seconds or 0,
+                payer_entity_id=await _media_job_payer(db, job),
+                pricing_source=pricing_source,
+                strict=True,
+            )
+            await db.commit()
+            return bool(recorded)
+    except Exception:
+        logger.warning("Video job %s unknown-cost record failed", job.id, exc_info=True)
+        return False
+
+
+async def _record_own_key_video(job, result: dict[str, Any], *, reached_gateway: bool) -> None:
+    """Record an own-key video call as a BYOK token row: an estimated cost, never a charge.
+
+    The user's provider bills the call, so no credit is deducted. Only provider-reported
+    token counts go on the row; a catalog estimate is not a count the provider returned.
+    A provider count at a model's token price also gets an approximate cost
+    (``byok_estimate``); an unpriced model keeps no cost.
+    """
+    if job.status != MediaJobStatus.COMPLETED and not reached_gateway:
+        return
+    usage = result.get("provider_usage") or {}
+    byok_estimate_usd = None
+    if usage.get("completion_tokens") is not None:
+        # The provider's own count, thinking tokens included.
+        prompt_tokens, completion_tokens = int(usage["prompt_tokens"]), int(usage["completion_tokens"])
+        pricing_source = "provider_usage"
+        byok_estimate_usd = _video_token_cost(job, completion_tokens)
+        if byok_estimate_usd is not None:
+            pricing_source = "byok_estimate"
+    elif job.status == MediaJobStatus.COMPLETED:
+        # No provider count: the table's token estimate, flagged as estimated.
+        prompt_tokens, completion_tokens = 0, int(result.get("completion_tokens") or 0)
+        # Keep the table's own verdict: unpriced or unknown tokens are not estimated.
+        pricing_source = {"unpriced": "unpriced", "unknown": "unknown"}.get(
+            str(result.get("pricing_source") or ""), "estimated",
+        )
+    else:
+        # A failed call with no count and no clip: nothing consumed is known.
+        prompt_tokens, completion_tokens = 0, 0
+        pricing_source = "unknown"
+    await _bill_usage(
+        job,
+        cost_usd=None,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        pricing_source=pricing_source,
+        byok_estimate_usd=byok_estimate_usd,
+    )
+
+
+async def _settle_platform_video(job, result: dict[str, Any], *, reached_gateway: bool) -> None:
+    """Bill a platform video job's gateway call and settle its reservation."""
+    if job.status == MediaJobStatus.COMPLETED and job.cost_usd is None:
+        # No gateway cost and no table price: keep the row, flag it, charge nothing.
+        pricing_source = str(result.get("pricing_source") or "unpriced")
+        logger.warning("Video job %s has no cost (pricing_source=%s)", job.id, pricing_source)
+        await _record_unknown_video_cost(job, pricing_source=pricing_source)
+        await _release_video_reservation(job.id, "video completed without a known cost")
+    elif job.status == MediaJobStatus.COMPLETED and job.cost_usd:
+        _, pricing_source = _official_video_cost(job, result)
+        billed = await _bill_usage(
+            job,
+            cost_usd=job.cost_usd,
+            prompt_tokens=int(result.get("prompt_tokens") or 0),
+            completion_tokens=int(result.get("completion_tokens") or 0),
+            pricing_source=pricing_source,
+        )
+        if billed:
+            await _consume_video_reservation(job.id, int(job.credits or 0) or None)
+    elif job.status == MediaJobStatus.COMPLETED:
+        await _release_video_reservation(job.id, "video completed without billable cost")
+    elif reached_gateway:
+        await _settle_failed_gateway_call(job, result)
+
+
+async def _settle_failed_gateway_call(job, result: dict[str, Any]) -> None:
+    """Bill a failed video request the provider served, at its official tokens.
+
+    A failed job whose provider reported no tokens has no official cost: it is
+    logged with a NULL cost and charges nothing. The media job keeps its
+    generation id for reconciliation.
+    """
+    from packages.core.services.usage_service import media_cost_credits
+
+    cost = job.cost_usd
+    if cost is None:
+        await _record_unknown_video_cost(job)
+        await _release_video_reservation(job.id, job.error or "video job failed")
+        return
+    if cost <= 0:
+        await _release_video_reservation(job.id, job.error or "video job failed")
+        return
+    usage = result.get("provider_usage") or {}
+    billed = await _bill_usage(
+        job,
+        cost_usd=cost,
+        prompt_tokens=int(usage.get("prompt_tokens") or 0),
+        completion_tokens=int(usage.get("completion_tokens") or 0),
+        pricing_source="official_tokens",
+    )
+    if billed:
+        await _consume_video_reservation(job.id, media_cost_credits(cost))
+    else:
+        await _release_video_reservation(job.id, job.error or "video job failed")
 
 
 async def _consume_video_reservation(job_id: str, consumed_credits: int | None) -> None:
@@ -1230,6 +1498,55 @@ async def _release_video_reservation(job_id: str, reason: str) -> None:
             await db.commit()
     except Exception:
         logger.warning("Video job %s reservation release failed", job_id, exc_info=True)
+
+
+async def reconcile_lapsed_media_reservation(job_id: str) -> str:
+    """Settle a video hold whose TTL ended unsettled, from its job.
+
+    ``_finalize_video_job`` commits the job before billing it, so a failed
+    ledger write or a worker that died there leaves a billable job uncharged
+    and its hold active. Bill such a job once (its own usage row is the
+    fence), then settle the hold. A job still running keeps its hold.
+
+    Returns ``charged``, ``settled``, ``released``, ``pending`` or ``retry``.
+    """
+    from packages.core.database import async_session
+    from packages.core.models.media_job import MediaJob
+    from packages.core.services.credit_reservations import LAPSED_RESERVATION_GRACE_SECONDS
+    from packages.core.services.usage_service import media_cost_credits
+
+    async with async_session() as db:
+        job = await db.get(MediaJob, job_id)
+        if job is not None:
+            db.expunge(job)
+        recorded = job is not None and await _video_charge_exists(db, job_id)
+    finished_before = datetime.now(timezone.utc) - timedelta(seconds=LAPSED_RESERVATION_GRACE_SECONDS)
+    if job is not None and (
+        job.status not in (MediaJobStatus.COMPLETED.value, MediaJobStatus.FAILED.value)
+        or job.completed_at is None
+        or job.completed_at > finished_before
+    ):
+        return "pending"
+    cost = float(job.cost_usd or 0) if job is not None and not job.byok else 0.0
+    if recorded:
+        await _consume_video_reservation(job_id, int(job.credits or 0) or None)
+        return "settled"
+    if cost <= 0:
+        await _release_video_reservation(job_id, "lapsed with nothing billable")
+        return "released"
+    usage = (job.params or {}).get("provider_usage") or {}
+    billed = await _bill_usage(
+        job,
+        cost_usd=cost,
+        prompt_tokens=int(usage.get("prompt_tokens") or 0),
+        completion_tokens=int(usage.get("completion_tokens") or 0),
+        pricing_source="official_tokens",
+    )
+    if not billed:
+        return "retry"
+    logger.warning("Charged video job %s whose billing never landed", job_id)
+    await _consume_video_reservation(job_id, media_cost_credits(cost))
+    return "charged"
 
 
 async def _push_notification(job) -> None:
@@ -1596,7 +1913,8 @@ def _extract_video_url(value) -> str:
     return ""
 
 
-async def _poll_volcengine_task(poll_url: str, headers: dict, *, timeout: float = 420.0) -> str:
+async def _poll_volcengine_task(poll_url: str, headers: dict, *, timeout: float = 420.0) -> dict[str, Any]:
+    """The completed task payload: its video URL and the usage it reports."""
     deadline = time.monotonic() + timeout
     interval = 5.0
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -1612,7 +1930,7 @@ async def _poll_volcengine_task(poll_url: str, headers: dict, *, timeout: float 
             status = str(data.get("status") or (data.get("data") or {}).get("status") or "").lower()
             provider_status = coerce_provider_media_status(status)
             if provider_status == MediaJobStatus.COMPLETED:
-                return _extract_video_url(data)
+                return data
             if provider_status == MediaJobStatus.FAILED:
                 raise RuntimeError(f"Seedance generation failed: {_provider_error_message(data)}")
     raise ProviderPollTimeout(f"Seedance generation still pending after {timeout}s")
@@ -1726,7 +2044,6 @@ async def _download_and_save(
 
     if room_agent_run_id:
         from packages.core.services.room_generated_files import store_room_media_bytes
-        from packages.core.services.billing_service import estimate_video_cost, video_to_credits
 
         document_id = await store_room_media_bytes(
             job_id=job_id, content=video_bytes, extension=ext,
@@ -1738,11 +2055,7 @@ async def _download_and_save(
             "source_url": video_url,
             "file_size": len(video_bytes),
             "duration_seconds": duration,
-            "cost_usd": estimate_video_cost(
-                model, duration, resolution,
-                with_audio=with_audio, has_video_input=has_video_input,
-            ),
-            "credits": video_to_credits(
+            **_estimated_video_usage(
                 model, duration, resolution,
                 with_audio=with_audio, has_video_input=has_video_input,
             ),
@@ -1781,9 +2094,13 @@ async def _download_and_save(
         if (
             home_dir
             and plan.artifact_base_dir.startswith(f"{home_dir}/")
-            and len(archive_parts) == 2
-            and archive_parts[0] in {"workflow", "runs"}
-            and archive_parts[1] not in {"", ".", ".."}
+            and not {"", ".", ".."} & set(archive_parts)
+            and (
+                (len(archive_parts) == 2 and archive_parts[0] in {"workflow", "runs"})
+                # A run working on a WorkflowProject makes its clips in the
+                # project's folder (or a take inside it), not a run archive.
+                or project_production_root(archive_suffix) == archive_suffix
+            )
         ):
             # The server persisted this exact plan before provider submission;
             # retries keep its lineage identity independently of worker context.
@@ -1907,21 +2224,14 @@ async def _download_and_save(
     except Exception:
         logger.warning("Video job %s doc registration failed", job_id, exc_info=True)
 
-    # Calculate cost
-    cost_usd = 0.0
-    credits_charged = 0
     try:
-        from packages.core.services.billing_service import estimate_video_cost, video_to_credits
-        cost_usd = estimate_video_cost(
-            model, duration, resolution,
-            with_audio=with_audio, has_video_input=has_video_input,
-        )
-        credits_charged = video_to_credits(
+        estimate = _estimated_video_usage(
             model, duration, resolution,
             with_audio=with_audio, has_video_input=has_video_input,
         )
     except Exception:
-        pass
+        logger.warning("Video job %s price estimate failed", job_id, exc_info=True)
+        estimate = {"cost_usd": None, "credits": 0, "completion_tokens": 0, "pricing_source": "unknown"}
 
     return {
         "result_url": local_url,
@@ -1929,8 +2239,39 @@ async def _download_and_save(
         "source_url": video_url,
         "file_size": len(video_bytes),
         "duration_seconds": duration,
-        "cost_usd": cost_usd,
-        "credits": credits_charged,
+        **estimate,
+    }
+
+
+def _estimated_video_usage(
+    model: str,
+    duration: float,
+    resolution: str,
+    *,
+    with_audio: bool = False,
+    has_video_input: bool = False,
+) -> dict[str, Any]:
+    """Price-table estimate of a clip (no gateway usage).
+
+    A model the table does not price gets no cost and no credits, and is flagged
+    ``unpriced``: a guessed price would look like a real charge.
+    """
+    from packages.core.services.billing_service import estimate_video_cost, video_to_credits
+    from packages.core.services.model_pricing_gateway import video_is_priced, video_output_tokens
+
+    if not video_is_priced(model):
+        return {"cost_usd": None, "credits": 0, "completion_tokens": 0, "pricing_source": "unpriced"}
+    return {
+        "cost_usd": estimate_video_cost(
+            model, duration, resolution,
+            with_audio=with_audio, has_video_input=has_video_input,
+        ),
+        "credits": video_to_credits(
+            model, duration, resolution,
+            with_audio=with_audio, has_video_input=has_video_input,
+        ),
+        "completion_tokens": video_output_tokens(model, duration, resolution),
+        "pricing_source": "estimated",
     }
 
 

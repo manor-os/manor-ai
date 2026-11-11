@@ -21,11 +21,11 @@ export default function ProductCard({ icon, title, description, badge, footer, o
         </div>
       )}
       {badge && <div style={{ marginBottom: "8px" }}>{badge}</div>}
-      <div style={{ fontSize: "14px", fontWeight: 700, color: "#292524", marginBottom: "6px" }}>
+      <div style={{ fontSize: "14px", fontWeight: 700, color: "var(--text-strong)", marginBottom: "6px" }}>
         {title}
       </div>
       {description && (
-        <div style={{ fontSize: "12px", color: "#a8a29e", lineHeight: 1.5 }}>
+        <div style={{ fontSize: "12px", color: "var(--text-muted)", lineHeight: 1.5 }}>
           {description}
         </div>
       )}

@@ -15,6 +15,62 @@ import re
 from typing import Any
 
 
+def workflow_step_label(step: Any) -> str:
+    """What a step is called for people: its name, else its id read as words.
+
+    A Flow written without step names keeps its ids (``owner_approval``) as
+    names; people see "Owner approval", never the id.
+    """
+    if not isinstance(step, dict):
+        return ""
+    step_id = str(step.get("id") or "").strip()
+    name = str(step.get("name") or "").strip()
+    if name and name != step_id:
+        return name
+    words = " ".join(step_id.replace("_", " ").replace("-", " ").split())
+    return words[:1].upper() + words[1:]
+
+
+CONFIRMATION_CHOICES = frozenset({"confirm", "done"})
+# Choices of a generic review. A wait offering only these says nothing about
+# whether the person judges work or reports something they did themselves.
+_GENERIC_REVIEW_CHOICES = frozenset({
+    "approve", "approved", "accept", "revise", "request_changes", "reject", "cancel",
+})
+_CONFIRMATION_ASK_RE = re.compile(r"\bconfirm\b|\bmark\b.*\b(done|complete)\b|确认", re.IGNORECASE)
+_REVIEW_ASK_RE = re.compile(
+    r"\b(approve|review|reject|revise|revision|sign[ -]off)\b|批准|审批|审核|审阅|修改",
+    re.IGNORECASE,
+)
+
+
+def workflow_wait_is_confirmation(config: Any) -> bool:
+    """Whether an approval wait asks the person to confirm what they did.
+
+    ``options: ['confirm']`` says so. Flows written before that choice existed
+    ask a confirmation with the generic approve/revise choices; their message
+    then asks to confirm and never to approve or review, and they read the same.
+    """
+    if not isinstance(config, dict) or str(config.get("wait_type") or "approval") != "approval":
+        return False
+    options = {str(option).strip().lower() for option in config.get("options") or [] if str(option or "").strip()}
+    if options and options <= CONFIRMATION_CHOICES:
+        return True
+    if options - _GENERIC_REVIEW_CHOICES or isinstance(config.get("review"), dict):
+        return False
+    message = str(config.get("message") or "")
+    return bool(_CONFIRMATION_ASK_RE.search(message)) and not _REVIEW_ASK_RE.search(message)
+
+
+def workflow_wait_options(config: Any) -> list[str] | None:
+    """The choices a person is offered at an approval wait, if it names them."""
+    if workflow_wait_is_confirmation(config):
+        options = [str(option).strip() for option in config.get("options") or []]
+        return [option for option in options if option.lower() in CONFIRMATION_CHOICES] or ["confirm"]
+    options = config.get("options") if isinstance(config, dict) else None
+    return [str(option) for option in options] if isinstance(options, list) and options else None
+
+
 _TEMPLATE_REFERENCE_RE = re.compile(
     r"\{\{\s*([A-Za-z_][\w-]*(?:\.[\w-]+)*)[^}]*\}\}"
 )

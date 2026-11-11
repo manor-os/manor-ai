@@ -74,7 +74,10 @@ JUSTIFICATION = {
     "why_human_required": "Only the user decides the launch date.",
     "attempted_resolution": [{"source": "conversation", "finding": "The brief names no date."}],
 }
-ASK = {"question": "Which launch date should the note use?", "justification": JUSTIFICATION}
+ASK = {
+    "question": "Which launch date should the note use?", "justification": JUSTIFICATION,
+    "recommended": "November 3", "recommendation_reason": "It is the date in the latest brief.",
+}
 
 
 async def _scope(db):

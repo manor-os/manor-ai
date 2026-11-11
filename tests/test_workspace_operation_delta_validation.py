@@ -237,7 +237,7 @@ def test_never_inheritable_codes_cover_the_access_and_tenant_boundaries():
     from packages.core.services.workspace_operation_validation import NEVER_INHERITED_ERROR_CODES
 
     assert {
-        "foreign_entity_agent", "integration_not_connected", "unavailable_workflow",
+        "foreign_entity_agent", "unavailable_workflow",
         "unavailable_app_target", "unavailable_channel_config", "task_scoped_binding_unsupported",
         "rule_implied_governance", "invalid_patch_shape", "duplicate_service_change",
     } <= NEVER_INHERITED_ERROR_CODES

@@ -20,7 +20,7 @@ html[data-theme="dark"] .workspace-app-calendar { --calendar-attention: #e8bd62;
 .workspace-app-calendar :is(button, a) { -webkit-tap-highlight-color: transparent; }
 .workspace-app-calendar :is(button, a, summary):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .workspace-app-calendar button { font-family: inherit; }
-.workspace-app-calendar__back, .workspace-app-calendar__month button, .workspace-app-calendar__day-close, .workspace-app-calendar__more, .workspace-app-calendar__load-more { display: inline-flex; align-items: center; gap: 6px; min-height: 36px; padding: 0; border: 0; background: transparent; color: var(--text-muted); font: inherit; cursor: pointer; }
+.workspace-app-calendar__back, .workspace-app-calendar__month > button, .workspace-app-calendar__day-close, .workspace-app-calendar__more, .workspace-app-calendar__load-more { display: inline-flex; align-items: center; gap: 6px; min-height: 36px; padding: 0; border: 0; background: transparent; color: var(--text-muted); font: inherit; cursor: pointer; }
 .workspace-app-calendar__back { justify-self: start; min-height: 34px; padding: 0 14px 0 10px; border-radius: 999px; background: var(--app-card-fill); color: var(--text-default); font-size: 13px; font-weight: 550; }
 .workspace-app-calendar__back:hover { background: var(--app-card-fill-hover); }
 .workspace-app-calendar__back:hover, .workspace-app-calendar__more:hover, .workspace-app-calendar__load-more:hover { color: var(--text-strong); }
@@ -37,9 +37,9 @@ html[data-theme="dark"] .workspace-app-calendar { --calendar-attention: #e8bd62;
   position: relative; isolation: isolate; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; gap: 12px;
   aspect-ratio: 5 / 4; padding: 16px; border-radius: calc(18px * var(--app-radius-scale, 1)); color: white;
   background:
-    radial-gradient(90% 80% at 85% 10%, hsl(var(--campaign-accent) 80% 66% / 85%), transparent 62%),
-    radial-gradient(110% 100% at 0% 100%, hsl(var(--campaign-hue) 70% 30%), transparent 75%),
-    linear-gradient(150deg, hsl(var(--campaign-hue) 55% 46%), hsl(var(--campaign-accent) 45% 18%));
+    radial-gradient(90% 80% at 85% 10%, hsl(var(--app-cover-accent, var(--campaign-accent)) 80% 66% / 85%), transparent 62%),
+    radial-gradient(110% 100% at 0% 100%, hsl(var(--app-cover-hue, var(--campaign-hue)) 70% 30%), transparent 75%),
+    linear-gradient(150deg, hsl(var(--app-cover-hue, var(--campaign-hue)) 55% 46%), hsl(var(--app-cover-accent, var(--campaign-accent)) 45% 18%));
   box-shadow: 0 1px 2px rgb(0 0 0 / 12%), 0 12px 28px -18px rgb(0 0 0 / 55%);
 }
 /* Slow light lines across the cover, echoing the hero's wave. */
@@ -100,8 +100,8 @@ html[data-theme="dark"] .workspace-app-calendar { --calendar-attention: #e8bd62;
 .workspace-app-calendar__heading {
   position: relative; isolation: isolate; overflow: hidden; padding: clamp(22px, 3.4cqi, 36px); border-radius: calc(22px * var(--app-radius-scale, 1)); color: white;
   background:
-    radial-gradient(70% 120% at 100% 0%, hsl(var(--campaign-accent) 75% 55% / 55%), transparent 60%),
-    radial-gradient(60% 110% at 70% 120%, hsl(var(--campaign-hue) 70% 45% / 45%), transparent 65%),
+    radial-gradient(70% 120% at 100% 0%, hsl(var(--app-cover-accent, var(--campaign-accent)) 75% 55% / 55%), transparent 60%),
+    radial-gradient(60% 110% at 70% 120%, hsl(var(--app-cover-hue, var(--campaign-hue)) 70% 45% / 45%), transparent 65%),
     #0b0b0d;
 }
 .workspace-app-calendar__heading::before {
@@ -120,8 +120,6 @@ html[data-theme="dark"] .workspace-app-calendar { --calendar-attention: #e8bd62;
 .workspace-app-calendar__plan-links .workspace-app-data__item { min-height: 36px; gap: 8px; padding: 0 16px; border-radius: 999px; background: white; color: #1d1d1f; }
 .workspace-app-calendar__plan-links .workspace-app-data__item :is(strong, svg) { color: inherit; }
 .workspace-app-calendar__plan-links .workspace-app-data__item strong { font-weight: 500; }
-.workspace-app-calendar__context-details { color: var(--text-muted); font-size: 13px; }
-.workspace-app-calendar__context-details:empty { display: none; }
 .workspace-app-calendar__summary { grid-column: 1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 6px; padding-bottom: 4px; }
 .workspace-app-calendar__summary > .workspace-app-calendar__completion { margin-right: 8px; }
 .workspace-app-calendar__summary .workspace-app-calendar__completion { font-size: 14px; }
@@ -130,12 +128,28 @@ html[data-theme="dark"] .workspace-app-calendar { --calendar-attention: #e8bd62;
 .workspace-app-calendar__summary .workspace-app-calendar__attention { font-weight: 600; }
 .workspace-app-calendar__layout { display: grid; min-width: 0; gap: 28px; align-items: start; }
 .workspace-app-calendar__month-area { min-width: 0; padding: 14px 16px 16px; border-radius: calc(22px * var(--app-radius-scale, 1)); background: var(--app-card-fill); }
-.workspace-app-calendar__month { display: grid; grid-template-columns: minmax(0, 1fr) 32px 32px; align-items: center; gap: 6px; min-height: 44px; margin-bottom: 10px; }
+.workspace-app-calendar__month { display: grid; grid-template-columns: minmax(0, 1fr) auto 32px 32px; align-items: center; gap: 6px; min-height: 44px; margin-bottom: 10px; }
 .workspace-app-calendar__month h4 { grid-row: 1; grid-column: 1; padding-left: 4px; }
-.workspace-app-calendar__month button:last-child { grid-column: 3; }
+/* The month/week switch sits before the arrows; on a narrow calendar it takes its own row. */
+.workspace-app-calendar__span { grid-row: 1; grid-column: 2; display: flex; margin-right: 6px; }
+.workspace-app-calendar__month > button:first-child { grid-row: 1; grid-column: 3; }
+.workspace-app-calendar__month > button:last-child { grid-row: 1; grid-column: 4; }
 .workspace-app-calendar__month h4 { margin: 0; color: var(--text-strong); font-size: 19px; font-weight: 650; letter-spacing: -.025em; line-height: 1.3; }
-.workspace-app-calendar__month button { justify-content: center; width: 32px; min-height: 32px; border-radius: 50%; background: var(--surface-panel); color: var(--text-strong); }
-.workspace-app-calendar__month button:hover { background: var(--text-strong); color: var(--surface-panel); }
+.workspace-app-calendar__month > button { justify-content: center; width: 32px; min-height: 32px; border-radius: 50%; background: var(--surface-panel); color: var(--text-strong); }
+.workspace-app-calendar__month > button:hover { background: var(--text-strong); color: var(--surface-panel); }
+@container campaign-calendar (max-width: 479px) {
+  .workspace-app-calendar__month { grid-template-columns: minmax(0, 1fr) 32px 32px; }
+  .workspace-app-calendar__month > button:first-child { grid-column: 2; }
+  .workspace-app-calendar__month > button:last-child { grid-column: 3; }
+  .workspace-app-calendar__span { grid-row: 2; grid-column: 1 / -1; margin-right: 0; }
+}
+/* A week: each day a tall column with every item it holds, its weekday above its date. */
+.workspace-app-calendar__grid.is-week { grid-auto-rows: minmax(180px, auto); }
+.workspace-app-calendar__grid.is-week .workspace-app-calendar__cell { min-height: 180px; }
+.workspace-app-calendar__date-weekday { color: var(--text-muted); font-size: 11px; font-weight: 500; }
+.workspace-app-calendar__cell.is-today .workspace-app-calendar__date-number { font-weight: 750; text-decoration: underline; text-underline-offset: 3px; }
+.workspace-app-calendar__grid.is-week .workspace-app-calendar__event { grid-template-columns: 12px minmax(0, 1fr); align-items: start; padding-top: 3px; padding-bottom: 3px; line-height: 16px; }
+.workspace-app-calendar__grid.is-week .workspace-app-calendar__event > span:last-child { grid-column: 1 / -1; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; white-space: normal; overflow-wrap: anywhere; }
 .workspace-app-calendar__weekdays, .workspace-app-calendar__grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); min-width: 0; }
 .workspace-app-calendar__weekdays span { padding: 0 6px 8px; color: var(--text-muted); font-size: 12px; text-align: center; }
 /* A week without posts stays short, so the campaign's own weeks are in view. */
@@ -162,6 +176,8 @@ html[data-theme="dark"] .workspace-app-calendar__date-dots svg:not([data-integra
 /* A narrow day cell keeps the time and status; the full label stays in the button's title and accessible name. */
 @container calendar-cell (max-width: 119px) {
   .workspace-app-calendar__event > span:last-child { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  /* A week's item has two lines for its label under its time, so it keeps its name in a narrow column. */
+  .workspace-app-calendar__grid.is-week .workspace-app-calendar__event > span:last-child { position: static; width: auto; height: auto; clip-path: none; white-space: normal; }
 }
 .workspace-app-calendar__event { min-height: 22px; margin-top: 2px; padding: 0 6px 0 4px; border-radius: calc(7px * var(--app-radius-scale, 1)); background: var(--app-card-fill); color: var(--text-default); font-size: 11.5px; line-height: 22px; }
 .workspace-app-calendar__event time { font-size: 11px; font-weight: 600; }
@@ -213,6 +229,8 @@ html[data-theme="dark"] .workspace-app-calendar__date-dots svg:not([data-integra
 .workspace-app-calendar__day-item.is-expanded .workspace-app-calendar__item-chevron { transform: rotate(180deg); color: var(--text-default); }
 .workspace-app-calendar__item-details { display: grid; gap: 14px; min-width: 0; margin: 0 0 18px 78px; padding: 16px 8px 0 0; border-top: 1px solid var(--calendar-line); }
 .workspace-app-calendar__item-details .workspace-app-data__progress-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; font-size: 12px; }
+/* A file a day has (its script, its shot plan) takes the whole row, so its name reads in full. */
+.workspace-app-calendar__item-details .workspace-app-data__progress-fields > :has(.workspace-app-data__document-preview) { grid-column: 1 / -1; }
 .workspace-app-calendar__item-details .workspace-app-data__progress-fields > span { display: block; min-width: 0; overflow-wrap: anywhere; }
 .workspace-app-calendar__item-details .workspace-app-data__progress-fields b { display: block; margin-bottom: 4px; color: var(--text-muted); font-weight: 400; }
 .workspace-app-calendar__item-details .workspace-app-data__execution, .workspace-app-calendar__item-details .workspace-app-data__execution-disclosure { font-size: 12px; }
@@ -277,6 +295,9 @@ html[data-theme="dark"] .workspace-app-calendar__date-dots svg:not([data-integra
   .workspace-app-calendar__month h4 { font-size: 17px; }
   .workspace-app-calendar__weekdays span { padding: 0 0 10px; font-size: 11px; }
   .workspace-app-calendar__grid { grid-auto-rows: minmax(54px, auto); gap: 0; }
+  /* A narrow week is a strip of seven days; the chosen day's items list under it, as in a month. */
+  .workspace-app-calendar__grid.is-week { grid-auto-rows: minmax(54px, auto); }
+  .workspace-app-calendar__grid.is-week .workspace-app-calendar__cell { min-height: 0; }
   .workspace-app-calendar__cell, .workspace-app-calendar__cell.has-items { min-height: 0; padding: 0; background: transparent; box-shadow: none; }
   .workspace-app-calendar__cell.is-selected { outline: none; background: transparent; }
   .workspace-app-calendar__date { align-items: center; justify-content: flex-start; gap: 4px; width: 100%; min-height: 54px; padding: 0 0 6px; font-size: 15px; text-align: center; }
@@ -317,3 +338,19 @@ html[data-theme="dark"] .workspace-app-calendar__date-dots svg:not([data-integra
 /* One being prepared, before it exists: a campaign card whose cover shows how far it is. */
 .workspace-app-calendar__context[data-making] .workspace-app-calendar__cover { align-items: center; justify-content: center; }
 .workspace-app-calendar__context[data-making]:disabled { cursor: default; }
+
+/* A week laid out by platform: a row per platform, a column per day; it scrolls sideways inside itself on a phone. */
+.workspace-app-calendar__lanes { display: grid; gap: 4px; min-width: 0; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: thin; padding-bottom: 4px; }
+.workspace-app-calendar__lane { display: grid; grid-template-columns: 88px repeat(7, minmax(84px, 1fr)); gap: 4px; min-width: 680px; }
+.workspace-app-calendar__lane-name { position: sticky; left: 0; z-index: 1; display: flex; align-items: center; padding: 6px 8px; border-radius: calc(10px * var(--app-radius-scale, 1));
+  background: var(--surface-muted); color: var(--text-strong); font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+
+.workspace-app-calendar__lane-day { display: flex; align-items: baseline; justify-content: center; gap: 4px; min-height: 32px; padding: 4px; border: 0; border-radius: calc(10px * var(--app-radius-scale, 1));
+  background: transparent; color: var(--text-default); font: inherit; font-size: 12px; cursor: pointer; }
+.workspace-app-calendar__lane-day small { color: var(--text-muted); font-size: 11px; }
+.workspace-app-calendar__lane-day.is-today span { font-weight: 750; text-decoration: underline; text-underline-offset: 3px; }
+.workspace-app-calendar__lane-day.is-selected { outline: 2px solid var(--text-strong); outline-offset: -2px; }
+.workspace-app-calendar__lane-cell { display: grid; align-content: start; gap: 2px; min-width: 0; min-height: 44px; padding: 3px; border-radius: calc(10px * var(--app-radius-scale, 1)); background: var(--surface-panel); box-shadow: 0 1px 2px rgb(0 0 0 / 5%); }
+html[data-theme="dark"] .workspace-app-calendar__lane-cell { background: var(--app-card-fill-hover); }
+.workspace-app-calendar__lane-cell .workspace-app-calendar__event { grid-template-columns: 12px minmax(0, 1fr); align-items: start; margin-top: 0; line-height: 16px; padding-top: 3px; padding-bottom: 3px; }
+.workspace-app-calendar__lane-cell .workspace-app-calendar__event > span:last-child { grid-column: 1 / -1; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; white-space: normal; overflow-wrap: anywhere; }

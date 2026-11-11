@@ -11,10 +11,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.cache import cache
 from packages.core.models.base import generate_ulid
 from packages.core.models.permission import Visibility
-from packages.core.models.workspace import Agent, AgentSubscription, ToolDefinition, AgentToolBinding
+from packages.core.models.workspace import (
+    Agent,
+    AgentSubscription,
+    AgentToolBinding,
+    ToolDefinition,
+    Workspace,
+)
 from packages.core.services.agent_runtime_config import normalize_agent_runtime_config
 from packages.core.services.reusable_resource_locks import (
     RESOURCE_AGENT,
+    lock_reusable_resource_lifecycle,
     lock_reusable_resource_reference,
 )
 
@@ -179,12 +186,21 @@ async def delete_agent(db: AsyncSession, agent_id: str, entity_id: str) -> bool:
     agent = await get_agent(db, agent_id)
     if not agent or agent.entity_id != entity_id:
         return False
+    # Serializes with restore_workspace, which drops mappings to deleted
+    # Agents: a Workspace restored concurrently is either seen as live here
+    # or sees this Agent as deleted there.
+    await lock_reusable_resource_lifecycle(db, entity_id=entity_id)
+    # A soft-deleted Workspace keeps its mappings active so it can be
+    # restored; only live Workspaces block deleting the Agent.
     active_workspace_mapping = await db.scalar(
-        select(AgentSubscription.id).where(
+        select(AgentSubscription.id).join(
+            Workspace, Workspace.id == AgentSubscription.workspace_id,
+        ).where(
             AgentSubscription.entity_id == entity_id,
             AgentSubscription.agent_id == agent_id,
-            AgentSubscription.workspace_id.is_not(None),
             AgentSubscription.status == "active",
+            Workspace.entity_id == entity_id,
+            Workspace.deleted_at.is_(None),
         ).limit(1)
     )
     if active_workspace_mapping:

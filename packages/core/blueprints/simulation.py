@@ -16,6 +16,8 @@ import re
 from copy import deepcopy
 from typing import Any, Iterable
 
+from packages.core.services.viewer_language import localized
+
 
 SIMULATION_EXPERIENCE_VERSION = "1.0"
 SIMULATION_ARTIFACT_KINDS = frozenset({
@@ -92,34 +94,41 @@ def _service_key(row: dict[str, Any] | None) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+def _zh(row: dict[str, Any]) -> dict[str, Any]:
+    """The row as a Chinese reader sees it, when the Blueprint translated it."""
+    return localized(row, "zh")
+
+
+def _summary(row: dict[str, Any], fallback: str) -> str:
+    return str(row.get("description") or row.get("summary") or _label(row, fallback)).strip()[:300]
+
+
 def _proposal_action(
     stage_id: str,
     rows: list[dict[str, Any]],
     *,
     fallback_title: str,
 ) -> dict[str, Any]:
-    items = []
-    for index, row in enumerate(rows[:3]):
-        title = _label(row, f"{fallback_title} {index + 1}")
-        summary = row.get("description") or row.get("summary") or title
-        items.append({
+    items = [
+        {
             "item_id": f"{stage_id}-{index + 1}",
             "kind": "workflow_change",
             "risk_level": "low",
-            "summary": str(summary).strip()[:300],
-        })
-    if not items:
-        items.append({
-            "item_id": f"{stage_id}-1",
-            "kind": "workflow_change",
-            "risk_level": "low",
-            "summary": fallback_title,
-        })
+            "summary": _summary(row, f"{fallback_title} {index + 1}"),
+        }
+        for index, row in enumerate(rows[:3])
+    ] or [{
+        "item_id": f"{stage_id}-1",
+        "kind": "workflow_change",
+        "risk_level": "low",
+        "summary": fallback_title,
+    }]
     return {
         "kind": "approve_proposals",
         "review_id": f"simulation-{stage_id}",
         "items": items,
-        "options": ["approve", "always_approve", "reject"],
+        # A walkthrough grants nothing, so it offers no standing approval.
+        "options": ["approve", "reject"],
     }
 
 
@@ -145,16 +154,19 @@ def _workflow_meta(title: str, services: list[dict[str, Any]]) -> dict[str, Any]
 
 def _generate_scenario(
     *,
-    title: str,
     primary_work: str,
+    primary_work_zh: str,
     artifacts: list[dict[str, Any]],
     recipe: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Build a complete, deterministic Chat walkthrough from Blueprint data.
+    """Build a short, deterministic Chat walkthrough from Blueprint data.
 
-    The scenario intentionally uses the same pending-action vocabulary and
-    message shapes as a live Workspace.  It is data, not a browser timer: the
-    server persists each stage and stops only at explicit operator gates.
+    Three decisions, the same ones a live run stops for: the plan, a
+    question, and the results before they go out. The scenario uses the same
+    pending-action vocabulary and message shapes as a live Workspace. It is
+    data, not a browser timer: the server persists each stage and stops only
+    at those cards. Every stage carries a Chinese overlay (``i18n.zh``) that
+    the runtime resolves for the person who drives the run.
     """
     operating_model = (
         recipe.get("operating_model")
@@ -163,207 +175,155 @@ def _generate_scenario(
     )
     services = _records(operating_model.get("services"))
     workflows = _records(recipe.get("workflows"))
-    goals = _records(recipe.get("goals"))
-    jobs = _records(recipe.get("scheduled_jobs"))
 
-    goal_title = _label(goals[0], primary_work) if goals else primary_work
-    workflow_title = (
-        _label(workflows[0], "Blueprint production workflow")
-        if workflows
-        else _label(services[0], "Blueprint production workflow")
-        if services
-        else "Blueprint production workflow"
-    )
-    planning_services = services[:3]
-    production_services = services[1:4] or services[:3]
-    delivery_services = services[-3:] if len(services) > 3 else services[:3]
+    first = services[0] if services else {}
+    last = services[-1] if services else {}
+    first_title = _label(first, "Planning") if first else "Planning"
+    first_title_zh = _label(_zh(first), "计划") if first else "计划"
+    workflow = workflows[0] if workflows else last
+    delivery_title = _label(workflow, "Delivery") if workflow else "Delivery"
+    delivery_title_zh = _label(_zh(workflow), "交付") if workflow else "交付"
     first_service_key = _service_key(services[0] if services else None)
     production_service_key = _service_key(
-        services[min(2, len(services) - 1)] if services else None
+        services[min(1, len(services) - 1)] if services else None
     )
-    delivery_service_key = _service_key(services[-1] if services else None)
-    audience_hint = str(
-        operating_model.get("audience")
-        or operating_model.get("customer")
-        or "the Blueprint's primary audience"
-    ).strip()
+    delivery_service_key = _service_key(last or None)
     artifact_titles = ", ".join(str(item.get("title") or item["id"]) for item in artifacts)
-    cadence = _label(jobs[0], "the configured cadence") if jobs else "the configured cadence"
+    artifact_titles_zh = "、".join(
+        str(((item.get("i18n") or {}).get("zh") or {}).get("title") or item.get("title") or item["id"])
+        for item in artifacts
+    )
+    plan = _proposal_action("plan-proposal", services, fallback_title="Prepare the first piece of work")
+    plan_zh_items = [
+        {"summary": _summary(_zh(row), f"计划 {index + 1}")}
+        for index, row in enumerate(services[:3])
+    ] or [{"summary": "准备第一项工作"}]
 
     return [
         {
-            "id": "goal-request",
+            "id": "request",
             "kind": "request",
-            "title": "Start the Blueprint goal",
+            "title": "Try a run",
             "author": "user",
-            "body": f"Run **{title}** from start to finish: **{goal_title}**. Keep the normal proposals, reviews, files, recovery, and Goal attribution visible in Workspace Chat.",
+            "body": primary_work,
+            "i18n": {"zh": {"title": "试运行一次", "body": primary_work_zh}},
         },
         {
             "id": "plan-proposal",
             "kind": "proposal",
-            "title": "Plan proposal",
+            "title": "Confirm the plan",
             "author": "agent",
             "service_key": first_service_key,
-            "body": f"I broke the goal into the first reviewable stage for **{primary_work}**. Choose the work that should enter the run.",
-            "pending_action": _proposal_action(
-                "plan-proposal",
-                planning_services,
-                fallback_title="Prepare the first Blueprint work packet",
-            ),
+            "body": "Here is the plan. Confirm it and I'll start:",
+            "pending_action": plan,
+            "i18n": {"zh": {
+                "title": "确认计划",
+                "body": "我按这个计划做，先确认一下：",
+                "pending_action": {"items": plan_zh_items},
+            }},
         },
         {
-            "id": "workspace-context",
-            "kind": "context",
-            "title": "Workspace context retrieved",
+            "id": "first-work",
+            "kind": "workflow",
+            "title": first_title,
             "author": "agent",
             "service_key": first_service_key,
-            "body": f"Workspace Knowledge, Blueprint rules, and the installed operating model are now in scope. The run is grounded in **{primary_work}** and will not call an external system.",
+            "body": f"{first_title} is done.",
+            "message_kind": "workflow_activity",
+            "meta": _workflow_meta(first_title, services[:1]),
+            "i18n": {"zh": {
+                "title": first_title_zh,
+                "body": f"{first_title_zh}已完成。",
+                "meta": {"workflow_title": first_title_zh},
+            }},
         },
         {
             "id": "operator-input",
             "kind": "input",
-            "title": "Confirm the run focus",
+            "title": "Who is this for?",
             "author": "agent",
-            "service_key": first_service_key,
-            "body": "A choice from you is needed before the completed retrieval can continue.",
+            "service_key": production_service_key or first_service_key,
+            "body": "One question before I continue:",
             "pending_action": {
                 "kind": "needs_input",
-                "title": "Choose the focus for this run",
-                "context_summary": "Your response resumes this persisted run without repeating completed work.",
+                "title": "Who is this for?",
+                "context_summary": "Your answer shapes the results.",
                 "questions": [
                     {
                         "key": "audience",
-                        "label": "Primary audience",
+                        "label": "Main audience",
                         "type": "select",
                         "required": True,
                         "options": [
-                            {"label": audience_hint[:80], "value": "primary"},
-                            {"label": "A smaller test audience", "value": "test"},
+                            {"label": "My current audience", "value": "current"},
+                            {"label": "A new audience", "value": "new"},
                         ],
                     },
                     {
                         "key": "guidance",
-                        "label": "Optional guidance",
+                        "label": "Anything else (optional)",
                         "type": "textarea",
                         "required": False,
-                        "placeholder": "Add a constraint or leave this blank",
+                        "placeholder": "For example: avoid Friday releases",
                     },
                 ],
             },
+            "i18n": {"zh": {
+                "title": "这次主要面向谁？",
+                "body": "继续之前问你一个问题：",
+                "pending_action": {
+                    "title": "这次主要面向谁？",
+                    "context_summary": "成品会按你的回答来准备。",
+                    "questions": [
+                        {
+                            "label": "主要面向",
+                            "options": [{"label": "现有受众"}, {"label": "新受众"}],
+                        },
+                        {"label": "补充说明（可不填）", "placeholder": "比如：避开周五发布"},
+                    ],
+                },
+            }},
         },
         {
-            "id": "production-proposal",
-            "kind": "proposal",
-            "title": "Production proposal",
-            "author": "agent",
-            "service_key": production_service_key or first_service_key,
-            "body": f"The input has been applied. Review the production stage before **{workflow_title}** runs.",
-            "pending_action": _proposal_action(
-                "production-proposal",
-                production_services,
-                fallback_title=f"Run {workflow_title}",
-            ),
-        },
-        {
-            "id": "workflow-run",
-            "kind": "workflow",
-            "title": workflow_title,
-            "author": "agent",
-            "service_key": production_service_key or first_service_key,
-            "body": f"The approved Blueprint workflow completed its simulated tool path and produced a reviewable checkpoint for **{primary_work}**.",
-            "message_kind": "workflow_activity",
-            "meta": _workflow_meta(workflow_title, production_services),
-        },
-        {
-            "id": "artifact-packet",
-            "kind": "artifact",
-            "title": "Generated review packet",
-            "author": "agent",
-            "service_key": production_service_key or first_service_key,
-            "body": f"Generated {len(artifacts)} Blueprint-defined reviewable outputs: {artifact_titles}. These previews are simulated and remain inside this Workspace.",
-            "artifact_ids": [str(item["id"]) for item in artifacts],
-        },
-        {
-            "id": "delivery-proposal",
-            "kind": "proposal",
-            "title": "Delivery proposal",
-            "author": "agent",
-            "service_key": delivery_service_key or production_service_key,
-            "body": f"The artifacts passed the production checkpoint. Select the delivery and verification work that should run on **{cadence}**.",
-            "pending_action": _proposal_action(
-                "delivery-proposal",
-                delivery_services,
-                fallback_title="Package and verify the final result",
-            ),
-        },
-        {
-            "id": "exact-output-approval",
+            "id": "output-approval",
             "kind": "approval",
-            "title": "Approve the exact output",
+            "title": "Check the results",
             "author": "agent",
-            "service_key": delivery_service_key or production_service_key,
-            "body": "The exact final packet is ready for the normal Workspace approval gate.",
+            "service_key": production_service_key or first_service_key,
+            "body": "The results are ready. Take a look before they go out:",
+            "artifact_ids": [str(item["id"]) for item in artifacts],
             "pending_action": {
                 "kind": "governance_approval",
                 "hitl_type": "review",
-                "prompt": "Approve this exact simulated output for the delivery step?",
-                "review_title": "Final Blueprint output",
-                "review": {
-                    "summary": f"{artifact_titles}",
-                    "checks": [
-                        "Blueprint rules applied",
-                        "Artifacts retained in Workspace Chat",
-                        "No external side effect",
-                    ],
-                },
+                "prompt": "Can these go out?",
+                "review_title": "Results",
+                "review": {"summary": artifact_titles},
                 "options": ["approve", "revise", "reject"],
             },
-        },
-        {
-            "id": "safe-failure",
-            "kind": "failure",
-            "title": "One branch needs recovery",
-            "author": "agent",
-            "service_key": delivery_service_key or production_service_key,
-            "body": "A simulated tool branch failed after the approval checkpoint.",
-            "pending_action": {
-                "kind": "workflow_retry",
-                "hitl_type": "error",
-                "title": "The simulated delivery reference expired",
-                "payload": {
-                    "what_happened": "The page changed, so the previous reference cannot be reused safely.",
-                    "why": "The simulation reproduces the same stale-reference recovery used by a live Workspace.",
-                    "action_to_take": "Retry only the failed branch; completed work and approvals remain intact.",
+            "i18n": {"zh": {
+                "title": "检查成品",
+                "body": "成品准备好了，发出去之前请你看一眼：",
+                "pending_action": {
+                    "prompt": "这些可以发出去吗？",
+                    "review_title": "成品",
+                    "review": {"summary": artifact_titles_zh},
                 },
-            },
+            }},
         },
         {
-            "id": "branch-retry",
+            "id": "delivery",
             "kind": "workflow",
-            "title": "Failed branch retried",
+            "title": f"{delivery_title} (simulated, nothing was sent)",
             "author": "agent",
             "service_key": delivery_service_key or production_service_key,
-            "body": "Only the failed branch was retried. Completed retrieval, production, artifacts, and approvals were reused without duplicate work.",
+            "body": "Delivered in the simulation. Nothing was sent, published or changed outside Manor.",
             "message_kind": "workflow_activity",
-            "meta": {
-                **_workflow_meta("Recover and verify the final delivery", delivery_services),
-                "workflow_attempt_number": 2,
-            },
-        },
-        {
-            "id": "simulation-receipt",
-            "kind": "receipt",
-            "title": "Verified simulation receipt",
-            "author": "system",
-            "body": "Verification complete. A durable simulated receipt was written to Workspace Chat; no external account, file store, publisher, or customer was changed.",
-        },
-        {
-            "id": "goal-completed",
-            "kind": "goal",
-            "title": "Goal completed",
-            "author": "system",
-            "message_kind": "goal_alert",
-            "body": f"**Goal completed (simulation)**\n\n**{goal_title}**\n\nThe Blueprint-specific run completed every proposed stage, review gate, generated artifact, recovery branch, verification receipt, and Goal attribution.",
+            "meta": _workflow_meta(f"{delivery_title} (simulated, nothing was sent)", services[-1:]),
+            "i18n": {"zh": {
+                "title": f"{delivery_title_zh}（模拟，没有真的发出去）",
+                "body": "模拟交付完成。没有发送、发布或修改 Manor 之外的任何东西。",
+                "meta": {"workflow_title": f"{delivery_title_zh}（模拟，没有真的发出去）"},
+            }},
         },
     ]
 
@@ -385,6 +345,9 @@ def generate_simulation_experience(payload: dict[str, Any]) -> dict[str, Any]:
     title = str(manifest.get("title") or "Workspace").strip()
     blueprint_slug = _slug(manifest.get("slug") or title)
     primary_work = str(operating_model.get("primary_work") or manifest.get("summary") or "Complete the Workspace's primary work.").strip()
+    primary_work_zh = str(
+        _zh(operating_model).get("primary_work") or _zh(manifest).get("summary") or primary_work
+    ).strip()
     signal_nodes = [
         manifest.get("title"),
         manifest.get("summary"),
@@ -402,11 +365,12 @@ def generate_simulation_experience(payload: dict[str, Any]) -> dict[str, Any]:
         {
             "id": "run-brief",
             "kind": "document",
-            "title": "Workspace run brief",
+            "title": "Run brief",
             "filename": f"{blueprint_slug}-run-brief.md",
             "mime_type": "text/markdown",
             "summary": primary_work[:240],
             "stage": "planning",
+            "i18n": {"zh": {"title": "运行简报", "summary": primary_work_zh[:240]}},
         }
     ]
 
@@ -416,12 +380,13 @@ def generate_simulation_experience(payload: dict[str, Any]) -> dict[str, Any]:
             {
                 "id": "generated-video",
                 "kind": "video",
-                "title": "Generated video draft",
+                "title": "Video draft",
                 "filename": f"{blueprint_slug}-demo.mp4",
                 "mime_type": "video/mp4",
-                "summary": "Reviewable simulated video output with duration and generation receipt.",
+                "summary": "Stands in for the video a live run makes.",
                 "stage": "production",
                 "duration_seconds": 45,
+                "i18n": {"zh": {"title": "视频初稿", "summary": "代表正式运行会做出的视频。"}},
             },
         ),
         (
@@ -429,11 +394,12 @@ def generate_simulation_experience(payload: dict[str, Any]) -> dict[str, Any]:
             {
                 "id": "generated-visual",
                 "kind": "image",
-                "title": "Generated visual",
+                "title": "Visual",
                 "filename": f"{blueprint_slug}-visual.png",
                 "mime_type": "image/png",
-                "summary": "Reviewable simulated visual generated from the approved brief.",
+                "summary": "Stands in for the image a live run makes.",
                 "stage": "production",
+                "i18n": {"zh": {"title": "配图", "summary": "代表正式运行会做出的图片。"}},
             },
         ),
         (
@@ -441,12 +407,13 @@ def generate_simulation_experience(payload: dict[str, Any]) -> dict[str, Any]:
             {
                 "id": "generated-audio",
                 "kind": "audio",
-                "title": "Generated narration",
+                "title": "Narration",
                 "filename": f"{blueprint_slug}-narration.mp3",
                 "mime_type": "audio/mpeg",
-                "summary": "Simulated narration output retained as a reusable checkpoint.",
+                "summary": "Stands in for the audio a live run makes.",
                 "stage": "production",
                 "duration_seconds": 45,
+                "i18n": {"zh": {"title": "旁白", "summary": "代表正式运行会做出的音频。"}},
             },
         ),
         (
@@ -454,11 +421,12 @@ def generate_simulation_experience(payload: dict[str, Any]) -> dict[str, Any]:
             {
                 "id": "generated-spreadsheet",
                 "kind": "spreadsheet",
-                "title": "Generated operating sheet",
+                "title": "Tracking sheet",
                 "filename": f"{blueprint_slug}-tracker.xlsx",
                 "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                "summary": "Simulated spreadsheet output populated from the Workspace run.",
+                "summary": "Stands in for the spreadsheet a live run fills in.",
                 "stage": "delivery",
+                "i18n": {"zh": {"title": "跟踪表", "summary": "代表正式运行会填好的表格。"}},
             },
         ),
         (
@@ -466,11 +434,12 @@ def generate_simulation_experience(payload: dict[str, Any]) -> dict[str, Any]:
             {
                 "id": "generated-presentation",
                 "kind": "presentation",
-                "title": "Generated presentation",
+                "title": "Presentation",
                 "filename": f"{blueprint_slug}-review.pptx",
                 "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                "summary": "Simulated presentation prepared for operator review.",
+                "summary": "Stands in for the deck a live run makes.",
                 "stage": "delivery",
+                "i18n": {"zh": {"title": "演示文稿", "summary": "代表正式运行会做出的演示文稿。"}},
             },
         ),
     ]
@@ -484,11 +453,12 @@ def generate_simulation_experience(payload: dict[str, Any]) -> dict[str, Any]:
         artifacts.append({
             "id": "review-packet",
             "kind": "document",
-            "title": "Workspace review packet",
+            "title": "Results",
             "filename": f"{blueprint_slug}-review-packet.md",
             "mime_type": "text/markdown",
-            "summary": "Simulated final packet containing the run result, checks, and next action.",
+            "summary": "Stands in for what a live run hands over.",
             "stage": "delivery",
+            "i18n": {"zh": {"title": "成果汇总", "summary": "代表正式运行会交出的成果。"}},
         })
 
     experience = {
@@ -496,11 +466,11 @@ def generate_simulation_experience(payload: dict[str, Any]) -> dict[str, Any]:
         "title": f"Try {title}",
         "sample_prompt": primary_work[:500],
         "artifacts": artifacts,
-        "completion_summary": "The artifacts, approvals, blockers, retries, and receipts are simulated inside Workspace Chat; no external system is changed.",
+        "completion_summary": "Everything in this walkthrough happened in Workspace Chat; no external system was changed.",
     }
     experience["stages"] = _generate_scenario(
-        title=title,
         primary_work=primary_work,
+        primary_work_zh=primary_work_zh,
         artifacts=artifacts,
         recipe=recipe,
     )

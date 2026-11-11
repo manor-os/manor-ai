@@ -14,6 +14,237 @@ from packages.core.services.response_surfaces import (
 )
 
 
+_LINKED_NAME = {
+    "type": "object",
+    "properties": {"name": {"type": "string", "maxLength": 160}, "url": {"type": "string", "maxLength": 2000}},
+    "required": ["name"],
+    "additionalProperties": False,
+}
+_CARD_TEMPLATE_PROPS = {
+    # card.email
+    "status": {"type": "string", "enum": ["received", "draft"]},
+    "from_name": {"type": "string", "maxLength": 160},
+    "from_address": {"type": "string", "maxLength": 254},
+    "to": {"type": "array", "maxItems": 10, "items": {"type": "string", "maxLength": 160}},
+    "subject": {"type": "string", "maxLength": 300},
+    "sent_at": {"type": "string", "maxLength": 40, "description": "As the person should read it, such as 09:41."},
+    "snippet": {"type": "string", "maxLength": 600},
+    "body": {"type": "string", "maxLength": 6000},
+    "attachments": {"type": "array", "maxItems": 10, "items": _LINKED_NAME},
+    "url": {"type": "string", "maxLength": 2000},
+    # card.delivery
+    "items": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 20,
+        "items": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "maxLength": 120},
+                "status": {"type": "string", "enum": ["sent", "published", "scheduled", "failed"]},
+                "count": {"type": "integer", "minimum": 0},
+                "detail": {"type": "string", "maxLength": 160},
+                "url": {"type": "string", "maxLength": 2000},
+            },
+            "required": ["label", "status"],
+            "additionalProperties": False,
+        },
+    },
+    # card.search_results
+    "results": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 10,
+        "items": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "maxLength": 200},
+                "source": {"type": "string", "maxLength": 120},
+                "snippet": {"type": "string", "maxLength": 300},
+                "when": {"type": "string", "maxLength": 40},
+                "url": {"type": "string", "maxLength": 2000},
+            },
+            "required": ["title", "source"],
+            "additionalProperties": False,
+        },
+    },
+    "total": {"type": "integer", "minimum": 0},
+    # card.post
+    "posts": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 6,
+        "items": {
+            "type": "object",
+            "properties": {
+                "platform": {"type": "string", "maxLength": 40},
+                "account": {"type": "string", "maxLength": 80},
+                "format": {"type": "string", "enum": ["vertical_video", "horizontal_video", "square_image", "portrait_image", "text"]},
+                "title": {"type": "string", "maxLength": 200},
+                "text": {"type": "string", "maxLength": 2000},
+                "media": _LINKED_NAME,
+                "images": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": _LINKED_NAME,
+                    "description": "Every image of an image post, in order. Use instead of media.",
+                },
+                "status": {"type": "string", "enum": ["draft", "scheduled", "published", "failed"]},
+                "status_detail": {"type": "string", "maxLength": 160},
+                "metrics": {
+                    "type": "array",
+                    "maxItems": 4,
+                    "items": {
+                        "type": "object",
+                        "properties": {"label": {"type": "string", "maxLength": 24}, "value": {"type": "string", "maxLength": 24}},
+                        "required": ["label", "value"],
+                        "additionalProperties": False,
+                    },
+                },
+                "url": {"type": "string", "maxLength": 2000},
+            },
+            "required": ["platform", "status"],
+            "additionalProperties": False,
+        },
+    },
+    # card.comment
+    "platform": {"type": "string", "maxLength": 40},
+    "account": {"type": "string", "maxLength": 80},
+    "post_title": {"type": "string", "maxLength": 200},
+    "post_url": {"type": "string", "maxLength": 2000},
+    "comments": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 20,
+        "items": {
+            "type": "object",
+            "properties": {
+                "author": {"type": "string", "maxLength": 80},
+                "text": {"type": "string", "maxLength": 1000},
+                "when": {"type": "string", "maxLength": 40},
+                "likes": {"type": "integer", "minimum": 0},
+                "status": {
+                    "type": "string",
+                    "enum": ["draft", "scheduled", "sent", "failed"],
+                    "description": "Only for a comment we wrote; leave it out for a comment we received.",
+                },
+                "url": {"type": "string", "maxLength": 2000},
+                "reply": {
+                    "type": "object",
+                    "properties": {
+                        "author": {"type": "string", "maxLength": 80},
+                        "text": {"type": "string", "maxLength": 1000},
+                        "status": {"type": "string", "enum": ["draft", "scheduled", "sent", "failed"]},
+                    },
+                    "required": ["text", "status"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["author", "text"],
+            "additionalProperties": False,
+        },
+    },
+    # card.person
+    "name": {"type": "string", "maxLength": 120, "description": "card.person or card.stock."},
+    "title": {"type": "string", "maxLength": 120},
+    "organization": {"type": "string", "maxLength": 120},
+    "email": {"type": "string", "maxLength": 254},
+    "phone": {"type": "string", "maxLength": 40},
+    "note": {"type": "string", "maxLength": 300},
+    # card.event
+    "events": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 8,
+        "items": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "maxLength": 200},
+                "date": {"type": "string", "description": "YYYY-MM-DD."},
+                "time": {"type": "string", "maxLength": 40, "description": "As the person should read it, such as 14:00-16:00."},
+                "location": {"type": "string", "maxLength": 200},
+                "attendees": {"type": "array", "maxItems": 20, "items": {"type": "string", "maxLength": 80}},
+                "status": {"type": "string", "enum": ["proposed", "confirmed", "cancelled"]},
+                "url": {"type": "string", "maxLength": 2000},
+            },
+            "required": ["title", "date"],
+            "additionalProperties": False,
+        },
+    },
+    # card.stock
+    "symbol": {"type": "string", "maxLength": 20},
+    "price": {"type": "number"},
+    "currency": {"type": "string", "maxLength": 8, "description": "A sign such as $ or ¥."},
+    "change": {"type": "number"},
+    "change_percent": {"type": "number"},
+    "as_of": {"type": "string", "maxLength": 60, "description": "How fresh the quote is, as the person should read it."},
+    "history": {"type": "array", "maxItems": 240, "items": {"type": "number"}, "description": "Recent prices, oldest first."},
+    # card.product
+    "products": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 6,
+        "items": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "maxLength": 200},
+                "price": {"type": "string", "maxLength": 40, "description": "As displayed, such as ¥1,299."},
+                "seller": {"type": "string", "maxLength": 120},
+                "detail": {"type": "string", "maxLength": 160},
+                "image": _LINKED_NAME,
+                "url": {"type": "string", "maxLength": 2000},
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        },
+    },
+    # card.map
+    "places": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 12,
+        "items": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "maxLength": 160},
+                "address": {"type": "string", "maxLength": 240},
+                "detail": {"type": "string", "maxLength": 160},
+                "lat": {"type": "number", "description": "A rough latitude estimated from what you know of the place is fine. A place without one is not on the map."},
+                "lng": {"type": "number", "description": "A rough longitude estimated from what you know of the place is fine. A place without one is not on the map."},
+                "url": {"type": "string", "maxLength": 2000},
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        },
+    },
+    # card.chart
+    "chart_type": {"type": "string", "enum": ["line", "bar", "share", "ranking"]},
+    "categories": {"type": "array", "minItems": 1, "maxItems": 24, "items": {"type": "string", "maxLength": 40}},
+    "series": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 3,
+        "description": "One value per category. Only line charts take more than one series.",
+        "items": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "maxLength": 40},
+                "values": {"type": "array", "maxItems": 24, "items": {"type": "number"}},
+            },
+            "required": ["name", "values"],
+            "additionalProperties": False,
+        },
+    },
+    "unit": {"type": "string", "maxLength": 12},
+    "reference": {
+        "type": "object",
+        "description": "A target line on a line chart.",
+        "properties": {"label": {"type": "string", "maxLength": 40}, "value": {"type": "number"}},
+        "required": ["label", "value"],
+        "additionalProperties": False,
+    },
+}
+
 RENDER_RESPONSE_SURFACE_SCHEMA = {
     "type": "function",
     "function": {
@@ -25,7 +256,13 @@ RENDER_RESPONSE_SURFACE_SCHEMA = {
             "artifact, do not use this tool and do not constrain that page to the Response Surface "
             "visual policy; use the appropriate page or artifact workflow and follow the user's "
             "requested design. Prefer a registered template for code labs or choices; use "
-            "sandboxed_html only for a one-off interface with no suitable template. Generated "
+            "sandboxed_html only for a one-off interface with no suitable template. "
+            "To show an email or draft, what was sent or published, search results, social posts, comments, "
+            "a person, events, a stock quote, products, places or a chart, always use render_kind template with the matching card template; never "
+            "hand-write sandboxed_html or SVG for these. Fill a card only with values "
+            "from tool results or the user: never invent numbers, recipients, statuses or links. A "
+            "card shows; it does not send or publish anything, so call the real tool first and ask "
+            "decisions through the normal approval or question flow. Generated "
             "sandboxed_html must follow the Manor Response Surface UI policy: calm warm-neutral, "
             "low-saturation, content-first UI; use the host tokens --module-text, --module-strong, "
             "--module-muted, --module-faint, --module-surface, --module-row, --module-sunken, "
@@ -64,10 +301,36 @@ RENDER_RESPONSE_SURFACE_SCHEMA = {
                 },
                 "template_id": {
                     "type": "string",
-                    "enum": ["learning.code_lab", "response.choice"],
+                    "enum": [
+                        "learning.code_lab",
+                        "response.choice",
+                        "card.email",
+                        "card.delivery",
+                        "card.search_results",
+                        "card.person",
+                        "card.event",
+                        "card.stock",
+                        "card.product",
+                        "card.map",
+                        "card.post",
+                        "card.comment",
+                        "card.chart",
+                    ],
                     "description": (
                         "Use learning.code_lab with language, optional languages, instructions, starter_code, and string tests. "
-                        "Use response.choice with prompt and 2-12 id/label options."
+                        "Use response.choice with prompt and 2-12 id/label options. "
+                        "card.email: subject, snippet or body, status, from_name, from_address, to, sent_at, attachments, url. "
+                        "card.delivery: items, one per outcome, with label, status, count, detail, url. "
+                        "card.search_results: results with an unnumbered title, source, snippet, when, url; total if more exist. "
+                        "card.post: posts, one per platform, with platform, format, status, text; media for one video or image, images for an image post. "
+                        "card.comment: platform, post_title, comments with author, text, when, likes, reply; total if more exist. "
+                        "card.chart: chart_type, categories, series, unit, reference. "
+                        "card.person: name, title, organization, email, phone, note, url. "
+                        "card.event: events with title, date, time, location, attendees, status. "
+                        "card.stock: name, symbol, price, currency, change, change_percent, as_of, history. "
+                        "card.product: products with name, price, seller, detail, image, url. "
+                        "card.map: places with name, address, detail, lat, lng, url. "
+                        "Links must be http(s) or a Manor file address such as /viewer/<document id>."
                     ),
                 },
                 "template_props": {
@@ -106,6 +369,7 @@ RENDER_RESPONSE_SURFACE_SCHEMA = {
                             "maxItems": 20,
                             "items": {"type": "string", "maxLength": 2000},
                         },
+                        **_CARD_TEMPLATE_PROPS,
                         "prompt": {"type": "string", "maxLength": 1000},
                         "options": {
                             "type": "array",

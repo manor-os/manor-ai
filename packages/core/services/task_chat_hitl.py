@@ -449,7 +449,7 @@ async def ensure_task_input_hitl(
         ),
         "action_link": question.get("action_link") or _task_url(task.id),
     }
-    for key in ("options", "fields", "context"):
+    for key in ("options", "recommendation", "fields", "context"):
         if question.get(key):
             payload[key] = question[key]
     request = await mint_approval_request(
@@ -501,6 +501,10 @@ async def ensure_task_input_hitl(
         "payload": payload,
         "prompt": text,
         **({"options": list(options)} if isinstance(options, list) and options else {}),
+        **(
+            {"recommendation": dict(question["recommendation"])}
+            if isinstance(question.get("recommendation"), dict) else {}
+        ),
         "input_schema": {
             "type": "object",
             "properties": {"response": {"type": "string"}},

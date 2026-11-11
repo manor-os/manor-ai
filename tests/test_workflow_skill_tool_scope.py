@@ -87,3 +87,29 @@ def test_a_node_that_withholds_declared_tools_from_its_skill_is_reported(config,
     assert len(messages) == 1 and "'video-edit'" in messages[0]
     assert all(name in messages[0] for name in withheld)
     assert validate_workflow_steps(_flow(config))["valid"]
+
+
+def _instructed_withheld(steps):
+    return [w["message"] for w in validate_workflow_steps(steps)["warnings"] if w["code"] == "instructed_tools_withheld"]
+
+
+@pytest.mark.parametrize("prompt,tools,withheld", [
+    # Production: a node had to confirm silence and platform acceptance with tools it was not given.
+    ("Confirm the final cut is silent: use analyze_audio, then verify the post with `mcp__chrome__read_page`.",
+     ["read_file"], ("analyze_audio", "mcp__chrome__read_page")),
+    ("Confirm the final cut is silent: use analyze_audio.", ["read_file", "analyze_audio"], ()),
+    # Naming what a later step does, or forbidding a tool, is not an instruction to use it.
+    ("Plan how each shot is generated (generate_video or a still). Do not call list_files.", ["read_file"], ()),
+], ids=["withheld", "covered", "described-or-forbidden"])
+def test_a_node_told_to_use_tools_it_lacks_is_reported(prompt, tools, withheld):
+    messages = _instructed_withheld(_flow({"tools": tools, "prompt": prompt}))
+    if not withheld:
+        assert messages == []
+        return
+    assert len(messages) == 1 and all(name in messages[0] for name in withheld)
+
+
+def test_no_shipped_blueprint_node_is_told_to_use_a_tool_it_lacks():
+    for name, payload in _payloads():
+        for workflow in (payload.get("recipe") or {}).get("workflows") or ():
+            assert _instructed_withheld(workflow.get("steps") or []) == [], (name, workflow.get("slug"))

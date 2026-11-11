@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.cache import cache
@@ -48,12 +48,18 @@ def _generic_workspace_settings_update(
     ``Workspace`` row.
     """
 
+    from packages.core.blueprints.registry import settings_without_package_alias
+
     current_settings = dict(current) if isinstance(current, dict) else {}
     requested_settings = dict(requested) if isinstance(requested, dict) else {}
+    # Clients may echo the read response, which omits the stored package alias.
+    # Accept that exact projection but still keep the original server record.
+    visible_settings = settings_without_package_alias(current_settings)
     for key in WORKSPACE_SERVER_SETTING_KEYS:
         if (
             key in requested_settings
             and requested_settings[key] != current_settings.get(key)
+            and requested_settings[key] != visible_settings.get(key)
         ):
             raise ProtectedWorkspaceSettingsError(
                 f"Workspace setting {key!r} is server-owned"
@@ -372,6 +378,11 @@ async def restore_workspace(
 
     await enforce_workspace_capacity(db, entity_id)
     ws.deleted_at = None
+    # Agents may be deleted while their Workspace sits in the trash; the API
+    # reports the dropped mappings so the restored roles read as unassigned.
+    ws._restore_unmapped_agents = tuple(
+        await _unmap_deleted_agents(db, ws)
+    )
     if not ws.artifact_folder_id:
         from packages.core.services.workspace_artifacts import ensure_workspace_artifact_folder
         await ensure_workspace_artifact_folder(db, ws)
@@ -388,6 +399,43 @@ async def restore_workspace(
     await db.flush()
     await db.refresh(ws)
     return ws
+
+
+async def _unmap_deleted_agents(db: AsyncSession, ws: Workspace) -> list[dict]:
+    """Deactivate a Workspace's mappings whose Agent no longer exists."""
+    from packages.core.models.workspace import Agent, AgentSubscription
+    from packages.core.services.workspace_service import get_workspace_agent_mappings
+
+    rows = list((await db.execute(
+        select(AgentSubscription, Agent.name)
+        .outerjoin(Agent, Agent.id == AgentSubscription.agent_id)
+        .where(
+            AgentSubscription.entity_id == ws.entity_id,
+            AgentSubscription.workspace_id == ws.id,
+            AgentSubscription.status == "active",
+            or_(Agent.id.is_(None), Agent.deleted_at.is_not(None)),
+        )
+        .order_by(AgentSubscription.created_at, AgentSubscription.id)
+        .with_for_update(of=AgentSubscription)
+    )).all())
+    if not rows:
+        return []
+    unmapped: list[dict] = []
+    for subscription, agent_name in rows:
+        subscription.status = "inactive"
+        unmapped.append({
+            "agent_id": subscription.agent_id,
+            "agent_name": agent_name,
+            "service_key": subscription.service_key,
+        })
+    await db.flush()
+    operating_model = dict(ws.operating_model or {})
+    if "agent_mappings" in operating_model:
+        operating_model["agent_mappings"] = await get_workspace_agent_mappings(
+            db, ws.id, ws.entity_id,
+        )
+        ws.operating_model = operating_model
+    return unmapped
 
 
 async def _requeue_restored_workspace_documents(
@@ -485,6 +533,147 @@ async def list_workspaces_due_for_purge(
         )
     )
     return list(result.scalars().all())
+
+
+async def _purge_workspace_artifact_knowledge(db: AsyncSession, ws: Workspace) -> None:
+    """Delete the Workspace's artifact-folder documents, their files and folders.
+
+    The folder tree is logical filing; a source file stored outside the
+    Workspace's canonical root retains its own lifecycle. Documents used by
+    another Knowledge group or a chat room are also kept, along with their
+    folders. Disk cleanup is enqueued in this transaction and runs after commit.
+    """
+    from sqlalchemy import delete as sa_delete, or_ as sa_or_, select as sa_select
+
+    from packages.core.models.chat_room import ChatRoomFile
+    from packages.core.models.document import (
+        Document,
+        DocumentFolder,
+        DocumentGroup,
+        DocumentGroupMember,
+    )
+    from packages.core.models.document_version import DocumentVersion
+    from packages.core.models.permission import (
+        ResourceGrant,
+        ResourceGrantPending,
+        ResourceType,
+        Share,
+    )
+    from packages.core.services.comment_service import delete_resource_comments
+    from packages.core.services.workspace_artifacts import workspace_artifact_storage_base
+    from packages.core.services.workspace_artifact_purge import (
+        ARTIFACT_CLEANUP_KIND_FILE,
+        document_derived_file_cleanup_bases,
+        document_derived_tree_cleanup_bases,
+        document_version_snapshot_cleanup_bases,
+        enqueue_artifact_cleanup_jobs,
+    )
+
+    folder_id = ws.artifact_folder_id
+    if not folder_id:
+        return
+    root_path = workspace_artifact_storage_base(folder_id)
+
+    folder_parents = dict((await db.execute(
+        sa_select(DocumentFolder.id, DocumentFolder.parent_id).where(
+            DocumentFolder.entity_id == ws.entity_id,
+        )
+    )).all())
+    children: dict[str | None, list[str]] = {}
+    for child_id, parent_id in folder_parents.items():
+        children.setdefault(parent_id, []).append(child_id)
+    subtree: list[str] = []
+    pending = [folder_id]
+    while pending:
+        current = pending.pop()
+        subtree.append(current)
+        pending.extend(children.get(current, []))
+    subtree_set = set(subtree)
+
+    docs = (await db.execute(
+        sa_select(Document.id, Document.fs_path, Document.folder_id).where(
+            Document.entity_id == ws.entity_id,
+            sa_or_(
+                Document.folder_id.in_(subtree),
+                Document.fs_path == root_path,
+                Document.fs_path.startswith(f"{root_path}/", autoescape=True),
+            ),
+        ).with_for_update()
+    )).all()
+    doc_ids = [row.id for row in docs]
+
+    def has_workspace_path(path: str) -> bool:
+        return path == root_path or path.startswith(f"{root_path}/")
+
+    retained = {row.id for row in docs if row.fs_path and not has_workspace_path(row.fs_path)}
+    if doc_ids:
+        group_members = (await db.execute(
+            sa_select(DocumentGroupMember.document_id)
+            .join(DocumentGroup, DocumentGroup.id == DocumentGroupMember.group_id)
+            .where(
+                DocumentGroupMember.document_id.in_(doc_ids),
+                sa_or_(DocumentGroup.workspace_id.is_(None), DocumentGroup.workspace_id != ws.id),
+            )
+        )).scalars().all()
+        chat_files = (await db.execute(
+            sa_select(ChatRoomFile.document_id).where(ChatRoomFile.document_id.in_(doc_ids))
+        )).scalars().all()
+        retained.update(group_members)
+        retained.update(chat_files)
+
+    delete_ids = [doc_id for doc_id in doc_ids if doc_id not in retained]
+    if delete_ids:
+        delete_set = set(delete_ids)
+        fs_paths = [row.fs_path for row in docs if row.id in delete_set and row.fs_path]
+        await delete_resource_comments(db, ws.entity_id, "document", delete_ids)
+        await db.execute(sa_delete(DocumentVersion).where(DocumentVersion.document_id.in_(delete_ids)))
+        await db.execute(sa_delete(DocumentGroupMember).where(DocumentGroupMember.document_id.in_(delete_ids)))
+        for model in (ResourceGrant, ResourceGrantPending, Share):
+            await db.execute(sa_delete(model).where(
+                model.resource_type == ResourceType.DOCUMENT,
+                model.resource_id.in_(delete_ids),
+            ))
+        await db.execute(sa_delete(Document).where(
+            Document.entity_id == ws.entity_id,
+            Document.id.in_(delete_ids),
+        ))
+        await enqueue_artifact_cleanup_jobs(
+            db,
+            ws.entity_id,
+            document_derived_tree_cleanup_bases(delete_ids)
+            | document_version_snapshot_cleanup_bases(delete_ids),
+        )
+        await enqueue_artifact_cleanup_jobs(
+            db,
+            ws.entity_id,
+            set(fs_paths) | document_derived_file_cleanup_bases(delete_ids),
+            target_kind=ARTIFACT_CLEANUP_KIND_FILE,
+        )
+
+    # Keep each retained document's folder and its ancestors inside the tree.
+    keep: set[str] = set()
+    for row in docs:
+        if row.id not in retained:
+            continue
+        current = row.folder_id
+        while current in subtree_set and current not in keep:
+            keep.add(current)
+            current = folder_parents.get(current)
+    delete_folders = [folder for folder in subtree if folder not in keep]
+    if delete_folders:
+        for model in (ResourceGrant, ResourceGrantPending, Share):
+            await db.execute(sa_delete(model).where(
+                model.resource_type == ResourceType.DOCUMENT_FOLDER,
+                model.resource_id.in_(delete_folders),
+            ))
+        await db.execute(sa_delete(DocumentFolder).where(
+            DocumentFolder.entity_id == ws.entity_id,
+            DocumentFolder.id.in_(delete_folders),
+        ))
+
+    # A retained Document still using this root prevents recursive cleanup.
+    if not any(row.id in retained and row.fs_path and has_workspace_path(row.fs_path) for row in docs):
+        await enqueue_artifact_cleanup_jobs(db, ws.entity_id, {root_path})
 
 
 async def purge_workspace(
@@ -610,7 +799,6 @@ async def purge_workspace(
     from packages.core.models.workspace_event import WorkspaceEvent
     from packages.core.models.billing import (
         CreditReservation,
-        CreditUsageAllocation,
         CreditUsageLog,
     )
     from packages.core.services.marketplace_resource_links import (
@@ -1600,40 +1788,29 @@ async def purge_workspace(
     await db.execute(sa_delete(RuntimeEvidence).where(
         RuntimeEvidence.workspace_id == workspace_id,
     ))
-    # Credit rows are another company's ledger when that company paid for
-    # spend here (a provider sponsoring a client delivery trial). Only the
-    # Workspace owner's own charges go with the Workspace.
-    workspace_credit_usage_ids = sa_select(CreditUsageLog.id).where(
-        CreditUsageLog.workspace_id == workspace_id,
-        CreditUsageLog.entity_id == ws.entity_id,
-    )
-    await db.execute(sa_delete(CreditUsageAllocation).where(
-        CreditUsageAllocation.usage_log_id.in_(workspace_credit_usage_ids),
-        CreditUsageAllocation.entity_id == ws.entity_id,
-    ))
-    await db.execute(sa_delete(CreditUsageLog).where(
-        CreditUsageLog.workspace_id == workspace_id,
-        CreditUsageLog.entity_id == ws.entity_id,
-    ))
-    await db.execute(sa_delete(CreditReservation).where(
-        CreditReservation.workspace_id == workspace_id,
-        CreditReservation.entity_id == ws.entity_id,
-    ))
-    # Another company's holds for work here can never settle once the
-    # Workspace is gone (some never expire), so release them; its consumed
-    # reservations stay as history.
+    # Credit usage and reservations are the balance's ledger: the balance is
+    # grants minus usage minus active holds, so deleting a row would hand the
+    # spent credit back. Release unsettled holds and detach the owner's rows.
+    # A sponsor's ledger is separate: keep its trial attribution after purge.
     from packages.core.services.credit_reservations import (
         RESERVATION_STATUS_ACTIVE,
         release_reservation,
     )
 
-    foreign_holds = (await db.execute(sa_select(CreditReservation.id).where(
+    open_holds = (await db.execute(sa_select(CreditReservation.id).where(
         CreditReservation.workspace_id == workspace_id,
-        CreditReservation.entity_id != ws.entity_id,
         CreditReservation.status == RESERVATION_STATUS_ACTIVE,
     ))).scalars().all()
-    for reservation_id in foreign_holds:
+    for reservation_id in open_holds:
         await release_reservation(db, reservation_id=reservation_id, reason="Workspace purged")
+    await db.execute(sa_update(CreditUsageLog).where(
+        CreditUsageLog.workspace_id == workspace_id,
+        CreditUsageLog.entity_id == ws.entity_id,
+    ).values(workspace_id=None))
+    await db.execute(sa_update(CreditReservation).where(
+        CreditReservation.workspace_id == workspace_id,
+        CreditReservation.entity_id == ws.entity_id,
+    ).values(workspace_id=None))
     await db.execute(sa_delete(TokenUsageLog).where(
         TokenUsageLog.workspace_id == workspace_id,
     ))
@@ -1897,9 +2074,10 @@ async def purge_workspace(
         await db.execute(sa_delete(model).where(model.workspace_id == workspace_id))
 
     # ── Level 3: Workspace itself ──
-    # Knowledge Documents, folders, source files, versions, and their ACLs
-    # remain Entity-owned after a Workspace lifecycle ends. Terminal Entity
-    # deletion uses purge_entity_knowledge instead.
+    # Documents, versions, files and folders in the Workspace artifact tree
+    # belong to the Workspace and go with it. Knowledge filed outside that tree
+    # keeps its own lifecycle; terminal Entity deletion uses
+    # purge_entity_knowledge instead.
     # Journals are runtime recovery state, not portable configuration. Match
     # the explicit owner only; a similar path is not Workspace ownership.
     from packages.core.models.runtime_file_commit import RuntimeFileCommit
@@ -1907,6 +2085,7 @@ async def purge_workspace(
         RuntimeFileCommit.entity_id == ws.entity_id,
         RuntimeFileCommit.owner["workspace_id"].astext == workspace_id,
     ))
+    await _purge_workspace_artifact_knowledge(db, ws)
     await db.delete(ws)
     await db.flush()
     return True

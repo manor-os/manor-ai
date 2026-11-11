@@ -215,8 +215,51 @@ def _changed_leaf_paths(before: Any, after: Any, path: list[str]):
         yield path, before, after
 
 
+def _authored(value: Any) -> Any:
+    from packages.core.services.viewer_language import without_machine_translations
+
+    return without_machine_translations(value)
+
+
+def _app_view_previous(previous: dict | None) -> dict | None:
+    """A page baseline in today's normal form.
+
+    Current and new pages are both normalized, so a field added to the normal
+    form after install would otherwise read as a person's edit of the page.
+    A baseline today's form rejects stays as saved and compares as before.
+    """
+    from packages.core.services.workspace_app_view import normalize_app_view_config
+
+    def normalized(content: Any) -> Any:
+        if not isinstance(content, dict) or not isinstance(content.get("value"), dict):
+            return content
+        try:
+            return {**content, "value": normalize_app_view_config(content["value"])}
+        except ValueError:
+            return content
+
+    if previous is None:
+        return None
+    return {
+        **previous,
+        "source_content": normalized(previous.get("source_content")),
+        "installed_content": normalized(previous.get("installed_content")),
+    }
+
+
 def configuration_action(current: Any, source: Any, previous: dict | None) -> str:
-    """Three-way comparison, including an acknowledged local customization."""
+    """Three-way comparison, including an acknowledged local customization.
+
+    Translations Workspace translation wrote on its own are not a person's
+    edit: compared without them, an untouched install updates cleanly.
+    """
+    current, source = _authored(current), _authored(source)
+    if previous is not None:
+        previous = {
+            **previous,
+            "source_content": _authored(previous.get("source_content")),
+            "installed_content": _authored(previous.get("installed_content")),
+        }
     if current == source:
         return "unchanged"
     if previous is not None and source == previous.get("source_content"):
@@ -652,7 +695,8 @@ async def _read(db: AsyncSession, workspace: Any, target: dict, *, lock: bool = 
             if value is None:
                 return None, None
             from packages.core.blueprints.app_view import remap_workspace_app_view
-            return {"value": await remap_workspace_app_view(db, workspace, value, to_runtime=False)}, None
+            return {"value": await remap_workspace_app_view(db, workspace, value, to_runtime=False,
+                                                            keep_local_pictures=True)}, None
         return _read_path(workspace, target["path"]), None
     if kind == "governance":
         from packages.core.governance.policy import policy_from_dict, policy_to_dict
@@ -844,6 +888,8 @@ async def plan_configuration(
                     "source_content": _merge_governance_upgrade(current, previous_source, previous_source),
                     "installed_content": _governance_content(comparison_previous.get("installed_content")),
                 }
+        elif target.get("path") == ["operating_model", "app_view"]:
+            comparison_previous = _app_view_previous(comparison_previous)
         action = configuration_action(current, target["source_content"], comparison_previous)
         item = {
             "key": key,
@@ -860,7 +906,7 @@ async def plan_configuration(
             "changes": ["retire Blueprint configuration; preserve history"]
             if target["source_content"] is None
             else ["reconcile Workspace configuration"],
-            "customized": action == "unchanged" and current != target["source_content"],
+            "customized": action == "unchanged" and _authored(current) != _authored(target["source_content"]),
         }
         if (
             (target.get("body_read_only") or target.get("initial_file_template"))
@@ -1489,7 +1535,8 @@ async def _write(
     if kind == "workspace_configuration":
         if target["path"] == ["operating_model", "app_view"] and content is not None:
             from packages.core.blueprints.app_view import remap_workspace_app_view
-            content = {"value": await remap_workspace_app_view(db, workspace, content["value"], to_runtime=True)}
+            content = {"value": await remap_workspace_app_view(db, workspace, content["value"], to_runtime=True,
+                                                               keep_local_pictures=True)}
         _write_path(workspace, target["path"], content)
         workspace.operation_revision = int(workspace.operation_revision or 0) + 1
         await db.flush()

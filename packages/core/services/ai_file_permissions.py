@@ -931,9 +931,10 @@ async def guard_ai_file_governance_hard_block(
                 mode=FilePermissionMode.DENY.value, reason=f"Governance configuration is unavailable: {exc}")
     if policy.allowed or policy.pause_for_hitl:
         return None
-    detail = policy.reason or "Denied by governance policy"
-    if policy.matched_rule and policy.matched_rule != policy.reason:
-        detail = f"{detail} (rule {policy.matched_rule})"
+    # The reason reaches the person through the reply; never a rule id.
+    from packages.core.services.decision_recommendation import user_facing_reason
+
+    detail = user_facing_reason(policy.reason) or "Your approval settings don't allow this change."
     return _deny_payload(action=action, tool_name=tool_name, paths=visible_paths,
         mode=FilePermissionMode.DENY.value, reason=detail)
 
@@ -1129,6 +1130,10 @@ async def guard_ai_file_mutation(
 
         operation_id = execution_id or (authorization_receipt.operation_id if authorization_receipt else None)
         if not operation_id and not approval_token:
+            logger.error(
+                "File operation refused for missing run identity: tool=%s entity=%s workspace=%s conversation=%s task=%s",
+                tool_name, entity_id, effective_workspace_id, conversation_id, task_id,
+            )
             return _deny_payload(action=action, tool_name=tool_name, paths=visible_paths,
                 mode="approval_operation_identity_missing", reason="A persisted execution identity is required for this file operation.")
         from packages.core.governance.approvals import _consent_requirements

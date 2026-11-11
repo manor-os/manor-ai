@@ -61,21 +61,44 @@ codex mcp add manor-self-hosted --url https://manor.example.com/api/v1/mcp
 The server needs `APP_URL` set to its public origin and must route
 `/.well-known/oauth-authorization-server` and
 `/.well-known/oauth-protected-resource*` to the API (the bundled nginx config
-already does). Self-registered clients may redirect
-only to loopback addresses; to allow a hosted callback, list it in
-`MANOR_OAUTH_DYNAMIC_REDIRECT_URIS` (comma-separated).
+already does). Self-registered clients may redirect to loopback addresses and
+to the sign-in callbacks of Claude, ChatGPT and Microsoft Teams.
+`MANOR_OAUTH_DYNAMIC_REDIRECT_URIS` replaces that list with comma-separated
+rules: an exact URI, `prefix:https://host/path/` (any URI under that path) or
+`scheme:name` (a native app's private-use scheme). The API logs the host of
+every callback it refuses, so a new host can be reviewed and added.
+
+Tokens carry the `mcp` scope (every tool) or `mcp:read` (read-only tools only),
+which the user can choose on the consent screen. Hosted clients may also use
+the https URL of a Client ID Metadata Document as their `client_id` instead of
+registering; callbacks on that document's own host are accepted.
+
+Where OAuth isn't available (CI, or a host that only sends a fixed
+`Authorization` header), create an access key under **Settings → Security →
+Connected apps and agents** and send it as `Authorization: Bearer manor_pat_…`.
+A key reaches only this endpoint, with the scope chosen for it, and stops
+working when revoked, when it expires, or when you sign out everywhere.
 
 ## Tools
 
 | Area | Tools |
 | --- | --- |
 | Inspect | `whoami`, `list_workspaces`, `get_workspace`, `describe_workspace_operations` (optional reference for already published tools) |
-| Edit a live Workspace | `stage_workspace_change`, `apply_workspace_change`, `discard_workspace_change`, `design_workspace_app_view`, `upsert_workflow`, `run_workflow`, `list_run_input_choices`, `get_workflow_run`, `upsert_skill`, `add_knowledge_document`, `create_upload` |
+| Create a Workspace | `list_workspace_recommendations`, `create_workspace` (empty), `start_workspace_draft`, `continue_workspace_draft`, `get_workspace_draft`, `update_workspace_draft_fields`, `apply_blueprint_to_workspace_draft`, `finalize_workspace_draft` (designed by Manor's Workspace Architect from a description; a long build returns `working` with `build_progress`, poll `get_workspace_draft`) |
+| Workspace chat | `send_workspace_chat_message`, `read_workspace_chat` (talk to a Workspace's agents as you; approvals they raise stay yours to answer in Manor) |
+| Chat records | `list_conversations`, `search_conversation_messages`, `read_conversation_messages` (read-only, across your personal chats, rooms, Workspace chats and external channels, limited to what you may see) |
+| Edit a live Workspace | `stage_workspace_change`, `apply_workspace_change`, `discard_workspace_change`, `get_workspace_app_audience`, `design_workspace_app_view`, `get_workspace_app_design`, `test_workspace_app_view`, `upsert_workflow` (including configurable editable review fields and revision requests), `run_workflow`, `list_run_input_choices` (the Ledger record keys or Workspace record ids a picker input offers; a picker of several takes a list), `get_workflow_run`, `retry_workflow_run`, `upsert_skill`, `add_knowledge_document`, `create_upload` |
 | Knowledge | `list_knowledge`, `search_knowledge`, `search_knowledge_content`, `read_knowledge_document` |
-| Tasks and schedules | `list_tasks`, `get_task`, `list_scheduled_jobs`, `get_scheduled_job`, `upsert_scheduled_job`, `toggle_scheduled_job`, `run_scheduled_job` |
+| Tasks and schedules | `list_tasks`, `list_attention`, `get_task`, `list_scheduled_jobs`, `get_scheduled_job`, `upsert_scheduled_job`, `toggle_scheduled_job`, `run_scheduled_job` |
 | Stats | `list_stats`, `upsert_stat`, `add_assessed_metrics` |
-| Workspace as code | `configure_knowledge_starter`, `export_blueprint`, `validate_blueprint`, `install_blueprint`, `compare_blueprints`, `promote_workspace`, `preview_workspace_upgrade`, `apply_workspace_upgrade`, `revert_workspace_upgrade` |
+| Workspace as code | `configure_knowledge_starter`, `export_blueprint`, `validate_blueprint`, `install_blueprint`, `compare_blueprints`, `promote_workspace`, `preview_workspace_upgrade`, `apply_workspace_upgrade` (also synchronizes the usage guide), `revert_workspace_upgrade`, `publish_workspace_release` |
 | Delivery | `list_clients`, `deliver_to_client`, `list_client_deliveries`, `publish_delivery_update` |
+
+`upsert_workflow` accepts `production.revise.context_inputs` on a production's
+trigger: it maps declared input/variable names to explicit previous-result
+variable names for a new version of a completed run. Runtime `__` fields and
+fresh notes/version input targets are excluded; normal retries keep invalidating
+their outputs.
 
 App design uses the same Workspace management boundary as operation drafts.
 Collaborators may design only inside their live-granted Workspace; the result

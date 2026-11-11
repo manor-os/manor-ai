@@ -13,6 +13,7 @@ import TabSwitcher from "./TabSwitcher";
 import { useDocumentThumbnail } from "./useDocumentThumbnail";
 import { IconExternalLink, IconPause, IconPlay } from "../icons";
 import { fileVisual } from "../workspaces/workspaceAppRunDisplay";
+import { PageLoading } from "./Skeleton";
 
 const PAGE_SIZE = 30;
 const KIND_TABS: Array<"all" | DocumentMediaKind> = ["all", "audio", "video", "image", "document"];
@@ -231,7 +232,7 @@ export default function HitlKnowledgePicker({ selectedIds, onToggle, onClose, re
         onChange={(key) => setKindTab(KIND_TABS.includes(key as "all") ? key as "all" | DocumentMediaKind : "all")}
       />}
       <div className="chat-hitl-knowledge-list" aria-busy={documents.isFetching || stale} data-stale={stale || undefined}>
-        {documents.isPending && <p role="status">{t("status.loading")}</p>}
+        {documents.isPending && <PageLoading label={t("status.loading")} minHeight={96} />}
         {!documents.isPending && !documents.isError && items.length === 0 && !documents.hasNextPage && (
           scope === "workspace" ? (
             <div className="chat-hitl-knowledge-empty" role="status">

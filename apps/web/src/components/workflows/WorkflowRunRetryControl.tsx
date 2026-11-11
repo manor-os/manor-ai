@@ -1,5 +1,5 @@
 import { useId, useRef, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, translateApiError } from "../../lib/api";
 import { t } from "../../lib/i18n";
 import Button from "../ui/Button";
@@ -8,8 +8,11 @@ import Textarea from "../ui/Textarea";
 import { formatDateLong } from "../../lib/format";
 import { IconRefresh } from "../icons";
 import WorkflowRunIntervention from "./WorkflowRunIntervention";
+import { integrationCatalogQueryOptions } from "../../lib/integrationCatalog";
+import IntegrationConnectRow from "../integrations/IntegrationConnectRow";
 import { WorkflowSchemaFields, parseWorkflowSchemaDraft, setWorkflowValueAtPath } from "./WorkflowSchemaFields";
 import { workflowRetrySchemaIsCompatible, type WorkflowHistoryRun } from "./workflowRunDisplay";
+import { PageLoading } from "../ui/Skeleton";
 
 export default function WorkflowRunRetryControl({ runId, workspaceId, bindingId, workflowId, businessOutcome, disabled, title, reviewRequired = false, size = "md", onRetried }: {
   runId: string;
@@ -78,6 +81,15 @@ export default function WorkflowRunRetryControl({ runId, workspaceId, bindingId,
     }
   };
 
+  // Every surface that shows this run or its Workspace App reads the new attempt after a retry
+  // starts, or after the server refuses one because an attempt is already running.
+  const refreshRunSurfaces = () => {
+    void queryClient.invalidateQueries({ queryKey: ["workspace-chat", workspaceId] });
+    for (const key of ["workflow-runs", "workspace-workflow-runs", "workflow-run", "workspace-chat-workflow-run-family", "workflow-run-history-detail", "workflow-run-history-family", "workflow-run-history-control", "chat-messages", "workspace-app-recent-run", "workspace-app-run", "workspace-app-run-detail"]) {
+      void queryClient.invalidateQueries({ queryKey: [key] });
+    }
+  };
+
   const resolve = async (choice: string, _note?: string, payload?: Record<string, unknown>) => {
     const action = detail?.intervention;
     if (disabled || !detail || !action || busyRef.current || choice !== "retry") return;
@@ -107,13 +119,13 @@ export default function WorkflowRunRetryControl({ runId, workspaceId, bindingId,
           ...(reviewDecision === "applied" ? { project_revisions: action.project_revisions } : {}),
         } } : {}),
       });
-      void queryClient.invalidateQueries({ queryKey: ["workspace-chat", workspaceId] });
-      for (const key of ["workflow-runs", "workspace-workflow-runs", "workflow-run", "workspace-chat-workflow-run-family", "workflow-run-history-detail", "workflow-run-history-family", "workflow-run-history-control", "chat-messages", "workspace-app-recent-run", "workspace-app-run", "workspace-app-run-detail"]) {
-        void queryClient.invalidateQueries({ queryKey: [key] });
-      }
+      refreshRunSurfaces();
       onRetried(retried);
       setOpen(false);
     } catch (cause) {
+      // 409: an attempt of this run is already running (another click or tab). Show the server's
+      // message and re-read the run, so the surfaces show that attempt instead of offering Retry again.
+      if ((cause as { status?: unknown } | null)?.status === 409) refreshRunSurfaces();
       setError(translateApiError(cause, t("component.workflow_run_history.retry_error")));
     } finally {
       busyRef.current = false;
@@ -122,6 +134,14 @@ export default function WorkflowRunRetryControl({ runId, workspaceId, bindingId,
   };
 
   const action = detail?.intervention;
+  // A step that stopped because its integration is not connected: connect it
+  // here (over this page), then continue from that step.
+  const connectionProvider = action?.kind === "workflow_retry" ? action.connection_provider || "" : "";
+  const catalog = useQuery(integrationCatalogQueryOptions(Boolean(connectionProvider)));
+  const connectionReady = Boolean(catalog.data?.find((server) => server.server_key === connectionProvider)?.agent_can_use);
+  const needsConnection = Boolean(connectionProvider) && !connectionReady;
+  const connectionLabel = action?.connection_label || connectionProvider;
+  const [justConnected, setJustConnected] = useState("");
   const retryStep = action?.retry_from_step_id || action?.step_id || detail?.current_step_id || "";
   // The compact run omits the definition snapshot; the action names its own resume step.
   const retryStepName = action?.retry_from_step_name
@@ -146,9 +166,18 @@ export default function WorkflowRunRetryControl({ runId, workspaceId, bindingId,
       className="workflow-response-dialog"
     >
       {error && <p role="alert">{error}</p>}
-      {busy && !detail && <p role="status">{t("component.workflow_run_history.loading_controls")}</p>}
+      {busy && !detail && <PageLoading label={t("component.workflow_run_history.loading_controls")} minHeight={96} />}
       {detail && <p className="workflow-run-input-context">{needsInput ? detail.workflow_name : `${t("component.workflow_run.retry_from")}: ${retryStepName}`}</p>}
-      {blocked ? <div className="workflow-run-intervention-fields">
+      {detail && justConnected && !needsConnection && <p role="status">{t("component.integration_connect.workflow_step_ready", { provider: justConnected })}</p>}
+      {detail && needsConnection ? <div className="workflow-run-intervention-fields">
+        <p role="status">{t("component.integration_connect.workflow_step_waiting", { provider: connectionLabel, step: retryStepName })}</p>
+        {/* The same connection row as everywhere; once connected the review reopens to retry. */}
+        <IntegrationConnectRow as="div" requirement={{ kind: "integration", provider: connectionProvider, label: connectionLabel }}
+          onConnected={() => { setJustConnected(connectionLabel); void openReview(); }} />
+        <div className="workflow-run-intervention-actions">
+          <Button variant="ghost" onClick={() => setOpen(false)}>{t("recommendation.label.integration.later")}</Button>
+        </div>
+      </div> : blocked ? <div className="workflow-run-intervention-fields">
         <p role="status">{t(action?.blocked_reason === "external_effect_requires_reconciliation"
           ? "component.workflow_run_history.external_effect_blocked"
           : "component.workspace_app_view.data_retry_review_required")}</p>

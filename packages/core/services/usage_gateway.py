@@ -317,6 +317,17 @@ async def get_team_usage_gateway(
         })
 
     totals["cost_usd"] = round(float(totals["cost_usd"]), 6)
+    # Charges no member made (scheduled runs, automations, client trials)
+    # so the member rows plus this one add up to the company's total.
+    unattributed = select(func.coalesce(func.sum(CreditUsageLog.total_credit), 0)).where(
+        CreditUsageLog.entity_id == entity_id,
+        CreditUsageLog.created_at >= cutoff,
+    )
+    if user_ids:
+        unattributed = unattributed.where(or_(
+            CreditUsageLog.user_id.is_(None), CreditUsageLog.user_id.not_in(user_ids),
+        ))
+    totals["unattributed_credits_used"] = int((await db.execute(unattributed)).scalar_one() or 0)
     return {
         "entity_id": entity_id,
         "scope": "company",

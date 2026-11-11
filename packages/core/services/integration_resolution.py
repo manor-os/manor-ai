@@ -76,8 +76,14 @@ async def integration_provider_readiness(
     entity_id: str,
     provider_keys: list[str] | set[str] | tuple[str, ...],
     user_id: str | None = None,
+    require_online: bool = True,
 ) -> dict[str, IntegrationProviderReadiness]:
-    """Resolve runtime readiness without changing MCP capability bindings."""
+    """Resolve runtime readiness without changing MCP capability bindings.
+
+    ``require_online=False`` asks whether each integration is connected, not
+    whether it answers right now (a paired Chrome that is closed counts as
+    connected): a setup gate must not open and close with a laptop lid.
+    """
     from packages.core.services.agent_permission_service import (
         can_use_mcp_server,
         provider_requires_integration_account_registry,
@@ -133,6 +139,7 @@ async def integration_provider_readiness(
             server_key=provider,
             integration_registry=integration_registry,
             allow_env_fallback=False,
+            require_online=require_online,
         )
         reason = decision.reason
         setup_kind = None
@@ -146,7 +153,13 @@ async def integration_provider_readiness(
     return out
 
 
-async def supported_integration_provider_keys(db: AsyncSession) -> set[str]:
+async def bindable_mcp_provider_keys(db: AsyncSession) -> set[str]:
+    """Active MCP providers an Agent binding may name.
+
+    Includes Manor's internal bridges (for example ``chrome_knowledge_local``),
+    which Blueprints bind directly but which are never offered to users as
+    integrations to connect.
+    """
     rows = (await db.execute(
         select(MCPServer.server_key).where(MCPServer.status == "active")
     )).scalars().all()
@@ -156,7 +169,15 @@ async def supported_integration_provider_keys(db: AsyncSession) -> set[str]:
         for key in rows
         if canonical_provider_key(key)
         and canonical_provider_key(key) not in coming_soon
-        and canonical_provider_key(key) not in _NON_USER_FACING_PROVIDER_KEYS
+    }
+
+
+async def supported_integration_provider_keys(db: AsyncSession) -> set[str]:
+    """Bindable providers that are user-facing integrations."""
+    return {
+        key
+        for key in await bindable_mcp_provider_keys(db)
+        if is_user_facing_integration_provider(key)
     }
 
 

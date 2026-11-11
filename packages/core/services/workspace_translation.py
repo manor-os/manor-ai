@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from packages.core.i18n import text_locale
-from packages.core.services.viewer_language import AUTO_KEY, I18N_KEY, TRANSLATED_LANGUAGES
+from packages.core.services.viewer_language import AUTO_KEY, DATA_PATH_KEYS, I18N_KEY, TRANSLATED_LANGUAGES
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +39,12 @@ _TEXT_KEYS = frozenset({
     "name", "title", "label", "description", "placeholder", "eyebrow", "review_title",
     "labels", "descriptions", "entries", "forms", "x-enum-labels", "x-example-labels", "x-example-groups",
     "x-enum-descriptions",
-    "stage_labels", "empty_message",
+    "stage_labels", "empty_message", "collection_title",
 })
 _NEVER_KEYS = frozenset({
     I18N_KEY, "id", "key", "type", "enum", "const", "required", "hidden", "target", "targets", "hero", "asks",
     "default", "examples", "options", "prompts", "presets", "prompt", "message", "url", "source", "path",
-})
+}) | DATA_PATH_KEYS
 _MAX_TEXT = 1200
 _BATCH = 120
 # Edits come in bursts (a draft applies many patches); wait for the last one.

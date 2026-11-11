@@ -13,7 +13,9 @@ from packages.core.ai.runtime.file_contracts import FileMutationAction
 from packages.core.contracts.file_engine import (
     FILE_CONVERSION_MAX_INPUT_BYTES,
     FILE_CONVERSION_TARGETS,
+    IMAGE_CONVERSION_TARGETS,
     OPERATION_GENERATION_TYPES,
+    PUBLIC_IMAGE_MAX_BYTES,
     TEMPLATE_OPERATION_GENERATION_TYPES,
     TEXT_CONTENT_TYPES,
     file_patch_operations,
@@ -22,6 +24,7 @@ from packages.core.contracts.file_engine import (
     normalize_file_operation_resources,
     normalize_file_patch_operation,
 )
+from packages.core.services.image_formats import sniff_image_type
 from packages.core.services.office_operation_resources import read_office_operation_resources
 
 
@@ -184,6 +187,14 @@ async def runtime_generate_document_file(
     if source is not None:
         if any(value is not None for value in (content, operations, template, options, expected_sha256)):
             return json.dumps({"error": "source conversion creates a new file; omit content/operations/template/options/expected_sha256"})
+    if isinstance(source, dict) and set(source) == {"url"}:
+        # A public web image saved into Knowledge (a post's cover): fetched once,
+        # decoded and re-encoded, so nothing but a real image is stored.
+        url = source["url"].strip() if isinstance(source["url"], str) else ""
+        if not url.lower().startswith("https://") or len(url) > 2048:
+            return json.dumps({"error": "source.url must be a public https:// image URL"})
+        source = {"url": url}
+    elif source is not None:
         if not isinstance(source, dict) or set(source) != {"path", "expected_sha256"}:
             return json.dumps({"error": "source requires path and expected_sha256 from read_file"})
         raw_path, digest = source["path"], source["expected_sha256"]
@@ -276,7 +287,13 @@ async def runtime_generate_document_file(
 
     ext = os.path.splitext(clean_name)[1].lower()
     detected_type = file_type_from_path(clean_name)
-    if source is not None:
+    if source is not None and "url" in source:
+        # The downloaded bytes name the source type; only the target is known now.
+        source_type = None
+        if detected_type != clean_file_type or clean_file_type not in IMAGE_CONVERSION_TARGETS:
+            return json.dumps({"error": "unsupported_file_conversion", "supported_targets": IMAGE_CONVERSION_TARGETS,
+                               "hint": "A source.url image is saved as png, jpg, jpeg or webp with a matching name."})
+    elif source is not None:
         source_type = file_type_from_path(source["path"])
         if detected_type != clean_file_type or clean_file_type not in FILE_CONVERSION_TARGETS.get(source_type, ()):
             return json.dumps({
@@ -351,7 +368,19 @@ async def runtime_generate_document_file(
     if patches is not None:
         approval_payload = {"file_type": clean_file_type, "operations": patches}
     source_bytes = None
-    if source is not None:
+    if source is not None and "url" in source:
+        from packages.core.services.code_projects import CodeProjectError, download_public_https
+
+        try:
+            source_bytes = await download_public_https(source["url"], max_bytes=PUBLIC_IMAGE_MAX_BYTES)
+        except CodeProjectError as exc:
+            return json.dumps({"error": "source_unavailable", "url": source["url"], "detail": str(exc)})
+        source_type = sniff_image_type(source_bytes)
+        if source_type is None:
+            return json.dumps({"error": "source_not_image", "url": source["url"],
+                               "hint": "The URL did not return a PNG, JPEG, WebP, GIF, AVIF or HEIC image."})
+        approval_payload = {"file_type": clean_file_type, "source": source}
+    elif source is not None:
         blocked = await runtime_guard_file_read_access(
             entity_id=entity_id, user_id=user_id or None, workspace_id=workspace_id,
             conversation_id=conversation_id,

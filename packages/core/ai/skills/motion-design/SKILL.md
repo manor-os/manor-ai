@@ -37,8 +37,8 @@ safe-area band), use the playbook's.
 - Installed fonts: Noto Sans and Noto Serif (Regular, Bold), Noto Sans CJK SC
   and Noto Serif CJK SC (Regular, Bold only), Roboto (Thin to Black, plus
   Condensed), Lato (Hairline to Black), Liberation Sans / Serif / Mono, Caladea
-  and Carlito. Any other face must be a user-supplied font file staged into the
-  project and declared with `@font-face`.
+  and Carlito: `@font-face { src: local("Noto Sans CJK SC"); }`, no file needed.
+  Any other face: a user-supplied font file staged into the project.
 - Inspect before rendering with
   `video_edit(operation="review", snapshot_times=[...])` (up to 12 times per
   review). Render only with the `review_sha256` that passed review and was

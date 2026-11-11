@@ -138,6 +138,7 @@ function formatToolName(name?: string) {
 const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 
 function displayToolName(tc: ToolCall) {
+  if (tc.displayLabel) return tc.displayLabel;
   if (isWebsiteAccessDenied(tc)) {
     const source = websiteAccessDeniedSource(tc);
     return source
@@ -322,9 +323,9 @@ export default function ToolCallList(props: ToolCallListProps) {
               marginBottom: 4,
               minWidth: 0,
               overflow: "hidden",
-              border: "1px solid rgba(28,25,23,0.06)",
+              border: "0.5px solid rgba(29, 29, 31,0.06)",
               borderRadius: 8,
-              background: "#fff",
+              background: "var(--surface-panel)",
             }
           : undefined
       }
@@ -343,7 +344,7 @@ export default function ToolCallList(props: ToolCallListProps) {
                 width: "100%",
                 border: "none",
                 background: "transparent",
-                color: isLiveTurn ? "#4f7d75" : hasError ? "#d65f59" : "#78716c",
+                color: isLiveTurn ? "#4f7d75" : hasError ? "#d65f59" : "#8e8e93",
                 cursor: "pointer",
                 fontSize: 11,
                 fontWeight: 650,
@@ -421,7 +422,7 @@ export default function ToolCallList(props: ToolCallListProps) {
                       cursor: canInspect ? "pointer" : "default",
                       fontSize: 11,
                       fontWeight: 600,
-                      color: "#57534e",
+                      color: "var(--text-muted)",
                     }}
                   >
                     <StatusIcon status={status} />
@@ -440,7 +441,7 @@ export default function ToolCallList(props: ToolCallListProps) {
                     </span>
                     {!grouped && tc.duration && (
                       <span
-                        style={{ fontSize: 10, color: "#a8a29e", fontWeight: 500 }}
+                        style={{ fontSize: 10, color: "var(--text-muted)", fontWeight: 500 }}
                       >
                         {tc.duration}
                       </span>
@@ -452,7 +453,7 @@ export default function ToolCallList(props: ToolCallListProps) {
                     <div
                       style={{
                         padding: "4px 8px 6px",
-                        borderTop: "1px solid rgba(0,0,0,0.05)",
+                        borderTop: "0.5px solid rgba(0,0,0,0.05)",
                         maxHeight: 120,
                         overflowY: "auto",
                       }}
@@ -460,7 +461,7 @@ export default function ToolCallList(props: ToolCallListProps) {
                       <pre
                         style={{
                           fontSize: 10,
-                          color: "#78716c",
+                          color: "var(--text-muted)",
                           whiteSpace: "pre-wrap",
                           wordBreak: "break-all",
                           margin: 0,
@@ -572,7 +573,7 @@ function ChevronIcon({ expanded }: { expanded?: boolean }) {
       height="10"
       viewBox="0 0 24 24"
       fill="none"
-      stroke="#a8a29e"
+      stroke="#aeaeb2"
       strokeWidth="2"
       style={{
         transform: expanded ? "rotate(90deg)" : "rotate(0deg)",

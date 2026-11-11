@@ -33,7 +33,6 @@ async def prepare_initial_workspace_review(db: AsyncSession, workspace: Workspac
     if provisioning.get("initial_review_run_id"):
         return
 
-    from packages.core.models.document import Integration
     from packages.core.models.goal import Goal
     from packages.core.models.workspace import AgentSubscription
     from packages.core.services.workspace_readiness import evaluate_workspace_blocking_setup
@@ -60,15 +59,22 @@ async def prepare_initial_workspace_review(db: AsyncSession, workspace: Workspac
     # Installation itself is not a later readiness change. Only baseline the
     # Workspaces receiving this assessment; retain all other startup paths.
     if "_readiness_snapshot" not in settings:
-        snapshot = {}
-        for key, model, scope in (
-            ("agents", AgentSubscription, AgentSubscription.workspace_id == workspace.id),
-            ("goals", Goal, Goal.workspace_id == workspace.id),
-            ("integrations", Integration, Integration.entity_id == workspace.entity_id),
-        ):
-            snapshot[key] = await db.scalar(select(func.count()).select_from(model).where(
-                scope, model.status == "active",
-            ))
+        from packages.core.strategist.context import workspace_configured_provider_keys
+
+        snapshot = {
+            "agents": await db.scalar(select(func.count()).select_from(AgentSubscription).where(
+                AgentSubscription.workspace_id == workspace.id,
+                AgentSubscription.status == "active",
+            )),
+        }
+        active_goals = list((await db.execute(select(Goal).where(
+            Goal.workspace_id == workspace.id, Goal.status == "active",
+        ))).scalars().all())
+        snapshot["goals"] = len(active_goals)
+        # Same Workspace-scoped provider count the readiness monitor compares.
+        snapshot["integration_providers"] = len(
+            await workspace_configured_provider_keys(db, workspace, active_goals)
+        )
         settings["_readiness_snapshot"] = snapshot
 
     from packages.core.services.scheduler_service import claim_job_run

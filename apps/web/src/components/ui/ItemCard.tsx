@@ -23,9 +23,9 @@ export default function ItemCard({ icon, title, subtitle, accent, actions, onCli
       <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
         {icon && <div className="manor-icon-box-sm">{icon}</div>}
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: "13px", fontWeight: 700, color: "#292524" }}>{title}</div>
+          <div style={{ fontSize: "13px", fontWeight: 700, color: "var(--text-strong)" }}>{title}</div>
           {subtitle && (
-            <div style={{ fontSize: "12px", color: "#a8a29e", marginTop: "2px" }}>{subtitle}</div>
+            <div style={{ fontSize: "12px", color: "var(--text-muted)", marginTop: "2px" }}>{subtitle}</div>
           )}
         </div>
         {actions && (

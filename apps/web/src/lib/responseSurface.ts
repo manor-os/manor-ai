@@ -1,5 +1,6 @@
 import type {
   AssistantResponseSurfaceBlock,
+  AssistantTemplateSurfaceRender,
   ResponseSurfaceSubmission,
   ResponseSurfaceSubmissionReceipt,
 } from "./chatStream";
@@ -10,6 +11,8 @@ import {
   workspaceLedgerQueryHtml,
 } from "./workspaceLedgerVisualization";
 import type { ResolvedDocumentTheme } from "../components/ui/ThemeAwareImage";
+import { RESPONSE_CARD_TEMPLATE_IDS } from "./responseCards";
+import { REMOVE_PEER_CONNECTION_CONSTRUCTORS } from "./generatedCodeSandbox";
 import {
   RESPONSE_SURFACE_CODE_LAB_PAYLOAD_LIMIT,
   RESPONSE_SURFACE_GENERIC_PAYLOAD_LIMIT,
@@ -101,6 +104,7 @@ const TEMPLATE_IDS = new Set([
   "response.choice",
   "workspace.ledger.overview",
   "workspace.ledger.query",
+  ...RESPONSE_CARD_TEMPLATE_IDS,
 ]);
 const REGISTERED_TEMPLATE_ACTIONS: Record<
   string,
@@ -813,11 +817,7 @@ export function normalizeResponseSurfaceBlock(
     if (templateId === "workspace.ledger.query" && !isWorkspaceLedgerQueryVisualization(props)) return null;
     normalizedRender = {
       kind: "template",
-      template_id: templateId as
-        | "learning.code_lab"
-        | "response.choice"
-        | "workspace.ledger.overview"
-        | "workspace.ledger.query",
+      template_id: templateId as AssistantTemplateSurfaceRender["template_id"],
       template_version: 1,
       props: props as Record<string, unknown>,
     };
@@ -1047,30 +1047,30 @@ const SURFACE_BASE_CSS = `
   color-scheme: light;
   --module-font: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --module-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
-  --module-text: #292524;
-  --module-strong: #1c1917;
-  --module-muted: #78716c;
-  --module-faint: #a8a29e;
+  --module-text: #2c2c2e;
+  --module-strong: #1d1d1f;
+  --module-muted: #8e8e93;
+  --module-faint: #aeaeb2;
   --module-surface: #ffffff;
   --module-row: #f7f6f3;
   --module-sunken: #f2f1ee;
-  --module-border: rgba(28,25,23,.08);
+  --module-border: rgba(29, 29, 31,.08);
   --module-accent: #436b65;
   --module-on-accent: #ffffff;
   --module-ring: rgba(67,107,101,.22);
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --module-text: #e7e5e4;
-  --module-strong: #fafaf9;
-  --module-muted: #a8a29e;
-  --module-faint: #78716c;
-  --module-surface: #1c1917;
-  --module-row: #292524;
-  --module-sunken: #0c0a09;
+  --module-text: #e5e5ea;
+  --module-strong: #fafafa;
+  --module-muted: #aeaeb2;
+  --module-faint: #8e8e93;
+  --module-surface: #1d1d1f;
+  --module-row: #2c2c2e;
+  --module-sunken: #000000;
   --module-border: rgba(255,255,255,.1);
   --module-accent: #9cc8be;
-  --module-on-accent: #1c1917;
+  --module-on-accent: #1d1d1f;
   --module-ring: rgba(156,200,190,.24);
 }
 * { box-sizing: border-box; }
@@ -1107,7 +1107,7 @@ body.response-surface-generated #surface-root :where(button,[role="button"])[dat
 body.response-surface-generated #surface-root form[data-manor-action] :where(button[type="submit"],input[type="submit"]) {
   display:inline-flex; min-height:38px; align-items:center; justify-content:center; padding:0 15px;
   border:0; border-radius:8px; background:var(--module-accent); color:var(--module-on-accent); font-weight:700;
-  box-shadow:0 1px 2px rgba(28,25,23,.08); cursor:pointer;
+  box-shadow:0 1px 2px rgba(29, 29, 31,.08); cursor:pointer;
 }
 body.response-surface-generated #surface-root :where(button,[role="button"])[data-manor-action]:hover:not(:disabled),
 body.response-surface-generated #surface-root form[data-manor-action] :where(button[type="submit"],input[type="submit"]):hover:not(:disabled) {
@@ -1339,7 +1339,7 @@ function codeLabBundle(props: Record<string, any>, labels: ResponseSurfaceLabels
       .code-lab {
         --ide-editor: #fbfaf8;
         --ide-line: #c7c1b8;
-        --ide-code: #292524;
+        --ide-code: #2c2c2e;
         --syntax-keyword: #3f7067;
         --syntax-string: #9a603d;
         --syntax-number: #746291;
@@ -1353,7 +1353,7 @@ function codeLabBundle(props: Record<string, any>, labels: ResponseSurfaceLabels
       :root[data-theme="dark"] .code-lab {
         --ide-editor: #211f1d;
         --ide-line: #77716b;
-        --ide-code: #f5f5f4;
+        --ide-code: #f5f5f7;
         --syntax-keyword: #9cc8be;
         --syntax-string: #d4a27f;
         --syntax-number: #b5a4d2;
@@ -1364,15 +1364,15 @@ function codeLabBundle(props: Record<string, any>, labels: ResponseSurfaceLabels
         --syntax-operator: #c7c1bb;
       }
       .lab-brief { padding:0 2px; }
-      .lab-brief > span { color:var(--module-muted); font:700 10px/1.3 var(--module-mono); letter-spacing:.08em; text-transform:uppercase; }
+      .lab-brief > span { color:var(--module-muted); font:700 10px/1.3 var(--module-mono); letter-spacing:.08em; text-transform: none; }
       h2 { margin:5px 0 0; color:var(--module-strong); font-size:14px; line-height:1.45; }
       form { display:flex; min-height:0; flex:1; flex-direction:column; gap:10px; }
-      .ide-shell { min-width:0; overflow:hidden; border:1px solid var(--module-border); border-radius:10px; background:var(--module-surface); box-shadow:0 10px 24px rgba(28,25,23,.07); }
+      .ide-shell { min-width:0; overflow:hidden; border:1px solid var(--module-border); border-radius:10px; background:var(--module-surface); box-shadow:0 10px 24px rgba(29, 29, 31,.07); }
       .ide-toolbar { display:flex; min-height:42px; align-items:center; justify-content:space-between; gap:12px; border-bottom:1px solid var(--module-border); background:var(--module-sunken); }
       .file-tab { align-self:stretch; display:flex; min-width:0; align-items:center; gap:8px; padding:0 13px; border-right:1px solid var(--module-border); background:var(--module-surface); color:var(--module-strong); }
       .file-tab > span { color:var(--module-accent); font:700 11px/1 var(--module-mono); }
       .file-tab strong { overflow:hidden; font:600 11px/1.3 var(--module-mono); text-overflow:ellipsis; white-space:nowrap; }
-      .language-control { display:flex; align-items:center; gap:8px; padding-right:8px; color:var(--module-muted); font-size:10px; font-weight:700; text-transform:uppercase; }
+      .language-control { display:flex; align-items:center; gap:8px; padding-right:8px; color:var(--module-muted); font-size:10px; font-weight:700; text-transform: none; }
       select { min-height:30px; padding:0 26px 0 9px; border:1px solid var(--module-border); border-radius:7px; background:var(--module-surface); color:var(--module-strong); font:600 11px/1 var(--module-font); cursor:pointer; }
       .editor-workbench { display:grid; min-height:300px; grid-template-columns:48px minmax(0,1fr); background:var(--ide-editor); }
       .line-numbers { min-height:300px; margin:0; padding:15px 11px 18px 0; overflow:hidden; border-right:1px solid var(--module-border); color:var(--ide-line); font:12px/1.65 var(--module-mono); text-align:right; user-select:none; }
@@ -1383,7 +1383,7 @@ function codeLabBundle(props: Record<string, any>, labels: ResponseSurfaceLabels
       textarea { z-index:1; resize:none; outline:0; background:transparent; color:transparent; caret-color:var(--module-accent); -webkit-text-fill-color:transparent; }
       textarea::selection { background:var(--module-ring); }
       textarea:focus-visible { outline:0; }
-      .ide-shell:focus-within { border-color:var(--module-accent); box-shadow:0 0 0 3px var(--module-ring),0 10px 24px rgba(28,25,23,.07); }
+      .ide-shell:focus-within { border-color:var(--module-accent); box-shadow:0 0 0 3px var(--module-ring),0 10px 24px rgba(29, 29, 31,.07); }
       .ide-status { display:flex; min-height:28px; align-items:center; justify-content:flex-end; gap:14px; padding:0 11px; border-top:1px solid var(--module-border); background:var(--module-sunken); color:var(--module-muted); font:10px/1 var(--module-mono); }
       .ide-status [data-code-language-status] { margin-right:auto; color:var(--module-accent); }
       .syntax-keyword { color:var(--syntax-keyword); font-weight:650; }
@@ -1656,10 +1656,11 @@ function interactiveDocument(
     : bundle.css;
   return `<!doctype html><html lang="${escapeHtml(normalizeDocumentLanguage(documentLanguage))}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src ${imageSourcePolicy}; font-src data:; connect-src 'none'; object-src 'none'; media-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'; navigate-to 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src ${imageSourcePolicy}; font-src data:; connect-src 'none'; object-src 'none'; media-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'">
 <style>${SURFACE_BASE_CSS}\n${escapeClosingTag(bundleCss, "style")}\n${generatedPolicyCss}\n${SURFACE_ACTIVITY_CSS}</style></head>
 <body class="${generatedSurface ? "response-surface-generated" : "response-surface-template"}" data-manor-ui-policy="response-surface.v1"><div id="surface-root"></div>${activityMarkup(surface, receipts, activityLabels)}<div id="surface-error" role="alert" hidden></div>
 <script>(() => {
+  ${REMOVE_PEER_CONNECTION_CONSTRUCTORS}
   const surfaceRoot = document.getElementById("surface-root");
   if (!surfaceRoot) return;
   surfaceRoot.innerHTML = ${safeJson(bundle.html)};

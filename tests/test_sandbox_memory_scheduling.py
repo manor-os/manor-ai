@@ -36,6 +36,8 @@ from packages.core.services.sandbox_queue_service import (
     enqueue_sandbox_reservation,
     expire_sandbox_reservations,
     fail_sandbox_allocation,
+    last_runner_code,
+    last_runner_reason,
     runner_memory_from_health,
 )
 from packages.core.services.sandbox_sdk.exceptions import (
@@ -347,7 +349,9 @@ def test_health_without_memory_fields_yields_no_report() -> None:
         (SandboxRunnerOutdatedError("capabilities could not be read", missing=["egress"], reported=False),
          "unavailable", "runner_outdated: "),
         (SandboxRunnerOutdatedError("runner lacks egress", missing=["egress"]), "fatal", "runner_outdated: "),
-        (SandboxRuntimeError("load failed", 500, code="load_skill_failed"), "retry", "SandboxRuntimeError"),
+        # A retried failure keeps the runner's code: the ticket says why (staging 11-09 recorded
+        # only "SandboxRuntimeError" for an exit proxy that was down).
+        (SandboxRuntimeError("load failed", 500, code="load_skill_failed"), "retry", "load_skill_failed: load failed"),
         (TimeoutError(), "retry", "TimeoutError"),
     ],
 )
@@ -504,7 +508,9 @@ class _RestartingRunner:
     (503 ``sandbox_service_draining``); ``refused``: nothing listens while the
     new image starts; ``dropped``: the port proxy accepts and drops the
     connection before the process listens; ``mismatch``: the exit proxy is
-    wrong (422 ``egress_ip_mismatch``); ``up``: the container is created.
+    wrong (422 ``egress_ip_mismatch``, gateway exit 4); ``exit_down``: the
+    exit proxy does not answer (503 ``egress_unverified``, gateway exit 3);
+    ``up``: the container is created.
     """
 
     def __init__(self, script: list[str]):
@@ -529,7 +535,15 @@ class _RestartingRunner:
             raise httpx.RemoteProtocolError("Server disconnected without sending a response.", request=request)
         if answer == "mismatch":
             return httpx.Response(422, json={
-                "detail": "egress exits from 198.51.100.9, expected 203.0.113.7", "code": "egress_ip_mismatch",
+                "detail": "The exit proxy answered from a different IP than expected.", "code": "egress_ip_mismatch",
+                "reason": "exit_ip_mismatch", "gateway_exit_code": 4,
+                "gateway_log": "egress-gateway: exit IP 198.51.100.9 is not the expected 203.0.113.7",
+            })
+        if answer == "exit_down":
+            return httpx.Response(503, json={
+                "detail": "The exit proxy could not be verified: it did not answer.", "code": "egress_unverified",
+                "reason": "proxy_unreachable", "gateway_exit_code": 3,
+                "gateway_log": "egress-gateway: upstream proxy unreachable",
             })
         return httpx.Response(200, json={
             "sandbox_id": "sbx-after-restart", "container_name": "c", "status": "ready", "workdir": "/workspace",
@@ -577,8 +591,9 @@ async def _serve_ticket_from(db_session, monkeypatch, runner: _RestartingRunner,
         )
         if ticket.status != SandboxReservationStatus.REQUEUED.value:
             break
-        assert ticket.attempt_count == 0, "waiting for a restarting runner is not a failed attempt"
-        assert ticket.last_error.startswith("sandbox_runner_unavailable: last runner answer: ")
+        if not ticket.last_error.startswith("egress_unverified: "):
+            assert ticket.attempt_count == 0, "waiting for a restarting runner is not a failed attempt"
+            assert ticket.last_error.startswith("sandbox_runner_unavailable: last runner answer: ")
         current = ticket.next_attempt_at
     return run, ticket
 
@@ -608,7 +623,37 @@ async def test_a_runner_refusing_the_request_still_fails_the_ticket_at_once(db_s
     assert runner.creates == 1
     assert ticket.status == SandboxReservationStatus.FAILED.value
     assert ticket.last_error.startswith("egress_ip_mismatch: ")
+    # The gateway's reason and log are kept for whoever reads the ticket.
+    assert "(reason exit_ip_mismatch; gateway exit 4; gateway log: egress-gateway: exit IP" in ticket.last_error
     assert run.status_reason == "sandbox_allocation_rejected"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("down_for", [1, 5])
+async def test_an_exit_that_is_down_is_retried_and_a_ticket_that_runs_out_says_why(
+    db_session, monkeypatch, down_for,
+) -> None:
+    # Staging 11-09: the exit proxy's tunnel was down; every attempt failed
+    # and the ticket recorded only "SandboxRuntimeError".
+    runner = _RestartingRunner(["exit_down"] * down_for + ["up"])
+
+    run, ticket = await _serve_ticket_from(db_session, monkeypatch, runner, index=27 + down_for)
+
+    if down_for == 1:
+        # One failed check is retried, and the person never hears of it.
+        assert runner.creates == 2
+        assert ticket.status == SandboxReservationStatus.ALLOCATED.value
+        return
+    assert runner.creates == 5, "the retries stay bounded"
+    assert ticket.status == SandboxReservationStatus.FAILED.value
+    assert ticket.last_error.startswith(
+        "sandbox_allocation_failed: last runner answer: egress_unverified: "
+        "The exit proxy could not be verified: it did not answer. "
+        "(reason proxy_unreachable; gateway exit 3; gateway log: egress-gateway: upstream proxy unreachable)"
+    )
+    assert last_runner_code(ticket.last_error) == "egress_unverified"
+    assert last_runner_reason(ticket.last_error) == "proxy_unreachable"
+    assert run.status_reason == "sandbox_allocation_failed"
 
 
 @pytest.mark.integration

@@ -35,9 +35,6 @@ for (const [locale, width] of [["en", 1280], ["zh", 1280], ["en", 390], ["zh", 3
       return route.fulfill({ json: [] });
     });
     await page.goto("/e2e/fixtures/workspace-app-pane.html", { waitUntil: "domcontentloaded" });
-    if (width < 600) {
-      await page.getByRole("button", { name: "Open chat", exact: true }).click();
-    }
     await page.evaluate(async (selectedLocale) => {
       const storePath = "/src/stores/chatStream.ts";
       const localePath = "/src/lib/i18n.ts";

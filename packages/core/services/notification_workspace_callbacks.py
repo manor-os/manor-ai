@@ -2,7 +2,7 @@
 
 When ``channel_reply_approvals.maybe_hold_external_reply_for_approval`` pauses an
 outbound reply for operator review, it now ALSO fans out a notification
-to the configured approvers with ``actions=[approve, always_approve, reject]`` and
+to the configured approvers with the card's own options (recommended first) and
 ``callback_kind="workspace.hitl.resolve_message"``. Whichever surface
 the operator chooses to use — web chat button or channel reply — the
 same ``chat_service.resolve_pending_action`` runs against the same
@@ -222,8 +222,6 @@ async def _resolve_message_via_chat_service(
             HumanDecisionIntent.APPROVE_STANDING,
         }
         standing = decision_intent is HumanDecisionIntent.APPROVE_STANDING
-        if standing:
-            return {"ok": False, "error": "approval_command_retired", "message": "Use the versioned approval settings command to save a rule."}
         if decision_intent not in {
             HumanDecisionIntent.APPROVE,
             HumanDecisionIntent.APPROVE_STANDING,
@@ -265,6 +263,32 @@ async def _resolve_message_via_chat_service(
                     "channel before creating a standing grant."
                 ),
             }
+        if standing:
+            # "Always allow" from a channel button saves the same Workspace
+            # rule the in-app button does, then approves this reply.
+            from packages.core.constants.channels import ExternalMessageActionKey
+            from packages.core.governance import approval_policy_service as approval_policies
+            from packages.core.governance.always_allow import save_always_allow_rule
+
+            try:
+                approval_scope = await approval_policies.resolve_scope(
+                    db, entity_id=payload_entity_id, workspace_id=workspace_id,
+                )
+                await save_always_allow_rule(
+                    db, scope=approval_scope, actor=actor,
+                    action_key=str(pending_action.get("action_key") or ExternalMessageActionKey.SEND.value),
+                )
+            except approval_policies.ApprovalPolicyAccessError:
+                await db.rollback()
+                return {"ok": False, "error": "standing_grant_authority_required"}
+            except approval_policies.ApprovalPolicyConflict:
+                await db.rollback()
+                return {
+                    "ok": False,
+                    "disposition": NotificationCallbackDisposition.RETRYABLE.value,
+                    "error": "approval_settings_changed",
+                    "message": "Approval settings changed meanwhile; please retry.",
+                }
         if approved:
             from packages.core.services.channel_outbound_delivery import (
                 ApprovedExternalReplyDeliveryDisposition,
@@ -584,6 +608,7 @@ async def notify_workspace_hitl_approvers(
     title: str,
     body: str,
     recipient_user_ids: list[str] | None = None,
+    pending_action: dict[str, Any] | None = None,
 ) -> int:
     """Send the HITL approval card out as an actionable notification.
 
@@ -614,7 +639,9 @@ async def notify_workspace_hitl_approvers(
         )
         return 0
 
-    actions = approval_notification_actions()
+    from packages.core.services.decision_recommendation import channel_actions
+
+    actions = channel_actions(pending_action) if pending_action else approval_notification_actions()
 
     delivered = 0
     for user_id in user_ids:

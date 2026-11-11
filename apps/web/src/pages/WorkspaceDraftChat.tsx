@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { startVisiblePolling } from "../lib/visiblePolling";
+import { useEffect, useRef, useState, useMemo } from "react";
 import type { CSSProperties } from "react";
 import { createPortal } from "react-dom";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { useToastStore } from "../stores/toast";
@@ -22,6 +23,9 @@ import EmptyState from "../components/ui/EmptyState";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
 import { ChatMessagesSkeleton } from "../components/ui/Skeleton";
 import ChatMarkdown from "../components/ChatMarkdown";
+import MessageQuestionOptions from "../components/ui/MessageQuestionOptions";
+import AssistantMessageBlocks from "../components/AssistantMessageBlocks";
+import type { AssistantBlock, AssistantProcessStep } from "../lib/chatStream";
 import MessageBubble from "../components/chat/MessageBubble";
 import ChatInputFooter, {
   manualSkillLabel,
@@ -30,12 +34,12 @@ import ChatInputFooter, {
   type ManualSkillItem,
 } from "../components/ChatInputFooter";
 import WorkspaceDraftConfigurationPanel from "../components/WorkspaceDraftConfigurationPanel";
+import { recommendWorkspaces, type RecommendationReason } from "../lib/workspaceRecommendations";
 
 /* ── Visual tokens ─────────────────────────────────────────────────── */
 
 const LABEL: CSSProperties = {
-  fontSize: 10, fontWeight: 800, textTransform: "uppercase",
-  letterSpacing: "0.12em", color: "var(--text-faint)", marginBottom: 6,
+  fontSize: 10, fontWeight: 800, color: "var(--text-faint)", marginBottom: 6,
 };
 /* ── Page-scoped CSS ───────────────────────────────────────────────── */
 
@@ -61,11 +65,7 @@ const CHAT_STYLES = `
   }
   .draft-chat {
     display: flex; flex-direction: column; min-height: 0;
-    background: rgba(255,255,255,0.85);
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
-    border: 1px solid rgba(231,229,228,0.6);
-    border-radius: 20px; overflow: hidden;
+    overflow: hidden;
   }
   .draft-msgs {
     flex: 1; min-height: 0; overflow-y: auto;
@@ -95,19 +95,54 @@ const CHAT_STYLES = `
   }
   .draft-starter-btn {
     min-height: 30px;
-    padding: 6px 10px;
-    border: 1px solid rgba(120,113,108,0.14);
-    border-radius: 8px;
-    background: rgba(255,255,255,0.74);
-    color: #57534e;
-    font-size: 12px; font-weight: 700; line-height: 1.25;
+    padding: 6px 12px;
+    border: none;
+    border-radius: 9px;
+    background: var(--surface-muted);
+    color: var(--text-default);
+    font-size: 13px; line-height: 1.25;
     cursor: pointer;
-    transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+    transition: background 0.15s ease;
   }
-  .draft-starter-btn:hover {
-    border-color: rgba(67,107,101,0.26);
-    color: #2f5f58;
-    background: rgba(250,250,249,0.9);
+  .draft-starter-btn:hover { background: var(--surface-sunken); }
+  .draft-recommendations {
+    display: flex; flex-direction: column; gap: 2px;
+    width: min(100%, var(--chat-thread-max-width, 920px));
+    margin: 0 auto;
+    box-sizing: border-box;
+  }
+  .draft-recommendation {
+    display: flex; flex-direction: column; gap: 2px;
+    min-width: 0;
+    padding: 10px 12px;
+    border: none;
+    border-radius: 10px;
+    background: transparent;
+    text-align: left;
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+  .draft-recommendation:hover { background: var(--surface-muted); }
+  .draft-recommendation-basis {
+    margin: 6px 0 0;
+    padding: 0 12px;
+    color: var(--text-faint);
+    font-size: 12px;
+  }
+  .draft-recommendation-basis a { color: var(--text-muted); text-decoration: underline; }
+  .draft-recommendation-title { color: var(--text-strong); font-size: 14px; font-weight: 500; }
+  .draft-recommendation-reason {
+    overflow: hidden;
+    color: var(--text-muted);
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .draft-shell--solo { grid-template-columns: minmax(0, 1fr); }
+  .draft-shell--solo .draft-side { display: none; }
+  .draft-msg-row.assistant .draft-msg-bubble {
+    padding: 0 !important; border: 0 !important; border-radius: 0 !important;
+    background: transparent !important; box-shadow: none !important;
   }
   .draft-side  { display: flex; flex-direction: column; gap: 14px; min-height: 0; overflow-y: auto; padding-right: 4px; }
   .draft-typing {
@@ -123,44 +158,9 @@ const CHAT_STYLES = `
     0%, 60%, 100% { opacity: 0.3; transform: scale(0.85); }
     30%           { opacity: 1.0; transform: scale(1.0);  }
   }
-
-  /* Construction log inside assistant message */
-  .draft-build-log {
-    margin-top: 10px; border-top: 1px dashed rgba(168,162,158,0.4); padding-top: 8px;
-  }
-  .draft-build-toggle {
-    background: none; border: none; padding: 0; cursor: pointer;
-    color: #57534e; font-size: 11px; font-weight: 700;
-    text-transform: uppercase; letter-spacing: 0.06em;
-    display: inline-flex; align-items: center; gap: 4px;
-  }
-  .draft-build-toggle:hover { color: #436b65; }
-  .draft-build-list {
-    margin: 8px 0 0; padding: 0; list-style: none;
-    display: flex; flex-direction: column; gap: 3px;
-    font-size: 11px; color: #78716c; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  }
-  .draft-build-list li { display: flex; gap: 6px; align-items: baseline; }
-  .draft-build-list .ok    { color: #436b65; }
-  .draft-build-list .err   { color: #c14a44; }
-  .draft-build-list .step  { color: #d6d3d1; }
-  .draft-build-list .name  { color: #44403c; font-weight: 600; }
-  .draft-build-list .summary { color: #78716c; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .draft-turn-paused { margin: 0; color: #78716c; font-size: 12px; line-height: 1.4; }
 
   /* Live activity strip while a turn is streaming */
-  .draft-live-strip {
-    display: flex; flex-direction: column; gap: 4px;
-    background: rgba(67,107,101,0.05);
-    border: 1px solid rgba(67,107,101,0.2);
-    border-radius: 10px; padding: 8px 12px;
-    font-size: 11px; color: #436b65;
-  }
-  .draft-live-strip .pulse {
-    width: 6px; height: 6px; border-radius: 50%; background: #436b65;
-    box-shadow: 0 0 8px #436b65;
-    animation: pulseDot 1.4s infinite ease-in-out;
-    display: inline-block; margin-right: 8px;
-  }
   html[data-theme="dark"] .draft-shell {
     color: var(--text-default);
   }
@@ -195,46 +195,10 @@ const CHAT_STYLES = `
   html[data-theme="dark"] .draft-msg-bubble .chat-md :where(p, li, td, th, strong, em, h1, h2, h3, h4, code) {
     color: var(--text-strong) !important;
   }
-  html[data-theme="dark"] .draft-starter-btn {
-    background: rgba(255,255,255,0.07);
-    border-color: rgba(255,255,255,0.14);
-    color: var(--text-default);
-  }
-  html[data-theme="dark"] .draft-starter-btn:hover {
-    background: rgba(127,208,196,0.12);
-    border-color: rgba(127,208,196,0.38);
-    color: #dff8f3;
-  }
   html[data-theme="dark"] .draft-chat .embedded-chat-footer {
     background: transparent;
     border-top-color: rgba(255,255,255,0.1);
     padding: 14px 28px 16px;
-  }
-  html[data-theme="dark"] .draft-chat .chat-composer {
-    margin: 0 auto 16px;
-    width: min(calc(100% - 56px), var(--chat-thread-max-width, 920px));
-    background: rgba(18,18,18,0.98);
-    border-color: rgba(255,255,255,0.16);
-    box-shadow:
-      inset 0 1px 0 rgba(255,255,255,0.07),
-      0 12px 40px rgba(0,0,0,0.24);
-  }
-  html[data-theme="dark"] .draft-chat .chat-composer.chat-composer--focused {
-    background: rgba(20,20,20,0.99);
-    border-color: rgba(127,208,196,0.42);
-    box-shadow:
-      0 0 0 3px rgba(127,208,196,0.14),
-      inset 0 1px 0 rgba(255,255,255,0.08),
-      0 16px 42px rgba(0,0,0,0.28);
-  }
-  html[data-theme="dark"] .draft-chat .chat-composer-rich-editor,
-  html[data-theme="dark"] .draft-chat .chat-composer-inline-render,
-  html[data-theme="dark"] .draft-chat .chat-composer-textarea {
-    color: #ffffff !important;
-  }
-  html[data-theme="dark"] .draft-chat .chat-composer-rich-editor:empty::before,
-  html[data-theme="dark"] .draft-chat .chat-composer-textarea::placeholder {
-    color: rgba(255,255,255,0.58) !important;
   }
   .draft-side-surface,
   .draft-meta-panel {
@@ -249,31 +213,6 @@ const CHAT_STYLES = `
   html[data-theme="dark"] .draft-side-surface :where(div, p, span, li, strong),
   html[data-theme="dark"] .draft-meta-panel :where(div, p, span, strong) {
     color: var(--text-strong) !important;
-  }
-  html[data-theme="dark"] .draft-build-log {
-    border-top-color: rgba(255,255,255,0.14);
-  }
-  html[data-theme="dark"] .draft-build-toggle,
-  html[data-theme="dark"] .draft-build-list {
-    color: var(--text-muted);
-  }
-  html[data-theme="dark"] .draft-build-list .step {
-    color: rgba(255,255,255,0.32);
-  }
-  html[data-theme="dark"] .draft-build-list .name {
-    color: var(--text-strong);
-  }
-  html[data-theme="dark"] .draft-build-list .summary {
-    color: var(--text-muted);
-  }
-  html[data-theme="dark"] .draft-live-strip {
-    background: rgba(127,208,196,0.09);
-    border-color: rgba(127,208,196,0.24);
-    color: #dff8f3;
-  }
-  html[data-theme="dark"] .draft-live-strip .pulse {
-    background: #7fd0c4;
-    box-shadow: 0 0 10px rgba(127,208,196,0.7);
   }
   @keyframes pulseDot {
     0%, 100% { opacity: 0.4; }
@@ -328,10 +267,80 @@ function _friendlyValue(value: string | null | undefined): string {
     .replace(/\bSop\b/g, "SOP")
     .replace(/\bCrm\b/g, "CRM");
 }
-function _toolLabel(name: string): string {
-  // "ws_propose_service" → "Propose service"
-  return _humanize(name.replace(/^ws_/, "")).replace(/^./, (c) => c.toUpperCase());
+// What Manor is doing, in the reader's words: tool names are not for people.
+const DRAFT_STEP_KEYS: Record<string, string> = {
+  ws_ask_user: "question",
+  ws_mark_ready: "finishing",
+  ws_get_draft: "checking",
+  ws_lint_draft: "reviewing",
+  ws_read_source: "reading",
+  ws_search_blueprints: "templates",
+  ws_suggest_blueprint: "templates",
+  ws_apply_blueprint: "applying_template",
+  ws_search_capabilities: "capabilities",
+  ws_search_entity_agents: "staff",
+  ws_propose_agent_mapping: "staff",
+  ws_assign_staff: "staff",
+  ws_request_custom_agent: "staff",
+  ws_commit_basics: "basics",
+  ws_confirm_creation_preferences: "basics",
+  ws_propose_service: "services",
+  ws_propose_goal: "goals",
+  ws_propose_rule: "rules",
+  ws_propose_stat: "stats",
+  ws_propose_workflow: "workflows",
+  ws_design_workflows: "workflows",
+  ws_propose_automation: "automations",
+  ws_propose_channel: "connections",
+  ws_flag_missing_integration: "connections",
+  ws_design_app_view: "app",
+  ws_accept_app_view: "app",
+  ws_attach_knowledge: "knowledge",
+  ws_set_autonomy: "operating",
+  ws_set_budget: "operating",
+  ws_set_evaluation: "operating",
+};
+
+function _draftStepKey(name: string): string {
+  return `page.workspace_draft_chat.step_${DRAFT_STEP_KEYS[name] || "updating"}`;
 }
+
+/** A draft turn as the process block every chat shows. */
+function _draftProcess(
+  events: WorkspaceArchitectToolEvent[],
+  { key, live, startedAtMs, durationMs }: { key: string; live: boolean; startedAtMs?: number; durationMs?: number },
+): AssistantBlock {
+  const steps: AssistantProcessStep[] = [];
+  for (const event of events) {
+    const displayKey = _draftStepKey(event.name);
+    const status = event.ok === false ? "error" : event.ok === true ? "success" : "running";
+    const last = steps[steps.length - 1];
+    // Several calls of one kind in a row are one thing to the reader.
+    if (last?.display_key === displayKey) {
+      last.status = status;
+      last.result_preview = _toolSummary(event) || last.result_preview;
+    } else {
+      steps.push({
+        id: `${key}-${event.step}`,
+        kind: "tool",
+        name: event.name,
+        display_key: displayKey,
+        status,
+        result_preview: _toolSummary(event),
+      });
+    }
+  }
+  return {
+    id: key,
+    type: "process",
+    lifecycle_status: live ? "running" : "completed",
+    default_collapsed: !live,
+    started_at_ms: startedAtMs,
+    duration_ms: durationMs,
+    steps,
+  };
+}
+
 function _toolSummary(e: WorkspaceArchitectToolEvent): string {
   const s = e.summary || {};
   if (e.ok === false) return String(s.error || "rejected");
@@ -350,19 +359,6 @@ interface AssistantTurn {
   meta?: WorkspaceArchitectTurnMeta;
 }
 
-function _formatTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}m`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
-  return n.toString();
-}
-function _formatMs(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  const s = ms / 1000;
-  if (s < 60) return `${s.toFixed(1)}s`;
-  const m = Math.floor(s / 60);
-  return `${m}m ${(s - m * 60).toFixed(0)}s`;
-}
-
 function _hasCompletedDraftTurn(
   messages: WorkspaceDraftMessage[],
   userMessage: string,
@@ -378,7 +374,31 @@ function _hasCompletedDraftTurn(
   );
 }
 
+/** The server saved this message and is still answering it. */
+function _hasPendingDraftTurn(draft: WorkspaceDraft, userMessage: string): boolean {
+  const last = draft.messages[draft.messages.length - 1];
+  return Boolean(draft.working) && last?.role === "user" && last.content.trim().startsWith(userMessage.trim());
+}
+
+const DRAFT_WORKING_POLL_MS = 5000;
+
 const DRAFT_ID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+function recommendationBrief(blueprint: { title: string; summary: string | null }): string {
+  return t("ui.workspace_recommendation_brief", { title: blueprint.title, summary: blueprint.summary || "" }).trim();
+}
+
+// A real reason when there is one; otherwise what the Workspace does.
+function recommendationDetail(blueprint: { summary: string | null }, reason: RecommendationReason): string {
+  if (reason.kind === "integration") return t("ui.workspace_recommendation_integration", { name: reason.name });
+  if (reason.kind === "workspace") return t("ui.workspace_recommendation_workspace", { name: reason.name });
+  if (reason.kind === "industry") return t("ui.workspace_recommendation_industry", { name: reason.name });
+  return blueprint.summary || t("ui.workspace_recommendation_ready");
+}
+
+function draftOpeningMessage(): WorkspaceDraftMessage {
+  return { role: "assistant", content: t("page.workspace_draft_chat.opening_question") };
+}
 
 function createClientDraftId(): string {
   const random = globalThis.crypto.getRandomValues(new Uint8Array(10));
@@ -393,6 +413,20 @@ function createClientDraftId(): string {
 }
 
 /* ── Page ──────────────────────────────────────────────────────────── */
+
+function draftHasPlan(draft: WorkspaceDraft | null | undefined): boolean {
+  if (!draft) return false;
+  const fields = draft.fields as Record<string, any>;
+  return Boolean(
+    draft.ready
+    || draft.applied_blueprint_id
+    || fields.name
+    || fields.primary_work
+    || fields.operating_context
+    || fields.services?.length
+    || fields.agent_mappings?.length,
+  );
+}
 
 export default function WorkspaceDraftChat({ embeddedInChat = false }: { embeddedInChat?: boolean }) {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -410,6 +444,8 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
   const draftChatRef = useRef<HTMLDivElement>(null);
   const startedRef = useRef(false);
   const openingDraftIdRef = useRef<string | null>(resumingOpening ? draftIdParam : null);
+  // A blank start asks a fixed question: no model call, and no draft until there is an answer.
+  const blankStartRef = useRef(!draftIdParam && !initialBriefParam);
 
   /* Existing-draft fetch */
   const { data: existingDraft, isLoading: loadingExisting } = useQuery({
@@ -425,7 +461,7 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
   const [messages, setMessages] = useState<(WorkspaceDraftMessage & {
     toolEvents?: WorkspaceArchitectToolEvent[];
     meta?: WorkspaceArchitectTurnMeta;
-  })[]>([]);
+  })[]>(() => (blankStartRef.current ? [draftOpeningMessage()] : []));
   const [streaming, setStreaming] = useState(false);
   /** Structured plan-limit detail surfaced when the gate refuses
    *  draft creation upfront. When set, the page renders a dedicated
@@ -437,12 +473,19 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
   const [liveEvents, setLiveEvents] = useState<WorkspaceArchitectToolEvent[]>([]);
   /** Meta for the in-flight turn (filled at end-of-turn just before done). */
   const liveMetaRef = useRef<WorkspaceArchitectTurnMeta | null>(null);
-  const [showAllLogs, setShowAllLogs] = useState<Record<string, boolean>>({});
+  const [liveStartedAtMs, setLiveStartedAtMs] = useState<number>();
+  useEffect(() => {
+    if (streaming) setLiveStartedAtMs(Date.now());
+  }, [streaming]);
 
   useEffect(() => {
     if (existingDraft) {
       setDraft(existingDraft);
-      setMessages(existingDraft.messages.map((m) => ({ ...m })));
+      // The opening question isn't stored on the draft; an empty record must not wipe it.
+      if (existingDraft.messages.length > 0) {
+        const stored = existingDraft.messages.map((m) => ({ ...m }));
+        setMessages(blankStartRef.current && stored[0]?.role === "user" ? [draftOpeningMessage(), ...stored] : stored);
+      }
     }
   }, [existingDraft]);
 
@@ -503,14 +546,31 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
     });
   };
 
+  /** The streamed reply has only text; the saved transcript also carries the
+   *  question's answer buttons. Copy them onto the last assistant bubble. */
+  const attachTurnQuestion = (saved: WorkspaceDraft) => {
+    const last = [...(saved.messages || [])].reverse().find((m) => m.role === "assistant");
+    if (!last?.question) return;
+    setMessages((prev) => {
+      const next = [...prev];
+      const index = next.length - 1;
+      if (next[index]?.role === "assistant") next[index] = { ...next[index], question: last.question };
+      return next;
+    });
+  };
+
   /* ── Mutations ── */
   const createMutation = useMutation({
-    mutationFn: async ({ initial_brief, document_ids }: { initial_brief?: string; document_ids?: string[] } = {}) => {
+    mutationFn: async ({ initial_brief, document_ids, displayText }: { initial_brief?: string; document_ids?: string[]; displayText?: string } = {}) => {
       setStartError(null);
       setStreaming(true);
       liveEventsRef.current = [];
       setLiveEvents([]);
-      setMessages([{ role: "assistant", content: "" }]);
+      setMessages([
+        ...(blankStartRef.current ? [draftOpeningMessage()] : []),
+        ...(initial_brief ? [{ role: "user" as const, content: displayText ?? initial_brief }] : []),
+        { role: "assistant", content: "" },
+      ]);
       const requestedDraftId = openingDraftIdRef.current || createClientDraftId();
       if (!openingDraftIdRef.current) {
         openingDraftIdRef.current = requestedDraftId;
@@ -550,6 +610,7 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
       setStartError(null);
       flushLiveEventsToLastAssistant();
       setDraft(turn.draft);
+      attachTurnQuestion(turn.draft);
       const readyParams = embeddedInChat ? new URLSearchParams({ new: "workspace", draft: turn.draft.id }) : new URLSearchParams({ draft: turn.draft.id });
       setSearchParams(readyParams, { replace: true });
       setDraftId(turn.draft.id);
@@ -565,16 +626,38 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
         setLiveEvents([]);
         return;
       }
-      setStartError(err.message);
-      toast.error(t("page.workspace_draft_chat.could_not_start_workspace_draft"), err.message);
-      setMessages([]);
       liveEventsRef.current = [];
       setLiveEvents([]);
+      const failStart = () => {
+        setStartError(err.message);
+        toast.error(t("page.workspace_draft_chat.could_not_start_workspace_draft"), err.message);
+        setMessages([]);
+      };
+      const openingId = openingDraftIdRef.current;
+      if (!openingId) {
+        failStart();
+        return;
+      }
+      // The saved opening may still be running, or have committed its reply
+      // before the connection lost its done frame. Follow either draft.
+      void api.workspaceDrafts.get(openingId).then((saved) => {
+        const hasReply = saved.messages.some((entry) => entry.role === "assistant" && entry.content.trim());
+        if (!saved.working && !hasReply) {
+          failStart();
+          return;
+        }
+        setStartError(null);
+        setDraft(saved);
+        setMessages(saved.messages.map((entry) => ({ ...entry })));
+        setSearchParams(embeddedInChat ? new URLSearchParams({ new: "workspace", draft: saved.id }) : new URLSearchParams({ draft: saved.id }), { replace: true });
+        setDraftId(saved.id);
+        openingDraftIdRef.current = null;
+      }).catch(failStart);
     },
   });
 
   useEffect(() => {
-    if (!draftId && !startedRef.current && !createMutation.isPending) {
+    if (!draftId && (initialBriefParam || resumingOpening) && !startedRef.current && !createMutation.isPending) {
       // Let StrictMode finish replaying mount effects before starting the
       // mutation; otherwise its observer can remain stuck in pending state.
       const startTimer = window.setTimeout(() => {
@@ -583,8 +666,9 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
       }, 0);
       return () => window.clearTimeout(startTimer);
     }
-  }, [draftId, initialBriefParam, createMutation.mutate, createMutation.isPending]);
+  }, [draftId, initialBriefParam, resumingOpening, createMutation.mutate, createMutation.isPending]);
 
+  const sendAbortRef = useRef<AbortController>(new AbortController());
   const sendMutation = useMutation({
     mutationFn: async ({
       id,
@@ -592,6 +676,7 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
       document_ids,
       displayText,
     }: { id: string; message: string; document_ids?: string[]; displayText?: string }) => {
+      sendAbortRef.current = new AbortController();
       setStreaming(true);
       liveEventsRef.current = [];
       setLiveEvents([]);
@@ -604,7 +689,7 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
         return await api.workspaceDrafts.sendMessageStream(
           id,
           { message, ...(document_ids && document_ids.length ? { document_ids } : {}) },
-          { onToken: appendToken, onReset: resetStreamBuffer, onToolStart, onToolEnd, onTurnMeta },
+          { onToken: appendToken, onReset: resetStreamBuffer, onToolStart, onToolEnd, onTurnMeta, signal: sendAbortRef.current.signal },
         );
       } finally {
         setStreaming(false);
@@ -613,28 +698,48 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
     onSuccess: (turn) => {
       flushLiveEventsToLastAssistant();
       setDraft(turn.draft);
+      attachTurnQuestion(turn.draft);
     },
     onError: (err: Error, { id, message }) => {
-      toast.error(t("page.workspace_draft_chat.send_failed"), err.message);
       setMessages((prev) => prev.slice(0, -2));
       // The server did not acknowledge this turn with ``done``. Put the
       // exact text back in the composer so a transport failure cannot make
       // the user's input disappear, then reconcile any state that committed
-      // before the connection ended.
+      // before the connection ended. A turn the server saved finishes there
+      // (it is run again if its server went away): show it, not an error.
       setInput((current) => current.trim() ? current : message);
       void api.workspaceDrafts.get(id).then((freshDraft) => {
         setDraft(freshDraft);
-        if (_hasCompletedDraftTurn(freshDraft.messages, message)) {
+        if (_hasCompletedDraftTurn(freshDraft.messages, message) || _hasPendingDraftTurn(freshDraft, message)) {
           setMessages(freshDraft.messages.map((entry) => ({ ...entry })));
           setInput((current) => current === message ? "" : current);
+          return;
         }
+        toast.error(t("page.workspace_draft_chat.send_failed"), err.message);
       }).catch(() => {
         // Keep the original send error and retryable composer text visible.
+        toast.error(t("page.workspace_draft_chat.send_failed"), err.message);
       });
       liveEventsRef.current = [];
       setLiveEvents([]);
     },
   });
+
+  /* A turn this page is not streaming (its connection or its server went
+     away, or another tab sent it) is answered on the server: follow the
+     draft until the reply lands. */
+  const answeringOnServer = Boolean(draft?.working) && !streaming
+    && !createMutation.isPending && !sendMutation.isPending;
+  useEffect(() => {
+    if (!answeringOnServer || !draftId) return;
+    const poll = startVisiblePolling(async (signal) => {
+      const fresh = await api.workspaceDrafts.get(draftId, signal);
+      if (signal.aborted) return;
+      setDraft(fresh);
+      if (!fresh.working) setMessages(fresh.messages.map((entry) => ({ ...entry })));
+    }, DRAFT_WORKING_POLL_MS);
+    return poll.stop;
+  }, [answeringOnServer, draftId]);
 
   /* ── Finalize progress ── */
   const [finalizeSteps, setFinalizeSteps] = useState<FinalizeProgressEvent[]>([]);
@@ -701,11 +806,6 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
     });
   }
 
-  function setComposerPrompt(prompt: string) {
-    setInput(prompt);
-    focusComposer();
-  }
-
   function formatComposerMessage(rawText: string, manualSkills: ManualSkillItem[] = []) {
     const text = stripManualSkillTokens(rawText, manualSkills).trim();
     const skillText = manualSkills.length > 0
@@ -739,7 +839,7 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
     manualSkills: ManualSkillItem[] = [],
   ) {
     const v = formatComposerMessage(rawText, manualSkills);
-    if (!v || createMutation.isPending || sendMutation.isPending || streaming) return;
+    if (!v || createMutation.isPending || sendMutation.isPending || streaming || answeringOnServer) return;
     let document_ids: string[] = [];
     try {
       document_ids = await resolveAttachmentDocumentIds(attachments);
@@ -753,13 +853,88 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
     if (!draftId || !draft) {
       setInput("");
       startedRef.current = true;
-      createMutation.mutate({ initial_brief: v, document_ids });
+      createMutation.mutate({ initial_brief: v, document_ids, displayText });
       return;
     }
     if (draft.status !== "active" && draft.status !== "ready") return;
     setInput("");
     sendMutation.mutate({ id: draftId, message: v, document_ids, displayText });
   }
+
+  /* What a blank start can suggest, from what the company already has. */
+  const recommending = blankStartRef.current && !draftId;
+  const { data: marketplaceBlueprints } = useQuery({
+    queryKey: ["blueprints", "published"],
+    queryFn: () => api.blueprints.list("published"),
+    enabled: recommending,
+    retry: false,
+  });
+  const { data: companyWorkspaces } = useQuery({
+    queryKey: ["workspaces"],
+    queryFn: () => api.workspaces.list(),
+    enabled: recommending,
+    retry: false,
+  });
+  const { data: connectedIntegrations } = useQuery({
+    queryKey: ["integrations"],
+    queryFn: () => api.integrations.list(),
+    enabled: recommending,
+    retry: false,
+  });
+  const { data: companySettings } = useQuery({
+    queryKey: ["admin-settings"],
+    queryFn: () => api.admin.getSettings(),
+    enabled: recommending,
+    retry: false,
+  });
+  const { data: personalRecommendations } = useQuery({
+    queryKey: ["workspace-recommendations"],
+    queryFn: () => api.workspaceDrafts.recommendations(),
+    enabled: recommending,
+    retry: false,
+    // The first result is being prepared in the background; it replaces the local one.
+    refetchInterval: (query) =>
+      query.state.data?.status === "pending" && query.state.dataUpdateCount < 12 ? 5000 : false,
+  });
+  const localRecommendations = useMemo(() => {
+    if (!Array.isArray(marketplaceBlueprints)) return [];
+    return recommendWorkspaces(
+      marketplaceBlueprints.map((blueprint) => ({
+        ...blueprint,
+        required_integrations: (blueprint.setup_preview?.required_integrations || [])
+          .map((item) => item.key || "")
+          .filter(Boolean),
+      })),
+      {
+        workspaces: Array.isArray(companyWorkspaces) ? companyWorkspaces : [],
+        connectedIntegrations: (Array.isArray(connectedIntegrations) ? connectedIntegrations : [])
+          .map((item) => String(item?.name || item?.provider || item?.type || ""))
+          .filter(Boolean),
+        industry: companySettings?.industry,
+      },
+    );
+  }, [marketplaceBlueprints, companyWorkspaces, connectedIntegrations, companySettings]);
+  const personalItems = personalRecommendations?.items || [];
+  const recommendations = [
+    ...personalItems.map((item, index) => ({
+      key: item.blueprint_id || `suggested-${index}`,
+      title: item.title,
+      detail: item.reason,
+      brief: item.brief,
+    })),
+    // Fewer reasoned picks than slots: fill with what the Workspace does, claiming no reason.
+    ...localRecommendations
+      .filter(({ blueprint }) => !personalItems.some((item) => item.blueprint_id === blueprint.id))
+      .map(({ blueprint, reason }) => ({
+        key: blueprint.id,
+        title: blueprint.title,
+        detail: personalItems.length > 0
+          ? blueprint.summary || t("ui.workspace_recommendation_ready")
+          : recommendationDetail(blueprint, reason),
+        brief: recommendationBrief(blueprint),
+      })),
+  ].slice(0, 3);
+  const recommendationSources = personalItems.length > 0 ? personalRecommendations?.sources || [] : [];
 
   /* Derived */
   const lastIsAssistant = messages[messages.length - 1]?.role === "assistant";
@@ -770,11 +945,21 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
   const finalized = draft?.status === "finalized";
   const editable = draft?.status === "active" || draft?.status === "ready";
   const showStarterPrompts =
-    editable &&
+    (editable || (!draftId && !createMutation.isPending)) &&
     !streaming &&
     !sendMutation.isPending &&
     messages.length > 0 &&
-    messages.every((m) => m.role !== "user");
+    messages.every((m) => m.role !== "user") &&
+    // One set of answers at a time: Manor's own options win over the examples.
+    !messages[messages.length - 1]?.question?.options?.length;
+  /* The latest message's turn ended without a reply and will not be run again. */
+  const turnPaused =
+    editable &&
+    !draft?.working &&
+    !streaming &&
+    !createMutation.isPending &&
+    !sendMutation.isPending &&
+    messages[messages.length - 1]?.role === "user";
 
   // Plan-limit short-circuit -- swap the whole creation UI for a
   // friendly explanation so the user knows up-front WHY they can't
@@ -813,7 +998,7 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
                   flex: 1,
                   padding: "12px 14px",
                   background: "rgba(250, 250, 249, 0.6)",
-                  border: "1px solid rgba(28,25,23,0.06)",
+                  border: "0.5px solid rgba(29, 29, 31,0.06)",
                   borderRadius: 12,
                 }}>
                   <div style={LABEL}>{t("page.workspace_draft_chat.used")}</div>
@@ -825,7 +1010,7 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
                   flex: 1,
                   padding: "12px 14px",
                   background: "rgba(250, 250, 249, 0.6)",
-                  border: "1px solid rgba(28,25,23,0.06)",
+                  border: "0.5px solid rgba(29, 29, 31,0.06)",
                   borderRadius: 12,
                 }}>
                   <div style={LABEL}>{t("page.workspace_draft_chat.plan_limit")}</div>
@@ -863,15 +1048,16 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
   }
 
   return (
-    <div style={{ height: "100%", display: "flex", flexDirection: "column", padding: 0, overflow: "hidden", gap: 16 }}>
+    <div className="workspace-draft-page" style={{ height: "100%", display: "flex", flexDirection: "column", padding: 0, overflow: "hidden", gap: 16 }}>
       <style>{CHAT_STYLES}</style>
 
       <PageHeader
+        inline
         title={t("page.workspaces.create_workspace")}
-        subtitle={t("page.workspace_draft_chat.tell_me_what_you_want_to_build_i_ll_draft_the_op")}
-      >
+        actions={(
         <Button
-          variant="outline"
+          variant="ghost"
+          size="sm"
           onClick={() => {
             if (draft && editable) {
               queryClient.invalidateQueries({ queryKey: ["workspace-drafts"] });
@@ -882,9 +1068,11 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
         >
           {draft && editable ? t("page.workspace_draft_chat.save_and_exit") : t("action.cancel")}
         </Button>
-      </PageHeader>
+        )}
+      />
 
-      <div className="draft-shell">
+      {/* Nothing to show beside the conversation until Manor has something to propose. */}
+      <div className={`draft-shell${draftHasPlan(draft) ? "" : " draft-shell--solo"}`}>
         {/* ── Chat ── */}
         <div className="draft-chat" ref={draftChatRef}>
           <div className="draft-msgs" ref={msgsRef}>
@@ -910,7 +1098,7 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
                     disabled={createMutation.isPending}
                     onClick={() => {
                       startedRef.current = true;
-                      createMutation.mutate({ initial_brief: initialBriefParam || undefined });
+                      createMutation.mutate(createMutation.variables ?? { initial_brief: initialBriefParam || undefined });
                     }}
                   >
                     {t("component.chat_message_actions.retry")}
@@ -922,7 +1110,6 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
                 {messages.map((m, i) => {
                   const isLast = i === messages.length - 1;
                   const isStreamingThis = isLast && streaming && m.role === "assistant";
-                  const showLog = !!showAllLogs[`m-${i}`];
                   const events = isStreamingThis ? liveEvents : (m.toolEvents || []);
                   return (
                     <div key={i} className={`draft-msg-row ${m.role}`}>
@@ -930,106 +1117,86 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
                         role={m.role === "user" ? "user" : "other"}
                         className="draft-msg-bubble"
                       >
-                        {m.role === "assistant" && m.content === "" && isStreamingThis ? (
-                          <span className="draft-typing"><span /><span /><span /></span>
-                        ) : m.role === "assistant" ? (
-                          <ChatMarkdown content={m.content} />
+                        {m.role === "assistant" && (isStreamingThis || events.length > 0) && (
+                          <AssistantMessageBlocks
+                            part="process"
+                            keyPrefix={`draft-${i}`}
+                            sourceMessageId={`draft-${i}`}
+                            streaming={isStreamingThis}
+                            blocks={[_draftProcess(events, {
+                              key: `draft-process-${i}`,
+                              live: isStreamingThis,
+                              startedAtMs: isStreamingThis ? liveStartedAtMs : undefined,
+                              durationMs: isStreamingThis ? undefined : m.meta?.duration_ms,
+                            })]}
+                          />
+                        )}
+                        {m.role === "assistant" && m.content === "" && isStreamingThis ? null
+                        : m.role === "assistant" ? (
+                          <>
+                            <ChatMarkdown content={m.content} />
+                            {/* Only the latest question is still open. */}
+                            {isLast && !streaming && m.question?.options?.length && draftId
+                              && (draft?.status === "active" || draft?.status === "ready") ? (
+                              <MessageQuestionOptions
+                                question={m.question}
+                                disabled={sendMutation.isPending}
+                                onAnswer={(answer) => sendMutation.mutate({ id: draftId, message: answer })}
+                                onOther={focusComposer}
+                              />
+                            ) : null}
+                          </>
                         ) : (
                           m.content
-                        )}
-
-                        {/* Live strip while streaming */}
-                        {isStreamingThis && events.length > 0 && (
-                          <div className="draft-live-strip">
-                            <div>
-                              <span className="pulse" />
-                              <strong>{_toolLabel(events[events.length - 1].name)}</strong>
-                              {(() => {
-                                const sum = _toolSummary(events[events.length - 1]);
-                                return sum ? <span> · {sum}</span> : null;
-                              })()}
-                            </div>
-                            <div style={{ color: "#436b65", opacity: 0.7 }}>
-                              {events.length} {t("page.flows.step")}{events.length === 1 ? "" : "s"} · {events.filter(e => e.ok === false).length} {t("page.workspace_draft_chat.error")}{events.filter(e => e.ok === false).length === 1 ? "" : "s"}
-                            </div>
-                          </div>
-                        )}
-
-                        {/* Past turn's collapsed construction log */}
-                        {!isStreamingThis && (events.length > 0 || m.meta) && (
-                          <div className="draft-build-log">
-                            <button
-                              className="draft-build-toggle"
-                              onClick={() => setShowAllLogs((s) => ({ ...s, [`m-${i}`]: !s[`m-${i}`] }))}
-                            >
-                              {showLog ? "▾" : "▸"}
-                              {events.length > 0 && (
-                                <> {t("page.workspace_draft_chat.construction")} {events.length} {t("page.flows.step")}{events.length === 1 ? "" : "s"}</>
-                              )}
-                              {m.meta && (
-                                <span style={{ color: "#a8a29e", fontWeight: 600, marginLeft: 8 }}>
-                                  {events.length === 0 ? t("page.workspace_draft_chat.turn") : "·"} {_formatTokens(m.meta.total_tokens)} {t("page.workspace_draft_chat.tok")} {_formatMs(m.meta.duration_ms)}
-                                  {m.meta.rounds > 1 && (
-                                    <> · {m.meta.rounds} {t("page.workspace_draft_chat.rounds")}</>
-                                  )}
-                                </span>
-                              )}
-                            </button>
-                            {showLog && (
-                              <>
-                                {m.meta && (
-                                  <div className="draft-meta-panel" style={{
-                                    marginTop: 6, padding: "6px 8px",
-                                    background: "rgba(67,107,101,0.04)",
-                                    border: "1px solid rgba(67,107,101,0.12)",
-                                    borderRadius: 8,
-                                    fontSize: 11, color: "#57534e",
-                                    display: "flex", flexWrap: "wrap", gap: 12,
-                                  }}>
-                                    <span><strong style={{ color: "#1c1917" }}>{_formatTokens(m.meta.total_tokens)}</strong> {t("page.workspace_draft_chat.tokens")}</span>
-                                    <span><strong style={{ color: "#1c1917" }}>{_formatTokens(m.meta.prompt_tokens)}</strong> {t("page.workspace_draft_chat.prompt")}</span>
-                                    <span><strong style={{ color: "#1c1917" }}>{_formatTokens(m.meta.completion_tokens)}</strong> {t("page.workspace_draft_chat.completion")}</span>
-                                    <span><strong style={{ color: "#1c1917" }}>{_formatMs(m.meta.duration_ms)}</strong></span>
-                                    <span><strong style={{ color: "#1c1917" }}>{m.meta.rounds}</strong> {t("page.workspace_draft_chat.round")}{m.meta.rounds === 1 ? "" : "s"}</span>
-                                    {m.meta.tool_calls > 0 && (
-                                      <span><strong style={{ color: "#1c1917" }}>{m.meta.tool_calls}</strong> {t("page.workspace_draft_chat.tool_calls")}</span>
-                                    )}
-                                    {m.meta.model && (
-                                      <span style={{ color: "#a8a29e" }}>· {m.meta.model}</span>
-                                    )}
-                                  </div>
-                                )}
-                                {events.length > 0 && (
-                                  <ul className="draft-build-list" style={{ marginTop: m.meta ? 6 : 8 }}>
-                                    {events.map((e, idx) => {
-                                      const sum = _toolSummary(e);
-                                      return (
-                                        <li key={`${e.step}-${idx}`}>
-                                          <span className="step">{String(e.step).padStart(2, " ")}</span>
-                                          <span className={e.ok === false ? "err" : "ok"}>{e.ok === false ? "✗" : "✓"}</span>
-                                          <span className="name">{_toolLabel(e.name)}</span>
-                                          {sum && <span className="summary">· {sum}</span>}
-                                        </li>
-                                      );
-                                    })}
-                                  </ul>
-                                )}
-                              </>
-                            )}
-                          </div>
                         )}
                       </MessageBubble>
                     </div>
                   );
                 })}
-                {showStarterPrompts && (
+                {answeringOnServer && (
+                  <div className="draft-msg-row assistant">
+                    <MessageBubble role="other" className="draft-msg-bubble">
+                      <span className="draft-typing"><span /><span /><span /></span>
+                    </MessageBubble>
+                  </div>
+                )}
+                {turnPaused && (
+                  <div className="draft-msg-row assistant">
+                    <p className="draft-turn-paused">{t("page.workspace_draft_chat.turn_paused")}</p>
+                  </div>
+                )}
+                {showStarterPrompts && recommendations.length > 0 && (
+                  <div className="draft-recommendations" aria-label={t("ui.workspace_recommendations")}>
+                    {recommendations.map((item) => (
+                      <button
+                        key={item.key}
+                        type="button"
+                        className="draft-recommendation"
+                        onClick={() => void send(item.brief)}
+                      >
+                        <span className="draft-recommendation-title">{item.title}</span>
+                        <span className="draft-recommendation-reason">{item.detail}</span>
+                      </button>
+                    ))}
+                    {recommendationSources.length > 0 && (
+                      <p className="draft-recommendation-basis">
+                        {recommendationSources.includes("public_web")
+                          ? t("ui.workspace_recommendation_basis_public")
+                          : t("ui.workspace_recommendation_basis_records")}
+                        {" · "}
+                        <Link to="/settings?tab=memories">{t("ui.manage")}</Link>
+                      </p>
+                    )}
+                  </div>
+                )}
+                {showStarterPrompts && recommendations.length === 0 && (
                   <div className="draft-starters" aria-label={t("page.workspace_draft_chat.sample_prompts")}>
                     {STARTER_PROMPTS.map((starter) => (
                       <button
                         key={starter}
                         type="button"
                         className="draft-starter-btn"
-                        onClick={() => setComposerPrompt(starter)}
+                        onClick={() => void send(starter)}
                       >
                         {starter}
                       </button>
@@ -1045,13 +1212,13 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
             value={input}
             onChange={setInput}
             enterToSend
-            streaming={sendMutation.isPending || streaming}
+            streaming={sendMutation.isPending || streaming || answeringOnServer}
             disabled={Boolean(draftId) && (!draft || !editable)}
-            showStopButton={false}
+            showStopButton={sendMutation.isPending}
             onSend={(text, attachments, skills) => {
               void send(text, attachments, skills);
             }}
-            onStop={() => {}}
+            onStop={() => sendAbortRef.current.abort()}
             placeholder={
               finalized
                 ? t("page.workspace_draft_chat.workspace_already_created")
@@ -1064,7 +1231,7 @@ export default function WorkspaceDraftChat({ embeddedInChat = false }: { embedde
 
         {/* ── Sidebar — live preview ── */}
         <div className="draft-side">
-          {draft && draftId && (
+          {draft && draftId && draftHasPlan(draft) && (
             <WorkspaceDraftConfigurationPanel
               draftId={draftId}
               draft={draft}
@@ -1160,27 +1327,22 @@ function FinalizeProgressOverlay({
     <div className="manor-dialog-overlay" style={{
       position: "fixed", inset: 0,
       background: "var(--modal-overlay-bg)",
-      backdropFilter: "blur(5px)",
-      WebkitBackdropFilter: "blur(5px)",
       display: "flex", alignItems: "center", justifyContent: "center",
       zIndex: 20000,
     }}>
       <div role="dialog" aria-modal="true" className="manor-dialog workspace-finalize-dialog" style={{
         width: "min(92vw, 480px)",
         background: "var(--modal-bg)",
-        backdropFilter: "blur(20px) saturate(1.08)",
-        WebkitBackdropFilter: "blur(20px) saturate(1.08)",
-        borderRadius: 24,
+        borderRadius: "var(--modal-radius)",
         padding: "32px 32px 28px",
-        border: "1px solid var(--modal-border)",
         boxShadow: "var(--modal-shadow)",
       }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 18 }}>
           {finalized ? (
             <div style={{
               width: 36, height: 36, borderRadius: "50%",
-              background: warning ? "#f8edd7" : "#e4efe8", display: "flex", alignItems: "center",
-              justifyContent: "center", color: warning ? "#936027" : "#3d7351", fontSize: 18, fontWeight: 800,
+              background: "var(--surface-muted)", display: "flex", alignItems: "center",
+              justifyContent: "center", color: warning ? "#936027" : "var(--text-strong)", fontSize: 18, fontWeight: 800,
             }}>{warning ? "!" : "✓"}</div>
           ) : (
             <LoadingSpinner size={20} />
@@ -1256,13 +1418,13 @@ function FinalizeProgressOverlay({
                   {done ? "✓" : active ? "•" : ""}
                 </span>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 13, color: done ? "#1c1917" : active ? "#436b65" : "#78716c" }}>
+                  <div style={{ fontSize: 13, color: done ? "#1d1d1f" : active ? "#436b65" : "#8e8e93" }}>
                     {s.key === "complete" && warning
                       ? t("page.workspace_draft_chat.workspace_created_startup_incomplete")
                       : s.label}
                   </div>
                   {subtitle && (
-                    <div style={{ fontSize: 11, color: "#a8a29e", marginTop: 1 }}>{subtitle}</div>
+                    <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 1 }}>{subtitle}</div>
                   )}
                 </div>
               </li>

@@ -381,7 +381,7 @@ function replaceAutocompleteTriggerRange(
   if (resolvedStart < 0) resolvedStart = safeStart;
 
   const triggerEnd =
-    value[resolvedStart] === "%" ? resolvedStart + 1 : resolvedStart;
+    value[resolvedStart] === trigger ? resolvedStart + 1 : resolvedStart;
   const firstWhitespaceAfterTrigger = value
     .slice(triggerEnd)
     .search(/\s/);
@@ -417,13 +417,14 @@ export function replaceWorkflowTriggerRange(
   replaceEnd: number,
   token: string,
   cursorPos = value.length,
+  trigger = "/",
 ) {
   return replaceAutocompleteTriggerRange(
     value,
     start,
     replaceEnd,
     token,
-    "%",
+    trigger,
     cursorPos,
   );
 }
@@ -660,7 +661,7 @@ function isOffsetInRanges(
   return ranges.some((range) => offset >= range.start && offset < range.end);
 }
 
-type ComposerTrigger = "@" | "#" | "/" | "%";
+type ComposerTrigger = "@" | "#" | "/";
 
 function findLastTriggerOutsideTokens(
   text: string,
@@ -942,7 +943,6 @@ export default function ChatInputFooter({
   const isSimple = useDisplayPreferences((s) => s.interfaceMode === "simple");
   const flowsAccess = usePreviewFeatureAccess("flows");
   const flowsAvailable = flowsAccess.enabled;
-  const flowsComingSoon = flowsAccess.loaded && !flowsAccess.released;
   const authToken = useAuthStore((s) => s.token);
   const authLoading = useAuthStore((s) => s.isLoading);
   const authUser = useAuthStore((s) => s.user);
@@ -955,7 +955,6 @@ export default function ChatInputFooter({
   const pendingHashTriggerPosRef = useRef<number | null>(null);
   const pendingMentionTriggerPosRef = useRef<number | null>(null);
   const pendingSkillTriggerPosRef = useRef<number | null>(null);
-  const pendingWorkflowTriggerPosRef = useRef<number | null>(null);
   const appliedSeedAttachmentsKeyRef = useRef<string | undefined>();
   const appliedSeedWorkflowKeyRef = useRef<string | undefined>();
   const lastNativeValueRef = useRef(value);
@@ -1024,17 +1023,11 @@ export default function ChatInputFooter({
   const [skillTriggerPos, setSkillTriggerPos] = useState(-1);
   const skillReplaceEndRef = useRef(-1);
   const [skillActiveIdx, setSkillActiveIdx] = useState(0);
-  const [workflowDropdownOpen, setWorkflowDropdownOpen] = useState(false);
-  const [workflowQuery, setWorkflowQuery] = useState("");
-  const [workflowTriggerPos, setWorkflowTriggerPos] = useState(-1);
-  const workflowReplaceEndRef = useRef(-1);
-  const [workflowActiveIdx, setWorkflowActiveIdx] = useState(0);
 
   useEffect(() => {
     if (!isSimple || humanChat) return;
     setMentionDropdownOpen(false);
     setSkillDropdownOpen(false);
-    setWorkflowDropdownOpen(false);
     setIntegrationsMenuOpen(false);
   }, [isSimple, humanChat]);
 
@@ -1172,7 +1165,7 @@ export default function ChatInputFooter({
     }
     if (integrationsMenuOpen) {
       setIntegrationsMenuCoords(
-        getPortalMenuCoords(integrationsMenuButtonRef.current, 390, "left"),
+        getPortalMenuCoords(integrationsMenuButtonRef.current ?? attachMenuButtonRef.current, 390, "left"),
       );
     }
     if (kbPickerOpen) {
@@ -1236,8 +1229,8 @@ export default function ChatInputFooter({
       }
       if (
         integrationsMenuOpen &&
-        integrationsMenuRef.current &&
-        !integrationsMenuRef.current.contains(target) &&
+        (integrationsMenuRef.current ?? attachMenuRef.current) &&
+        !(integrationsMenuRef.current ?? attachMenuRef.current)?.contains(target) &&
         !integrationsMenuPortalRef.current?.contains(target)
       ) {
         setIntegrationsMenuOpen(false);
@@ -1344,7 +1337,7 @@ export default function ChatInputFooter({
   const selectedWorkflowIsInline = Boolean(
     selectedWorkflow && hasInlineToken(value, workflowInvokeToken(selectedWorkflow)),
   );
-  const workflowFiltered = searchComposerOptions(selectedWorkflowIsInline ? [] : workflows, workflowQuery, {
+  const workflowFiltered = searchComposerOptions(selectedWorkflowIsInline || !flowsAvailable ? [] : workflows, skillQuery, {
     key: (item) => item.bindingId,
     names: (item) => [item.title, workflowInvokeToken(item).slice(1)],
     keywords: (item) => [item.description, item.workspace_name], limit: 20,
@@ -1355,8 +1348,7 @@ export default function ChatInputFooter({
     keywords: (item) => [item.subtitle, item.type, resourceOrigin(item)], limit: 12,
   });
   useEffect(() => {
-    setSkillActiveIdx((index) => Math.min(index, Math.max(0, skillFiltered.length - 1)));
-    setWorkflowActiveIdx((index) => Math.min(index, Math.max(0, workflowFiltered.length - 1)));
+    setSkillActiveIdx((index) => Math.min(index, Math.max(0, skillFiltered.length + workflowFiltered.length - 1)));
     setMentionActiveIdx((index) => Math.min(index, Math.max(0, mentionFiltered.length - 1)));
   }, [skillFiltered.length, workflowFiltered.length, mentionFiltered.length]);
 
@@ -1461,8 +1453,6 @@ export default function ChatInputFooter({
           hashReplaceEndRef.current = -1;
           setSkillDropdownOpen(false);
           skillReplaceEndRef.current = -1;
-          setWorkflowDropdownOpen(false);
-          workflowReplaceEndRef.current = -1;
           return;
         }
       } else {
@@ -1499,8 +1489,6 @@ export default function ChatInputFooter({
           setHashActiveIdx(0);
           setSkillDropdownOpen(false);
           skillReplaceEndRef.current = -1;
-          setWorkflowDropdownOpen(false);
-          workflowReplaceEndRef.current = -1;
           return;
         }
       } else {
@@ -1542,8 +1530,6 @@ export default function ChatInputFooter({
           mentionReplaceEndRef.current = -1;
           setHashDropdownOpen(false);
           hashReplaceEndRef.current = -1;
-          setWorkflowDropdownOpen(false);
-          workflowReplaceEndRef.current = -1;
           return;
         }
       } else {
@@ -1551,49 +1537,6 @@ export default function ChatInputFooter({
         skillReplaceEndRef.current = -1;
       }
 
-      const forcedWorkflowIdx = pendingWorkflowTriggerPosRef.current;
-      pendingWorkflowTriggerPosRef.current = null;
-      const activeWorkflowTrigger = findActiveTextTrigger("%");
-      const workflowIdx =
-        activeWorkflowTrigger?.index ??
-        (forcedWorkflowIdx != null
-          ? val[forcedWorkflowIdx] === "%"
-            ? forcedWorkflowIdx
-            : findLastTriggerOutsideTokens(val, "%", allProtectedTokenRanges)
-          : findLastTriggerOutsideTokens(before, "%", protectedTokenRanges));
-      if (
-        !humanChat && !isSimple && workflows.length > 0 &&
-        workflowIdx >= 0 &&
-        (workflowIdx === 0 || /\s/.test(val[workflowIdx - 1]))
-      ) {
-        const workflowCursor = activeWorkflowTrigger
-          ? workflowIdx + 1 + activeWorkflowTrigger.query.length
-          : forcedWorkflowIdx != null || cursorPos < workflowIdx + 1
-            ? Math.max(cursorPos, workflowIdx + 1)
-            : cursorPos;
-        const q =
-          activeWorkflowTrigger?.query ??
-          val.substring(workflowIdx + 1, workflowCursor);
-        if (selectedWorkflowIsInline || q.includes(" ") || q.includes("\n")) {
-          setWorkflowDropdownOpen(false);
-          workflowReplaceEndRef.current = -1;
-        } else {
-          setWorkflowDropdownOpen(true);
-          setWorkflowQuery(q);
-          setWorkflowTriggerPos(workflowIdx);
-          workflowReplaceEndRef.current = workflowCursor;
-          setWorkflowActiveIdx(0);
-          setMentionDropdownOpen(false);
-          mentionReplaceEndRef.current = -1;
-          setHashDropdownOpen(false);
-          hashReplaceEndRef.current = -1;
-          setSkillDropdownOpen(false);
-          skillReplaceEndRef.current = -1;
-        }
-      } else {
-        setWorkflowDropdownOpen(false);
-        workflowReplaceEndRef.current = -1;
-      }
     },
     [
       attachedFiles,
@@ -1619,8 +1562,6 @@ export default function ChatInputFooter({
         pendingMentionTriggerPosRef.current = getPlainOffset(editorRef.current);
       } else if (nativeEvent.data === "/") {
         pendingSkillTriggerPosRef.current = getPlainOffset(editorRef.current);
-      } else if (nativeEvent.data === "%") {
-        pendingWorkflowTriggerPosRef.current = getPlainOffset(editorRef.current);
       }
     },
     [],
@@ -1650,13 +1591,6 @@ export default function ChatInputFooter({
         previousVal,
         val,
         "/",
-      );
-    }
-    if (pendingWorkflowTriggerPosRef.current == null) {
-      pendingWorkflowTriggerPosRef.current = findInsertedTriggerPosition(
-        previousVal,
-        val,
-        "%",
       );
     }
     lastNativeValueRef.current = val;
@@ -1781,17 +1715,17 @@ export default function ChatInputFooter({
     (workflow: WorkflowInvokeItem) => {
       if (!flowsAvailable) return;
       // `value` may still be one input event behind when a pointer click picks
-      // a Flow. Use the contenteditable value so the typed `%` is in the
+      // a Flow. Use the contenteditable value so the typed `/` is in the
       // replacement source instead of being left behind as plain text.
       const editorValue = getEditorText(editorRef.current) || value;
       const editorCursor = getPlainOffset(editorRef.current);
       const start =
-        workflowTriggerPos >= 0
-          ? workflowTriggerPos
+        skillTriggerPos >= 0
+          ? skillTriggerPos
           : editorCursor;
       const replaceEnd =
-        workflowReplaceEndRef.current >= start
-          ? workflowReplaceEndRef.current
+        skillReplaceEndRef.current >= start
+          ? skillReplaceEndRef.current
           : Math.max(start, editorCursor);
       const token = workflowInvokeToken(workflow);
       const replacement = replaceWorkflowTriggerRange(
@@ -1805,17 +1739,17 @@ export default function ChatInputFooter({
       const nextCursor = replacement.cursor;
       pendingCursorRef.current = nextCursor;
       setSelectedWorkflow(workflow);
-      setWorkflowDropdownOpen(false);
-      setWorkflowQuery("");
-      setWorkflowTriggerPos(-1);
-      workflowReplaceEndRef.current = -1;
-      setWorkflowActiveIdx(0);
+      setSkillDropdownOpen(false);
+      setSkillQuery("");
+      setSkillTriggerPos(-1);
+      skillReplaceEndRef.current = -1;
+      setSkillActiveIdx(0);
       setTimeout(() => {
         editorRef.current?.focus();
         setPlainOffset(editorRef.current, nextCursor);
       }, 0);
     },
-    [flowsAvailable, onChange, value, workflowTriggerPos],
+    [flowsAvailable, onChange, skillTriggerPos, value],
   );
 
   const openSkillPicker = useCallback(() => {
@@ -1834,8 +1768,6 @@ export default function ChatInputFooter({
     mentionReplaceEndRef.current = -1;
     setHashDropdownOpen(false);
     hashReplaceEndRef.current = -1;
-    setWorkflowDropdownOpen(false);
-    workflowReplaceEndRef.current = -1;
     setAttachMenuOpen(false);
     setIntegrationsMenuOpen(false);
     setTimeout(() => editorRef.current?.focus(), 0);
@@ -1902,22 +1834,6 @@ export default function ChatInputFooter({
         removeAutocompleteTriggerRange("/", start, replaceEnd, refocus);
     },
     [removeAutocompleteTriggerRange, skillTriggerPos],
-  );
-
-  const dismissWorkflowAutocomplete = useCallback(
-    (removeTrigger = false, refocus = true) => {
-      const start = workflowTriggerPos;
-      const replaceEnd = workflowReplaceEndRef.current;
-      setWorkflowDropdownOpen(false);
-      setWorkflowQuery("");
-      setWorkflowTriggerPos(-1);
-      workflowReplaceEndRef.current = -1;
-      setWorkflowActiveIdx(0);
-      if (removeTrigger) {
-        removeAutocompleteTriggerRange("%", start, replaceEnd, refocus);
-      }
-    },
-    [removeAutocompleteTriggerRange, workflowTriggerPos],
   );
 
   const dismissHashAutocomplete = useCallback(
@@ -2102,7 +2018,7 @@ export default function ChatInputFooter({
       // Popup authorization must not unmount the composer and discard its draft/files.
       // Reuse Integrations' authorization controller, including sync and WhatsApp setup.
       if (accessState === "connect" && server.nango_provider_config_key) {
-        integrationsMenuButtonRef.current?.focus();
+        (integrationsMenuButtonRef.current ?? attachMenuButtonRef.current)?.focus();
         setNangoConnector(server);
         return;
       }
@@ -2253,56 +2169,29 @@ export default function ChatInputFooter({
       }
 
       if (skillDropdownOpen) {
-        if (e.key === "ArrowDown" && skillFiltered.length > 0) {
+        const slashCount = skillFiltered.length + workflowFiltered.length;
+        if (e.key === "ArrowDown" && slashCount > 0) {
           e.preventDefault();
-          setSkillActiveIdx((i) => Math.min(i + 1, skillFiltered.length - 1));
+          setSkillActiveIdx((i) => Math.min(i + 1, slashCount - 1));
           return;
         }
-        if (e.key === "ArrowUp" && skillFiltered.length > 0) {
+        if (e.key === "ArrowUp" && slashCount > 0) {
           e.preventDefault();
           setSkillActiveIdx((i) => Math.max(i - 1, 0));
           return;
         }
         if (
           (e.key === "Enter" || e.key === "Tab") &&
-          skillFiltered.length > 0
+          slashCount > 0
         ) {
           e.preventDefault();
-          selectManualSkill(skillFiltered[skillActiveIdx]);
+          if (skillActiveIdx < skillFiltered.length) selectManualSkill(skillFiltered[skillActiveIdx]);
+          else selectWorkflow(workflowFiltered[skillActiveIdx - skillFiltered.length]);
           return;
         }
         if (e.key === "Escape") {
           e.preventDefault();
           dismissSkillAutocomplete(true);
-          return;
-        }
-      }
-
-      if (workflowDropdownOpen) {
-        if (e.key === "ArrowDown" && workflowFiltered.length > 0) {
-          e.preventDefault();
-          setWorkflowActiveIdx((i) =>
-            Math.min(i + 1, workflowFiltered.length - 1),
-          );
-          return;
-        }
-        if (e.key === "ArrowUp" && workflowFiltered.length > 0) {
-          e.preventDefault();
-          setWorkflowActiveIdx((i) => Math.max(i - 1, 0));
-          return;
-        }
-        if (
-          (e.key === "Enter" || e.key === "Tab") &&
-          flowsAvailable &&
-          workflowFiltered.length > 0
-        ) {
-          e.preventDefault();
-          selectWorkflow(workflowFiltered[workflowActiveIdx]);
-          return;
-        }
-        if (e.key === "Escape") {
-          e.preventDefault();
-          dismissWorkflowAutocomplete(true);
           return;
         }
       }
@@ -2361,12 +2250,9 @@ export default function ChatInputFooter({
       skillActiveIdx,
       selectManualSkill,
       dismissSkillAutocomplete,
-      workflowDropdownOpen,
       workflowFiltered,
-      workflowActiveIdx,
       flowsAvailable,
       selectWorkflow,
-      dismissWorkflowAutocomplete,
       hashDropdownOpen,
       hashFiltered,
       hashActiveIdx,
@@ -2382,7 +2268,6 @@ export default function ChatInputFooter({
     setFocused(false);
     if (mentionDropdownOpen) dismissMentionAutocomplete(true, false);
     if (skillDropdownOpen) dismissSkillAutocomplete(true, false);
-    if (workflowDropdownOpen) dismissWorkflowAutocomplete(true, false);
     if (hashDropdownOpen) dismissHashAutocomplete(true, false);
   }, [
     dismissMentionAutocomplete,
@@ -2391,8 +2276,6 @@ export default function ChatInputFooter({
     hashDropdownOpen,
     mentionDropdownOpen,
     skillDropdownOpen,
-    workflowDropdownOpen,
-    dismissWorkflowAutocomplete,
   ]);
 
   const canSend =
@@ -2652,8 +2535,9 @@ export default function ChatInputFooter({
               className="chat-composer-menu-item"
               type="button"
             >
-              <IconDocument size={16} style={{ color: "#4869ac" }} />
+              <IconDocument size={16} />
               <span>{t("component.chat_input_footer.add_from_knowledge_base")}</span>
+              <kbd className="chat-composer-menu-key">#</kbd>
             </button>}
             <button
               onClick={() => {
@@ -2663,9 +2547,46 @@ export default function ChatInputFooter({
               className="chat-composer-menu-item"
               type="button"
             >
-              <IconUpload size={16} style={{ color: "#78716c" }} />
+              <IconUpload size={16} />
               <span>{t("component.chat_input_footer.add_from_local_files")}</span>
             </button>
+            {!humanChat && !isSimple && <>
+              <div className="chat-composer-menu-divider" role="separator" />
+              <button
+                onClick={() => {
+                  setAttachMenuOpen(false);
+                  openSkillPicker();
+                }}
+                className="chat-composer-menu-item"
+                type="button"
+              >
+                <IconSkill size={16} />
+                <span>{t("component.chat_input_footer.do_something")}</span>
+                <kbd className="chat-composer-menu-key">/</kbd>
+              </button>
+              <button
+                onClick={() => {
+                  setAttachMenuOpen(false);
+                  insertComposerHint(t("component.chat_input_footer.create_task_hint"));
+                }}
+                className="chat-composer-menu-item"
+                type="button"
+              >
+                <IconChecklist size={16} />
+                <span>{t("component.chat_input_footer.create_task")}</span>
+              </button>
+              <button
+                onClick={() => {
+                  setAttachMenuOpen(false);
+                  setIntegrationsMenuOpen(true);
+                }}
+                className="chat-composer-menu-item"
+                type="button"
+              >
+                <IconConnection size={16} />
+                <span>{t("component.chat_input_footer.connectors")}</span>
+              </button>
+            </>}
           </div>,
           document.body,
         )
@@ -3012,7 +2933,7 @@ export default function ChatInputFooter({
             {!humanChat && !isSimple && skillDropdownOpen && (
               <div className="chat-composer-mention-menu chat-composer-skill-menu">
                 <div className="chat-composer-hash-title">
-                  <span>{t("nav.skills")}</span>
+                  <span>{t("component.chat_input_footer.do_something")}</span>
                   <button
                     type="button"
                     className="chat-composer-autocomplete-close"
@@ -3035,12 +2956,13 @@ export default function ChatInputFooter({
                       {t("component.chat_input_footer.retry")}
                     </button>
                   </div>
-                ) : skillFiltered.length === 0 ? (
+                ) : skillFiltered.length === 0 && workflowFiltered.length === 0 ? (
                   <div className="chat-composer-hash-empty">
                     {skillQuery ? t("component.chat_input_footer.no_matching_skills") : t("component.chat_input_footer.no_skills_available")}
                   </div>
                 ) : (
-                  skillFiltered.map((skill: any, idx: number) => {
+                  <>
+                  {skillFiltered.map((skill: any, idx: number) => {
                     const description = getSkillDescription(skill);
                     return (
                       <button
@@ -3073,71 +2995,34 @@ export default function ChatInputFooter({
                         </span>
                       </button>
                     );
-                  })
-                )}
-              </div>
-            )}
-            {!humanChat && !isSimple && workflowDropdownOpen && (
-              <div className="chat-composer-mention-menu chat-composer-workflow-menu">
-                <div className="chat-composer-hash-title">
-                  <span>
-                    {t("nav.flows")}
-                    {flowsComingSoon
-                      ? ` · ${t("component.chat_mode.soon")}`
-                      : ""}
-                  </span>
-                  <button
-                    type="button"
-                    className="chat-composer-autocomplete-close"
-                    aria-label={t("component.chat_input_footer.cancel_flow")}
-                    title={t("component.chat_input_footer.cancel_flow")}
-                    onMouseDown={(e) => e.preventDefault()}
-                    onClick={() => dismissWorkflowAutocomplete(true)}
-                  >
-                    <IconClose size={12} />
-                  </button>
-                </div>
-                {workflowFiltered.length === 0 ? (
-                  <div className="chat-composer-hash-empty">
-                    {workflowQuery
-                      ? t("component.chat_input_footer.no_matching_flows")
-                      : t("component.chat_input_footer.no_flows_available")}
-                  </div>
-                ) : (
-                  workflowFiltered.map((workflow, idx) => (
-                    <button
-                      key={workflow.bindingId}
-                      onMouseDown={(e) => e.preventDefault()}
-                      onClick={() => selectWorkflow(workflow)}
-                      onMouseEnter={() => setWorkflowActiveIdx(idx)}
-                      className={`chat-composer-mention-item ${idx === workflowActiveIdx ? "active" : ""}`}
-                      type="button"
-                      disabled={!flowsAvailable}
-                      aria-disabled={!flowsAvailable}
-                      title={
-                        flowsComingSoon
-                          ? t("component.chat_mode.flows_coming_soon")
-                          : undefined
-                      }
-                    >
-                      <span className="chat-composer-mention-avatar chat-composer-mention-avatar--workflow">
-                        <IconFlow size={14} />
-                      </span>
-                      <span className="chat-composer-mention-main">
-                        <strong>{workflow.title}</strong>
-                        <ComposerResourceSource source={workflow.workspace_name || (workflow.workspace_id ? t("page.app_layout.workspace") : "")} identity={workflowIdentity(workflow)} id={workflow.bindingId} />
-                        <small>
-                          {workflow.description ||
-                            t("component.chat_input_footer.run_this_flow_for_the_next_message")}
-                        </small>
-                      </span>
-                      <span className="chat-composer-mention-type">
-                        {flowsComingSoon
-                          ? t("component.chat_mode.soon")
-                          : "%"}
-                      </span>
-                    </button>
-                  ))
+                  })}
+                  {workflowFiltered.map((workflow, index) => {
+                    const idx = skillFiltered.length + index;
+                    return (
+                      <button
+                        key={workflow.bindingId}
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => selectWorkflow(workflow)}
+                        onMouseEnter={() => setSkillActiveIdx(idx)}
+                        className={`chat-composer-mention-item ${idx === skillActiveIdx ? "active" : ""}`}
+                        type="button"
+                      >
+                        <span className="chat-composer-mention-avatar chat-composer-mention-avatar--workflow">
+                          <IconFlow size={14} />
+                        </span>
+                        <span className="chat-composer-mention-main">
+                          <strong>{workflow.title}</strong>
+                          <ComposerResourceSource source={workflow.workspace_name || (workflow.workspace_id ? t("page.app_layout.workspace") : "")} identity={workflowIdentity(workflow)} id={workflow.bindingId} />
+                          <small>
+                            {workflow.description ||
+                              t("component.chat_input_footer.run_this_flow_for_the_next_message")}
+                          </small>
+                        </span>
+                        <span className="chat-composer-mention-type">{t("nav.flows")}</span>
+                      </button>
+                    );
+                  })}
+                  </>
                 )}
               </div>
             )}
@@ -3201,9 +3086,9 @@ export default function ChatInputFooter({
               data-placeholder={
                 voice.phase === "recording"
                   ? t("component.chat_input_footer.speak_now")
-                  : isSimple && !humanChat && !disabled
-                  ? t("component.chat_input_footer.simple_placeholder")
-                  : placeholder || t("component.chat_input_footer.message_placeholder")
+                  : placeholder || (isSimple && !humanChat && !disabled
+                    ? t("component.chat_input_footer.simple_placeholder")
+                    : t("component.chat_input_footer.message_placeholder"))
               }
               onBeforeInput={handleEditorBeforeInput}
               onInput={handleEditorInput}
@@ -3313,47 +3198,6 @@ export default function ChatInputFooter({
               </AnchoredPopover>
             )}
 
-            {/* Integrations */}
-            {!humanChat && !isSimple && <>
-            <div style={{ position: "relative" }} ref={integrationsMenuRef}>
-              <button
-                ref={integrationsMenuButtonRef}
-                onClick={() => setIntegrationsMenuOpen(!integrationsMenuOpen)}
-                disabled={streaming || disabled}
-                title={t("component.chat_input_footer.connectors")}
-                aria-label={t("component.chat_input_footer.connectors")}
-                aria-expanded={integrationsMenuOpen}
-                className={`chat-composer-icon-btn ${integrationsMenuOpen ? "chat-composer-icon-btn--active" : ""}`}
-                type="button"
-              >
-                <IconConnection size={18} />
-              </button>
-            </div>
-
-            <button
-              onClick={() => insertComposerHint(t("component.chat_input_footer.create_task_hint"))}
-              disabled={streaming || disabled}
-              title={t("component.chat_input_footer.create_task")}
-              aria-label={t("component.chat_input_footer.create_task")}
-              className="chat-composer-icon-btn"
-              type="button"
-            >
-              <IconChecklist size={17} />
-            </button>
-
-            <button
-              onClick={openSkillPicker}
-              disabled={streaming || disabled}
-              title={t("component.chat_input_footer.use_skill")}
-              aria-label={t("component.chat_input_footer.use_skill")}
-              aria-expanded={skillDropdownOpen}
-              className={`chat-composer-icon-btn ${skillDropdownOpen ? "chat-composer-icon-btn--active" : ""}`}
-              type="button"
-            >
-              <IconSkill size={17} />
-            </button>
-            </>}
-
             {!humanChat && <VoiceInputButton voice={voice} disabled={streaming || disabled} />}
             {!humanChat && voiceScope && <LiveChatCallButton scope={voiceScope} disabled={streaming || disabled || voice.busy} onConversation={onVoiceConversation} />}
               </div>
@@ -3413,7 +3257,7 @@ export default function ChatInputFooter({
           open
           onClose={() => setNangoConnector(null)}
           title={nangoConnector.name}
-          restoreFocusFallback={() => integrationsMenuButtonRef.current?.focus()}
+          restoreFocusFallback={() => (integrationsMenuButtonRef.current ?? attachMenuButtonRef.current)?.focus()}
         >
           <div className="flex flex-col gap-4">
             <div className="flex items-center gap-3">

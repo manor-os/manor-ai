@@ -24,5 +24,5 @@ api.workspaces.saveAppView = async (_id, config) => { view.config = config; retu
 
 void setLocale("zh").then(() => {
   document.body.style.cssText = "margin:0;background:#f7f6f4;";
-  createRoot(document.getElementById("root")!).render(<React.StrictMode><MemoryRouter><QueryClientProvider client={new QueryClient()}><div style={{ padding: "48px clamp(16px, 4vw, 64px)" }}><div style={{ maxWidth: 1320, margin: "0 auto 12px", fontSize: 12, color: "#78716c" }}>Workspace App View · 示意数据</div><WorkspaceAppViewSettings workspaceId="preview" canManage /></div></QueryClientProvider></MemoryRouter></React.StrictMode>);
+  createRoot(document.getElementById("root")!).render(<React.StrictMode><MemoryRouter><QueryClientProvider client={new QueryClient()}><div style={{ padding: "48px clamp(16px, 4vw, 64px)" }}><div style={{ maxWidth: 1320, margin: "0 auto 12px", fontSize: 12, color: "var(--text-muted)" }}>Workspace App View · 示意数据</div><WorkspaceAppViewSettings workspaceId="preview" canManage /></div></QueryClientProvider></MemoryRouter></React.StrictMode>);
 });

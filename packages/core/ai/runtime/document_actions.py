@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import os
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
@@ -15,6 +17,7 @@ RUNTIME_DOCUMENT_TOOL_CACHE_TTL_SECONDS = int(os.getenv("DOCUMENT_TOOL_CACHE_TTL
 RUNTIME_DOCUMENT_LIST_DEFAULT_LIMIT = 20
 RUNTIME_DOCUMENT_LIST_MAX_LIMIT = 50
 RUNTIME_DOCUMENT_CACHE_NAMESPACE = "documents"
+RUNTIME_DOCUMENT_SCOPE_ALL_KNOWLEDGE = "all_knowledge"
 
 
 def runtime_document_viewer_url(document_id: Any) -> str | None:
@@ -207,6 +210,137 @@ def _runtime_document_query_filters(
     }
 
 
+@dataclass(frozen=True)
+class _RuntimeDocumentScope:
+    """Where one listing or search looks, given what the caller named."""
+
+    workspace_id: str | None = None
+    # The run reads beyond its Workspace: a person asked, or a folder was named.
+    execution_workspace_id: str | None = None
+    # The run's Workspace applied only because nothing else was named.
+    default_workspace_id: str | None = None
+    all_knowledge_refused: bool = False
+    person_in_chat: bool = False
+
+    def apply(self, filters: dict[str, Any]) -> dict[str, Any]:
+        if self.execution_workspace_id:
+            return {**filters, "execution_workspace_id": self.execution_workspace_id}
+        return filters
+
+    def cache_fields(self) -> dict[str, Any]:
+        return {
+            "person_in_chat": self.person_in_chat,
+            "all_knowledge_refused": self.all_knowledge_refused,
+        }
+
+
+def _runtime_document_scope(
+    raw_params: dict[str, Any],
+    *,
+    workspace_id: str | None,
+    person_in_chat: bool,
+    folder_id: str | None = None,
+) -> _RuntimeDocumentScope:
+    named_workspace = str(raw_params.get("workspace_id") or "").strip()
+    run_workspace = str(workspace_id or "").strip()
+    if not run_workspace or (named_workspace and named_workspace != run_workspace):
+        return _RuntimeDocumentScope(workspace_id=named_workspace or None)
+    if _runtime_document_string_list(raw_params.get("workspace_ids")):
+        return _RuntimeDocumentScope(workspace_id=run_workspace)
+    # The top level is not a named location: it is where the unrelated files are.
+    folders = {*_runtime_document_string_list(raw_params.get("folder_ids"))}
+    if folder_id is not None:
+        folders.add(folder_id)
+    names_folder = bool(folders) and not folders & {"", "root"}
+    asks_all = str(raw_params.get("scope") or "").strip() == RUNTIME_DOCUMENT_SCOPE_ALL_KNOWLEDGE
+    if names_folder or (asks_all and person_in_chat):
+        return _RuntimeDocumentScope(execution_workspace_id=run_workspace)
+    return _RuntimeDocumentScope(
+        workspace_id=run_workspace,
+        default_workspace_id=run_workspace,
+        all_knowledge_refused=asks_all,
+        person_in_chat=person_in_chat,
+    )
+
+
+def runtime_glob_names_location(pattern: str) -> bool:
+    """A pattern starting with a literal name points somewhere; ``**/*.csv`` searches."""
+
+    first = str(pattern or "").replace("\\", "/").split("/", 1)[0]
+    return first not in {"", "."} and not glob.has_magic(first)
+
+
+def runtime_workspace_search_scope_note(excluded: int = 0, *, person_in_chat: bool = False) -> str:
+    """Tell an agent a search stopped at its Workspace, so "nothing found" is not read as "does not exist"."""
+
+    note = (
+        f"Search covered this Workspace only; {excluded} file(s) outside it were left out."
+        if excluded
+        else "Search covered this Workspace only."
+    )
+    if person_in_chat:
+        note += (
+            " If the person asks to look outside this Workspace, use search_documents "
+            f"with scope='{RUNTIME_DOCUMENT_SCOPE_ALL_KNOWLEDGE}', or name the exact path."
+        )
+    return note
+
+
+async def _runtime_documents_left_out(
+    session: Any,
+    *,
+    entity_id: str,
+    user_id: str | None,
+    scope: _RuntimeDocumentScope,
+    filters: dict[str, Any],
+    query: str,
+    in_scope_total: int,
+    folder_id: str | None = None,
+) -> int:
+    """Readable documents matching this request that the default scope leaves out."""
+
+    if not scope.default_workspace_id or not user_id:
+        return 0
+    from packages.core.services.document_access import list_visible_documents
+
+    folder_filter = {"folder_id": folder_id} if folder_id is not None else {}
+    _page, total = await list_visible_documents(
+        session,
+        entity_id,
+        user_id=user_id,
+        **{
+            **filters,
+            **folder_filter,
+            "workspace_id": None,
+            "execution_workspace_id": scope.default_workspace_id,
+        },
+        actor_type="agent",
+        name_search=query or None,
+        limit=0,
+    )
+    return max(total - in_scope_total, 0)
+
+
+def _runtime_document_scope_note(
+    scope: _RuntimeDocumentScope,
+    *,
+    left_out: int,
+    found_any: bool,
+    offset: int,
+) -> dict[str, str]:
+    if not scope.default_workspace_id or offset:
+        return {}
+    if not (left_out or not found_any or scope.all_knowledge_refused):
+        return {}
+    note = runtime_workspace_search_scope_note(left_out, person_in_chat=scope.person_in_chat)
+    if scope.all_knowledge_refused:
+        note += (
+            f" scope='{RUNTIME_DOCUMENT_SCOPE_ALL_KNOWLEDGE}' applies only when a person "
+            "asks for it in chat."
+        )
+    return {"scope_note": note}
+
+
 async def runtime_search_documents_action(
     *,
     entity_id: str,
@@ -215,17 +349,18 @@ async def runtime_search_documents_action(
     params: dict[str, Any] | None = None,
     db: Any = None,
     user_wording: str | None = None,
+    person_in_chat: bool = False,
 ) -> str:
     from packages.core.database import async_session
     from packages.core.services.document_access import list_visible_documents
 
     raw_params = dict(params or {})
-    workspace_scope = str(raw_params.get("workspace_id") or workspace_id or "").strip() or None
     try:
-        filters = _runtime_document_query_filters(
+        scope = _runtime_document_scope(raw_params, workspace_id=workspace_id, person_in_chat=person_in_chat)
+        filters = scope.apply(_runtime_document_query_filters(
             raw_params,
-            workspace_id=workspace_scope,
-        )
+            workspace_id=scope.workspace_id,
+        ))
     except ValueError as exc:
         return json.dumps({
             "error": "invalid_document_filters",
@@ -247,12 +382,13 @@ async def runtime_search_documents_action(
         "user_id": user_id,
         "user_wording": user_wording or None,
         **filters,
+        **scope.cache_fields(),
     }
     cached = await _runtime_get_cached_document_action("search_documents", entity_id, cache_params)
     if cached is not None:
         return cached
 
-    async def search(session: Any) -> tuple[list[Any], int, dict[str, Any] | None]:
+    async def search(session: Any) -> tuple[list[Any], int, dict[str, Any] | None, int]:
         docs, total = await list_visible_documents(
             session,
             entity_id,
@@ -262,6 +398,15 @@ async def runtime_search_documents_action(
             name_search=query or None,
             limit=limit,
             offset=offset,
+        )
+        left_out = 0 if offset else await _runtime_documents_left_out(
+            session,
+            entity_id=entity_id,
+            user_id=user_id,
+            scope=scope,
+            filters=filters,
+            query=query,
+            in_scope_total=total,
         )
         content = None
         if query and offset == 0:
@@ -273,13 +418,13 @@ async def runtime_search_documents_action(
                 session, entity_id=entity_id, user_id=user_id, query=query,
                 limit=limit, filters=filters, user_wording=user_wording,
             )
-        return docs, total, content
+        return docs, total, content, left_out
 
     if db is not None:
-        docs, total, content = await search(db)
+        docs, total, content, left_out = await search(db)
     else:
         async with async_session() as session:
-            docs, total, content = await search(session)
+            docs, total, content, left_out = await search(session)
 
     payload: dict[str, Any] = {
         "total": total,
@@ -297,6 +442,12 @@ async def runtime_search_documents_action(
             for match in content["matches"]
         ]
         payload["content_search"] = {"scanned": content["scanned"], "partial": content["partial"]}
+    payload.update(_runtime_document_scope_note(
+        scope,
+        left_out=left_out,
+        found_any=bool(docs or (content or {}).get("matches")),
+        offset=offset,
+    ))
     result = json.dumps(payload)
     await _runtime_set_cached_document_action("search_documents", entity_id, cache_params, result)
     return result
@@ -309,24 +460,30 @@ async def runtime_list_documents_action(
     workspace_id: str | None = None,
     params: dict[str, Any] | None = None,
     db: Any = None,
+    person_in_chat: bool = False,
 ) -> str:
     from packages.core.database import async_session
     from packages.core.services.document_access import list_visible_documents
 
     raw_params = dict(params or {})
-    workspace_scope = str(raw_params.get("workspace_id") or workspace_id or "").strip() or None
+    folder_id = _runtime_document_folder_id(raw_params)
     try:
-        filters = _runtime_document_query_filters(
+        scope = _runtime_document_scope(
             raw_params,
-            workspace_id=workspace_scope,
+            workspace_id=workspace_id,
+            person_in_chat=person_in_chat,
+            folder_id=folder_id,
         )
+        filters = scope.apply(_runtime_document_query_filters(
+            raw_params,
+            workspace_id=scope.workspace_id,
+        ))
     except ValueError as exc:
         return json.dumps({
             "error": "invalid_document_filters",
             "message": str(exc),
         })
     query = _runtime_document_search_text(raw_params)
-    folder_id = _runtime_document_folder_id(raw_params)
     limit = _runtime_bounded_document_limit(
         raw_params.get("limit"),
         default=RUNTIME_DOCUMENT_LIST_DEFAULT_LIMIT,
@@ -342,14 +499,15 @@ async def runtime_list_documents_action(
         "detail": detail,
         "user_id": user_id,
         **filters,
+        **scope.cache_fields(),
     }
     cached = await _runtime_get_cached_document_action("list_documents", entity_id, cache_params)
     if cached is not None:
         return cached
 
-    if db is not None:
+    async def list_page(session: Any) -> tuple[list[Any], int, int]:
         docs, total = await list_visible_documents(
-            db,
+            session,
             entity_id,
             user_id=user_id,
             **filters,
@@ -359,19 +517,23 @@ async def runtime_list_documents_action(
             limit=limit,
             offset=offset,
         )
+        left_out = 0 if offset else await _runtime_documents_left_out(
+            session,
+            entity_id=entity_id,
+            user_id=user_id,
+            scope=scope,
+            filters=filters,
+            query=query,
+            in_scope_total=total,
+            folder_id=folder_id,
+        )
+        return docs, total, left_out
+
+    if db is not None:
+        docs, total, left_out = await list_page(db)
     else:
         async with async_session() as session:
-            docs, total = await list_visible_documents(
-                session,
-                entity_id,
-                user_id=user_id,
-                **filters,
-                actor_type="agent",
-                name_search=query or None,
-                folder_id=folder_id,
-                limit=limit,
-                offset=offset,
-            )
+            docs, total, left_out = await list_page(session)
 
     result = json.dumps({
         "total": total,
@@ -381,6 +543,12 @@ async def runtime_list_documents_action(
         "next_offset": offset + len(docs) if offset + len(docs) < total else None,
         "has_more": offset + len(docs) < total,
         "documents": [runtime_document_to_dict(doc, detail=detail) for doc in docs],
+        **_runtime_document_scope_note(
+            scope,
+            left_out=left_out,
+            found_any=bool(docs),
+            offset=offset,
+        ),
     })
     await _runtime_set_cached_document_action("list_documents", entity_id, cache_params, result)
     return result

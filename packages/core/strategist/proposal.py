@@ -318,10 +318,37 @@ class ProposedHumanRequest(BaseModel):
     context: Optional[str] = Field(default=None, max_length=2000)
     """Short context the human needs to answer well."""
 
+    options: list[str] = Field(default_factory=list)
+    """Up to 3 short answers to pick from (the person may still type one)."""
+
+    recommended: Optional[str] = Field(default=None, max_length=200)
+    """The Strategist's recommended answer; leads the options."""
+
+    recommendation_reason: Optional[str] = Field(default=None, max_length=280)
+    """One sentence on why that answer is recommended."""
+
     @field_validator("request_key", mode="before")
     @classmethod
     def _normalize_request_key(cls, v):
         return _normalize_task_key(v)
+
+    @model_validator(mode="after")
+    def _recommended_leads(self):
+        """Keep at most 3 options with the recommended answer first.
+
+        Lenient by design: a recommended answer missing from the options
+        becomes the first option rather than failing the whole proposal.
+        """
+        options = [" ".join(str(item).split())[:200] for item in self.options if str(item).strip()]
+        options = list(dict.fromkeys(options))
+        recommended = " ".join(str(self.recommended or "").split())
+        if recommended:
+            options = [recommended, *[item for item in options if item != recommended]]
+            self.recommended = recommended
+        else:
+            self.recommended = None
+        self.options = options[:3]
+        return self
 
 
 class ExperimentMetricSpec(BaseModel):

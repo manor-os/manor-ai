@@ -55,6 +55,9 @@ class TransientStepFailure(StrEnum):
     DATABASE_UNAVAILABLE = "database_unavailable"
     CONNECTION_UNAVAILABLE = "connection_unavailable"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
+    # An Agent step's tool hit a platform fault it never got past, so the
+    # step's declared output was not produced.
+    TOOL_UNAVAILABLE = "tool_unavailable"
 
 
 _REASON_MESSAGES = {
@@ -62,6 +65,7 @@ _REASON_MESSAGES = {
     TransientStepFailure.DATABASE_UNAVAILABLE: "the database was temporarily unavailable",
     TransientStepFailure.CONNECTION_UNAVAILABLE: "a platform service refused the connection",
     TransientStepFailure.PROVIDER_UNAVAILABLE: "the model provider stopped responding",
+    TransientStepFailure.TOOL_UNAVAILABLE: "a tool the step needed was temporarily unavailable",
 }
 # Runtime loop error codes that name an outage, not a request problem.
 _PROVIDER_OUTAGE_ERROR_CODES = frozenset({"llm_provider_unavailable"})

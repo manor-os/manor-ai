@@ -87,6 +87,18 @@ async def test_exhausted_validation_raises_instead_of_manufacturing_empty_propos
 
 
 @pytest.mark.asyncio
+async def test_a_failed_model_call_reports_why_instead_of_no_content(context, monkeypatch):
+    """Staging 2026-11-04: a provider error surfaced as "returned no proposal content"."""
+    completion = AsyncMock(return_value=SimpleNamespace(content="", usage={"error": "402 no credits"}))
+    monkeypatch.setattr(prompt, "runtime_execute_strategist_completion", completion)
+    with pytest.raises(prompt.StrategistProposalGenerationError) as caught:
+        await prompt.generate_proposal(context, review_id="review")
+    assert caught.value.code == "proposal_llm_unavailable"
+    assert "402 no credits" in caught.value.details["cause"]
+    assert completion.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_unavailable_provider_fails_once_with_redacted_diagnostics(context, monkeypatch, caplog):
     secret = "sk-provider-secret-123456789"
     completion = AsyncMock(side_effect=RuntimeError(f"No model available; api_key={secret}"))

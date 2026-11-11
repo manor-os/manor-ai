@@ -1,14 +1,3 @@
-const SKILL_COLORS = [
-  { bg: "#efedea", fg: "#57534e" },
-  { bg: "#e3e9f1", fg: "#3f57a0" },
-  { bg: "#f3e5ed", fg: "#a04a72" },
-  { bg: "#ece9f5", fg: "#6443a0" },
-  { bg: "#f3ecd6", fg: "#936027" },
-  { bg: "#dceae3", fg: "#3f7361" },
-  { bg: "#e8eff4", fg: "#426c87" },
-  { bg: "#f1dddb", fg: "#a23e38" },
-];
-
 const SKILL_CATEGORY_ICONS: Record<string, string> = {
   analysis: "M21 21l-4.35-4.35M11 18a7 7 0 110-14 7 7 0 010 14z",
   research: "M21 21l-4.35-4.35M11 18a7 7 0 110-14 7 7 0 010 14z",
@@ -29,16 +18,10 @@ const SKILL_CATEGORY_ICONS: Record<string, string> = {
 const SKILL_DEFAULT_ICON =
   "M9 18h6M10 21h4M12 3a6 6 0 00-3.6 10.8c.5.37.85.9.95 1.5l.15.7h5l.15-.7c.1-.6.45-1.13.95-1.5A6 6 0 0012 3z";
 
-function hashString(name: string): number {
-  let hash = 0;
-  for (let i = 0; i < name.length; i += 1) {
-    hash = name.charCodeAt(i) + ((hash << 5) - hash);
-  }
-  return Math.abs(hash);
-}
 
-function skillColor(seed: string) {
-  return SKILL_COLORS[hashString(seed || "skill") % SKILL_COLORS.length];
+// Skills are told apart by shape, not colour.
+function skillColor(_seed: string) {
+  return { bg: "var(--surface-muted)", fg: "var(--text-default)" };
 }
 
 function skillIconPath(skill: any): string {

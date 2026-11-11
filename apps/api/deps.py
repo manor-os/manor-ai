@@ -34,6 +34,8 @@ from packages.core.services.auth_service import (
 )
 from packages.core.services.actor_authorization import (
     AuthenticatedUserCredential,
+    remember_admitted_actor,
+    resolve_authenticating_user_actor,
     resolve_current_user_actor,
 )
 from packages.core.services.collaborator_steering import collaborator_request_acting
@@ -136,6 +138,8 @@ async def authenticate_token_claims(request: Request, claims: dict, db: AsyncSes
     that decode their own audience-bound token first.
     """
     request.state.auth_claims = claims
+    # The OAuth client (or ``pat:<id>`` access token) acting for the user; None for first-party sessions.
+    request.state.auth_client = claims.get("azp") or None
     from packages.core.services.auth_context import set_current_mfa_verified
     set_current_mfa_verified("mfa" in {
         str(method).strip().lower() for method in claims.get("amr", [])
@@ -147,7 +151,26 @@ async def authenticate_token_claims(request: Request, claims: dict, db: AsyncSes
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid token payload")
 
 
-    user = await get_user_by_id(db, user_id)
+    # The account and its admission to the token's entity come from one read;
+    # a token without an entity, or one the credential checks refuse before
+    # reading, takes the two-read path.
+    user = actor = None
+    if claims.get("entity_id"):
+        credential = authenticated_user_credential_from_claims(
+            user_id=str(user_id),
+            entity_id=str(claims["entity_id"]),
+            claims=claims,
+        )
+        user, actor = await resolve_authenticating_user_actor(
+            db,
+            credential,
+            enforce_entity_suspension=False,
+        )
+        if user is not None and user.deleted_at is not None:
+            user = None
+    resolved_together = user is not None
+    if not resolved_together:
+        user = await get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User not found")
 
@@ -158,16 +181,17 @@ async def authenticate_token_claims(request: Request, claims: dict, db: AsyncSes
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Account disabled")
 
     token_entity_id = claims.get("entity_id") or user.entity_id
-    credential = authenticated_user_credential_from_claims(
-        user_id=str(user.id),
-        entity_id=str(token_entity_id),
-        claims=claims,
-    )
-    actor = await resolve_current_user_actor(
-        db,
-        credential,
-        enforce_entity_suspension=False,
-    )
+    if not resolved_together:
+        credential = authenticated_user_credential_from_claims(
+            user_id=str(user.id),
+            entity_id=str(token_entity_id),
+            claims=claims,
+        )
+        actor = await resolve_current_user_actor(
+            db,
+            credential,
+            enforce_entity_suspension=False,
+        )
     if actor is None:
         if await collaboration_ended(db, user_id=str(user.id), entity_id=str(token_entity_id)):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, COLLABORATION_ENDED)
@@ -199,24 +223,19 @@ async def authenticate_token_claims(request: Request, claims: dict, db: AsyncSes
         # integrations it binds carry the collaborator's provenance.
         collaborator_request_acting(db, actor.entity_id, actor.user_id)
 
-    # Check entity-level suspension (set by platform admin)
+    # Check entity-level suspension (set by platform admin), read with the actor.
     from packages.core.constants.plans import is_cloud
-    if is_cloud() and user.entity_id:
-        from packages.core.models.user import Entity
-        entity = (await db.execute(
-            select(Entity).where(Entity.id == user.entity_id)
-        )).scalar_one_or_none()
-        if entity and (entity.settings or {}).get("platform_suspended_at"):
-            reason = (entity.settings or {}).get("platform_suspended_reason", "")
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                f"Your organization has been suspended. {reason}".strip(),
-            )
+    if is_cloud() and actor.entity_suspended_reason is not None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"Your organization has been suspended. {actor.entity_suspended_reason}".strip(),
+        )
 
     # Authentication is a read snapshot, not a transaction for the subsequent
     # upload, external lookup or Agent run. Support-session bookkeeping and
     # other writes deliberately remain on their original commit/rollback path.
     await release_read_transaction(db)
+    remember_admitted_actor(db, credential, actor)
     return user
 
 

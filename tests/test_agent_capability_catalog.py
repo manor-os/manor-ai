@@ -22,6 +22,10 @@ from packages.core.services.agent_capability_catalog import (
 )
 
 
+def _request_text(messages: list[dict[str, str]]) -> str:
+    return "\n".join(message["content"] for message in messages)
+
+
 def _catalog() -> AgentCapabilityCatalog:
     return AgentCapabilityCatalog(candidates=(
         AgentCapabilityCandidate(
@@ -328,8 +332,8 @@ async def test_agent_ai_uses_a_separate_semantic_capability_match(monkeypatch) -
     assert plan.selected_catalog_ids == ("capability:web.safe_search",)
     assert len(calls) == 2
     assert "semantic classification task, not keyword matching" in calls[0][0]["content"]
-    assert "mcp:gmail:send_message" in calls[0][1]["content"]
-    assert "mcp:gmail:send_message" not in calls[1][1]["content"]
+    assert "mcp:gmail:send_message" in calls[0][0]["content"]
+    assert "mcp:gmail:send_message" not in _request_text(calls[1])
     assert "same role as alternatives" in calls[1][0]["content"]
 
 
@@ -376,11 +380,12 @@ async def test_agent_ai_semantic_match_supports_one_hundred_forty_exact_ids(
         verbose=True,
     )
     payload_chars = len(agent_generator._compact_json(catalog.prompt_payload()))
+    scan_chunks = agent_generator._chunk_capability_payload(catalog.scan_payload())
     calls: list[list[dict[str, str]]] = []
 
     async def fake_completion(messages, **_kwargs):
         calls.append(messages)
-        user_content = messages[1]["content"]
+        user_content = _request_text(messages)
         if "Semantic scan chunk" in user_content:
             returned = [
                 catalog_id for catalog_id in selected
@@ -408,18 +413,154 @@ async def test_agent_ai_semantic_match_supports_one_hundred_forty_exact_ids(
     )
 
     assert 48_000 < payload_chars < 96_000
-    assert len(calls) == 3  # two scans plus one final least-privilege review
+    assert len(calls) == len(scan_chunks) + 1  # the scans plus one final least-privilege review
     assert len(plan.selected_catalog_ids) == 140
     assert len(plan.tool_names) == 120
     assert len(plan.skill_ids) == 10
     assert len(plan.mcp_server_keys) == 10
 
 
-@pytest.mark.asyncio
-async def test_agent_ai_semantic_match_rejects_an_invented_id(monkeypatch) -> None:
+def test_recall_scan_keeps_every_candidate_and_only_the_review_reads_them_in_full() -> None:
     from packages.core.services import agent_generator
 
-    async def fake_completion(_messages, **_kwargs):
+    server_level = AgentCapabilityCandidate(
+        catalog_id="mcp:browser",
+        kind=AgentCapabilityKind.MCP_ACTION,
+        ref="browser",
+        name="Browser",
+        description="Operate the browser. " * 30,
+        readiness=AgentCapabilityPlanStatus.SETUP_REQUIRED,
+        actions=tuple(
+            {"name": f"action_{index}", "description": "Does one thing. " * 10, "effect": "write"}
+            for index in range(60)
+        ),
+        metadata={"all_actions": True, "setup_required_reason": "Pair the browser."},
+    )
+    catalog = AgentCapabilityCatalog(candidates=(*_catalog().candidates, server_level))
+    every_id = {candidate.catalog_id for candidate in catalog.candidates}
+
+    scan = catalog.scan_payload()
+    assert agent_generator._capability_ids(scan) == every_id
+    # A row of actions offers their exact ids, never a bare server the review could not resolve.
+    gmail = next(row for row in scan if row.get("server") == "gmail")
+    assert gmail["action_ids"] == ["mcp:gmail:list_messages", "mcp:gmail:send_message"]
+    assert "mcp:gmail" not in agent_generator._capability_ids(scan)
+    scanned = next(row for row in scan if row.get("id") == "mcp:browser")
+    assert "actions" not in scanned and len(scanned["description"]) <= 120
+
+    review = next(row for row in catalog.review_payload(["mcp:browser"]))
+    assert len(review["description"]) == 220 and "setup_required_reason" not in review
+    assert review["readiness"] == "setup_required"
+    assert review["actions"][0] == "action_0" and review["actions_total"] == 60
+    # The prompt payload is what plans are fingerprinted against, and it stays whole.
+    assert len(server_level.prompt_dict()["actions"]) == 60
+
+
+def test_review_of_a_recalled_bundle_can_keep_only_the_tools_the_agent_needs() -> None:
+    # A bundle grants all of its tools, so the review must be offered each of
+    # them on its own or it can only grant the whole bundle or nothing.
+    catalog = _catalog()
+    review_ids = {row["id"] for row in catalog.review_payload(["capability:web.safe_search"])}
+    assert review_ids == {"capability:web.safe_search", "tool:web_search"}
+    narrowed = catalog.resolve(["tool:web_search"])
+    assert narrowed.tool_names == ("web_search",) and narrowed.business_capability_ids == ()
+
+
+def test_a_skill_grouped_by_job_grants_only_the_group_an_agent_needs() -> None:
+    """Staging 2026-11-09: every candle shop content Agent got delete_post, hide_comment and
+    send_messenger through the one Facebook Skill it needed for publishing."""
+    import json
+    from pathlib import Path
+
+    from packages.core.services.agent_capability_catalog import skill_tool_groups
+
+    config = json.loads(Path("packages/core/ai/skills/mcp_facebook/config.json").read_text())
+    skill = SimpleNamespace(tools=config["tools"], config={"groups": config["groups"]})
+    groups = skill_tool_groups(skill)
+    assert set(groups) == {"publish", "engage", "insights", "manage"}
+    # Every action the Skill declares is in some group, and publishing keeps its whole Instagram chain.
+    assert {name for group in groups.values() for name in group["tools"]} == set(config["tools"])
+    publish = set(groups["publish"]["tools"])
+    assert {"mcp__facebook__create_instagram_media", "mcp__facebook__get_instagram_container_status",
+            "mcp__facebook__publish_instagram_media"} <= publish
+    assert not publish & {"mcp__facebook__delete_post", "mcp__facebook__hide_comment", "mcp__facebook__send_messenger"}
+
+    def action(name: str) -> AgentCapabilityCandidate:
+        return AgentCapabilityCandidate(
+            catalog_id=f"mcp:facebook:{name}", kind=AgentCapabilityKind.MCP_ACTION, ref="facebook", name=name,
+            actions=({"name": name, "tool_name": f"mcp__facebook__{name}"},),
+            metadata={"server_key": "facebook", "action": name})
+
+    whole = AgentCapabilityCandidate(
+        catalog_id="skill:01FB", kind=AgentCapabilityKind.SKILL, ref="01FB", name="mcp_facebook",
+        metadata={"declared_tools": tuple(config["tools"]), "grouped": True})
+    group = AgentCapabilityCandidate(
+        catalog_id="skill:01FB#publish", kind=AgentCapabilityKind.SKILL, ref="01FB", name="mcp_facebook · Publish",
+        metadata={"declared_tools": groups["publish"]["tools"], "group": "publish"})
+    catalog = AgentCapabilityCatalog(candidates=(
+        *_catalog().candidates, whole, group,
+        *(action(name.removeprefix("mcp__facebook__")) for name in config["tools"])))
+    # The matcher chooses among groups; the whole Skill still resolves for an exact binding.
+    selectable = {candidate.catalog_id for candidate in catalog.selectable_candidates()}
+    assert "skill:01FB#publish" in selectable and "skill:01FB" not in selectable
+    plan = catalog.resolve(["skill:01FB#publish"])
+    assert plan.skill_ids == ("01FB",)
+    assert set(plan.mcp_allowed_tools["facebook"]) == {name.removeprefix("mcp__facebook__") for name in publish}
+    assert "delete_post" in catalog.resolve(["skill:01FB"]).mcp_allowed_tools["facebook"]
+
+
+def test_a_workspace_service_agent_gets_no_workspace_building_it_did_not_ask_for() -> None:
+    # Staging 2026-11-09: every candle shop Agent was matched scheduling, one
+    # the whole Flow-authoring set, though no service listed either.
+    from packages.core.ai.tools.workspace_arch_tools import _workspace_service_plan
+
+    def tool(name: str) -> AgentCapabilityCandidate:
+        return AgentCapabilityCandidate(catalog_id=f"tool:{name}", kind=AgentCapabilityKind.TOOL, ref=name, name=name)
+
+    catalog = AgentCapabilityCatalog(candidates=(
+        *_catalog().candidates,
+        *(tool(name) for name in ("create_scheduled_job", "create_workflow", "start_workspace_flow", "get_workflow_run")),
+        AgentCapabilityCandidate(
+            catalog_id="capability:workflow.manage", kind=AgentCapabilityKind.BUSINESS_CAPABILITY,
+            ref="workflow.manage", name="Workflow management",
+            metadata={"tool_names": ("create_workflow", "get_workflow_run")},
+        ),
+    ))
+    matched = catalog.resolve([
+        "tool:web_search", "tool:create_scheduled_job", "tool:create_workflow", "capability:workflow.manage",
+        "tool:start_workspace_flow", "tool:get_workflow_run",
+    ])
+
+    plan = _workspace_service_plan(catalog, matched, {"required_capabilities": ["workspace.search"]})
+    # Following a Flow it starts is workflow.run, which every service keeps.
+    assert plan.selected_catalog_ids == ("tool:web_search", "tool:start_workspace_flow", "tool:get_workflow_run")
+
+    # A Skill brings the tools it declares (workspace-workflows declares the authoring set).
+    guide = AgentCapabilityCandidate(
+        catalog_id="skill:01WORKFLOWS", kind=AgentCapabilityKind.SKILL, ref="01WORKFLOWS", name="workspace-workflows",
+        metadata={"declared_tools": ("start_workspace_flow", "create_workflow")})
+    with_guide = AgentCapabilityCatalog(candidates=(*catalog.candidates, guide))
+    assert "skill:01WORKFLOWS" not in _workspace_service_plan(
+        with_guide, with_guide.resolve(["tool:web_search", "skill:01WORKFLOWS"]),
+        {"required_capabilities": ["workspace.search"]}).selected_catalog_ids
+
+    builder = _workspace_service_plan(catalog, matched, {"required_capabilities": ["workflow.manage"]})
+    assert "capability:workflow.manage" in builder.selected_catalog_ids
+    assert "tool:create_workflow" in builder.selected_catalog_ids
+    assert "tool:create_scheduled_job" not in builder.selected_catalog_ids
+
+
+@pytest.mark.asyncio
+async def test_agent_ai_scan_drops_an_invented_id_and_the_review_rejects_one(monkeypatch) -> None:
+    from packages.core.services import agent_generator
+
+    calls: list[str] = []
+
+    async def fake_completion(messages, **_kwargs):
+        calls.append(_request_text(messages))
+        if "Semantic scan chunk" in calls[-1]:
+            # The scan's invented id neither fails the match nor costs a retry.
+            return SimpleNamespace(content='{"capability_ids":["tool:web_magic","tool:web_search"]}')
         return SimpleNamespace(content='{"capability_ids":["tool:web_magic"]}')
 
     monkeypatch.setattr(
@@ -435,6 +576,9 @@ async def test_agent_ai_semantic_match_rejects_an_invented_id(monkeypatch) -> No
             entity_id="01ENTITY",
             capability_catalog=_catalog(),
         )
+
+    assert len(calls) == 3  # one scan, the review and its one repair attempt
+    assert '"tool:web_search"' in calls[1] and "tool:web_magic" not in calls[1]
 
 
 @pytest.mark.asyncio
@@ -487,7 +631,7 @@ async def test_agent_ai_scans_every_catalog_chunk_before_final_review(monkeypatc
 
     async def fake_completion(messages, **_kwargs):
         calls.append(messages)
-        user_content = messages[1]["content"]
+        user_content = _request_text(messages)
         supplied = {
             candidate.catalog_id
             for candidate in catalog.candidates
@@ -523,6 +667,62 @@ async def test_agent_ai_scans_every_catalog_chunk_before_final_review(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_agent_ai_scan_requests_share_a_cacheable_catalog_prefix(monkeypatch) -> None:
+    """Prompt caching reuses a request's leading tokens. Every Agent the actor
+    matches scans the same catalog chunks, so each chunk must come before the
+    request-specific text: scans for two different Agents start identically
+    and carry the same cache key."""
+    import json
+
+    from packages.core.ai import llm_client
+    from packages.core.services import agent_generator
+
+    scans: list[list[dict[str, str]]] = []
+    cache_keys: list[str | None] = []
+
+    async def fake_completion(messages, **_kwargs):
+        if "Semantic scan chunk" in _request_text(messages):
+            scans.append(messages)
+            cache_keys.append(llm_client._prompt_cache_key_var.get())
+        return SimpleNamespace(content=json.dumps({"capability_ids": []}))
+
+    monkeypatch.setattr(agent_generator, "_CAPABILITY_SCAN_MAX_ITEMS", 2)
+    monkeypatch.setattr(
+        agent_generator,
+        "runtime_execute_text_completion",
+        fake_completion,
+    )
+    requests = (
+        ("Research public sources.", {"name": "Research Agent"}),
+        ("Read Gmail and summarize threads.", {"name": "Inbox Agent"}),
+    )
+    for prompt, spec in requests:
+        await agent_generator._match_agent_capabilities(
+            prompt=prompt,
+            spec=spec,
+            entity_id="01ENTITY",
+            capability_catalog=_catalog(),
+        )
+
+    first, second = scans[:3], scans[3:]
+    assert len(first) == len(second) == 3
+    for (prompt, spec), agent_scans in zip(requests, (first, second)):
+        for messages in agent_scans:
+            *prefix, request = messages
+            assert prompt in request["content"]
+            assert not any(
+                prompt in message["content"] or spec["name"] in message["content"]
+                for message in prefix
+            )
+    for first_scan, second_scan in zip(first, second):
+        assert first_scan[:-1] == second_scan[:-1]
+        assert "Semantic scan chunk" in first_scan[0]["content"]
+    # Routes that pick a cache machine by key see one key per chunk.
+    assert cache_keys[:3] == cache_keys[3:]
+    assert None not in cache_keys and len(set(cache_keys)) == 3
+
+
+@pytest.mark.asyncio
 async def test_agent_ai_hierarchically_reduces_large_recalled_catalog(monkeypatch) -> None:
     from packages.core.services import agent_generator
     from packages.core.services.agent_capability_catalog import (
@@ -545,7 +745,7 @@ async def test_agent_ai_hierarchically_reduces_large_recalled_catalog(monkeypatc
     call_sizes: list[int] = []
 
     async def fake_completion(messages, **_kwargs):
-        user_content = messages[1]["content"]
+        user_content = _request_text(messages)
         call_sizes.append(len(user_content))
         supplied = [
             candidate.catalog_id
@@ -690,7 +890,7 @@ async def test_agent_ai_factory_serializes_catalog_provider_calls(
         max_active = max(max_active, active)
         try:
             await asyncio.sleep(0.01)
-            content = messages[1]["content"]
+            content = _request_text(messages)
             selected = [
                 candidate.catalog_id
                 for candidate in catalog.candidates

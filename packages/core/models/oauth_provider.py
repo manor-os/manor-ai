@@ -31,15 +31,18 @@ class OAuthClientApp(Base, TimestampMixin):
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
 
-    # Public identifier shared with the client app
-    client_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    # Public identifier shared with the client app. A Client ID Metadata
+    # Document client's id is the https URL of that document.
+    client_id: Mapped[str] = mapped_column(String(512), nullable=False, unique=True)
 
     # Bcrypt hash of the client secret (never stored in plaintext). Null for a
     # public client (RFC 8252 native app), which must redeem codes with S256 PKCE.
     client_secret_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
-    # "configured" (env/admin seeded) or "dynamic" (RFC 7591 self-registration).
-    # Dynamic clients chose their own name, so consent shows them as unverified.
+    # "configured" (env/admin seeded), "dynamic" (RFC 7591 self-registration) or
+    # "metadata_document" (a Client ID Metadata Document fetched from client_id).
+    # Dynamic clients chose their own name, so consent shows them as unverified;
+    # a metadata-document client is identified by the host serving its document.
     registration_source: Mapped[str] = mapped_column(
         String(20), nullable=False, default="configured", server_default="configured",
     )
@@ -75,6 +78,11 @@ class OAuthClientApp(Base, TimestampMixin):
     # Token TTL in minutes (uses JWT_EXPIRE_MINUTES default if null)
     access_token_ttl_minutes: Mapped[Optional[int]] = mapped_column()
 
+    # When a metadata-document client's row was last fetched from its client_id
+    # URL, and until when that copy is fresh (the document's Cache-Control).
+    metadata_fetched_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    metadata_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
 
 class OAuthAuthorizationCode(Base, TimestampMixin):
     """Short-lived authorisation code issued by /authorize and redeemed at /token."""
@@ -90,7 +98,7 @@ class OAuthAuthorizationCode(Base, TimestampMixin):
     # The opaque code string (random, URL-safe). 10-minute lifetime.
     code: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
 
-    client_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    client_id: Mapped[str] = mapped_column(String(512), nullable=False)
     user_id: Mapped[str] = mapped_column(String(26), nullable=False)
     entity_id: Mapped[str] = mapped_column(String(26), nullable=False)
 
@@ -112,7 +120,7 @@ class OAuthAuthorizationCode(Base, TimestampMixin):
 
 
 class OAuthRefreshToken(Base, TimestampMixin):
-    """Rotating refresh token for a public OAuth client (OAuth 2.1 §4.3.1).
+    """Rotating refresh token for an OAuth client (OAuth 2.1 §4.3.1).
 
     Each redemption replaces the row with a new one in the same family. Presenting
     an already-rotated token revokes the whole family (theft detection). Tokens
@@ -129,11 +137,40 @@ class OAuthRefreshToken(Base, TimestampMixin):
     # SHA-256 hex of the opaque token; the plaintext is only ever returned once.
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     family_id: Mapped[str] = mapped_column(String(26), nullable=False)
-    client_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    client_id: Mapped[str] = mapped_column(String(512), nullable=False)
     user_id: Mapped[str] = mapped_column(String(26), nullable=False)
     entity_id: Mapped[str] = mapped_column(String(26), nullable=False)
     scope: Mapped[list] = mapped_column(JSONB, nullable=False, server_default='[]')
     token_version: Mapped[int] = mapped_column(nullable=False, default=0, server_default="0")
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     rotated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class PersonalAccessToken(Base, TimestampMixin):
+    """A long-lived bearer key a user creates for callers that cannot run OAuth.
+
+    Bound to one resource audience (only the MCP endpoint today) and one scope;
+    the REST API never accepts it. It dies with the user's ``token_version``
+    (sign out everywhere) like refresh tokens do, and can be revoked on its own.
+    """
+    __tablename__ = "personal_access_tokens"
+    __table_args__ = (
+        Index("ix_personal_access_tokens_hash", "token_hash", unique=True),
+        Index("ix_personal_access_tokens_user", "user_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
+    user_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    entity_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    audience: Mapped[str] = mapped_column(String(64), nullable=False)
+    scope: Mapped[str] = mapped_column(String(64), nullable=False)
+    # SHA-256 hex of the token; the plaintext is only ever returned at creation.
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    # The token's first characters after its fixed prefix, to recognise it in a list.
+    token_prefix: Mapped[str] = mapped_column(String(16), nullable=False)
+    token_version: Mapped[int] = mapped_column(nullable=False, default=0, server_default="0")
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))

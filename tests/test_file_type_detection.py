@@ -56,6 +56,15 @@ def test_detect_file_type_keeps_declared_text_when_first_line_has_a_comma(tmp_pa
     assert (detected.extension, detected.display_name, detected.mismatch) == ("md", path.name, False)
 
 
+def test_detect_file_type_keeps_declared_csv_with_markdown_links(tmp_path):
+    path = tmp_path / "content-analysis-evidence.csv"
+    path.write_text("creator,source,reference\n@natgeo,reel,[radar.json](/viewer/01ABC)\n", encoding="utf-8")
+
+    detected = detect_file_type(str(path), declared_name=path.name)
+
+    assert (detected.extension, detected.display_name, detected.mismatch) == ("csv", path.name, False)
+
+
 def test_detect_file_type_reads_large_json_through_a_shared_descriptor(tmp_path):
     """Knowledge sync sniffs through /dev/fd/N; on macOS every reopen shares one offset."""
     path = tmp_path / "dataset.json"

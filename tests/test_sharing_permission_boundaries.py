@@ -26,6 +26,7 @@ from packages.core.models import (
 from packages.core.models.base import generate_ulid
 from packages.core.services.resource_grant_policy import ResourceGrantPolicyError, ResourceGrantPolicyFactory
 from test_document_permissions import _auth, _invite_and_accept_member
+from tests.async_waits import wait_for_signal
 
 
 def _patch_filesystem_settings(monkeypatch, root, *, enabled: bool) -> None:
@@ -1624,8 +1625,8 @@ async def test_workspace_read_gate_rechecks_membership_before_response(
     proceed = asyncio.Event()
     original_blueprint_payloads = workspace_router._blueprint_payloads_for
 
-    async def blueprint_barrier(db, rows):
-        payloads = await original_blueprint_payloads(db, rows)
+    async def blueprint_barrier(db, rows, **kwargs):
+        payloads = await original_blueprint_payloads(db, rows, **kwargs)
         if any(str(row.id) == workspace_id for row in rows):
             ready.set()
             await proceed.wait()
@@ -1639,7 +1640,7 @@ async def test_workspace_read_gate_rechecks_membership_before_response(
     path = f"/api/v1/workspaces/{workspace_id}" if surface == "detail" else "/api/v1/workspaces"
     pending = asyncio.create_task(client.get(path, headers=member_headers))
     try:
-        await asyncio.wait_for(ready.wait(), timeout=60)
+        await wait_for_signal(ready, pending)
         async with db_module.async_session() as session:
             membership = await session.get(WorkspaceStaff, membership_id)
             membership.status = "inactive"
@@ -2051,7 +2052,7 @@ async def test_browse_final_folder_gate_reloads_current_policy(client, monkeypat
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("change", ["membership_revoked", "workspace_deleted"])
-async def test_browse_page_rechecks_workspace_access_after_folder_scan(client, monkeypatch, change):
+async def test_browse_page_rechecks_workspace_access_after_document_scan(client, monkeypatch, change):
     from apps.api.routers import documents as routes
     from packages.core.models.workspace import Workspace, WorkspaceStaff
 
@@ -2077,16 +2078,16 @@ async def test_browse_page_rechecks_workspace_access_after_folder_scan(client, m
         workspace_id, membership_id = workspace.id, membership.id
 
     ready, proceed = asyncio.Event(), asyncio.Event()
-    original_folders = routes._visible_document_folders_for_user
+    original_list = routes.list_documents
 
-    async def after_initial_folder_scan(*args, **kwargs):
-        result = await original_folders(*args, **kwargs)
-        if not ready.is_set() and folder_id in result[1]:
+    async def after_document_scan(*args, **kwargs):
+        result = await original_list(*args, **kwargs)
+        if not ready.is_set():
             ready.set()
             await proceed.wait()
         return result
 
-    monkeypatch.setattr(routes, "_visible_document_folders_for_user", after_initial_folder_scan)
+    monkeypatch.setattr(routes, "list_documents", after_document_scan)
     pending = asyncio.create_task(client.get(
         "/api/v1/documents/browse-page", params={"folder_id": folder_id}, headers=member_headers,
     ))

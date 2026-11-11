@@ -64,6 +64,82 @@ def _pending_hitl_id(pending_action: dict[str, Any]) -> str:
     ).strip()
 
 
+async def _runtime_workspace_resolve_workflow_retry(
+    *,
+    entity_id: str,
+    workspace_id: str,
+    conversation_id: str,
+    user_id: str,
+    message_id: str,
+    action: str,
+    note: str,
+) -> str | None:
+    """Relay "continue" / "stop" to a failed Workflow's Retry card.
+
+    The same path as pressing Retry on the card: the original run is retried
+    with its own inputs and brief, instead of the chat starting the work
+    again without them. ``None`` when the target is not such a card.
+    """
+    from sqlalchemy import select
+
+    from packages.core.constants.pending_actions import PendingActionKind
+    from packages.core.database import async_session
+    from packages.core.models.task import Conversation, Message
+    from packages.core.models.user import User
+    from packages.core.services.workflow_message_actions import (
+        WorkflowMessageActionError,
+        resolve_workflow_message_action,
+    )
+
+    async with async_session() as db:
+        message = (await db.execute(
+            select(Message).where(Message.id == message_id, Message.conversation_id == conversation_id)
+        )).scalar_one_or_none()
+        pending = message.pending_action if message is not None and isinstance(message.pending_action, dict) else {}
+        if pending.get("kind") != PendingActionKind.WORKFLOW_RETRY.value:
+            return None
+        if action not in {"approve", "reject"}:
+            return _dumps({"resolved": False, "reason": "unsupported_action", "options": ["approve", "reject"]})
+        # A retry spends credits, so only the person's latest message, sent after
+        # the card and itself a reply to it ("继续完成", "retry", "cancel"), decides
+        # it; the model's reading of some other message does not.
+        from packages.core.services.workspace_workflow_router import pending_action_reply_matches
+
+        latest = (await db.execute(
+            select(Message.content, Message.created_at).where(
+                Message.conversation_id == conversation_id,
+                Message.author_kind == "user",
+            ).order_by(Message.created_at.desc(), Message.id.desc()).limit(1)
+        )).one_or_none()
+        if latest is None or latest.created_at <= message.created_at:
+            return _dumps({"resolved": False, "reason": "retry_not_seen_by_user", "message_id": message.id})
+        if not pending_action_reply_matches(str(latest.content or ""), [pending]):
+            return _dumps({
+                "resolved": False, "reason": "latest_message_is_not_a_reply_to_this_card",
+                "message": "Ask the person whether to retry this run, or let them press Retry on the card.",
+                "message_id": message.id,
+            })
+        conversation = await db.get(Conversation, conversation_id)
+        user = await db.get(User, user_id)
+        if conversation is None or user is None or str(conversation.workspace_id or "") != workspace_id:
+            return _dumps({"resolved": False, "reason": "target_not_found"})
+        choice = "retry" if action == "approve" else "cancel"
+        try:
+            result = await resolve_workflow_message_action(
+                db, message=message, conversation=conversation, choice=choice,
+                note=note or None, payload=None, user=user,
+            )
+        except WorkflowMessageActionError as exc:
+            await db.rollback()
+            return _dumps({"resolved": False, "reason": "workflow_retry_refused", "message": str(exc.detail)})
+        if result is None:
+            return None
+        return _dumps({
+            "resolved": True, "message_id": message.id, "choice": choice,
+            "workflow_run_id": str(result.run.id),
+        })
+
+
 def _normalise_hitl_action(action: Any) -> str:
     raw = str(action or "").strip().lower()
     if raw in {"approve", "approved", "yes", "accept", "confirm", "confirmed", "ok"}:
@@ -131,6 +207,14 @@ async def runtime_workspace_resolve_hitl_action(
         resolve_workspace_operation_review,
     )
     from packages.core.workspace_chat import service as workspace_chat_service
+
+    if message_id:
+        retried = await _runtime_workspace_resolve_workflow_retry(
+            entity_id=entity_id, workspace_id=workspace_id, conversation_id=conversation_id,
+            user_id=user_id, message_id=message_id, action=action, note=note,
+        )
+        if retried is not None:
+            return retried
 
     async with async_session() as db:
         rows = list((await db.execute(
@@ -516,6 +600,9 @@ _WORKSPACE_OPERATION_ACTION_ALIASES = {
     "cancel": "discard_draft",
     "design": "design_app",
     "design_app_view": "design_app",
+    "audience": "app_audience",
+    "test": "test_app",
+    "test_app_view": "test_app",
 }
 
 
@@ -528,15 +615,22 @@ WORKSPACE_OPERATION_ACTIONS: tuple[str, ...] = (
     "apply_draft",
     "discard_draft",
     "design_app",
+    "app_audience",
+    "test_app",
 )
 
 
 _WORKSPACE_OPERATION_APP_VIEW_GUIDANCE = (
     "To design or redesign the App page (its layout, entries, card actions and data views), command the "
     "App designer with action=design_app and params brief:<what the person wants to do from the App>; "
-    "it returns a checked candidate as an app_view.update draft with its design notes. Accept it with "
-    "apply_draft (the review card), send it back with design_app plus feedback and that draft_id, or "
-    "discard_draft. Use app_view.update yourself only for a small named change (a title, a label, one target). "
+    "when the request names no person and no change, first call app_audience and ask with request_input "
+    "who the page is for (each option a person or role with what they act on first), then pass the answer "
+    "as audience. It returns a checked candidate as an app_view.update draft with its design notes and shows the "
+    "person its review card, which previews the page; they approve or reject it there. To revise, call design_app "
+    "with feedback and that draft_id. Use app_view.update yourself only for a small named change (a title, a label, one target). "
+    "action=test_app self-checks the saved page, or a draft's with draft_id: read-only, it reads every view as this "
+    "person, fails one whose cards would show an unfilled template, id or internal key, and says which failed, "
+    "why and how to fix it. It proves reads work, not that clicking works; say so. "
     "The Workspace App connects directly to Agents, active Workflow bindings, and Automations. "
     "It does not require a Service. When asked to add an App action, first call get_current. "
     "Use app_view.update with entries:{'action:<unique entry id>':{title:<name>}} and "
@@ -551,7 +645,7 @@ _WORKSPACE_OPERATION_APP_VIEW_GUIDANCE = (
     "create_draft with app_view.update and payload.app_view={eyebrow:<short label>, title:<page title>, "
     "description:<intro>, hero:<key>, order:[<keys>], hidden:[<keys>], "
     "labels:{<key>:<display name>}, descriptions:{<key>:<short description>}, "
-    "forms:{<action key>:[{key:<id>,label:<question>,type:'text'|'long_text'|'file'|'number'|'select',required:true|false,placeholder:<hint>,options:[<choices>]}]}, "
+    "forms:{<action key>:[{key:<id>,label:<question>,type:'text'|'long_text'|'file'|'number'|'select'|'picture_choice',required:true|false,placeholder:<hint>,options:[<choices>],option_labels:[<names>],option_images:[</blueprints/... picture per option>]}]}, "
     "entries:{'action:<id>':{title:<name>}}, prompts:{<action key>:<Agent command>}, "
     "presets:{<action key>:{<Flow input key>:<prefilled text>}} (one Flow offered as several entries, e.g. deck types), "
     "targets:{<action key>:'agent:<id>'|'agent:default'|'workflow:<binding_id>'|'automation:<job_id>'}, "
@@ -565,9 +659,41 @@ _WORKSPACE_OPERATION_APP_VIEW_GUIDANCE = (
     "Optional record_display is {title:{source:<owner or ancestor project source>,field:[<state path>]},fields:[{label:<caption>,source:<owner or ancestor project source>,field:[<state path>],labels?:{<stored value>:<display label>}}],media:[{source:<project_documents source>,label?:<caption>}]}. "
     "Media supports at most four unique document sources parented to the record owner or a declared ancestor; exact Document IDs are resolved from that project's state and checked against Knowledge access. Never infer association from filenames or platform. Media preview does not prove external application. "
     "For a selected-project context, use a summary block only with the component's project source: "
-    "{type:'summary',source:<context source>,fields:[{label:<caption>,field:[<declared state path>],format:'text'|'status'|'date'|'link'|'link_list'|'document',hide_when_empty:true|false,labels?:{<stored value>:<display label>}}]}. "
-    "Summary fields are read-only declared state, never a query or a runtime control; link and link_list render only safe public HTTP(S) URLs; document takes a stored Document ID and opens it in the viewer. "
+    "{type:'summary',source:<context source>,fields:[{label:<caption>,field:[<declared state path>],format:'text'|'status'|'date'|'link'|'link_list'|'document'|'record',hide_when_empty:true|false,labels?:{<stored value>:<display label>},project_type?:<record type, with format record>}]}. "
+    "Summary fields are read-only declared state, never a query or a runtime control; link and link_list render only safe public HTTP(S) URLs; document takes a stored Document ID and opens it in the viewer; record takes one Workspace record (project) id or a list of them and shows each by its name. "
     "A calendar display is read-only: its progress source must contain every stage, use the source's declared datetime order, and share its source with a count-by-stage rollup. It returns one batch summary per listed context and never changes dates, posts, or approval state. "
+    "A workspace-context data_view may carry one calendar of every dated project (no period to pick): its progress block reads workflow_projects, rollup_block is optional and context_block is absent. "
+    "A progress or summary block's item_action, and up to four more in item_actions, may carry prefill:{<Flow input>:<source field path>} to open the entry with the record's values, and confirm:<question> to ask first and run in place; a record still changes only through that Workflow. "
+    "A progress block over workflow_projects may set add_action:{action:<entry key>,label} to put the entry that adds one of its records in the list's header; it opens that entry as its tile does. "
+    "Field formats include number (optional unit:'g'), money (with currency:<ISO code>), boolean, rating (0-5), video, "
+    "percent (scale:1 for 0-1 or 100 for 0-100), duration (seconds), file_size (bytes), progress (max:<number> or max_field:<path>, default 100), "
+    "date_range (field is the start, end_field:<path> the end), date with relative:true ('3 hours ago'), phone, email, address, code, color (#rrggbb), "
+    "tags (a list of words), member (user or AI staff ids, shown by name and face), audio (a document id played in place), images (document ids as a strip), "
+    "clips (video or audio document ids, each played in place) and timeline (segments {start, end|duration, label, track} in seconds); "
+    "copy:true on a text, link, code, phone, email, address or tags field adds a copy button; a workspace-level progress block over workflow_projects may declare filters:[{field:<path>,label}|{by:'stage',label}] (up to 3) and search:{fields:[<paths>],label}. "
+    "Media fields take aspect:'auto'|'9:16'|'4:5'|'3:4'|'1:1'|'4:3'|'16:9' (image, images, video, clips; never cropped), layout:'carousel'|'grid' (images), transparent:true (image, images: a checkerboard), "
+    "compare_field:<path> with compare:'slider' (pictures)|'side_by_side' (image, video: the reference or the version before), captions_field:<path> (video: a .vtt/.srt document), "
+    "transcript_field:<path> (audio, video: a captions document or [{start,end,text,speaker}]) and chapters_field:<path> (audio, video: [{at,title}]); each path is declared by the source. "
+    "A gallery block may set media:{layout:'grid'|'masonry'|'carousel'|'strip'|'board'|'list', aspect, group:'record' (a record's files as versions: 9:16 · 1:1 · 16:9), "
+    "size_label, transparent, hover_play, details (size, model, prompt), download (each file and all one by one), comments (pinned to an area or a moment)}: each card then opens the media viewer; "
+    "its item_action is the viewer's button for one file (input gets the file; time_input the player's moment, start_input with end_input a marked span; no confirm). "
+    "A workflow_results source may set versions:true to keep each result's earlier finished versions. "
+    "A progress, records or gallery block may set preview:{platform:'instagram'|'instagram_reels'|'instagram_story'|'xiaohongshu'|'tiktok'|'douyin'|'youtube_shorts'|'x'|'linkedin'|'facebook'|'youtube'|'wechat_article'|'wechat_moments'|'pinterest', "
+    "fields:{platform,images,video,cover,title,caption,hashtags,account,avatar,link,published_at,summary,thread,comments: <paths the source declares>}, aspect, layout:'feed'|'side_by_side', group_field:<path>} "
+    "to show each record as the post it will be (a neutral frame per platform, the words counted against its limit, copyable hashtags; fields.platform picks each record's own frame; "
+    "side_by_side puts a post's platform versions in one row, a row per group_field value); it needs platform or fields.platform and one of images, video, cover, title, caption. "
+    "On a records block over publication-receipt/v1 records its fields read the receipt's parent project, and the card adds the real link, time and metrics_source counts. "
+    "A progress block may set view:'list' (cards, default)|'table' (a sortable column per field)|'board' (a column per stage); a calendar display may set span:'month' (default)|'week' "
+    "and lane_field:<path every calendar block's source reads, e.g. ['platform']> to lay the week out as a row per platform. "
+    "view may also be 'timeline' (timeline:{date_field}), 'gantt' (timeline:{date_field,end_field,depends_field}: read-only bars, depends_field holds project ids), "
+    "'places' (places:{address_field,name_field,lat_field,lng_field}: grouped by place with a maps link; no map tiles) or 'tree' (tree:{children:[1-2 related_projects sources, each the child of the one before]}, workspace context). "
+    "A progress block may set group_by:[{field:<path>|by:'stage',label}] (list, table or board), select:true (tick rows), export:true (CSV of every record the filters keep), "
+    "and totals:[{field:<one of its money/number/percent/duration/file_size/rating fields>,agg:'sum'|'avg'|'min'|'max'}] (over workflow_projects in a workspace context); a number-like field may set bar:true, "
+    "and format:'sparkline' draws a list of numbers. A table lets each viewer hide columns and save filtered views as tabs. "
+    "A chart block {type:'chart',source:<workflow_projects|related_projects|project_records|workspace_stats>,chart:{kind:'line'|'area'|'bar'|'stacked_bar'|'stacked_area'|'donut'|'funnel'|'leaderboard'|'heatmap'|'scatter', "
+    "x:{field:<path>,bucket:'day'|'week'|'month'|'weekday'|'hour'}|{by:'stage'}, value:{agg:'count'|'sum'|'avg'|'min'|'max',field} (a leaderboard without x: value:{field}), series:<like x>, y:{field} (scatter), "
+    "format:'number'|'money'|'percent'|'duration', currency, unit, scale, labels, order (a funnel's steps), limit, target:{value|goal:<goal key>,label}}} draws one chart; "
+    "over workspace_stats each Stat is a series of its readings (x:{bucket}, value agg last|sum|avg|min|max). display.layout:'grid' lays charts and metrics two to a row. "
     "Any data block may set empty_message for an honest empty state. project_rollup may set "
     "completion:{stages:[<completed stages>],label:<caption>} to derive a displayed completed count, and "
     "project_rollup or progress may set stage_labels:{<stored stage>:<caption>}. These are presentation-only "
@@ -724,9 +850,11 @@ async def _runtime_design_app(
     entity_id: str,
     workspace_id: str,
     user_id: str | None,
+    conversation_id: str | None,
     raw_params: dict[str, Any],
 ) -> str:
-    """Command the App designer; its page comes back as a draft to accept or discard."""
+    """Command the App designer; its page comes back as a review card the person
+    approves or rejects, with a preview of the page."""
     from packages.core.database import async_session
     from packages.core.services.workspace_app_designer import design_workspace_app_view
 
@@ -736,6 +864,8 @@ async def _runtime_design_app(
                 db, workspace_id=workspace_id, entity_id=entity_id, user_id=user_id or None,
                 brief=str(raw_params.get("brief") or ""), feedback=raw_params.get("feedback"),
                 replaces_draft_id=str(raw_params.get("draft_id") or "").strip() or None,
+                audience=str(raw_params.get("audience") or "").strip() or None,
+                conversation_id=conversation_id or None,
             )
             if not result.get("ok"):
                 await db.rollback()
@@ -745,19 +875,95 @@ async def _runtime_design_app(
         logger.exception("workspace App design failed")
         return _dumps({"error": f"failed to design the App page: {exc}"})
     draft = result["draft"]
+    # The person sees the page before it applies: the review card links to its preview.
+    payload = _operation_review_or_needs_fix(
+        draft, prompt="Apply these page changes?", content=_operation_draft_review_content(draft),
+    )
     return _dumps({
+        **payload,
         "draft_id": draft.get("id"),
         "candidate": result["candidate"],
         "recipes": result["recipes"],
         "warnings": result["warnings"],
         "design_notes": result["design_notes"],
-        "validation": draft.get("validation"),
         "next": (
-            "Review the candidate against the request. Accept it with apply_draft on this draft_id "
-            "(the person approves it on the review card), send it back with design_app plus feedback and "
-            "this draft_id, or discard_draft."
+            "The person now has this page's review card, which previews it with their real data. Tell them in "
+            "a few lines who the page is for and what its first screen shows, then end your turn: they approve "
+            "or reject it on the card. If the candidate misses the request, call design_app again with feedback "
+            "and this draft_id instead (its card closes)."
         ),
     })
+
+
+async def _runtime_app_audience(*, entity_id: str, workspace_id: str, user_id: str | None) -> str:
+    """Who the App page could be for, so the agent asks the person before designing it."""
+    from packages.core.database import async_session
+    from packages.core.services.workspace_access import user_can_manage_workspace
+    from packages.core.services.workspace_app_designer import workspace_app_audience
+
+    async with async_session() as db:
+        if not user_id or not await user_can_manage_workspace(db, workspace_id=workspace_id, user_id=user_id):
+            return _dumps({"error": "blocked_by_permission",
+                           "message": "Only people who manage this Workspace can design its page"})
+        audience = await workspace_app_audience(db, workspace_id=workspace_id, entity_id=entity_id)
+    if audience is None:
+        return _dumps({"error": "workspace not found"})
+    return _dumps({
+        **audience,
+        "next": (
+            "Ask the person with request_input who this page is mainly for. Offer up to 3 options (as options, "
+            "with recommended), each a person or role from people/roles in the person's language, with what they "
+            "act on first: approvals that wait "
+            "on them (waiting, approvals), the project stages that wait on their role (live_projects stages), "
+            "finished deliverables, or the entries they start most (usage). Recommend the one with the most "
+            "waiting on them; with nothing waiting, the one who starts the work. Then call design_app with "
+            "brief (the person's request) and audience (the chosen option, in their words)."
+        ),
+    })
+
+
+async def _runtime_test_app(*, entity_id: str, workspace_id: str, user_id: str | None, raw_params: dict[str, Any]) -> str:
+    """The App page's self-check as this person: read-only, it proves reads, not clicks."""
+    from packages.core.database import async_session
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.workspace_access import user_can_manage_workspace
+    from packages.core.services.workspace_app_selfcheck import self_check_app_page, self_check_user
+    from packages.core.services.workspace_app_view import app_view_draft_preview
+
+    async with async_session() as db:
+        if not user_id or not await user_can_manage_workspace(db, workspace_id=workspace_id, user_id=user_id):
+            return _dumps({"error": "blocked_by_permission",
+                           "message": "Only people who manage this Workspace can test its page"})
+        workspace = await db.get(Workspace, workspace_id)
+        if workspace is None or workspace.entity_id != entity_id:
+            return _dumps({"error": "workspace not found"})
+        user = await self_check_user(db, workspace, user_id)
+        if user is None:
+            return _dumps({"error": "workspace not found"})
+        draft_id = str(raw_params.get("draft_id") or "").strip()
+        shown = await app_view_draft_preview(db, workspace, draft_id) if draft_id else workspace
+        if shown is None:
+            return _dumps({"error": "App page draft not found"})
+        return _dumps(await self_check_app_page(db, shown, user=user))
+
+
+async def _with_app_self_check(db: Any, draft: Any, user_id: str | None) -> None:
+    """A page change the agent staged gets the same self-check on its review card as a designed one."""
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.workspace_app_selfcheck import attach_app_self_check, self_check_app_page, self_check_user
+    from packages.core.services.workspace_app_view import app_view_draft_preview
+
+    if ((draft.validation or {}).get("errors")
+            or not any(isinstance(patch, dict) and patch.get("op") == "app_view.update" for patch in draft.patches or [])):
+        return
+    try:
+        workspace = await db.get(Workspace, draft.workspace_id)
+        user = await self_check_user(db, workspace, user_id)
+        shown = await app_view_draft_preview(db, workspace, draft.id) if user is not None else None
+        if user is not None and shown is not None:
+            attach_app_self_check(draft, await self_check_app_page(db, shown, user=user))
+    except Exception:  # noqa: BLE001 - the card still comes; the check is a note on it
+        logger.warning("App self-check of draft %s could not run", draft.id, exc_info=True)
 
 
 async def runtime_workspace_operation_action(
@@ -791,8 +997,14 @@ async def runtime_workspace_operation_action(
 
     if action == "design_app":
         return await _runtime_design_app(
-            entity_id=entity_id, workspace_id=workspace_id, user_id=user_id, raw_params=raw_params,
+            entity_id=entity_id, workspace_id=workspace_id, user_id=user_id, conversation_id=conversation_id,
+            raw_params=raw_params,
         )
+    if action == "app_audience":
+        return await _runtime_app_audience(entity_id=entity_id, workspace_id=workspace_id, user_id=user_id)
+    if action == "test_app":
+        return await _runtime_test_app(entity_id=entity_id, workspace_id=workspace_id, user_id=user_id,
+                                       raw_params=raw_params)
 
     try:
         from packages.core.database import async_session
@@ -854,6 +1066,7 @@ async def runtime_workspace_operation_action(
                 )
                 if not draft:
                     return _dumps({"error": "workspace not found"})
+                await _with_app_self_check(db, draft, user_id)
                 draft_data = draft_to_dict(draft)
                 payload = _operation_review_or_needs_fix(
                     draft_data,
@@ -880,6 +1093,7 @@ async def runtime_workspace_operation_action(
                 # A patch is how an invalid draft gets fixed, so this is where
                 # the review card has to come from once the draft validates —
                 # otherwise the model has no action that shows the card again.
+                await _with_app_self_check(db, draft, user_id)
                 draft_data = draft_to_dict(draft)
                 payload = _operation_review_or_needs_fix(
                     draft_data,

@@ -425,7 +425,7 @@ async def test_manual_api_persists_requester_for_ownerless_goal_job(manual_sched
     monkeypatch.setattr(database, "create_worker_session", lambda: ExistingSession)
     published = []
     monkeypatch.setattr(scheduler_tasks, "_publish_scheduled_dispatch", published.append)
-    await run_job_now(state.job.id, "ownerless-measure", state.actor, state.db)
+    await run_job_now(state.job.id, idempotency_key="ownerless-measure", body=None, user=state.actor, db=state.db)
     run = (await state.db.execute(select(ScheduledJobRun).where(
         ScheduledJobRun.job_id == job_id,
     ))).scalar_one()

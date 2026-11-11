@@ -152,7 +152,7 @@ async def ensure_workspace_artifact_folder(
     )
     # Serialize sibling name allocation and legacy-folder claims per entity.
     root = (await db.execute(
-        select(DocumentFolder).where(DocumentFolder.id == root.id).with_for_update()
+        select(DocumentFolder).where(DocumentFolder.id == root.id).with_for_update(key_share=True)
     )).scalar_one()
     desired_name = _display_folder_name(workspace.name)
 
@@ -261,7 +261,7 @@ async def _ensure_workspace_document_folder_in_session(
             Workspace.id == workspace_id,
             Workspace.entity_id == entity_id,
             Workspace.deleted_at.is_(None),
-        ).with_for_update().limit(1)
+        ).with_for_update(key_share=True).limit(1)
     )).scalar_one_or_none()
     if workspace is None:
         return None
@@ -297,7 +297,7 @@ async def ensure_workspace_artifact_directory(
                 Workspace.id == workspace_id,
                 Workspace.entity_id == entity_id,
                 Workspace.deleted_at.is_(None),
-            ).with_for_update().limit(1)
+            ).with_for_update(key_share=True).limit(1)
         )).scalar_one_or_none()
         if workspace is None:
             raise ValueError("Workspace artifact directory could not resolve the Workspace")

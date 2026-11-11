@@ -79,8 +79,25 @@ from packages.core.services.reusable_resource_locks import (
 
 logger = logging.getLogger(__name__)
 
-#: Where apply() leaves what revert() needs.
-RESTORE_POINT_KEY = "restore_point"
+
+def legacy_restore_point(state: Any) -> dict[str, Any] | None:
+    """The undo apply() left in the Workspace's upgrade state row, if any.
+
+    The row keeps one undo at a time, outside Workspace.settings so every
+    Workspace read stays small. A reviewed (protocol 3) receipt names its
+    protocol; a point written by apply() does not.
+    """
+    point = getattr(state, "restore_point", None)
+    if isinstance(point, dict) and "protocol_version" not in point:
+        return point
+    return None
+
+
+async def _upgrade_state(db: AsyncSession, workspace: Any, *, lock: bool = False):
+    from packages.core.blueprints.reconfigure import _state
+
+    return await _state(db, workspace, lock=lock)
+
 
 #: Where apply() records the revision each item ended on, so the next
 #: upgrade can tell its own bump apart from an operator's edit.
@@ -925,7 +942,7 @@ async def plan(
         "blueprint_slug": record.get("blueprint_slug"),
         "blueprint_fingerprint": None,
         "items": [],
-        "can_revert": bool(record.get(RESTORE_POINT_KEY)),
+        "can_revert": bool(legacy_restore_point(await _upgrade_state(db, workspace))),
     }
     # ``payload`` is resolved by the API before the plan reaches us. Older
     # built-in installs recorded only ``blueprint_slug`` (the stable
@@ -2547,6 +2564,10 @@ async def apply(
         and previous_personalization_values != personalization
     )
     previous_variable_declarations_present = VARIABLE_DECLARATIONS_KEY in record
+    previous_usage_guide_present = "usage_guide" in record
+    previous_usage_guide = record.get("usage_guide")
+    usage_guide = manifest.get("usage_guide")
+    usage_guide_changed = fully_synchronized and previous_usage_guide != usage_guide
     previous_variable_declarations = copy.deepcopy(
         record.get(VARIABLE_DECLARATIONS_KEY)
     )
@@ -2638,6 +2659,7 @@ async def apply(
         or variable_declarations_changed
         or runtime_contract_changed
         or setup_changed
+        or usage_guide_changed
     )
     if updated or restore_settings:
         restore_point = {
@@ -2680,6 +2702,10 @@ async def apply(
                 previous_personalization_present
             )
             restore_point["personalization"] = previous_personalization
+        if usage_guide_changed:
+            restore_point["usage_guide_present"] = previous_usage_guide_present
+            restore_point["usage_guide"] = previous_usage_guide
+            restore_point["usage_guide_after"] = usage_guide
         if variable_declarations_changed:
             restore_point["variable_declarations_present"] = (
                 previous_variable_declarations_present
@@ -2695,7 +2721,17 @@ async def apply(
         if fully_synchronized:
             restore_point["setup_before"] = setup_before
             restore_point["setup_after"] = setup_after
-        record[RESTORE_POINT_KEY] = restore_point
+        from packages.core.models.blueprint_upgrade import WorkspaceBlueprintUpgradeState
+
+        state = await _upgrade_state(db, workspace, lock=True)
+        if state is None:
+            state = WorkspaceBlueprintUpgradeState(
+                workspace_id=workspace.id, entity_id=workspace.entity_id, baseline={},
+            )
+            db.add(state)
+        else:
+            state.revision += 1
+        state.restore_point = restore_point
     if intended.get("materialized_unsupported_baseline"):
         # A partial upgrade may save new personalization. Keep the original
         # materialized baseline so the next preview cannot reconstruct it from
@@ -2731,6 +2767,8 @@ async def apply(
             settings.pop(PERSONALIZATION_SETTINGS_KEY, None)
     if variable_declarations is not None:
         record[VARIABLE_DECLARATIONS_KEY] = variable_declarations
+    if fully_synchronized:
+        record["usage_guide"] = usage_guide
     if applied_runtime_contract is not None:
         record["upgrade_runtime_contract"] = applied_runtime_contract
     if canonical_source_id:
@@ -2808,7 +2846,7 @@ async def apply(
             if item["action"] == UpgradeAction.KEEP_YOURS.value
             and (item["kind"], item["slug"]) not in explicit_conflict_updates
         ],
-        "can_revert": bool(record.get(RESTORE_POINT_KEY)),
+        "can_revert": bool(legacy_restore_point(await _upgrade_state(db, workspace))),
         "fully_synchronized": fully_synchronized,
     }
 
@@ -2861,12 +2899,14 @@ async def revert(
     workspace = locked_workspace
     settings = dict(getattr(workspace, "settings", None) or {})
     record = dict(settings.get(BLUEPRINT_SETTINGS_KEY) or {})
-    point = record.get(RESTORE_POINT_KEY)
+    state = await _upgrade_state(db, workspace, lock=True)
+    point = legacy_restore_point(state)
     has_settings_restore = isinstance(point, dict) and (
         "personalization_present" in point
         or "variable_declarations_present" in point
         or "upgrade_runtime_contract_present" in point
         or "setup_before" in point
+        or "usage_guide_present" in point
     )
     if not isinstance(point, dict) or (
         not point.get("items") and not has_settings_restore
@@ -2896,6 +2936,8 @@ async def revert(
     if "setup_after" in point and point["setup_after"] != {
         key: record[key] for key in LIVE_SETUP_STATE_KEYS if key in record
     }:
+        changed()
+    if "usage_guide_after" in point and record.get("usage_guide") != point["usage_guide_after"]:
         changed()
 
     # Match the attach path's account -> binding lock order. A transferred or
@@ -3391,6 +3433,11 @@ async def revert(
             )
         else:
             record.pop(VARIABLE_DECLARATIONS_KEY, None)
+    if "usage_guide_present" in point:
+        if point["usage_guide_present"]:
+            record["usage_guide"] = point.get("usage_guide")
+        else:
+            record.pop("usage_guide", None)
     if "upgrade_runtime_contract_present" in point:
         if point.get("upgrade_runtime_contract_present"):
             record["upgrade_runtime_contract"] = copy.deepcopy(
@@ -3404,7 +3451,8 @@ async def revert(
                 record[key] = copy.deepcopy(point["setup_before"][key])
             else:
                 record.pop(key, None)
-    record.pop(RESTORE_POINT_KEY, None)
+    state.restore_point = None
+    state.revision += 1
     await sync_installed_package(db, record)
     settings[BLUEPRINT_SETTINGS_KEY] = record
     workspace.settings = settings

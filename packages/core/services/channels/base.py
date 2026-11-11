@@ -324,6 +324,26 @@ class ChannelAdapter(abc.ABC):
 _ADAPTERS: Dict[str, ChannelAdapter] = {}
 
 
+# integration.provider → [(channel_type, channel_provider), ...]
+# The channel accounts a connection materializes. Keep this list aligned
+# with registered ChannelAdapters.
+INTEGRATION_CHANNEL_ACCOUNTS: dict[str, list[tuple[str, str]]] = {
+    "telegram":        [("telegram",         "telegram_bot")],
+    "whatsapp":        [("whatsapp",         "whatsapp_cloud")],
+    "wechat_official": [("wechat",           "wechat_oa")],
+    "wechat_personal": [("wechat_personal",  "itchat_runner")],
+    "email":           [("email",            "smtp_imap")],
+    "slack":           [("slack",            "slack_app")],
+    "discord":         [("discord",          "discord_app")],
+    "ms_teams":        [("ms_teams",          "microsoft_graph")],
+    "outlook":         [("outlook",           "microsoft_graph")],
+    # Twilio needs two channel types so one account can serve both SMS
+    # and voice webhooks/dispatch without manual DB surgery.
+    "twilio":          [("twilio_sms",       "twilio"), ("twilio_voice", "twilio")],
+    "facebook":        [("facebook",         "facebook_graph")],
+}
+
+
 def register_adapter(adapter: ChannelAdapter) -> None:
     """Register an adapter instance under ``adapter.channel_type``.
 

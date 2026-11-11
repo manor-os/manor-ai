@@ -46,6 +46,44 @@ def test_run_agent_task_does_not_handoff_waiting_result_to_settlement(
     settle.assert_not_called()
 
 
+@pytest.mark.parametrize("task_ended", [True, False])
+def test_terminal_delivery_settles_even_when_the_execution_claim_is_held(
+    monkeypatch, task_ended,
+) -> None:
+    """A person cancels a BLOCKED Task while its execution lease is still held."""
+    import packages.core.database as database
+
+    cancelled = {"task_id": "task-blocked", "status": "cancelled", "response": "Cancelled by a person."}
+
+    def run(awaitable):
+        name = awaitable.cr_code.co_name
+        awaitable.close()
+        if name == "_run_scheduled_agent_task_if_open":
+            return False, None  # claim denied: the lease is not released yet
+        assert name == "_terminal_task_result"
+        return cancelled if task_ended else None
+
+    settle = Mock()
+    monkeypatch.setattr(database, "create_worker_session", lambda: object())
+    monkeypatch.setattr(ai_tasks, "_run_async", run)
+    monkeypatch.setattr(ai_tasks, "_update_job_run_status", settle)
+
+    result = ai_tasks.run_agent_task.run(
+        "task-blocked", "agent-1",
+        scheduled_run_id="run-blocked", scheduled_job_id="job-blocked", claim_recheck=True,
+    )
+
+    if task_ended:
+        settle.assert_called_once()
+        assert settle.call_args.args[2] == cancelled
+        assert settle.call_args.kwargs["scheduled_run_id"] == "run-blocked"
+        assert result["status"] == "cancelled"
+    else:
+        # A Task still running keeps its lease owner in charge.
+        settle.assert_not_called()
+        assert result["duplicate_suppressed"] is True
+
+
 def test_sync_settlement_boundary_ignores_waiting_result(monkeypatch) -> None:
     async_settle = AsyncMock()
     defer = AsyncMock()

@@ -25,11 +25,12 @@ import markdownLang from "react-syntax-highlighter/dist/esm/languages/prism/mark
 import java from "react-syntax-highlighter/dist/esm/languages/prism/java";
 import go from "react-syntax-highlighter/dist/esm/languages/prism/go";
 import docker from "react-syntax-highlighter/dist/esm/languages/prism/docker";
-import { resolveDisplayMediaUrl } from "../lib/api";
+import { api, parseTaskAttachmentUrl, resolveDisplayMediaUrl } from "../lib/api";
 import { t } from "../lib/i18n";
 import InlineFileReferenceCard from "./InlineFileReferenceCard";
-import ChatFilePreview, { FoldedPreview, previewName } from "./ChatFilePreview";
+import ChatFilePreview, { FoldedPreview, ResultFilePreview, previewName } from "./ChatFilePreview";
 import InlineTaskReferenceCard from "./InlineTaskReferenceCard";
+import TaskAttachmentLink from "./task/TaskAttachmentLink";
 import InlineIntegrationLink from "./InlineIntegrationLink";
 import SourceCitation from "./SourceCitation";
 import remarkSourceCitations from "../lib/remarkSourceCitations.mjs";
@@ -41,8 +42,9 @@ import {
   looksLikeViewerRouteReference,
 } from "../lib/chatRouteReferences";
 import { visibleAssistantText } from "../lib/assistantTextProjection";
-import { redactInternalAssistantErrorDetails } from "../lib/assistant-visible-text.mjs";
+import { redactInternalAssistantErrorDetails, stripInternalReferences } from "../lib/assistant-visible-text.mjs";
 import { decodeFileReferenceHref, isInternalFileTarget, isOpenableFileReference, linkifyFileReferencesInMarkdown } from "../lib/fileReferences";
+import { inPlaceResultFileForLink, resultFilePreviewTarget } from "../lib/resultFiles";
 
 
 SyntaxHighlighter.registerLanguage("tsx", tsx);
@@ -73,6 +75,10 @@ interface ChatMarkdownProps {
   isUser?: boolean;
   streaming?: boolean;
   enableFileCards?: boolean;
+  /** Literal file content and Task descriptions keep identifiers rather than treating them as chat prose. */
+  preserveReferences?: boolean;
+  /** A reply's linked results (tables, documents, pictures) show as themselves under their sentence. */
+  showFilesInPlace?: boolean;
   returnTo?: string;
 }
 
@@ -80,6 +86,7 @@ interface MarkdownRenderOptions {
   isUser?: boolean;
   returnTo?: string;
   enableFileCards: boolean;
+  showFilesInPlace?: boolean;
   deferSyntaxHighlighting: boolean;
 }
 
@@ -87,6 +94,107 @@ const MarkdownRenderContext = createContext<MarkdownRenderOptions>({
   enableFileCards: true,
   deferSyntaxHighlighting: false,
 });
+
+/** Links whose file is shown in place right below; in the sentence they read as the plain name. */
+const InPlaceFileLinks = createContext<ReadonlySet<string>>(new Set());
+
+type HastNode = {
+  type: string;
+  tagName?: string;
+  value?: string;
+  properties?: Record<string, unknown>;
+  children?: HastNode[];
+};
+
+function hastText(node: HastNode): string {
+  if (node.type === "text") return node.value || "";
+  return (node.children || []).map(hastText).join("");
+}
+
+/**
+ * The results linked in one paragraph or list item (not in a nested list),
+ * and whether the line holds nothing but those links.
+ */
+type InPlaceLine = {
+  files: NonNullable<ReturnType<typeof inPlaceResultFileForLink>>[];
+  hrefs: Set<string>;
+  linksOnly: boolean;
+};
+
+function inPlaceFilesInLine(node: HastNode | undefined): InPlaceLine {
+  const files: InPlaceLine["files"] = [];
+  const hrefs = new Set<string>();
+  if (!node || typeof window === "undefined") return { files, hrefs, linksOnly: false };
+  let rest = "";
+  const visit = (child: HastNode) => {
+    if (child.type === "text") { rest += child.value || ""; return; }
+    if (child.type !== "element" || ["p", "ul", "ol", "pre", "table"].includes(child.tagName || "")) return;
+    if (child.tagName === "img") {
+      const src = String(child.properties?.src || "");
+      const file = inPlaceResultFileForLink(src, String(child.properties?.alt || ""), window.location.origin, { image: true });
+      if (file) {
+        if (!files.some((existing) => existing.reference === file.reference)) files.push(file);
+        hrefs.add(src);
+      }
+      return;
+    }
+    if (child.tagName === "a") {
+      const href = String(child.properties?.href || "");
+      const label = hastText(child);
+      const file = inPlaceResultFileForLink(href, label, window.location.origin);
+      if (file) {
+        if (!files.some((existing) => existing.reference === file.reference)) files.push(file);
+        hrefs.add(href);
+        return;
+      }
+      rest += label;
+      return;
+    }
+    (child.children || []).forEach(visit);
+  };
+  (node.children || []).forEach(visit);
+  return { files, hrefs, linksOnly: files.length > 0 && !rest.replace(/[\s:：,，、;；.。·•\-–—|()（）]+/g, "") };
+}
+
+/**
+ * One pass over the whole reply, in reading order: each paragraph or list item
+ * that names results gets the files it shows, and a file already shown above
+ * (the same file named twice, or as a link and a picture) is not shown again.
+ */
+/** A file's identity in this reply: its document id, else its address. */
+function fileKeys(file: InPlaceLine["files"][number]): string[] {
+  const target = typeof window === "undefined" ? null : resultFilePreviewTarget(file.reference, window.location.origin);
+  return [target && "documentId" in target ? `document:${target.documentId}` : `ref:${file.reference}`];
+}
+
+function rehypeInPlaceFiles() {
+  return (tree: HastNode) => {
+    const shown = new Set<string>();
+    const visit = (node: HastNode) => {
+      if (node.type === "element" && (node.tagName === "p" || node.tagName === "li")) {
+        const line = inPlaceFilesInLine(node);
+        if (line.hrefs.size) {
+          line.files = line.files.filter((file) => !fileKeys(file).some((key) => shown.has(key)));
+          line.files.forEach((file) => fileKeys(file).forEach((key) => shown.add(key)));
+          (node as HastNode & { data?: { inPlace?: InPlaceLine } }).data = { ...(node as { data?: object }).data, inPlace: line };
+        }
+      }
+      (node.children || []).forEach(visit);
+    };
+    visit(tree);
+  };
+}
+const inPlaceRehypePlugins = [rehypeInPlaceFiles];
+
+function inPlaceLineOf(node: unknown): InPlaceLine | null {
+  return (node as { data?: { inPlace?: InPlaceLine } } | undefined)?.data?.inPlace || null;
+}
+
+function InPlaceFiles({ files, returnTo }: { files: InPlaceLine["files"]; returnTo?: string }) {
+  return <div className="chat-md-files">
+    {files.map((file) => <ResultFilePreview key={file.key} file={file} returnTo={returnTo} />)}
+  </div>;
+}
 
 const assistantRemarkPlugins = [remarkGfm, remarkSourceCitations, remarkBreaks];
 const userRemarkPlugins = [remarkGfm, remarkBreaks];
@@ -179,26 +287,49 @@ function getTextContent(children: ReactNode): string {
   return "";
 }
 
+/**
+ * Where an image's bytes are. ``/viewer/<id>`` is the file page, not an image:
+ * a Knowledge file is read through its preview, a file in this Manor's storage
+ * through the storage address. Anything else is an ordinary image URL.
+ */
+async function markdownImageBytes(src: string): Promise<{ url: string; revoke: () => void }> {
+  const reference = decodeFileReferenceHref(src) || src;
+  const target = typeof window === "undefined" ? null : resultFilePreviewTarget(reference, window.location.origin);
+  if (target && "documentId" in target) {
+    const url = await api.documents.preview(target.documentId, { cache: true });
+    return { url, revoke: () => URL.revokeObjectURL(url) };
+  }
+  if (target) return resolveDisplayMediaUrl(target.url);
+  // A file page that names no previewable file has no picture to show.
+  if (looksLikeViewerRouteReference(reference)) throw new Error("Not an image address");
+  return resolveDisplayMediaUrl(src);
+}
+
 function ProtectedMarkdownImage({ src, alt }: { src?: string; alt?: string }) {
-  const [displayUrl, setDisplayUrl] = useState<string | null>(null);
+  const [display, setDisplay] = useState<{ src: string; url: string | null; failed: boolean } | null>(null);
+  const current = display?.src === src ? display : null;
 
   useEffect(() => {
     if (!src) return;
     let cancelled = false;
     let revoke = () => {};
-    resolveDisplayMediaUrl(src)
+    markdownImageBytes(src)
       .then((resolved) => {
         revoke = resolved.revoke;
-        if (!cancelled) setDisplayUrl(resolved.url);
+        if (!cancelled) setDisplay({ src, url: resolved.url, failed: false });
+        else resolved.revoke();
       })
       .catch(() => {
-        if (!cancelled) setDisplayUrl(null);
+        if (!cancelled) setDisplay({ src, url: null, failed: true });
       });
     return () => { cancelled = true; revoke(); };
   }, [src]);
 
-  if (!displayUrl) return null;
-  return <img src={displayUrl} alt={alt || ""} style={{ maxWidth: "100%", borderRadius: 10 }} />;
+  // Never a broken picture: an image that cannot load reads as its name.
+  if (current?.failed) return alt ? <span className="chat-md-image-missing">{alt}</span> : null;
+  if (!current?.url) return null;
+  return <img src={current.url} alt={alt || ""} style={{ maxWidth: "100%", borderRadius: 10 }}
+    onError={() => src && setDisplay({ src, url: null, failed: true })} />;
 }
 
 function toMarkdownText(value: unknown): string {
@@ -322,12 +453,45 @@ const markdownComponents: Components = {
             );
           },
 
+          p({ node, children }) {
+            const { returnTo } = useContext(MarkdownRenderContext);
+            const inPlace = inPlaceLineOf(node);
+            if (!inPlace) return <p>{children}</p>;
+            // Nothing but the file (shown here or already above): no empty line is left behind.
+            if (inPlace.linksOnly) return inPlace.files.length ? <InPlaceFiles files={inPlace.files} returnTo={returnTo} /> : null;
+            return <>
+              <InPlaceFileLinks.Provider value={inPlace.hrefs}><p>{children}</p></InPlaceFileLinks.Provider>
+              {inPlace.files.length > 0 && <InPlaceFiles files={inPlace.files} returnTo={returnTo} />}
+            </>;
+          },
+
+          li({ node, children, className }) {
+            const { returnTo } = useContext(MarkdownRenderContext);
+            const inPlace = inPlaceLineOf(node);
+            if (!inPlace) return <li className={className}>{children}</li>;
+            if (inPlace.linksOnly && !inPlace.files.length) return null;
+            if (inPlace.linksOnly) {
+              return <li className={`${className || ""} chat-md-file-item`.trim()}>
+                <InPlaceFiles files={inPlace.files} returnTo={returnTo} />
+              </li>;
+            }
+            return <li className={className}>
+              <InPlaceFileLinks.Provider value={inPlace.hrefs}>{children}</InPlaceFileLinks.Provider>
+              {inPlace.files.length > 0 && <InPlaceFiles files={inPlace.files} returnTo={returnTo} />}
+            </li>;
+          },
+
           a({ href, children }) {
             const { enableFileCards, isUser, returnTo } = useContext(MarkdownRenderContext);
+            const inPlaceLinks = useContext(InPlaceFileLinks);
             const label = getTextContent(children).trim();
+            if (href && inPlaceLinks.has(href)) return <span className="chat-md-file-name">{children}</span>;
             // An unsafe scheme (emptied by urlTransform) or a sandbox-internal
             // file location is not a destination: keep the words, drop the link.
             if (!href?.trim() || isInternalFileTarget(href)) return <>{children}</>;
+            if (parseTaskAttachmentUrl(href)) {
+              return <TaskAttachmentLink href={href} style={{ color: isUser ? "#c4dfd2" : "#4f7d75", textDecoration: "underline", textUnderlineOffset: 2 }}>{children}</TaskAttachmentLink>;
+            }
             const integrationProvider = href && typeof window !== "undefined"
               ? parseIntegrationSetupLink(href, window.location.origin)
               : null;
@@ -393,6 +557,8 @@ const markdownComponents: Components = {
 
           img({ src, alt }) {
             const { isUser } = useContext(MarkdownRenderContext);
+            const inPlaceLinks = useContext(InPlaceFileLinks);
+            if (src && inPlaceLinks.has(src)) return null;
             const image = <ProtectedMarkdownImage src={src || ""} alt={alt || ""} />;
             // A reply's image folds away like the files it links to.
             if (isUser || !src) return image;
@@ -428,20 +594,23 @@ const markdownComponents: Components = {
           },
 };
 
-function ChatMarkdown({ content, isUser, streaming, enableFileCards = true, returnTo }: ChatMarkdownProps) {
+function ChatMarkdown({ content, isUser, streaming, enableFileCards = true, preserveReferences = false, showFilesInPlace = false, returnTo }: ChatMarkdownProps) {
   const projectedText = visibleAssistantText(toMarkdownText(content));
-  const rawText = isUser
+  // What Manor says names things: no IDs or raw tool keys in its prose.
+  const messageText = isUser
     ? projectedText
     : redactInternalAssistantErrorDetails(projectedText);
+  const rawText = isUser || preserveReferences ? messageText : stripInternalReferences(messageText);
   const routeLinkedText = enableFileCards ? linkifyChatRouteReferencesInMarkdown(rawText) : rawText;
   const text = enableFileCards ? linkifyFileReferencesInMarkdown(routeLinkedText) : routeLinkedText;
   const deferSyntaxHighlighting = Boolean(streaming && hasUnclosedFencedCodeBlock(text));
 
   return (
     <div className={isUser ? "chat-md chat-md--user" : `chat-md${streaming ? " chat-md--streaming" : ""}`}>
-      <MarkdownRenderContext.Provider value={{ isUser, returnTo, enableFileCards, deferSyntaxHighlighting }}>
+      <MarkdownRenderContext.Provider value={{ isUser, returnTo, enableFileCards, showFilesInPlace: showFilesInPlace && !isUser, deferSyntaxHighlighting }}>
         <Markdown
           remarkPlugins={isUser ? userRemarkPlugins : assistantRemarkPlugins}
+          rehypePlugins={enableFileCards && showFilesInPlace && !isUser ? inPlaceRehypePlugins : undefined}
           urlTransform={transformChatUrl}
           components={markdownComponents}
         >

@@ -6,7 +6,8 @@
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { t } from "../../lib/i18n";
-import { IconPause, IconPlay, IconSearch } from "../icons";
+import { ImagePreviewDialog } from "../file-preview/ImagePreview";
+import { IconExpand, IconPause, IconPlay, IconSearch } from "../icons";
 import type { WorkflowSchemaSuggestion } from "./workflowSchema";
 
 const SHOWN = 8;
@@ -26,6 +27,7 @@ export default function SuggestionGallery({ suggestions, value, label, disabled,
   const [group, setGroup] = useState("");
   const [query, setQuery] = useState("");
   const [open, setOpen] = useState(false);
+  const [enlarged, setEnlarged] = useState<WorkflowSchemaSuggestion | null>(null);
   const needle = query.trim().toLowerCase();
   const matching = suggestions.filter((item) => (!group || item.group === group)
     && (!needle || `${item.label} ${item.detail} ${item.group || ""}`.toLowerCase().includes(needle)));
@@ -83,6 +85,18 @@ export default function SuggestionGallery({ suggestions, value, label, disabled,
           {item.label && <strong>{item.label}</strong>}
           <span>{item.detail}</span>
         </button>
+        {/* Sibling of the pick button, not a child: the zoom never selects the card. */}
+        {item.image && <div className="suggestion-gallery__thumb">
+          <button type="button" className="suggestion-gallery__zoom"
+            aria-label={t("component.workflow_schema.enlarge_image", { name: item.label || item.detail })}
+            onClick={(event) => {
+              // Focus the zoom control first, so the viewer hands focus back to it on close.
+              event.currentTarget.focus();
+              setEnlarged(item);
+            }}>
+            <IconExpand size={13} />
+          </button>
+        </div>}
         {item.sample && <button type="button" className="suggestion-gallery__sample" data-playing={playing === item.value || undefined}
           aria-label={t(playing === item.value ? "component.workflow_schema.stop_sample" : "component.workflow_schema.play_sample",
             { name: item.label || item.detail })}
@@ -95,5 +109,7 @@ export default function SuggestionGallery({ suggestions, value, label, disabled,
     {matching.length > SHOWN && <button type="button" className="suggestion-gallery__more" onClick={() => setOpen(!open)}>
       {open ? t("component.workflow_schema.show_fewer") : t("component.workflow_schema.show_all", { count: matching.length })}
     </button>}
+    {enlarged?.image && <ImagePreviewDialog key={enlarged.value} src={enlarged.image} alt={enlarged.label || enlarged.detail}
+      onClose={() => setEnlarged(null)} />}
   </div>;
 }

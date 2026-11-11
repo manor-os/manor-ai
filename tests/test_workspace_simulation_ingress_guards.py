@@ -1,9 +1,9 @@
 """Simulation Workspaces must never enter ordinary execution runtimes."""
-
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import AsyncClient
@@ -43,7 +43,7 @@ async def test_simulation_workspace_rejects_normal_chat_before_message_or_dispat
     monkeypatch.setattr(
         workspace_chat,
         "_schedule_workspace_chat_processing",
-        lambda **kwargs: scheduled.append(kwargs),
+        AsyncMock(side_effect=lambda **kwargs: scheduled.append(kwargs)),
     )
 
     response = await client.post(

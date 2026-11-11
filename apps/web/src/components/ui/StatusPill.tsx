@@ -19,14 +19,14 @@ type StatusEntry = {
 };
 
 const STATUS_CONFIG: Record<string, StatusEntry> = {
-  created:              { labelKey: "component.status.created",     color: "#78716c", bg: "#f5f5f4", Icon: IconPlus },
+  created:              { labelKey: "component.status.created",     color: "var(--text-muted)", bg: "#f5f5f7", Icon: IconPlus },
   proposed:             { labelKey: "component.status.proposed",    color: "#6f4ba8", bg: "#ece9f5", Icon: IconCircleDot },
   pending:              { labelKey: "component.status.pending",     color: "#b27c34", bg: "#f3ecd6", Icon: IconClock },
   scheduled:            { labelKey: "component.status.scheduled",   color: "#6f4ba8", bg: "#ece9f5", Icon: IconCalendar },
   running:              { labelKey: "component.status.running",     color: "#426c87", bg: "#e8eff4", Icon: IconPlay },
   active:               { labelKey: "component.status.active",      color: "#437f6b", bg: "#dceae3", Icon: IconCircleDot },
   muted:                { labelKey: "component.status.muted",       color: "#b27c34", bg: "#f3ecd6", Icon: IconBell },
-  paused:               { labelKey: "component.status.paused",      color: "#78716c", bg: "#f5f5f4", Icon: IconPause },
+  paused:               { labelKey: "component.status.paused",      color: "var(--text-muted)", bg: "#f5f5f7", Icon: IconPause },
   needs_setup:          { labelKey: "component.status.needs_setup", color: "#b27c34", bg: "#f3ecd6", Icon: IconWarning },
   error:                { labelKey: "component.status.error",       color: "#c14a44", bg: "#f1dddb", Icon: IconError },
   in_progress:          { labelKey: "component.status.in_progress", color: "#426c87", bg: "#e8eff4", Icon: IconPlay },
@@ -34,7 +34,7 @@ const STATUS_CONFIG: Record<string, StatusEntry> = {
   on_hold:              { labelKey: "component.status.on_hold",     color: "#6f4ba8", bg: "#ece9f5", Icon: IconPause },
   blocked:              { labelKey: "component.status.blocked",     color: "#c14a44", bg: "#f1dddb", Icon: IconWarning },
   completed:            { labelKey: "component.status.completed",   color: "#437f6b", bg: "#dceae3", Icon: IconCheckCircle },
-  cancelled:            { labelKey: "component.status.cancelled",   color: "#57534e", bg: "#e7e5e4", Icon: IconClose },
+  cancelled:            { labelKey: "component.status.cancelled",   color: "var(--text-muted)", bg: "#e5e5ea", Icon: IconClose },
   failed:               { labelKey: "component.status.failed",      color: "#be123c", bg: "#ffe4e6", Icon: IconError },
 };
 
@@ -52,11 +52,11 @@ const ALERT_STATUSES = new Set(["blocked", "failed", "needs_setup", "error"]);
 export default function StatusPill({ status, label, color, bg, size = "md" }: StatusPillProps) {
   const cfg = status ? STATUS_CONFIG[status] : null;
   // The status colour now lives on the icon only — a small, meaningful signal.
-  const iconColor = color || cfg?.color || "#78716c";
+  const iconColor = color || cfg?.color || "#8e8e93";
   const isAlert = status ? ALERT_STATUSES.has(status) : false;
   // Neutral surface + neutral label by default; alerts keep their colour.
-  const textColor = color ? iconColor : isAlert ? iconColor : "#57534e";
-  const b = bg || (isAlert ? cfg?.bg : "#f5f5f4") || "#f5f5f4";
+  const textColor = color ? iconColor : isAlert ? iconColor : "#6e6e73";
+  const b = bg || (isAlert ? cfg?.bg : "#f5f5f7") || "#f5f5f7";
   const l = label || (cfg?.labelKey ? t(cfg.labelKey) : status) || "";
   const Icon = cfg?.Icon || IconCircleDot;
   const fs = size === "sm" ? 10 : 11;
@@ -67,7 +67,7 @@ export default function StatusPill({ status, label, color, bg, size = "md" }: St
     <span style={{
       display: "inline-flex", alignItems: "center", gap: 5,
       padding: pad, borderRadius: 20, fontSize: fs, fontWeight: 600,
-      color: textColor, background: b, letterSpacing: "0.01em",
+      color: textColor, background: b,
     }}>
       <Icon size={iconSize} style={{ color: iconColor }} />
       {l}

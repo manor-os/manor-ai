@@ -193,6 +193,39 @@ async def test_answer_rejects_missing_or_foreign_runs_and_empty_answers(db_sessi
     assert foreign.value.code == "run_not_found"
 
 
+async def test_form_answers_are_held_to_the_question_field_schemas(db_session) -> None:
+    """A booking question's fields (date range, signature) refuse a reversed range or a
+    missing signature before the run resumes, and accept the corrected answer."""
+    from packages.core.ai.runtime.human_input import normalize_input_request
+
+    run = await create_runtime_run(
+        db_session, conversation_id="conv_form", assistant_message_id="msg_form", entity_id="entity_hi",
+        user_id="user_hi", agent_id=None, workspace_id=None, execution_payload={"message": "book it"},
+    )
+    await db_session.flush()
+    control = _control("When should the inspector come?")
+    control["payload"] = normalize_input_request(question="When should the inspector come?", fields=[
+        {"name": "visit", "type": "date_range"}, {"name": "signature", "type": "signature"},
+    ])
+    run = await persist_runtime_run_suspension(db_session, run_id=run.id, control=control)
+    await db_session.flush()
+
+    with pytest.raises(RuntimeHumanInputError) as refused:
+        await answer_runtime_human_input(
+            db_session, run_id=run.id, entity_id="entity_hi", user_id="user_hi", answer="",
+            fields={"visit": {"start": "2026-12-05", "end": "2026-12-04"}},
+        )
+    assert refused.value.code == "answer_invalid"
+    assert "visit" in refused.value.detail and "signature" in refused.value.detail
+    assert run.status_reason == HUMAN_INPUT_SUSPENSION_REASON
+
+    answered = await answer_runtime_human_input(
+        db_session, run_id=run.id, entity_id="entity_hi", user_id="user_hi", answer="",
+        fields={"visit": {"start": "2026-12-04", "end": "2026-12-05"}, "signature": [{"document_id": "doc_sig"}]},
+    )
+    assert answered.status_reason == HUMAN_INPUT_ANSWERED_REASON
+
+
 async def test_a_run_that_is_not_parked_cannot_be_answered(db_session) -> None:
     run = await create_runtime_run(
         db_session,

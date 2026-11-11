@@ -1,3 +1,4 @@
+import { ConfigAddRow, ConfigBlock, ConfigGroup, ConfigPage, ConfigRow } from "../components/ui/GroupedList";
 import { invalidateCatalogQueries } from "../lib/catalogInvalidation";
 import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -65,7 +66,7 @@ const CATEGORIES = [
   { value: "HR", label: t("page.agent_detail.category_hr") },
 ];
 
-type Tab = "overview" | "tools" | "skills" | "executions" | "learning" | "initiative" | "settings";
+type Tab = "overview" | "tools" | "skills" | "executions" | "learning" | "initiative" | "settings" | "where";
 
 function objectConfig(value: unknown): Record<string, any> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
@@ -95,29 +96,32 @@ function agentConnectionInfo(agent: Pick<Agent, "config" | "source" | "is_templa
   if (source === "https") {
     return {
       label: "HTTPS",
-      detail: "Runs through a generic HTTPS agent endpoint when added to a workspace.",
+      detail: t("ui.runs_through_a_generic_https_agent_endpoint_when"),
       type: "info",
       endpoint,
     };
   }
   if (agent.is_template) {
     return {
-      label: "Template",
+      label: t("ui.template"),
       detail: "A reusable agent template that can be added to workspaces.",
       type: "success",
     };
   }
   return {
-    label: "Manor Hosted",
-    detail: "Runs on Manor Hosted by default. HTTPS connections are chosen when adding it to a workspace.",
+    label: t("ui.manor_hosted"),
+    detail: t("ui.runs_on_manor_hosted_by_default_https_connection"),
     type: "success",
   };
 }
 
 /* -- component --------------------------------------------- */
 
-export default function AgentDetail() {
-  const { agentId } = useParams<{ agentId: string }>();
+/** `agentId` shows the employee inside Settings › AI next to the list; otherwise it comes from the route. */
+export default function AgentDetail({ agentId: embeddedAgentId }: { agentId?: string } = {}) {
+  const { agentId: routeAgentId } = useParams<{ agentId: string }>();
+  const agentId = embeddedAgentId || routeAgentId;
+  const embedded = Boolean(embeddedAgentId);
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const catalogScope = useCatalogScope();
@@ -188,7 +192,7 @@ export default function AgentDetail() {
 
   const { data: deployments } = useQuery({
     ...deploymentQueryOptions(catalogScope, agentId),
-    enabled: !!catalogScope && !!agentId && (tab === "overview" || tab === "learning"),
+    enabled: !!catalogScope && !!agentId && (tab === "overview" || tab === "learning" || tab === "where"),
   });
 
   const {
@@ -198,7 +202,7 @@ export default function AgentDetail() {
   } = useQuery({
     queryKey: ["agent-learning-candidates", agentId],
     queryFn: () => api.agents.learningCandidates(agentId!, { limit: 50, status: null }),
-    enabled: !!agentId && tab === "learning",
+    enabled: !!agentId && (tab === "learning" || (embedded && tab === "overview")),
   });
 
   const {
@@ -208,7 +212,7 @@ export default function AgentDetail() {
   } = useQuery({
     queryKey: ["agent-runtime-evidence", agentId],
     queryFn: () => api.agents.runtimeEvidence(agentId!, { limit: 50 }),
-    enabled: !!agentId && tab === "learning",
+    enabled: !!agentId && (tab === "learning" || (embedded && tab === "overview")),
   });
 
   const { data: modelCatalog } = useQuery({
@@ -379,7 +383,7 @@ export default function AgentDetail() {
         <div style={{ width: 64, height: 64, borderRadius: 20, background: "#f1dddb", display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 16 }}>
           <IconWarning size={32} className="text-red-300" />
         </div>
-        <p style={{ fontSize: 15, fontWeight: 600, color: "#78716c" }}>{t("page.agent_detail.agent_not_found")}</p>
+        <p style={{ fontSize: 15, fontWeight: 600, color: "var(--text-muted)" }}>{t("page.agent_detail.agent_not_found")}</p>
         <Button variant="primary" onClick={() => navigate("/agents")}>
           {t("page.agent_detail.back_to_agents")}
         </Button>
@@ -417,6 +421,15 @@ export default function AgentDetail() {
     { key: "settings", label: t("page.agent_detail.actions") },
   ];
 
+  // Inside Settings: who they are, what they can do, where they work.
+  const sectionTabs = embedded ? [
+    { key: "overview", label: t("page.agent_detail.section_who") },
+    { key: "skills", label: t("page.agent_detail.section_abilities"), count: toolCount + skillCount },
+    { key: "where", label: t("page.agent_detail.section_where"), count: deployments?.length },
+    { key: "executions", label: t("page.agent_detail.executions"), count: execItems.length },
+    { key: "settings", label: t("page.agent_detail.actions") },
+  ] : tabs;
+
   const filteredCatalog = (toolCatalog || []).filter((t: any) => {
     const bound = (tools || []).map((bt: any) => bt.id);
     const matchesSearch =
@@ -441,31 +454,84 @@ export default function AgentDetail() {
     t("page.api_keys.default"),
   );
 
+  const connectionCard = (
+            <div className="glass-card" style={{ padding: 20 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 16, alignItems: "flex-start", flexWrap: "wrap", marginBottom: 16 }}>
+                <div style={{ minWidth: 0 }}>
+                  <h3 style={{ fontSize: 14, fontWeight: 800, color: "var(--text-default)", margin: 0 }}>{t("page.agent_detail.connection")}</h3>
+                  <p style={{ margin: "6px 0 0", fontSize: 13, lineHeight: 1.5, color: "var(--text-muted)" }}>
+                    {connectionInfo.detail}
+                  </p>
+                  {connectionInfo.endpoint ? (
+                    <p style={{ margin: "8px 0 0", fontSize: 12, color: "var(--text-muted)" }}>
+                      Endpoint <span style={{ fontFamily: "var(--font-mono)", color: "var(--text-default)" }}>{connectionInfo.endpoint}</span>
+                    </p>
+                  ) : null}
+                </div>
+                <StatusBadge type={connectionInfo.type}>{connectionInfo.label}</StatusBadge>
+              </div>
+
+              {deploymentItems.length === 0 ? (
+                <div style={{ border: "1px dashed rgba(29, 29, 31,0.06)", borderRadius: 12, padding: 14, background: "rgba(250,250,249,0.65)" }}>
+                  <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: "var(--text-default)" }}>{t("page.agent_detail.not_in_workspace")}</p>
+                  <p style={{ margin: "4px 0 0", fontSize: 12, color: "var(--text-muted)" }}>
+                    {t("page.agent_detail.not_in_workspace_hint")}
+                  </p>
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {deploymentItems.map((deployment) => (
+                    <div
+                      key={deployment.id}
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "minmax(0, 1fr) auto auto",
+                        gap: 12,
+                        alignItems: "center",
+                        border: "0.5px solid rgba(29, 29, 31,0.06)",
+                        borderRadius: 12,
+                        padding: "10px 12px",
+                        background: "var(--surface-panel)",
+                      }}
+                    >
+                      <div style={{ minWidth: 0 }}>
+                        <p style={{ margin: 0, fontSize: 13, fontWeight: 800, color: deployment.workspace_status && deployment.workspace_status !== "active" ? "#aeaeb2" : "#48484a", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {deployment.workspace_name || "Workspace"}
+                          {deployment.workspace_status && deployment.workspace_status !== "active" ? (
+                            <span style={{ marginLeft: 8, fontSize: 10, fontWeight: 700, color: "var(--text-muted)" }}>
+                              {deployment.workspace_status}
+                            </span>
+                          ) : null}
+                        </p>
+                        <p style={{ margin: "3px 0 0", fontSize: 11, color: "var(--text-muted)" }}>
+                          {deployment.service_key ? <span style={{ fontFamily: "var(--font-mono)" }}>{deployment.service_key}</span> : null}
+                          {deployment.created_at ? <> · {t("ui.added_time", { time: relativeTime(deployment.created_at) })}</> : null}
+                        </p>
+                      </div>
+                      <StatusBadge type={(deployment.workers || []).length > 0 ? "success" : "warning"}>
+                        {(deployment.workers || []).length > 0 ? `${deployment.workers.length} worker${deployment.workers.length === 1 ? "" : "s"}` : "Hosted"}
+                      </StatusBadge>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => deployment.workspace_id && navigate(`/workspaces/${deployment.workspace_id}?tab=agents`)}
+                        disabled={!deployment.workspace_id}
+                      >
+                        {t("ui.open")}
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+  );
+
   return (
     <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
       {/* Back + Header */}
       <div style={{ marginBottom: 24 }}>
-        <button
-          onClick={() => navigate("/agents")}
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 6,
-            fontSize: 13,
-            color: "#78716c",
-            background: "transparent",
-            border: "none",
-            cursor: "pointer",
-            marginBottom: 16,
-            minHeight: 36,
-            padding: "0 2px",
-          }}
-        >
-          <IconChevronLeft size={16} />
-          {t("page.agent_detail.back_to_agents")}
-        </button>
-
         <PageHeader
+          inline={embedded}
           title={(
             <span className="inline-flex min-w-0 items-center gap-3">
               <span aria-hidden="true">
@@ -498,335 +564,167 @@ export default function AgentDetail() {
               )}
             </span>
           )}
-          subtitle={agentDescription}
-          meta={(
-            <>
-              <StatusBadge type={agent.status === "active" ? "success" : "inactive"} dot>
-                {agent.status === "active" ? t("page.workspaces.filter_active") : agent.status || t("page.workspaces.draft")}
-              </StatusBadge>
-              <StatusBadge type={connectionInfo.type}>
-                {connectionInfo.label}
-              </StatusBadge>
-              <span
-                style={{
-                  fontSize: 10,
-                  fontWeight: 700,
-                  padding: "2px 8px",
-                  borderRadius: 99,
-                  background: agent.source === "custom" ? "#f3e8ff" : "#dceae3",
-                  color: agent.source === "custom" ? "#6f4ba8" : "#437f6b",
-                }}
-              >
-                {agent.source === "custom" ? t("page.agent_detail.custom") : t("page.agent_detail.template")}
-              </span>
-            </>
+          subtitle={embedded ? undefined : agentDescription}
+          breadcrumb={embedded ? undefined : (
+            <button type="button" className="page-header-back" onClick={() => navigate("/agents")}>
+              <IconChevronLeft size={14} />
+              {t("page.agent_detail.back_to_agents")}
+            </button>
           )}
+          // Only an exception is worth a badge: an AI employee that is not
+          // active. Where it comes from is told in Connection below.
+          meta={agent.status !== "active" ? (
+            <StatusBadge type="inactive" dot>{agent.status || t("page.workspaces.draft")}</StatusBadge>
+          ) : undefined}
           actions={(
-            <Button variant="outline" size="sm" onClick={() => navigate(`/agents?edit=${agent.id}`)}>
-              {t("page.agents.edit_agent")}
-            </Button>
+            <>
+              <Button variant="outline" size="sm" onClick={() => navigate(`/agents?edit=${agent.id}`)}>
+                {t("page.agents.edit_agent")}
+              </Button>
+              <Button variant={embedded ? "outline" : "primary"} size="sm" onClick={() => navigate(`/chat?agent=${encodeURIComponent(agent.id)}`)}>
+                {t("page.agent_detail.send_message")}
+              </Button>
+            </>
           )}
         />
       </div>
 
       {/* Tabs */}
       <div style={{ marginBottom: 24 }}>
-        <TabSwitcher tabs={tabs} value={tab} onChange={(k) => setTab(k as Tab)} wrap />
+        <TabSwitcher tabs={sectionTabs} value={tab} onChange={(k) => setTab(k as Tab)} wrap />
       </div>
 
       {/* Tab Content */}
-      <div style={{ flex: 1, overflowY: "auto" }}>
+      <div className="agent-detail-content" style={{ flex: 1, overflowY: "auto" }}>
         {/* ====== OVERVIEW ====== */}
         {tab === "overview" && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-            {/* Quick stats */}
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 150px), 1fr))", gap: 10 }}>
-              {[
-                { label: t("page.agent_detail.total_executions"), value: execItems.length },
-                {
-                  label: t("page.agent_dashboard.kpi_avg_response"),
-                  value: execItems.length
-                    ? `${(execItems.reduce((s: number, e: any) => s + (e.duration_ms || 0), 0) / execItems.length / 1000).toFixed(1)}s`
-                    : "--",
-                },
-                { label: "Workspace uses", value: deploymentItems.length },
-                { label: "Capabilities", value: toolCount + skillCount },
-              ].map((stat, i) => (
-                <div key={i} className="glass-card" style={{ padding: "12px 14px" }}>
-                  <p style={{ fontSize: 10, fontWeight: 700, color: "#a8a29e", textTransform: "uppercase", letterSpacing: "0.03em", margin: 0 }}>
-                    {stat.label}
-                  </p>
-                  <p style={{ fontSize: 18, fontWeight: 800, color: "#292524", margin: "4px 0 0" }}>{stat.value}</p>
-                </div>
-              ))}
-            </div>
-
-            {/* Connection + workspace usage */}
-            <div className="glass-card" style={{ padding: 20 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", gap: 16, alignItems: "flex-start", flexWrap: "wrap", marginBottom: 16 }}>
-                <div style={{ minWidth: 0 }}>
-                  <h3 style={{ fontSize: 14, fontWeight: 800, color: "#44403c", margin: 0 }}>Connection</h3>
-                  <p style={{ margin: "6px 0 0", fontSize: 13, lineHeight: 1.5, color: "#78716c" }}>
-                    {connectionInfo.detail}
-                  </p>
-                  {connectionInfo.endpoint ? (
-                    <p style={{ margin: "8px 0 0", fontSize: 12, color: "#78716c" }}>
-                      Endpoint <span style={{ fontFamily: "monospace", color: "#44403c" }}>{connectionInfo.endpoint}</span>
-                    </p>
-                  ) : null}
-                </div>
-                <StatusBadge type={connectionInfo.type}>{connectionInfo.label}</StatusBadge>
-              </div>
-
-              {deploymentItems.length === 0 ? (
-                <div style={{ border: "1px dashed rgba(28,25,23,0.06)", borderRadius: 12, padding: 14, background: "rgba(250,250,249,0.65)" }}>
-                  <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: "#44403c" }}>Not used in a workspace yet</p>
-                  <p style={{ margin: "4px 0 0", fontSize: 12, color: "#78716c" }}>
-                    Add it from a workspace to choose Manor Hosted, HTTPS, or a custom profile for that workspace.
-                  </p>
-                </div>
-              ) : (
-                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                  {deploymentItems.map((deployment) => (
-                    <div
-                      key={deployment.id}
-                      style={{
-                        display: "grid",
-                        gridTemplateColumns: "minmax(0, 1fr) auto auto",
-                        gap: 12,
-                        alignItems: "center",
-                        border: "1px solid rgba(28,25,23,0.06)",
-                        borderRadius: 12,
-                        padding: "10px 12px",
-                        background: "#fff",
-                      }}
-                    >
-                      <div style={{ minWidth: 0 }}>
-                        <p style={{ margin: 0, fontSize: 13, fontWeight: 800, color: deployment.workspace_status && deployment.workspace_status !== "active" ? "#a8a29e" : "#44403c", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                          {deployment.workspace_name || "Workspace"}
-                          {deployment.workspace_status && deployment.workspace_status !== "active" ? (
-                            <span style={{ marginLeft: 8, fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.03em", color: "#a8a29e" }}>
-                              {deployment.workspace_status}
-                            </span>
-                          ) : null}
-                        </p>
-                        <p style={{ margin: "3px 0 0", fontSize: 11, color: "#a8a29e" }}>
-                          service <span style={{ fontFamily: "monospace" }}>{deployment.service_key || "unscoped"}</span>
-                          {deployment.created_at ? <> · added {relativeTime(deployment.created_at)}</> : null}
-                        </p>
-                      </div>
-                      <StatusBadge type={(deployment.workers || []).length > 0 ? "success" : "warning"}>
-                        {(deployment.workers || []).length > 0 ? `${deployment.workers.length} worker${deployment.workers.length === 1 ? "" : "s"}` : "Hosted"}
-                      </StatusBadge>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => deployment.workspace_id && navigate(`/workspaces/${deployment.workspace_id}?tab=agents`)}
-                        disabled={!deployment.workspace_id}
-                      >
-                        Open
-                      </Button>
-                    </div>
-                  ))}
-                </div>
+          <ConfigPage>
+            <ConfigGroup title={t("page.agent_profile.who")}>
+              <ConfigRow
+                label={t("page.agent_profile.job_description")}
+                note={!editingPrompt && agent.system_prompt ? String(agent.system_prompt).slice(0, 80) : undefined}
+                expanded={editingPrompt}
+                onClick={() => setEditingPrompt((open) => !open)}
+              />
+              {editingPrompt && (
+                <ConfigBlock>
+                  <textarea className="config-textarea" rows={8} value={promptDraft} onChange={(e) => setPromptDraft(e.target.value)} aria-label={t("page.agent_profile.job_description")} />
+                  <div className="config-block-actions config-block-actions--end">
+                    <Button variant="ghost" size="sm" onClick={() => setEditingPrompt(false)}>{t("action.cancel")}</Button>
+                    <Button size="sm" onClick={savePrompt}>{t("action.save")}</Button>
+                  </div>
+                </ConfigBlock>
               )}
-            </div>
-
-            {/* System prompt */}
-            <div className="glass-card" style={{ padding: 20 }}>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-                <h3 style={{ fontSize: 14, fontWeight: 700, color: "#44403c", margin: 0 }}>{t("page.skill_form.system_prompt")}</h3>
-                {editingPrompt ? (
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <Button variant="outline" size="sm" onClick={() => setEditingPrompt(false)}>{t("action.cancel")}</Button>
-                    <Button variant="primary" size="sm" onClick={savePrompt}>{t("action.save")}</Button>
-                  </div>
-                ) : (
-                  <button onClick={() => setEditingPrompt(true)} style={{ fontSize: 12, fontWeight: 600, color: "#436b65", background: "transparent", border: "none", cursor: "pointer", minHeight: 32, padding: "6px 8px", borderRadius: 8 }}>{t("action.edit")}</button>
-                )}
-              </div>
-              {editingPrompt ? (
-                <Textarea
-                  value={promptDraft}
-                  onChange={(e) => setPromptDraft(e.target.value)}
-                  rows={8}
-                />
-              ) : (
-                <div style={{ background: "rgba(28,25,23,0.04)", borderRadius: 12, padding: "12px 16px", fontSize: 13, color: "#57534e", fontFamily: "monospace", whiteSpace: "pre-wrap", maxHeight: 256, overflowY: "auto" }}>
-                  {agent.system_prompt || t("page.agent_detail.no_system_prompt_configured")}
-                </div>
-              )}
-            </div>
-
-            {/* Config */}
-            <div className="glass-card" style={{ padding: 20 }}>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-                <h3 style={{ fontSize: 14, fontWeight: 700, color: "#44403c", margin: 0 }}>{t("page.flows.configuration")}</h3>
-                {editingConfig ? (
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <Button variant="outline" size="sm" onClick={() => setEditingConfig(false)}>{t("action.cancel")}</Button>
-                    <Button variant="primary" size="sm" onClick={saveConfig}>{t("action.save")}</Button>
-                  </div>
-                ) : (
-                  <button onClick={() => setEditingConfig(true)} style={{ fontSize: 12, fontWeight: 600, color: "#436b65", background: "transparent", border: "none", cursor: "pointer", minHeight: 32, padding: "6px 8px", borderRadius: 8 }}>{t("action.edit")}</button>
-                )}
-              </div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 180px), 1fr))", gap: 16 }}>
-                <div>
-                  <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: "#78716c", marginBottom: 4 }}>{t("page.agent_detail.model_override")}</label>
-                  {editingConfig ? (
-                    <Select
-                      value={
-                        agentModelMode(configDraft) === AgentModelMode.Fixed
-                          ? fixedAgentModel(configDraft)
-                          : AGENT_MODEL_INHERIT_VALUE
-                      }
-                      onChange={(selection) => {
-                        const nextConfig = { ...configDraft };
-                        if (selection === AGENT_MODEL_INHERIT_VALUE) {
-                          nextConfig.model_mode = AgentModelMode.Inherit;
-                          delete nextConfig.model;
-                        } else {
-                          nextConfig.model_mode = AgentModelMode.Fixed;
-                          nextConfig.model = selection;
-                        }
-                        setConfigDraft(nextConfig);
-                      }}
-                      options={modelOptions}
-                      placeholder={t("page.api_keys.default")}
-                      filterable
-                    />
-                  ) : (
-                    <p style={{ fontSize: 13, color: "#44403c", margin: 0 }}>{fixedAgentModel(agent.config) || t("page.api_keys.default")}</p>
-                  )}
-                </div>
-                <div>
-                  <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: "#78716c", marginBottom: 4 }}>
-                    {t("page.agent_detail.temperature")} {editingConfig ? configDraft.temperature ?? 0.7 : agent.config?.temperature ?? 0.7}
-                  </label>
-                  {editingConfig ? (
-                    <input type="range" min="0" max="2" step="0.1" value={configDraft.temperature ?? 0.7} onChange={(e) => setConfigDraft({ ...configDraft, temperature: parseFloat(e.target.value) })} style={{ width: "100%", accentColor: "#436b65" }} />
-                  ) : (
-                    <div style={{ width: "100%", background: "#f5f5f4", borderRadius: 99, height: 8, marginTop: 8 }}>
-                      <div style={{ background: "#436b65", height: 8, borderRadius: 99, width: `${((agent.config?.temperature ?? 0.7) / 2) * 100}%` }} />
+              <ConfigRow
+                label={t("page.agent_profile.ai_model")}
+                meta={fixedAgentModel(agent.config) || t("page.agent_profile.follow_company_default")}
+                expanded={editingConfig}
+                onClick={() => setEditingConfig((open) => !open)}
+              />
+              {editingConfig && (
+                <>
+                  <ConfigRow
+                    label={t("page.agent_profile.which_model")}
+                    control={(
+                      <Select
+                        value={agentModelMode(configDraft) === AgentModelMode.Fixed ? fixedAgentModel(configDraft) : AGENT_MODEL_INHERIT_VALUE}
+                        onChange={(selection) => {
+                          const nextConfig = { ...configDraft };
+                          if (selection === AGENT_MODEL_INHERIT_VALUE) {
+                            nextConfig.model_mode = AgentModelMode.Inherit;
+                            delete nextConfig.model;
+                          } else {
+                            nextConfig.model_mode = AgentModelMode.Fixed;
+                            nextConfig.model = selection;
+                          }
+                          setConfigDraft(nextConfig);
+                        }}
+                        options={modelOptions}
+                        placeholder={t("page.api_keys.default")}
+                        filterable
+                        ariaLabel={t("page.agent_profile.which_model")}
+                      />
+                    )}
+                  />
+                  <ConfigRow
+                    label={`${t("page.agent_detail.temperature")} ${configDraft.temperature ?? 0.7}`}
+                    control={<input type="range" min="0" max="2" step="0.1" value={configDraft.temperature ?? 0.7} onChange={(e) => setConfigDraft({ ...configDraft, temperature: parseFloat(e.target.value) })} aria-label={t("page.agent_detail.temperature")} />}
+                  />
+                  <ConfigRow
+                    label={t("page.agent_profile.max_tokens")}
+                    htmlFor="agent-max-tokens"
+                    control={<input id="agent-max-tokens" className="config-input config-input--short" type="number" value={String(configDraft.max_tokens || "")} onChange={(e) => setConfigDraft({ ...configDraft, max_tokens: parseInt(e.target.value, 10) || undefined })} />}
+                  />
+                  <ConfigBlock>
+                    <div className="config-block-actions config-block-actions--end">
+                      <Button variant="ghost" size="sm" onClick={() => setEditingConfig(false)}>{t("action.cancel")}</Button>
+                      <Button size="sm" onClick={saveConfig}>{t("action.save")}</Button>
                     </div>
-                  )}
-                </div>
-                <div>
-                  <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: "#78716c", marginBottom: 4 }}>{t("page.agent_detail.max_tokens")}</label>
-                  {editingConfig ? (
-                    <Input type="number" value={String(configDraft.max_tokens || "")} onChange={(e) => setConfigDraft({ ...configDraft, max_tokens: parseInt(e.target.value) || undefined })} placeholder="4096" />
-                  ) : (
-                    <p style={{ fontSize: 13, color: "#44403c", margin: 0 }}>{agent.config?.max_tokens || t("page.api_keys.default")}</p>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            {/* Category + Tags */}
-            <div className="glass-card" style={{ padding: 20 }}>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-                <h3 style={{ fontSize: 14, fontWeight: 700, color: "#44403c", margin: 0 }}>{t("page.agent_detail.category_tags")}</h3>
-                {editingMeta ? (
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <Button variant="outline" size="sm" onClick={() => setEditingMeta(false)}>{t("action.cancel")}</Button>
-                    <Button variant="primary" size="sm" onClick={saveMeta}>{t("action.save")}</Button>
-                  </div>
-                ) : (
-                  <button onClick={() => setEditingMeta(true)} style={{ fontSize: 12, fontWeight: 600, color: "#436b65", background: "transparent", border: "none", cursor: "pointer", minHeight: 32, padding: "6px 8px", borderRadius: 8 }}>{t("action.edit")}</button>
-                )}
-              </div>
-              {editingMeta ? (
-                <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-                  <select value={categoryDraft} onChange={(e) => setCategoryDraft(e.target.value)} className="manor-input">
-                    <option value="">{t("page.agent_detail.no_category")}</option>
-                    {CATEGORIES.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
-                  </select>
+                  </ConfigBlock>
+                </>
+              )}
+              <ConfigRow
+                label={t("page.agent_profile.category_tags")}
+                meta={[agent.category, ...(Array.isArray(agent.tags) ? agent.tags : [])].filter(Boolean).join("、") || undefined}
+                expanded={editingMeta}
+                onClick={() => setEditingMeta((open) => !open)}
+              />
+              {editingMeta && (
+                <ConfigBlock>
+                  <Select
+                    value={categoryDraft}
+                    onChange={setCategoryDraft}
+                    options={[{ value: "", label: t("page.agent_detail.no_category") }, ...CATEGORIES.map((c) => ({ value: c.value, label: c.label }))]}
+                    ariaLabel={t("page.agent_profile.category_tags")}
+                    style={{ width: "100%" }}
+                  />
                   <Input value={tagsDraft} onChange={(e) => setTagsDraft(e.target.value)} placeholder={t("page.agent_detail.comma_separated_tags")} />
-                </div>
-              ) : (
-                <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
-                  {agent.category && (
-                    <span style={{ fontSize: 11, fontWeight: 600, padding: "2px 10px", borderRadius: 99, background: "#e3ebe8", color: "#436b65" }}>{agent.category}</span>
-                  )}
-                  {agent.tags && (Array.isArray(agent.tags) ? agent.tags : []).map((tag, i) => (
-                    <span key={i} style={{ fontSize: 11, padding: "2px 10px", borderRadius: 8, background: "#f5f5f4", color: "#78716c" }}>{tag}</span>
-                  ))}
-                  {!agent.category && (!agent.tags || agent.tags.length === 0) && (
-                    <span style={{ fontSize: 12, color: "#a8a29e" }}>{t("page.agent_detail.no_category_or_tags_set")}</span>
-                  )}
-                </div>
+                  <div className="config-block-actions config-block-actions--end">
+                    <Button variant="ghost" size="sm" onClick={() => setEditingMeta(false)}>{t("action.cancel")}</Button>
+                    <Button size="sm" onClick={saveMeta}>{t("action.save")}</Button>
+                  </div>
+                </ConfigBlock>
               )}
-            </div>
+            </ConfigGroup>
 
-            {/* Dates */}
-            <div className="glass-card" style={{ padding: 20 }}>
-              <h3 style={{ fontSize: 14, fontWeight: 700, color: "#44403c", margin: "0 0 12px 0" }}>{t("page.agent_detail.details")}</h3>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 240px), 1fr))", gap: 16, fontSize: 13 }}>
-                <div>
-                  <span style={{ fontSize: 11, color: "#a8a29e" }}>{t("page.dashboard.created")}</span>
-                  <p style={{ color: "#44403c", margin: "2px 0 0 0" }}>{formatDateFull((agent as any).created_at)}</p>
-                </div>
-                <div>
-                  <span style={{ fontSize: 11, color: "#a8a29e" }}>{t("page.agent_detail.last_updated")}</span>
-                  <p style={{ color: "#44403c", margin: "2px 0 0 0" }}>{formatDateFull((agent as any).updated_at)}</p>
-                </div>
-              </div>
-            </div>
-          </div>
-	        )}
+            {!embedded && <div className="config-group">{connectionCard}</div>}
+
+            {!embedded && (execItems.length > 0 || (agent as any).created_at || (agent as any).updated_at) && (
+              <ConfigGroup title={t("page.agent_profile.record")}>
+                {execItems.length > 0 && (
+                  <ConfigRow
+                    label={t("page.agent_detail.total_executions")}
+                    meta={`${execItems.length} · ${t("page.agent_dashboard.kpi_avg_response")} ${(execItems.reduce((sum: number, e: any) => sum + (e.duration_ms || 0), 0) / execItems.length / 1000).toFixed(1)}s`}
+                  />
+                )}
+                {(agent as any).created_at && <ConfigRow label={t("page.dashboard.created")} meta={formatDateFull((agent as any).created_at)} />}
+                {(agent as any).updated_at && <ConfigRow label={t("page.agent_detail.last_updated")} meta={formatDateFull((agent as any).updated_at)} />}
+              </ConfigGroup>
+            )}
+          </ConfigPage>
+        )}
 
 	        {/* ====== TOOLS ====== */}
-        {tab === "tools" && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <h3 style={{ fontSize: 14, fontWeight: 700, color: "#44403c", margin: 0 }}>{t("page.agent_detail.bound_tools")}{toolCount})</h3>
-              <Button variant="primary" size="sm" onClick={() => setShowBindModal(true)}>
-                <IconPlus size={14} />
-                {t("page.agent_detail.bind_tool")}
-              </Button>
-            </div>
+        {tab === "where" && connectionCard}
 
-            {(tools || []).length === 0 ? (
-              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "64px 0", textAlign: "center" }}>
-                <div style={{ width: 56, height: 56, borderRadius: 20, background: "#f5f5f4", display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 12 }}>
-                  <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#d6d3d1" strokeWidth={1.5}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M11.42 15.17l-5.1-5.1M20.49 3.51l-5.1 5.1M6.32 20.49l5.1-5.1m3.07-3.07l5.1-5.1M12 3v2.25M12 18.75V21M6.75 12H4.5m15 0h-2.25M8.636 8.636l-1.591-1.591m10.91 10.91l-1.591-1.591m0-7.728l1.591-1.591M7.045 18.955l1.591-1.591" />
-                  </svg>
-                </div>
-                <p style={{ fontSize: 14, fontWeight: 600, color: "#78716c" }}>{t("page.agent_detail.no_tools_bound")}</p>
-                <p style={{ fontSize: 12, color: "#a8a29e", marginTop: 4 }}>{t("page.agent_detail.bind_tools_to_extend_this_agent_s_capabilities")}</p>
-              </div>
-            ) : (
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 240px), 1fr))", gap: 12 }}>
-                {(tools || []).map((tool: any) => (
-                  <div key={tool.id} className="glass-card-sm" style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
-                    <div style={{ width: 36, height: 36, borderRadius: 10, background: "#e3e9f1", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#5f84bd" strokeWidth={1.5}>
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M11.42 15.17l-5.1-5.1M20.49 3.51l-5.1 5.1M6.32 20.49l5.1-5.1m3.07-3.07l5.1-5.1" />
-                      </svg>
-                    </div>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <h4 style={{ fontSize: 13, fontWeight: 700, color: "#44403c", margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{tool.name}</h4>
-                      {tool.description && (
-                        <p style={{ fontSize: 12, color: "#78716c", marginTop: 2, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{tool.description}</p>
-                      )}
-                      {tool.category && (
-                        <span style={{ display: "inline-block", marginTop: 4, fontSize: 10, fontWeight: 600, padding: "2px 8px", borderRadius: 99, background: "#e3e9f1", color: "#4869ac" }}>{tool.category}</span>
-                      )}
-                    </div>
-                    <Button
-                      variant="danger"
-                      size="sm"
-                      onClick={() => unbindToolMutation.mutate([tool.id])}
-                      disabled={unbindToolMutation.isPending}
-                    >
+        {(tab === "tools" || (embedded && tab === "skills")) && (
+          <ConfigPage>
+            <ConfigGroup>
+              {(tools || []).length === 0 && <ConfigBlock><p className="config-empty">{t("page.agent_detail.no_tools_bound")}</p></ConfigBlock>}
+              {(tools || []).map((tool: any) => (
+                <ConfigRow
+                  key={tool.id}
+                  label={tool.display_name || tool.name}
+                  note={[tool.description, tool.category].filter(Boolean).join(" · ") || undefined}
+                  control={(
+                    <Button variant="ghost" size="sm" onClick={() => unbindToolMutation.mutate([tool.id])} disabled={unbindToolMutation.isPending}>
                       {t("page.skills.unbind")}
                     </Button>
-                  </div>
-                ))}
-              </div>
-            )}
+                  )}
+                />
+              ))}
+              <ConfigAddRow label={t("page.agent_detail.bind_tool")} onClick={() => setShowBindModal(true)} />
+            </ConfigGroup>
 
             {/* Bind Tool Modal */}
             <Modal
@@ -855,7 +753,7 @@ export default function AgentDetail() {
               <SearchInput value={toolSearch} onChange={setToolSearch} placeholder={t("page.agent_detail.search_tools")} className="mb-4" />
               <div style={{ maxHeight: 256, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8 }}>
                 {filteredCatalog.length === 0 ? (
-                  <p style={{ fontSize: 13, color: "#a8a29e", textAlign: "center", padding: 24 }}>{t("page.agent_detail.no_tools_available")}</p>
+                  <p style={{ fontSize: 13, color: "var(--text-muted)", textAlign: "center", padding: 24 }}>{t("page.agent_detail.no_tools_available")}</p>
                 ) : (
                   filteredCatalog.map((tool: any) => (
                     <label
@@ -885,9 +783,9 @@ export default function AgentDetail() {
                         style={{ accentColor: "#436b65" }}
                       />
                       <div style={{ flex: 1, minWidth: 0 }}>
-                        <p style={{ fontSize: 13, fontWeight: 600, color: "#44403c", margin: 0 }}>{tool.name}</p>
+                        <p style={{ fontSize: 13, fontWeight: 600, color: "var(--text-default)", margin: 0 }}>{tool.name}</p>
                         {tool.description && (
-                          <p style={{ fontSize: 12, color: "#a8a29e", margin: "2px 0 0 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{tool.description}</p>
+                          <p style={{ fontSize: 12, color: "var(--text-muted)", margin: "2px 0 0 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{tool.description}</p>
                         )}
                       </div>
                     </label>
@@ -895,59 +793,28 @@ export default function AgentDetail() {
                 )}
               </div>
             </Modal>
-          </div>
+          </ConfigPage>
         )}
 
         {/* ====== SKILLS ====== */}
         {tab === "skills" && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <h3 style={{ fontSize: 14, fontWeight: 700, color: "#44403c", margin: 0 }}>{t("page.agent_detail.bound_skills")}{skillCount})</h3>
-              <Button variant="primary" size="sm" onClick={() => setShowBindSkillModal(true)}>
-                <IconPlus size={14} />
-                {t("page.agent_detail.bind_skill")}
-              </Button>
-            </div>
-
-            {(boundSkills || []).length === 0 ? (
-              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "64px 0", textAlign: "center" }}>
-                <div style={{ width: 56, height: 56, borderRadius: 20, background: "#f2f6f5", color: "#436b65", display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 12, fontWeight: 800, fontSize: 20 }}>
-                  S
-                </div>
-                <p style={{ fontSize: 14, fontWeight: 600, color: "#78716c" }}>{t("page.agent_detail.no_skills_bound")}</p>
-                <p style={{ fontSize: 12, color: "#a8a29e", marginTop: 4 }}>{t("page.agent_detail.bind_skills_to_extend_this_agent_s_capabilities")}</p>
-              </div>
-            ) : (
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 260px), 1fr))", gap: 12 }}>
-                {(boundSkills || []).map((skill: any) => {
-                  const description = getSkillDescription(skill);
-                  return (
-                    <div key={skill.id} className="glass-card-sm" style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
-                      <div style={{ width: 36, height: 36, borderRadius: 10, background: "#f2f6f5", color: "#436b65", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, fontWeight: 800 }}>
-                        {(skill.display_name || skill.name || "S").charAt(0).toUpperCase()}
-                      </div>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <h4 style={{ fontSize: 13, fontWeight: 700, color: "#44403c", margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{skill.display_name || skill.name}</h4>
-                        {description && (
-                          <p style={{ fontSize: 12, color: "#78716c", marginTop: 2, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{description}</p>
-                        )}
-                        {skill.category && (
-                          <span style={{ display: "inline-block", marginTop: 4, fontSize: 10, fontWeight: 600, padding: "2px 8px", borderRadius: 99, background: "#dceae3", color: "#3f7361" }}>{skill.category}</span>
-                        )}
-                      </div>
-                      <Button
-                        variant="danger"
-                        size="sm"
-                        onClick={() => unbindSkillMutation.mutate(skill.id)}
-                        disabled={unbindSkillMutation.isPending}
-                      >
-                        {t("page.skills.unbind")}
-                      </Button>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
+          <ConfigPage>
+            <ConfigGroup>
+              {(boundSkills || []).length === 0 && <ConfigBlock><p className="config-empty">{t("page.agent_detail.no_skills_bound")}</p></ConfigBlock>}
+              {(boundSkills || []).map((skill: any) => (
+                <ConfigRow
+                  key={skill.id}
+                  label={skill.display_name || skill.name}
+                  note={[getSkillDescription(skill), skill.category].filter(Boolean).join(" · ") || undefined}
+                  control={(
+                    <Button variant="ghost" size="sm" onClick={() => unbindSkillMutation.mutate(skill.id)} disabled={unbindSkillMutation.isPending}>
+                      {t("page.skills.unbind")}
+                    </Button>
+                  )}
+                />
+              ))}
+              <ConfigAddRow label={t("page.agent_detail.bind_skill")} onClick={() => setShowBindSkillModal(true)} />
+            </ConfigGroup>
 
             <Modal
               open={showBindSkillModal}
@@ -975,7 +842,7 @@ export default function AgentDetail() {
               <SearchInput value={skillSearch} onChange={setSkillSearch} placeholder={t("page.agent_detail.search_skills")} className="mb-4" />
               <div style={{ maxHeight: 320, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8 }}>
                 {filteredAvailableSkills.length === 0 ? (
-                  <p style={{ fontSize: 13, color: "#a8a29e", textAlign: "center", padding: 24 }}>{t("page.agent_detail.no_skills_available")}</p>
+                  <p style={{ fontSize: 13, color: "var(--text-muted)", textAlign: "center", padding: 24 }}>{t("page.agent_detail.no_skills_available")}</p>
                 ) : (
                   filteredAvailableSkills.map((skill: any) => {
                     const description = getSkillDescription(skill);
@@ -1007,9 +874,9 @@ export default function AgentDetail() {
                           style={{ accentColor: "#436b65" }}
                         />
                         <div style={{ flex: 1, minWidth: 0 }}>
-                          <p style={{ fontSize: 13, fontWeight: 600, color: "#44403c", margin: 0 }}>{skill.display_name || skill.name}</p>
+                          <p style={{ fontSize: 13, fontWeight: 600, color: "var(--text-default)", margin: 0 }}>{skill.display_name || skill.name}</p>
                           {description && (
-                            <p style={{ fontSize: 12, color: "#a8a29e", margin: "2px 0 0 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{description}</p>
+                            <p style={{ fontSize: 12, color: "var(--text-muted)", margin: "2px 0 0 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{description}</p>
                           )}
                         </div>
                       </label>
@@ -1018,22 +885,22 @@ export default function AgentDetail() {
                 )}
               </div>
             </Modal>
-          </div>
+          </ConfigPage>
         )}
 
         {/* ====== EXECUTIONS ====== */}
         {tab === "executions" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-            <h3 style={{ fontSize: 14, fontWeight: 700, color: "#44403c", margin: 0 }}>{t("page.agent_detail.recent_executions")}{execItems.length})</h3>
+            <h3 style={{ fontSize: 14, fontWeight: 700, color: "var(--text-default)", margin: 0 }}>{t("page.agent_detail.recent_executions")}{execItems.length})</h3>
 
             {execItems.length === 0 ? (
               <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "64px 0", textAlign: "center" }}>
-                <div style={{ width: 56, height: 56, borderRadius: 20, background: "#f5f5f4", display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 12 }}>
-                  <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#d6d3d1" strokeWidth={1.5}>
+                <div style={{ width: 56, height: 56, borderRadius: 20, background: "var(--surface-muted)", display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 12 }}>
+                  <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#d1d1d6" strokeWidth={1.5}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M3 13.125C3 12.504 3.504 12 4.125 12h2.25c.621 0 1.125.504 1.125 1.125v6.75C7.5 20.496 6.996 21 6.375 21h-2.25A1.125 1.125 0 013 19.875v-6.75z" />
                   </svg>
                 </div>
-                <p style={{ fontSize: 14, fontWeight: 600, color: "#78716c" }}>{t("page.agent_detail.no_executions_yet")}</p>
+                <p style={{ fontSize: 14, fontWeight: 600, color: "var(--text-muted)" }}>{t("page.agent_detail.no_executions_yet")}</p>
               </div>
             ) : (
               <div className="glass-card" style={{ overflow: "hidden", padding: 0 }}>
@@ -1064,17 +931,17 @@ export default function AgentDetail() {
                               {exec.status || t("page.browser_sessions.unknown")}
                             </StatusBadge>
                           </td>
-                          <td style={{ padding: "12px 16px", color: "#57534e", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 180 }}>
+                          <td style={{ padding: "12px 16px", color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 180 }}>
                             {exec.input_preview || exec.input?.substring(0, 60) || "--"}
                           </td>
-                          <td style={{ padding: "12px 16px", color: "#57534e", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 180 }}>
+                          <td style={{ padding: "12px 16px", color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 180 }}>
                             {exec.output_preview || exec.output?.substring(0, 60) || "--"}
                           </td>
-                          <td style={{ padding: "12px 16px", color: "#57534e" }}>{exec.turns ?? "--"}</td>
-                          <td style={{ padding: "12px 16px", color: "#57534e" }}>
+                          <td style={{ padding: "12px 16px", color: "var(--text-muted)" }}>{exec.turns ?? "--"}</td>
+                          <td style={{ padding: "12px 16px", color: "var(--text-muted)" }}>
                             {exec.duration_ms ? `${(exec.duration_ms / 1000).toFixed(1)}s` : "--"}
                           </td>
-                          <td style={{ padding: "12px 16px", color: "#a8a29e", fontSize: 12 }}>
+                          <td style={{ padding: "12px 16px", color: "var(--text-muted)", fontSize: 12 }}>
                             {relativeTime(exec.created_at)}
                           </td>
                         </tr>
@@ -1083,27 +950,27 @@ export default function AgentDetail() {
                             <td colSpan={6} style={{ padding: "16px 16px", background: "rgba(250,250,249,0.5)" }}>
                               <div style={{ display: "flex", flexDirection: "column", gap: 12, fontSize: 12 }}>
                                 <div>
-                                  <span style={{ fontWeight: 600, color: "#78716c" }}>{t("page.agent_detail.full_input")}</span>
-                                  <pre style={{ marginTop: 4, background: "rgba(255,255,255,0.7)", borderRadius: 10, padding: 12, overflow: "auto", color: "#57534e", whiteSpace: "pre-wrap" }}>
+                                  <span style={{ fontWeight: 600, color: "var(--text-muted)" }}>{t("page.agent_detail.full_input")}</span>
+                                  <pre style={{ marginTop: 4, background: "rgba(255,255,255,0.7)", borderRadius: 10, padding: 12, overflow: "auto", color: "var(--text-muted)", whiteSpace: "pre-wrap" }}>
                                     {exec.input || "--"}
                                   </pre>
                                 </div>
                                 <div>
-                                  <span style={{ fontWeight: 600, color: "#78716c" }}>{t("page.agent_detail.full_output")}</span>
-                                  <pre style={{ marginTop: 4, background: "rgba(255,255,255,0.7)", borderRadius: 10, padding: 12, overflow: "auto", color: "#57534e", whiteSpace: "pre-wrap" }}>
+                                  <span style={{ fontWeight: 600, color: "var(--text-muted)" }}>{t("page.agent_detail.full_output")}</span>
+                                  <pre style={{ marginTop: 4, background: "rgba(255,255,255,0.7)", borderRadius: 10, padding: 12, overflow: "auto", color: "var(--text-muted)", whiteSpace: "pre-wrap" }}>
                                     {exec.output || "--"}
                                   </pre>
                                 </div>
                                 {exec.tools_used && (
                                   <div>
-                                    <span style={{ fontWeight: 600, color: "#78716c" }}>{t("page.agent_detail.tools_used")} </span>
-                                    <span style={{ color: "#57534e" }}>{Array.isArray(exec.tools_used) ? exec.tools_used.join(", ") : exec.tools_used}</span>
+                                    <span style={{ fontWeight: 600, color: "var(--text-muted)" }}>{t("page.agent_detail.tools_used")} </span>
+                                    <span style={{ color: "var(--text-muted)" }}>{Array.isArray(exec.tools_used) ? exec.tools_used.join(", ") : exec.tools_used}</span>
                                   </div>
                                 )}
                                 {exec.token_usage && (
                                   <div>
-                                    <span style={{ fontWeight: 600, color: "#78716c" }}>{t("page.agent_detail.token_usage")} </span>
-                                    <span style={{ color: "#57534e" }}>{typeof exec.token_usage === "object" ? JSON.stringify(exec.token_usage) : exec.token_usage}</span>
+                                    <span style={{ fontWeight: 600, color: "var(--text-muted)" }}>{t("page.agent_detail.token_usage")} </span>
+                                    <span style={{ color: "var(--text-muted)" }}>{typeof exec.token_usage === "object" ? JSON.stringify(exec.token_usage) : exec.token_usage}</span>
                                   </div>
                                 )}
                               </div>
@@ -1120,7 +987,7 @@ export default function AgentDetail() {
         )}
 
         {/* ====== LEARNING ====== */}
-        {tab === "learning" && (
+        {(tab === "learning" || (embedded && tab === "overview")) && (
           <AgentLearningPanel
             candidates={learningCandidates || []}
             evidence={runtimeEvidence || []}
@@ -1135,7 +1002,7 @@ export default function AgentDetail() {
         )}
 
         {/* ====== INITIATIVE ====== */}
-        {tab === "initiative" && <AgentInitiativePanel agentId={agent.id} />}
+        {(tab === "initiative" || (embedded && tab === "settings")) && <AgentInitiativePanel agentId={agent.id} />}
 
         {/* ====== SETTINGS ====== */}
         {tab === "settings" && (
@@ -1143,10 +1010,10 @@ export default function AgentDetail() {
             <div className="glass-card" style={{ padding: 20 }}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: 16, alignItems: "flex-start" }}>
                 <div style={{ minWidth: 0 }}>
-                  <h3 style={{ fontSize: 14, fontWeight: 700, color: "#44403c", margin: 0 }}>
+                  <h3 style={{ fontSize: 14, fontWeight: 700, color: "var(--text-default)", margin: 0 }}>
                     {t("page.agent_detail.runtime_learning")}
                   </h3>
-                  <p style={{ margin: "6px 0 0", fontSize: 13, lineHeight: 1.5, color: "#78716c" }}>
+                  <p style={{ margin: "6px 0 0", fontSize: 13, lineHeight: 1.5, color: "var(--text-muted)" }}>
                     {t("page.agent_detail.runtime_learning_desc")}
                   </p>
                 </div>
@@ -1160,7 +1027,7 @@ export default function AgentDetail() {
             </div>
 
             <div className="glass-card" style={{ padding: 20 }}>
-              <h3 style={{ fontSize: 14, fontWeight: 700, color: "#44403c", margin: "0 0 16px 0" }}>{t("page.custom_fields.actions")}</h3>
+              <h3 style={{ fontSize: 14, fontWeight: 700, color: "var(--text-default)", margin: "0 0 16px 0" }}>{t("page.custom_fields.actions")}</h3>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
                 <Button variant="outline" onClick={cloneAgent}>
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}>

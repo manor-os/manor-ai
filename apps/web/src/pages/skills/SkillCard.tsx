@@ -89,7 +89,7 @@ export function SectionHeader({
         style={{
           fontSize: 13,
           fontWeight: 800,
-          color: "#44403c",
+          color: "var(--text-muted)",
           letterSpacing: "-0.01em",
         }}
       >
@@ -100,8 +100,8 @@ export function SectionHeader({
           style={{
             fontSize: 11,
             fontWeight: 700,
-            color: "#a8a29e",
-            background: "#f5f5f4",
+            color: "var(--text-faint)",
+            background: "var(--surface-muted)",
             padding: "2px 8px",
             borderRadius: 999,
           }}
@@ -138,10 +138,10 @@ export function ActionBtn({
   const borderColor = danger
     ? isH
       ? "#ddafac"
-      : "#f5f5f4"
+      : "#f5f5f7"
     : isH
       ? color
-      : "#f5f5f4";
+      : "#f5f5f7";
   return (
     <button
       onMouseEnter={() => setIsH(true)}
@@ -153,9 +153,9 @@ export function ActionBtn({
         width: 32,
         height: 32,
         borderRadius: "50%",
-        background: isH ? "#fff" : "#fafaf9",
+        background: isH ? "#fff" : "#fafafa",
         border: `1px solid ${borderColor}`,
-        color: isH ? color : "#a8a29e",
+        color: isH ? color : "#aeaeb2",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -280,16 +280,14 @@ export function SkillCard({
           ),
           body: (
             <div style={{ display: "grid", gap: 14 }}>
-              <p style={{ margin: 0, color: "#44403c" }}>{description}</p>
+              <p style={{ margin: 0, color: "var(--text-default)" }}>{description}</p>
               {bindingContexts.length ? (
                 <div style={{ display: "grid", gap: 8 }}>
                   <div
                     style={{
                       fontSize: 10,
                       fontWeight: 800,
-                      color: "#a8a29e",
-                      letterSpacing: 0.8,
-                      textTransform: "uppercase",
+                      color: "var(--text-faint)",
                     }}
                   >
                     Binding provenance
@@ -301,13 +299,13 @@ export function SkillCard({
                         display: "grid",
                         gap: 3,
                         padding: "8px 0",
-                        borderTop: index === 0 ? "1px solid #e7e5e4" : "none",
+                        borderTop: index === 0 ? "0.5px solid #e5e5ea" : "none",
                       }}
                     >
-                      <div style={{ fontSize: 12, fontWeight: 700, color: "#292524" }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-strong)" }}>
                         {detailedBindingLabel(context)}
                       </div>
-                      <div style={{ fontSize: 11, color: "#78716c" }}>
+                      <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
                         {bindingSourceLabel(context)}
                         {context.service_key ? ` · ${context.service_key}` : ""}
                       </div>

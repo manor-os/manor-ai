@@ -65,7 +65,7 @@ async def test_applied_blueprint_draft_materializes_workflows_and_data_app_per_w
         "slug": "campaign_flow", "name": "Campaign flow", "trigger_type": "manual",
         "steps": [
             {"id": "create", "type": "workflow_project", "name": "Create", "next": [], "config": {
-                "operation": "create", "project_type": "campaign", "project_key": "campaign",
+                "operation": "create", "project_type": "campaign",
                 "schema_version": 1, "state_schema": {"type": "object", "properties": {"status": {"type": "string"}}},
                 "state": {}, "current_stage": "new",
             }},
@@ -133,7 +133,7 @@ async def test_draft_resource_materialization_failure_leaves_no_workspace(
             "workflows": [{
                 "slug": "rollback_flow", "name": "Rollback flow", "trigger_type": "manual",
                 "steps": [{"id": "create", "type": "workflow_project", "name": "Create", "next": [], "config": {
-                    "operation": "create", "project_type": "rollback", "project_key": "rollback",
+                    "operation": "create", "project_type": "rollback",
                     "schema_version": 1, "state_schema": {"type": "object", "properties": {}},
                     "state": {}, "current_stage": "new",
                 }}],
@@ -197,7 +197,7 @@ async def test_architect_resource_tools_materialize_and_export_from_a_draft(
     await db_session.flush()
     workflow = await _propose_workflow(db_session, entity_id=entity_id, user_id=user_id, draft_id=draft.id,
         slug="delivery_flow", name="Delivery flow", steps=[{"id": "create", "type": "workflow_project", "name": "Create", "next": [], "config": {
-            "operation": "create", "project_type": "delivery", "project_key": "delivery", "schema_version": 1,
+            "operation": "create", "project_type": "delivery", "schema_version": 1,
             "state_schema": {"type": "object", "properties": {
                 "status": {"type": "string"}, "title": {"type": "string"}, "publication": {"type": "object"},
             }}, "state": {}, "current_stage": "new"}}])
@@ -297,6 +297,123 @@ async def test_workspace_draft_persists_platform_blueprint_ids(
     await db_session.commit()
     await db_session.refresh(draft)
     assert draft.applied_blueprint_id == blueprint_id
+
+
+def _catalog_blueprint(slug: str, title: str, *, tags: list[str], install_count: int = 0, **manifest) -> WorkspaceBlueprint:
+    return WorkspaceBlueprint(
+        id=generate_ulid(), entity_id=None, slug=f"{slug}-{generate_ulid().lower()}", title=title,
+        summary=manifest.pop("summary"), tags=tags, install_count=install_count, status="published",
+        payload={"manifest": {"title": title, **manifest}},
+    )
+
+
+async def test_blueprint_search_ranks_by_the_users_need_and_explains_the_match(
+    db_session: AsyncSession,
+) -> None:
+    """The fitting Blueprint leads the inventory over a more installed one, with its matched fields."""
+    from packages.core.ai.tools.workspace_arch_tools import _search_blueprints
+
+    entity_id, user_id = generate_ulid(), generate_ulid()
+    music = _catalog_blueprint(
+        "indie-music", "Indie Music Release Studio", tags=["music", "independent-artists"],
+        summary="Promote songs on YouTube, Instagram and TikTok with posters and teaser videos.",
+        use_when="An independent artist promoting a released or unreleased song.",
+        outcome_summary="Approved campaign posts, verified publication links and weekly campaign reports.",
+        i18n={"zh": {"summary": "独立音乐人推广歌曲，生成海报和预告短视频。"}},
+    )
+    support = _catalog_blueprint(
+        "support-desk", "Customer Support Desk", tags=["support", "email"], install_count=500,
+        summary="Draft replies to customer email about orders, shipping and returns.",
+        use_when="A shop answering customer questions by email.",
+        outcome_summary="Approved replies and a weekly summary of customer issues.",
+    )
+    draft = WorkspaceDraft(
+        entity_id=entity_id, user_id=user_id, fields=dict(DEFAULT_FIELDS),
+        messages=[], missing=[], ready=False, status="active",
+    )
+    db_session.add_all([music, support, draft])
+    await db_session.commit()
+
+    async def search(**kwargs) -> dict:
+        return json.loads(await _search_blueprints(
+            db_session, entity_id=entity_id, user_id=user_id, draft_id=draft.id, **kwargs,
+        ))
+
+    result = await search(query=(
+        "independent music artist promoting songs: campaign plan for YouTube, Instagram and TikTok, "
+        "posters and teaser videos, publication links, weekly campaign reports"
+    ))
+    assert result["ok"] is True
+    rows = {row["id"]: (index, row) for index, row in enumerate(result["blueprints"])}
+    music_index, music_row = rows[music.id]
+    support_index, support_row = rows[support.id]
+    assert music_index < support_index
+    assert music_row["match"]["level"] == "high"
+    assert support_row["match"]["level"] in {"low", "none"}
+    assert music_row["match"]["score"] > support_row["match"]["score"]
+    assert any(reason.startswith("title matches:") and "music" in reason for reason in music_row["match"]["reasons"])
+    assert music_row["use_when"] == "An independent artist promoting a released or unreleased song."
+
+    # A brief in another language still meets a translated catalog entry.
+    chinese = await search(query="我是独立音乐人，想推广歌曲")
+    assert chinese["blueprints"][0]["id"] == music.id
+
+    # Without a query, the draft's committed basics and services are the need.
+    draft.fields = {**dict(DEFAULT_FIELDS), "name": "Shop Support", "services": [
+        {"service_key": "customer_email", "name": "Customer Email Replies",
+         "description": "Reply to customer email about orders, shipping and returns."},
+    ]}
+    await db_session.commit()
+    from_draft = await search()
+    assert [row["id"] for row in from_draft["blueprints"]].index(support.id) < [
+        row["id"] for row in from_draft["blueprints"]
+    ].index(music.id)
+
+    draft.fields = dict(DEFAULT_FIELDS)
+    await db_session.commit()
+    assert (await search())["ok"] is False
+
+
+async def test_architect_applies_the_blueprint_the_user_chose(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from packages.core.ai.tools.workspace_arch_tools import _apply_blueprint
+
+    async def ready_without_agent_repair(*_args, **_kwargs):
+        return True
+    monkeypatch.setattr("packages.core.services.workspace_draft_service._refresh_missing_from_lint", ready_without_agent_repair)
+
+    entity_id, user_id = generate_ulid(), generate_ulid()
+    payload = _payload(agent_slug="chosen-agent", skill_slug="chosen-skill", server_slug="chosen-server")
+    payload["embedded"] = {"agents": [], "skills": [], "tools": [], "mcp_servers": []}
+    payload["contract"]["requires"] = {"skills": [], "mcp_servers": [], "tools": []}
+    payload["recipe"]["subscriptions"] = []
+    blueprint = WorkspaceBlueprint(
+        id=generate_ulid(), entity_id=entity_id, slug="chosen", title="Chosen Blueprint",
+        payload=payload, status="published",
+    )
+    draft = WorkspaceDraft(
+        entity_id=entity_id, user_id=user_id, fields=dict(DEFAULT_FIELDS),
+        messages=[], missing=[], ready=False, status="active",
+    )
+    db_session.add_all([blueprint, draft])
+    await db_session.commit()
+
+    async def apply(blueprint_id: str) -> dict:
+        return json.loads(await _apply_blueprint(
+            db_session, entity_id=entity_id, user_id=user_id, draft_id=draft.id, blueprint_id=blueprint_id,
+        ))
+
+    missing = await apply(generate_ulid())
+    assert missing["ok"] is False and "not available" in missing["error"]
+
+    result = await apply(blueprint.id)
+    assert result["ok"] is True
+    assert result["blueprint_id"] == blueprint.id
+    assert result["services"] == ["Blueprint Operations"]
+    await db_session.refresh(draft)
+    assert draft.applied_blueprint_id == blueprint.id
 
 
 @pytest.mark.parametrize("blueprint_mode", [False, True])
@@ -758,16 +875,34 @@ async def test_apply_blueprint_materializes_agent_capabilities(
 
 @pytest.mark.parametrize(
     ("skill_scope", "available"),
-    [("missing", False), ("marketplace", True), ("local", False)],
+    [("missing", False), ("marketplace", True), ("local", False), ("builtin", True)],
 )
 async def test_blueprint_draft_lints_exact_platform_skill_availability(
     db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
     skill_scope: str,
     available: bool,
 ):
     entity_id = generate_ulid()
     creator_id = generate_ulid()
     marketplace_id = generate_ulid()
+    if skill_scope == "builtin":
+        # Blueprint export names a built-in by its portable id, never by the
+        # deployment's row id.
+        from packages.core.services import builtin_skill_loader
+
+        slug = f"lint_builtin_{entity_id.lower()}"
+        bundle = tmp_path / slug
+        bundle.mkdir()
+        (bundle / "SKILL.md").write_text(f"---\nname: {slug}\nversion: 1.0.0\n---\nRead files.\n")
+        (bundle / "config.json").write_text(json.dumps({
+            "type": "runtime_guidance", "execution_mode": "instructions_only",
+            "tools": ["read_file"],
+        }))
+        monkeypatch.setattr(builtin_skill_loader, "_builtin_skill_dirs", lambda: [bundle])
+        await builtin_skill_loader.seed_builtin_skills(db_session)
+        marketplace_id = f"builtin:{slug}"
     server_slug = f"blueprint-exact-mcp-{entity_id}"
     payload = _with_exact_platform_skill(
         _payload(
@@ -806,7 +941,7 @@ async def test_blueprint_draft_lints_exact_platform_skill_availability(
             status="active",
         ),
     ]
-    if skill_scope != "missing":
+    if skill_scope in {"marketplace", "local"}:
         rows.append(Skill(
             id=marketplace_id,
             entity_id=None if skill_scope == "marketplace" else entity_id,
@@ -843,6 +978,62 @@ async def test_blueprint_draft_lints_exact_platform_skill_availability(
     if exact_issues:
         assert exact_issues[0]["severity"] == "P0"
         assert marketplace_id in exact_issues[0]["message"]
+
+
+async def test_blueprint_draft_binds_internal_bridge_and_keeps_service_declared_by_key(
+    db_session: AsyncSession,
+):
+    """A Blueprint Agent may bind an internal bridge, which is never user setup
+    work, and a service declared by ``key`` (the installer's own spelling) is
+    the service its subscription names, not a reason for a placeholder."""
+    entity_id = generate_ulid()
+    creator_id = generate_ulid()
+    internal_key = "chrome_knowledge_local"
+    payload = _payload(
+        agent_slug=f"blueprint-bridge-agent-{entity_id}",
+        skill_slug=f"blueprint-bridge-skill-{entity_id}",
+        server_slug=internal_key,
+    )
+    payload["recipe"]["operating_model"]["services"][0] = {
+        "key": "blueprint_operations", "name": "Blueprint Operations",
+    }
+    existing = (await db_session.execute(
+        select(MCPServer).where(MCPServer.server_key == internal_key)
+    )).scalar_one_or_none()
+    if existing is None:
+        db_session.add(MCPServer(
+            id=generate_ulid(), server_key=internal_key, name="Knowledge bridge",
+            transport="builtin", auth_type="none", status="active",
+        ))
+    else:
+        existing.status = "active"
+    blueprint = WorkspaceBlueprint(
+        id=generate_ulid(), entity_id=entity_id, slug=f"bridge-copy-{entity_id}",
+        title="Bridge Copy", payload=payload, payload_version="1.1", status="published",
+    )
+    draft = WorkspaceDraft(
+        id=generate_ulid(), entity_id=entity_id, user_id=creator_id,
+        fields=dict(DEFAULT_FIELDS), messages=[], missing=[], ready=False, status="active",
+    )
+    db_session.add_all([blueprint, draft])
+    await db_session.commit()
+
+    applied = await apply_blueprint(
+        db_session, draft_id=draft.id, entity_id=entity_id,
+        blueprint_id=blueprint.id, user_id=creator_id,
+    )
+    lint = await runtime_lint_workspace_draft(
+        db_session, entity_id=entity_id, draft_id=applied.id, user_id=creator_id,
+    )
+
+    assert [service.get("service_key") for service in applied.fields["services"]] == [
+        "blueprint_operations",
+    ]
+    assert "key" not in applied.fields["services"][0]
+    issues = (lint or {}).get("issues", [])
+    assert [issue for issue in issues if issue["severity"] == "P0"] == []
+    assert not any(internal_key in str(issue.get("message")) for issue in issues)
+    assert applied.ready is True
 
 
 async def test_workspace_draft_lint_rejects_local_id_as_marketplace_agent(

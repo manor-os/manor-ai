@@ -17,7 +17,8 @@ import AiEditPreviewControls, { AiEditPreviewInteractionShield } from "../compon
 import MediaInsertDialog from "../components/MediaInsertDialog";
 import MarkdownTable from "../components/MarkdownTable";
 import { PageHeaderTitle } from "../components/ui/PageHeader";
-import { IconArrowLeft, IconEdit, IconDownload, IconClose, IconDocument, IconPlus, IconShare, IconInfo, IconText, IconSignature, IconTrash, IconCheck, IconUndo, IconRedo, IconHighlighter, IconPenLine, IconEraser, IconCopy, IconRefresh, IconComment, IconPlay } from "../components/icons";
+import Dropdown from "../components/ui/Dropdown";
+import { IconSparkles, IconFolder, IconArrowLeft, IconEdit, IconDownload, IconClose, IconDocument, IconPlus, IconShare, IconInfo, IconText, IconSignature, IconTrash, IconCheck, IconUndo, IconRedo, IconHighlighter, IconPenLine, IconEraser, IconCopy, IconRefresh, IconComment, IconPlay } from "../components/icons";
 import CommentThread from "../components/CommentThread";
 import SitePublishAction from "../components/SitePublishAction";
 import SignatureRequestDialog from "../components/permissions/SignatureRequestDialog";
@@ -243,20 +244,11 @@ function taskOutputPreviewDocument(docId: string | undefined, preview: TaskOutpu
 
 function categoryLabel(cat: FileCategory): string {
   const labels: Record<FileCategory, string> = {
-    text: "Text", markdown: "Markdown", code: "Code", html: "HTML", image: "Image",
-    video: "Video", audio: "Audio",
-    pdf: "PDF", csv: "CSV", json: "JSON", diagram: "Diagram", docx: "Word", xlsx: "Spreadsheet", pptx: "Presentation", unsupported: "File",
+    text: t("ui.file_type_text"), markdown: "Markdown", code: t("ui.file_type_code"), html: "HTML", image: t("ui.file_type_image"),
+    video: t("ui.file_type_video"), audio: t("ui.file_type_audio"),
+    pdf: "PDF", csv: "CSV", json: "JSON", diagram: t("ui.file_type_diagram"), docx: "Word", xlsx: t("ui.file_type_spreadsheet"), pptx: t("ui.file_type_presentation"), unsupported: t("ui.file_type_file"),
   };
   return labels[cat];
-}
-
-function categoryBadgeType(cat: FileCategory): string {
-  const types: Record<FileCategory, string> = {
-    text: "gray", markdown: "purple", code: "orange", html: "blue", image: "red",
-    video: "pink", audio: "cyan",
-    pdf: "red", csv: "green", json: "blue", diagram: "purple", docx: "blue", xlsx: "green", pptx: "orange", unsupported: "gray",
-  };
-  return types[cat];
 }
 
 function isEditable(
@@ -985,7 +977,7 @@ function colorizeJSON(text: string): string {
       .replace(/: "([^"]*)"/g, ': <span style="color:#86efac">"$1"</span>')
       .replace(/: (\d+\.?\d*)/g, ': <span style="color:#fcd34d">$1</span>')
       .replace(/: (true|false)/g, ': <span style="color:#c4b5fd">$1</span>')
-      .replace(/: (null)/g, ': <span style="color:#a8a29e">$1</span>');
+      .replace(/: (null)/g, ': <span style="color:#aeaeb2">$1</span>');
     return colored;
   } catch {
     return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -1523,7 +1515,7 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
 
   if (loading) return <div style={{ display: "flex", justifyContent: "center", padding: 64 }}><LoadingSpinner size={28} /></div>;
   if (error) return <p style={{ color: "#c14a44", textAlign: "center", padding: 32 }}>{error}</p>;
-  if (sheets.length === 0) return <p style={{ color: "#78716c", textAlign: "center", padding: 32 }}>{t("page.file_viewer.empty_spreadsheet")}</p>;
+  if (sheets.length === 0) return <p style={{ color: "var(--text-muted)", textAlign: "center", padding: 32 }}>{t("page.file_viewer.empty_spreadsheet")}</p>;
 
   return (
     <div>
@@ -1539,12 +1531,12 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
                 gridRef.current?.scrollTo({ left: 0, top: 0 });
               }}
               style={{
-                padding: "6px 16px",
+                padding: "5px 12px",
                 fontSize: 13,
-                fontWeight: i === activeSheet ? 700 : 500,
-                color: i === activeSheet ? "#436b65" : "#78716c",
-                background: i === activeSheet ? "rgba(67,107,101,0.08)" : "transparent",
-                border: "1px solid " + (i === activeSheet ? "rgba(67,107,101,0.2)" : "rgba(231,229,228,0.6)"),
+                fontWeight: i === activeSheet ? 500 : 400,
+                color: i === activeSheet ? "var(--text-strong)" : "var(--text-muted)",
+                background: i === activeSheet ? "rgba(118,118,128,0.12)" : "transparent",
+                border: "none",
                 borderRadius: 8,
                 cursor: "pointer",
                 transition: "all 0.15s",
@@ -1560,7 +1552,7 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
         ref={gridRef}
         data-spreadsheet-preview-grid
         onScroll={(event) => setGridScroll({ left: event.currentTarget.scrollLeft, top: event.currentTarget.scrollTop })}
-        style={{ overflow: "auto", maxHeight: 600, borderRadius: 12, border: "1px solid rgba(28,25,23,0.06)" }}
+        style={{ overflow: "auto", maxHeight: 600, borderRadius: 12, border: "0.5px solid rgba(29, 29, 31,0.06)" }}
       >
         <div role="table" aria-label={sheet.name} aria-rowcount={sheet.rowHeights.length + 1} aria-colcount={sheet.columnWidths.length + 1} style={{ position: "relative", width: Math.max(gridWidth, gridViewport.width), height: gridHeight, fontSize: 13 }}>
           <div role="row" aria-rowindex={1} style={{ position: "sticky", top: 0, zIndex: 4, height: 34 }}>
@@ -1571,7 +1563,7 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
           </div>
           {[...visibleCellRows].map(([row, columns]) => (
             <div key={row} role="row" aria-rowindex={row + 2} style={{ position: "absolute", top: 34 + rowOffsets[row], left: 0, width: "100%", height: rowHeights[row] || 32 }}>
-              <div role="rowheader" aria-colindex={1} style={{ ...tdStyle, padding: "6px 4px", position: "sticky", left: 0, width: 48, height: "100%", boxSizing: "border-box", color: "#a8a29e", fontWeight: 600, background: "#fafaf9", textAlign: "center", zIndex: 3 }}>{row + 1}</div>
+              <div role="rowheader" aria-colindex={1} style={{ ...tdStyle, padding: "6px 4px", position: "sticky", left: 0, width: 48, height: "100%", boxSizing: "border-box", color: "var(--text-muted)", fontWeight: 600, background: "var(--surface-muted)", textAlign: "center", zIndex: 3 }}>{row + 1}</div>
               {columns.map((column) => {
             const merge = spreadsheetMergeAt(sheet.merges, row, column);
             if (merge.covered) return null;
@@ -1627,7 +1619,7 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
           <SpreadsheetChartPreview charts={sheet.charts} />
         </div>
       )}
-      <p style={{ fontSize: 12, color: "#a8a29e", marginTop: 8 }}>
+      <p style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 8 }}>
         {sheet.data.length} {t("page.file_viewer.rows_sheet")} {sheet.name}
       </p>
     </div>
@@ -1638,9 +1630,9 @@ const thStyle: React.CSSProperties = {
   padding: "8px 12px",
   fontSize: 11,
   fontWeight: 700,
-  color: "#78716c",
-  background: "#fafaf9",
-  borderBottom: "2px solid rgba(28,25,23,0.06)",
+  color: "#8e8e93",
+  background: "#fafafa",
+  borderBottom: "2px solid rgba(29, 29, 31,0.06)",
   textAlign: "left",
   position: "sticky",
   top: 0,
@@ -1649,7 +1641,7 @@ const thStyle: React.CSSProperties = {
 
 const tdStyle: React.CSSProperties = {
   padding: "6px 12px",
-  borderBottom: "1px solid #f5f5f4",
+  borderBottom: "1px solid #f5f5f7",
   whiteSpace: "nowrap",
   maxWidth: 300,
   overflow: "hidden",
@@ -1688,8 +1680,8 @@ function parseTextSlides(text: string): PptxSlide[] {
       const bLines = block.trim().split("\n").filter(l => l.trim() && l.trim() !== "(empty slide)");
       const accent = SLIDE_ACCENTS[slides.length % SLIDE_ACCENTS.length];
       const texts: PptxShape["texts"] = bLines.map(line => {
-        if (line.startsWith("## ")) return { text: line.slice(3), bold: true, fontSize: 32, color: "#1c1917", align: "center" as const };
-        return { text: line.replace(/^[-*]\s+/, ""), fontSize: 18, color: "#57534e", bullet: line.match(/^[-*]\s/) ? "\u2022" : undefined };
+        if (line.startsWith("## ")) return { text: line.slice(3), bold: true, fontSize: 32, color: "#1d1d1f", align: "center" as const };
+        return { text: line.replace(/^[-*]\s+/, ""), fontSize: 18, color: "#6e6e73", bullet: line.match(/^[-*]\s/) ? "\u2022" : undefined };
       });
       slides.push({
         bg: "#ffffff",
@@ -1732,9 +1724,9 @@ function parseTextSlides(text: string): PptxSlide[] {
     // Title slide
     if (title || slideData.length === 0) {
       slides.push({
-        bg: "#1c1917",
+        bg: "#1d1d1f",
         shapes: [
-          { x: 0, y: 0, w: 100, h: 100, gradFill: { angle: 135, stops: [{ pos: 0, color: "#1c1917", alpha: 1 }, { pos: 100, color: "#1e3a5f", alpha: 1 }] }, texts: [] },
+          { x: 0, y: 0, w: 100, h: 100, gradFill: { angle: 135, stops: [{ pos: 0, color: "#1d1d1f", alpha: 1 }, { pos: 100, color: "#1e3a5f", alpha: 1 }] }, texts: [] },
           { x: 10, y: 30, w: 80, h: 40, texts: [
             { text: title || "Presentation", bold: true, fontSize: 44, color: "#ffffff", align: "center" },
           ]},
@@ -1749,7 +1741,7 @@ function parseTextSlides(text: string): PptxSlide[] {
       const items: PptxShape["texts"] = sd.items.map(item => ({
         text: item.replace(/^[-*•]\s*/, "").replace(/^\d+\.\s*/, ""),
         fontSize: 20,
-        color: "#44403c",
+        color: "#48484a",
         bullet: item.match(/^[-*•]/) ? "\u2022" : item.match(/^\d+\./) ? `${item.match(/^(\d+)\./)?.[1]}.` : undefined,
         indent: (item.match(/^[-*•]/) || item.match(/^\d+\./)) ? 24 : undefined,
       }));
@@ -1760,7 +1752,7 @@ function parseTextSlides(text: string): PptxSlide[] {
           { x: 0, y: 0, w: 100, h: 1.2, fill: accent, texts: [] },
           // Title
           { x: 6, y: 5, w: 88, h: 15, texts: [
-            { text: sd.title, bold: true, fontSize: 32, color: "#1c1917" },
+            { text: sd.title, bold: true, fontSize: 32, color: "#1d1d1f" },
           ]},
           // Content
           { x: 8, y: 22, w: 84, h: 72, texts: items },
@@ -1780,7 +1772,7 @@ function parseTextSlides(text: string): PptxSlide[] {
           text: l.replace(/^#+\s*/, ""),
           bold: l.startsWith("#"),
           fontSize: l.startsWith("#") ? 28 : 16,
-          color: l.startsWith("#") ? "#1c1917" : "#57534e",
+          color: l.startsWith("#") ? "#1d1d1f" : "#6e6e73",
         })),
       }],
     });
@@ -1801,10 +1793,10 @@ function PreviewDownloadFallback({
   return (
     <div style={{
       textAlign: "center", padding: "64px 24px", borderRadius: 12,
-      border: "1px solid rgba(28,25,23,0.06)", background: "rgba(250,250,249,0.75)",
+      border: "0.5px solid rgba(29, 29, 31,0.06)", background: "rgba(250,250,249,0.75)",
     }}>
       <IconDocument size={32} className="text-stone-400" />
-      <p style={{ color: "#78716c", margin: "16px 0" }}>{message}</p>
+      <p style={{ color: "var(--text-muted)", margin: "16px 0" }}>{message}</p>
       <div style={{ display: "flex", justifyContent: "center", flexWrap: "wrap", gap: 8 }}>
         {onRetry && (
           <Button variant="outline" onClick={onRetry} style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
@@ -2034,9 +2026,9 @@ const PDF_EDITOR_COPY = {
   signedPdf: t("page.file_viewer.pdf_editor.signed_pdf_read_only"),
 };
 
-const PDF_TEXT_COLORS = ["#1c1917", "#c14a44", "#436b65", "#4869ac"];
+const PDF_TEXT_COLORS = ["#1d1d1f", "#c14a44", "#436b65", "#4869ac"];
 const PDF_HIGHLIGHT_COLORS = ["#fde047", "#86efac", "#93c5fd", "#f9a8d4"];
-const PDF_DRAW_COLORS = ["#1c1917", "#c14a44", "#436b65", "#4869ac"];
+const PDF_DRAW_COLORS = ["#1d1d1f", "#c14a44", "#436b65", "#4869ac"];
 const PDF_DEFAULT_ZOOM = 140;
 const PDF_SIGNATURE_STORAGE_KEY = "manor.pdfEditor.signature";
 
@@ -2254,7 +2246,7 @@ function parsePdfLiveEditAnnotations(
         ...base,
         kind: "draw",
         points,
-        color: isValidPdfHexColor(raw?.color) ? raw.color : existing?.kind === "draw" ? existing.color : "#1c1917",
+        color: isValidPdfHexColor(raw?.color) ? raw.color : existing?.kind === "draw" ? existing.color : "#1d1d1f",
         strokeWidth: Math.min(10, Math.max(1, coercePdfNumber(raw?.strokeWidth, existing?.kind === "draw" ? existing.strokeWidth : 2))),
       })];
     }
@@ -2286,7 +2278,7 @@ function parsePdfLiveEditAnnotations(
       kind: "text",
       text: typeof raw?.text === "string" ? raw.text : existing?.kind === "text" ? existing.text : "",
       fontSize: Math.min(48, Math.max(8, coercePdfNumber(raw?.fontSize, existing?.kind === "text" ? existing.fontSize : 14))),
-      color: isValidPdfHexColor(raw?.color) ? raw.color : existing?.kind === "text" ? existing.color : "#1c1917",
+      color: isValidPdfHexColor(raw?.color) ? raw.color : existing?.kind === "text" ? existing.color : "#1d1d1f",
     })];
   });
 }
@@ -2502,7 +2494,7 @@ function PdfSignatureDialog({
     ctx.lineWidth = 2.4;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
-    ctx.strokeStyle = "#1c1917";
+    ctx.strokeStyle = "#1d1d1f";
   }, []);
 
   useEffect(() => {
@@ -2569,7 +2561,7 @@ function PdfSignatureDialog({
         alignItems: "center",
         justifyContent: "center",
         padding: 20,
-        background: "rgba(28,25,23,0.42)",
+        background: "rgba(29, 29, 31,0.42)",
       }}
       onClick={onClose}
     >
@@ -2579,7 +2571,7 @@ function PdfSignatureDialog({
         onClick={(event) => event.stopPropagation()}
       >
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 15, fontWeight: 700, color: "#292524" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 15, fontWeight: 700, color: "var(--text-strong)" }}>
             <IconSignature size={18} />
             {PDF_EDITOR_COPY.signatureTitle}
           </div>
@@ -2587,7 +2579,7 @@ function PdfSignatureDialog({
             type="button"
             onClick={onClose}
             aria-label={t("action.close")}
-            style={{ width: 32, height: 32, borderRadius: 8, border: "none", background: "transparent", color: "#78716c", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
+            style={{ width: 32, height: 32, borderRadius: 8, border: "none", background: "transparent", color: "var(--text-muted)", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
           >
             <IconClose size={17} />
           </button>
@@ -2601,7 +2593,7 @@ function PdfSignatureDialog({
           style={{
             display: "block",
             borderRadius: 10,
-            border: "1px solid rgba(28,25,23,0.06)",
+            border: "0.5px solid rgba(29, 29, 31,0.06)",
             background: "white",
             touchAction: "none",
           }}
@@ -2630,6 +2622,7 @@ export function PdfJsViewer({
   onSaved,
   onLiveEditBridgeChange,
   canEdit = true,
+  toolsOpen = true,
 }: {
   url: string;
   blob?: Blob | null;
@@ -2639,6 +2632,7 @@ export function PdfJsViewer({
   onSaved?: (savedDoc: Document, savedBlob: Blob) => void | Promise<void>;
   onLiveEditBridgeChange?: (bridge: PdfLiveEditBridge | null) => void;
   canEdit?: boolean;
+  toolsOpen?: boolean;
 }) {
   const [pdfDoc, setPdfDoc] = useState<any>(null);
   const [pageCount, setPageCount] = useState(0);
@@ -3377,7 +3371,7 @@ export function PdfJsViewer({
           height: rect.height,
           text: "",
           fontSize: 14,
-          color: "#1c1917",
+          color: "#1d1d1f",
         };
         commitAnnotations((current) => [...current, annotation]);
         setActiveTool("select");
@@ -3935,7 +3929,7 @@ export function PdfJsViewer({
               zIndex: 2,
               borderRadius: 4,
               background: "#436b65",
-              boxShadow: "0 1px 4px rgba(28,25,23,0.18)",
+              boxShadow: "0 1px 4px rgba(29, 29, 31,0.18)",
               cursor: "move",
             }}
           />
@@ -3954,7 +3948,7 @@ export function PdfJsViewer({
               borderRadius: 4,
               border: "2px solid #ffffff",
               background: "#436b65",
-              boxShadow: "0 1px 4px rgba(28,25,23,0.2)",
+              boxShadow: "0 1px 4px rgba(29, 29, 31,0.2)",
               cursor: "nwse-resize",
             }}
           />
@@ -4030,7 +4024,7 @@ export function PdfJsViewer({
         <button onClick={() => setZoom(Math.min(200, zoom + 25))} className={editorToolButtonClass({ icon: true })}>
           <IconPlus size={16} />
         </button>
-        {canEdit && (
+        {canEdit && (toolsOpen || annotations.length > 0) && (
           <>
             <span className="manor-editor-toolbar-divider" />
             <button
@@ -4171,22 +4165,22 @@ export function PdfJsViewer({
         <aside className="pdf-editor-inspector">
           <div className="pdf-editor-inspector-title">
             <div>
-              <h3>PDF editor</h3>
+              <h3>{t("ui.pdf_editor")}</h3>
               <p>{annotations.length} editable layer{annotations.length === 1 ? "" : "s"}</p>
             </div>
             <StatusBadge type={hasAnnotations ? "orange" : "gray"}>
-              {hasAnnotations ? "Unsaved" : "Clean"}
+              {hasAnnotations ? t("ui.unsaved") : t("ui.clean")}
             </StatusBadge>
           </div>
           {hint ? (
             <p className="pdf-editor-inspector-hint" style={{ color: hint.includes("failed") || hint.includes("Could not") ? "#c14a44" : undefined }}>{hint}</p>
           ) : (
-            <p className="pdf-editor-inspector-hint">Choose a tool, then draw or select an editable layer on the PDF.</p>
+            <p className="pdf-editor-inspector-hint">{t("ui.choose_a_tool_then_draw_or_select_an_editable_la")}</p>
           )}
           {signatureDataUrl && (activeTool === "signature" || selectedAnnotation?.kind === "signature") && (
             <div className="pdf-editor-inspector-section">
               <span className="manor-editor-toolbar-muted">{PDF_EDITOR_COPY.savedSignature}</span>
-              <span style={{ width: 82, height: 30, borderRadius: 8, border: "1px solid rgba(28,25,23,0.06)", background: "white", display: "inline-flex", alignItems: "center", justifyContent: "center", padding: 3 }}>
+              <span style={{ width: 82, height: 30, borderRadius: 8, border: "0.5px solid rgba(29, 29, 31,0.06)", background: "white", display: "inline-flex", alignItems: "center", justifyContent: "center", padding: 3 }}>
                 <img src={signatureDataUrl} alt="" style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", display: "block" }} />
               </span>
               <button
@@ -4554,16 +4548,16 @@ function PptxViewJsViewer({ url, blob, onDownload }: { url: string; blob?: Blob 
             disabled={activeSlide === 0 || rendering}
             style={{
               width: 36, height: 36, borderRadius: 10,
-              background: activeSlide === 0 || rendering ? "#f5f5f4" : "white",
-              border: "1px solid rgba(28,25,23,0.06)",
+              background: activeSlide === 0 || rendering ? "#f5f5f7" : "white",
+              border: "0.5px solid rgba(29, 29, 31,0.06)",
               cursor: activeSlide === 0 || rendering ? "default" : "pointer",
               display: "flex", alignItems: "center", justifyContent: "center",
-              color: activeSlide === 0 || rendering ? "#d6d3d1" : "#57534e",
+              color: activeSlide === 0 || rendering ? "#d1d1d6" : "#6e6e73",
             }}
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path d="M15 18l-6-6 6-6" /></svg>
           </button>
-          <span style={{ fontSize: 13, fontWeight: 600, color: "#78716c" }}>
+          <span style={{ fontSize: 13, fontWeight: 600, color: "var(--text-muted)" }}>
             {t("page.file_viewer.slide")} {activeSlide + 1} {t("page.file_viewer.of")} {slideCount}
           </span>
           <button
@@ -4571,11 +4565,11 @@ function PptxViewJsViewer({ url, blob, onDownload }: { url: string; blob?: Blob 
             disabled={activeSlide === slideCount - 1 || rendering}
             style={{
               width: 36, height: 36, borderRadius: 10,
-              background: activeSlide === slideCount - 1 || rendering ? "#f5f5f4" : "white",
-              border: "1px solid rgba(28,25,23,0.06)",
+              background: activeSlide === slideCount - 1 || rendering ? "#f5f5f7" : "white",
+              border: "0.5px solid rgba(29, 29, 31,0.06)",
               cursor: activeSlide === slideCount - 1 || rendering ? "default" : "pointer",
               display: "flex", alignItems: "center", justifyContent: "center",
-              color: activeSlide === slideCount - 1 || rendering ? "#d6d3d1" : "#57534e",
+              color: activeSlide === slideCount - 1 || rendering ? "#d1d1d6" : "#6e6e73",
             }}
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path d="M9 18l6-6-6-6" /></svg>
@@ -4721,10 +4715,10 @@ function PptxCssSlidePreview({
                         if ((cell as any).vMerge) return null;
                         return (
                           <td key={columnIndex} colSpan={(cell as any).gridSpan || undefined} style={{
-                            border: `${presentationPointsToCqh(0.75)} solid rgba(28,25,23,0.06)`,
+                            border: `${presentationPointsToCqh(0.75)} solid rgba(29, 29, 31,0.06)`,
                             padding: "0.4cqh 0.6cqw",
-                            background: cell.fill || (rowIndex === 0 ? "#f5f5f4" : "white"),
-                            color: cell.color || "#292524",
+                            background: cell.fill || (rowIndex === 0 ? "#f5f5f7" : "white"),
+                            color: cell.color || "#2c2c2e",
                             fontWeight: cell.bold || rowIndex === 0 ? 700 : 400,
                             overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", lineHeight: 1.3,
                           }}>{cell.text}</td>
@@ -5202,7 +5196,7 @@ export function PptxViewer({ url, blob, docId, onDownload }: { url: string; blob
   if (loading) return <div style={{ display: "flex", justifyContent: "center", padding: 64 }}><LoadingSpinner size={28} /></div>;
   if (error) return <PreviewDownloadFallback message={error} onDownload={onDownload} />;
 
-  if (totalSlides === 0) return <p style={{ color: "#78716c", textAlign: "center", padding: 32 }}>{t("page.file_viewer.empty_presentation")}</p>;
+  if (totalSlides === 0) return <p style={{ color: "var(--text-muted)", textAlign: "center", padding: 32 }}>{t("page.file_viewer.empty_presentation")}</p>;
 
   // Server-rendered mode: show slide images (blob URLs fetched with auth)
   if (renderMode === "server" && slideImageUrls.length > 0) {
@@ -5850,7 +5844,7 @@ function AudioViewer({
 function DetailRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
-      <span style={{ fontSize: 11, color: "#a8a29e", flexShrink: 0 }}>{label}</span>
+      <span style={{ fontSize: 11, color: "var(--text-muted)", flexShrink: 0 }}>{label}</span>
       <div style={{ textAlign: "right", minWidth: 0 }}>{children}</div>
     </div>
   );
@@ -5945,16 +5939,16 @@ function AccessLogSection({ docId }: { docId: string }) {
   if (q.isError) return null;
   const rows = q.data || [];
   return (
-    <div style={{ borderTop: "1px solid rgba(28,25,23,0.06)", paddingTop: 12 }}>
-      <p style={{ fontSize: 11, fontWeight: 600, color: "#57534e", margin: "0 0 8px" }}>
+    <div style={{ borderTop: "0.5px solid rgba(29, 29, 31,0.06)", paddingTop: 12 }}>
+      <p style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", margin: "0 0 8px" }}>
         {t("page.file_viewer.access_log.title")}
       </p>
       {q.isLoading ? (
-        <p style={{ fontSize: 11, color: "#a8a29e", textAlign: "center", margin: 0 }}>
+        <p style={{ fontSize: 11, color: "var(--text-muted)", textAlign: "center", margin: 0 }}>
           {t("page.file_viewer.access_log.loading")}
         </p>
       ) : rows.length === 0 ? (
-        <p style={{ fontSize: 11, color: "#d6d3d1", textAlign: "center", margin: 0 }}>
+        <p style={{ fontSize: 11, color: "#d1d1d6", textAlign: "center", margin: 0 }}>
           {t("page.file_viewer.access_log.empty")}
         </p>
       ) : (
@@ -5963,14 +5957,14 @@ function AccessLogSection({ docId }: { docId: string }) {
             <li
               key={`${r.ts}-${i}`}
               style={{
-                fontSize: 11, color: "#57534e",
+                fontSize: 11, color: "#6e6e73",
                 padding: "4px 6px", borderRadius: 4,
                 background: "rgba(245,245,244,0.5)",
               }}
             >
               <div style={{ display: "flex", justifyContent: "space-between", gap: 6 }}>
                 <span style={{ fontWeight: 600 }}>{r.action}</span>
-                <span style={{ color: "#a8a29e" }}>
+                <span style={{ color: "var(--text-muted)" }}>
                   {new Date(r.ts).toLocaleString(undefined, {
                     month: "short", day: "numeric",
                     hour: "2-digit", minute: "2-digit",
@@ -5978,7 +5972,7 @@ function AccessLogSection({ docId }: { docId: string }) {
                   })}
                 </span>
               </div>
-              <div style={{ color: "#a8a29e" }}>
+              <div style={{ color: "var(--text-muted)" }}>
                 {r.actor_type}: {r.actor_id || "—"}
                 {r.share_id && ` · ${t("page.file_viewer.access_log.via_share")}`}
               </div>
@@ -6160,6 +6154,7 @@ function ImageEditor({
   onSaved,
   onLiveEditBridgeChange,
   canEdit = true,
+  toolsOpen = true,
 }: {
   url: string;
   docId?: string;
@@ -6168,6 +6163,7 @@ function ImageEditor({
   onSaved: (savedDoc: Document, savedBlob: Blob) => void;
   onLiveEditBridgeChange?: (bridge: ImageLiveEditBridge | null) => void;
   canEdit?: boolean;
+  toolsOpen?: boolean;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
@@ -6337,6 +6333,7 @@ function ImageEditor({
     || hue !== 0
     || strokes.length > 0
     || Boolean(activeStroke);
+  const showEditTools = canEdit && (toolsOpen || hasEdits);
   const showingOriginal = !hasEdits && tool !== "draw";
 
   const renderCanvas = useCallback(() => {
@@ -6806,21 +6803,21 @@ function ImageEditor({
         className="manor-editor-toolbar image-editor-toolbar"
         {...aiEditInteractionLockProps(Boolean(imageAiPreview))}
       >
-        {canEdit && (
+        {showEditTools && (
           <>
             <button
               type="button"
               className={editorToolButtonClass({ active: tool === "select" })}
               onClick={() => setTool("select")}
             >
-              <IconEdit size={15} /> Select
+              <IconEdit size={15} /> {t("ui.select")}
             </button>
             <button
               type="button"
               className={editorToolButtonClass({ active: tool === "draw" })}
               onClick={() => setTool("draw")}
             >
-              <IconPenLine size={15} /> Draw
+              <IconPenLine size={15} /> {t("ui.draw")}
             </button>
             <span className="manor-editor-toolbar-divider" />
           </>
@@ -6829,7 +6826,7 @@ function ImageEditor({
           type="button"
           className={editorToolButtonClass({ icon: true })}
           onClick={() => setZoom((value) => Math.max(25, value - 25))}
-          title="Zoom out"
+          title={t("ui.zoom_out")}
         >
           <svg style={{ width: 16, height: 16 }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19.5 12h-15" /></svg>
         </button>
@@ -6838,82 +6835,86 @@ function ImageEditor({
           type="button"
           className={editorToolButtonClass({ icon: true })}
           onClick={() => setZoom((value) => Math.min(400, value + 25))}
-          title="Zoom in"
+          title={t("ui.zoom_in")}
         >
           <IconPlus size={16} />
         </button>
-        {canEdit && (
+        {showEditTools && (
           <>
             <span className="manor-editor-toolbar-divider" />
-            {renderMenu("transform", "Transform", (
+            {renderMenu("transform", t("ui.transform"), (
               <>
                 <button type="button" className={editorToolButtonClass()} onClick={() => setRotation((value) => value - 90)}>
-                  <IconUndo size={14} /> Rotate left
+                  <IconUndo size={14} /> {t("ui.rotate_left")}
                 </button>
                 <button type="button" className={editorToolButtonClass()} onClick={() => setRotation((value) => value + 90)}>
-                  <IconRedo size={14} /> Rotate right
+                  <IconRedo size={14} /> {t("ui.rotate_right")}
                 </button>
                 <button type="button" className={editorToolButtonClass()} onClick={() => setFlipX((value) => !value)}>Flip H</button>
                 <button type="button" className={editorToolButtonClass()} onClick={() => setFlipY((value) => !value)}>Flip V</button>
                 <button type="button" className={editorToolButtonClass()} onClick={resetEdits}>
-                  <IconRefresh size={14} /> Reset
+                  <IconRefresh size={14} /> {t("ui.reset")}
                 </button>
               </>
             ))}
-            {renderMenu("adjust", "Adjust", (
+            {renderMenu("adjust", t("ui.adjust"), (
               <>
                 <label className="manor-editor-toolbar-label image-editor-slider-label">
-                  Brightness
+                  {t("ui.brightness")}
                   <input className="manor-editor-range" type="range" min={40} max={180} value={brightness} onChange={(event) => setBrightness(Number(event.target.value))} />
                 </label>
                 <label className="manor-editor-toolbar-label image-editor-slider-label">
-                  Contrast
+                  {t("ui.contrast")}
                   <input className="manor-editor-range" type="range" min={40} max={180} value={contrast} onChange={(event) => setContrast(Number(event.target.value))} />
                 </label>
                 <label className="manor-editor-toolbar-label image-editor-slider-label">
-                  Saturation
+                  {t("ui.saturation")}
                   <input className="manor-editor-range" type="range" min={0} max={220} value={saturation} onChange={(event) => setSaturation(Number(event.target.value))} />
                 </label>
                 <label className="manor-editor-toolbar-label image-editor-slider-label">
-                  Hue
+                  {t("ui.hue")}
                   <input className="manor-editor-range" type="range" min={-180} max={180} value={hue} onChange={(event) => setHue(Number(event.target.value))} />
                 </label>
               </>
             ))}
-            {renderMenu("brush", "Brush", (
+            {renderMenu("brush", t("ui.brush"), (
               <>
                 <label className="manor-editor-toolbar-label">
-                  Color
+                  {t("ui.color")}
                   <input type="color" value={brushColor} onChange={(event) => setBrushColor(event.target.value)} className="image-editor-color-input" />
                 </label>
                 <label className="manor-editor-toolbar-label image-editor-slider-label">
-                  Size
+                  {t("ui.size")}
                   <input className="manor-editor-range" type="range" min={1} max={28} value={brushSize} onChange={(event) => setBrushSize(Number(event.target.value))} />
                 </label>
                 <button type="button" className={editorToolButtonClass()} onClick={() => setStrokes((items) => items.slice(0, -1))} disabled={strokes.length === 0}>
-                  <IconUndo size={14} /> Undo draw
+                  <IconUndo size={14} /> {t("ui.undo_draw")}
                 </button>
               </>
             ))}
           </>
         )}
-        <span className="manor-editor-toolbar-divider" />
-        <button
-          type="button"
-          className={editorToolButtonClass()}
-          onClick={downloadEditedImage}
-          disabled={!imageReady || !hasEdits}
-        >
-          <IconDownload size={15} /> Download edited
-        </button>
-        {canEdit && (
+        {showEditTools && (
+          <>
+            <span className="manor-editor-toolbar-divider" />
+            <button
+              type="button"
+              className={editorToolButtonClass()}
+              onClick={downloadEditedImage}
+              disabled={!imageReady || !hasEdits}
+            >
+              <IconDownload size={15} /> {t("ui.download_edited")}
+            </button>
+          </>
+        )}
+        {showEditTools && (
           <button
             type="button"
             className={editorToolButtonClass({ primary: true })}
             onClick={() => { void saveEditedImage(); }}
             disabled={!imageReady || !hasEdits || saving}
           >
-            <IconCheck size={15} /> {saving ? "Saving" : "Save image"}
+            <IconCheck size={15} /> {saving ? t("ui.saving") : t("ui.save_image")}
           </button>
         )}
         {status && (
@@ -6947,7 +6948,7 @@ function ImageEditor({
               objectFit: "fill",
               background: "#fff",
               borderRadius: 10,
-              boxShadow: "0 20px 45px rgba(28, 25, 23, 0.16)",
+              boxShadow: "0 20px 45px rgba(29, 29, 31, 0.16)",
             }}
           />
         )}
@@ -6965,7 +6966,7 @@ function ImageEditor({
             maxWidth: "none",
             background: "#fff",
             borderRadius: 10,
-            boxShadow: "0 20px 45px rgba(28, 25, 23, 0.16)",
+            boxShadow: "0 20px 45px rgba(29, 29, 31, 0.16)",
             cursor: canEdit && tool === "draw" ? "crosshair" : "default",
             touchAction: canEdit && tool === "draw" ? "none" : "auto",
           }}
@@ -7004,6 +7005,8 @@ function FileViewerDocument() {
   const [error, setError] = useState("");
   const [previewError, setPreviewError] = useState("");
   const [detailsOpen, setDetailsOpen] = useState(false);
+  // A file opens to be read; PDF and image tools appear when asked for.
+  const [editToolsOpen, setEditToolsOpen] = useState(false);
   const [commentsOpen, setCommentsOpen] = useState(false);
   const [commentAnchor, setCommentAnchor] = useState<CommentAnchor | null>(null);
   const [activeCommentId, setActiveCommentId] = useState<string | null>(null);
@@ -7031,6 +7034,7 @@ function FileViewerDocument() {
   const canShareCurrentDoc = canShareDocument(currentUser, doc);
   const canSendSignatureRequest = canShareDocumentExternally(currentUser, doc);
   const currentDocumentId = doc?.source === "task_output_preview" ? docId : doc?.id || docId;
+  useEffect(() => setEditToolsOpen(false), [currentDocumentId]);
 
   // Live grants + shares — only fetched when the dialog opens (saves a
   // round-trip on most viewer loads).
@@ -7186,10 +7190,10 @@ function FileViewerDocument() {
       }
 
       if (["image", "video", "audio", "pdf", "xlsx", "pptx"].includes(cat)) {
-        // For video/audio, prefer streaming URL (avoids downloading entire file into memory)
+        // A video plays while it downloads; audio opens in the editor, which works on the whole file.
         try {
           if (["video", "audio"].includes(cat)) {
-            const streamUrl = api.documents.streamUrl(meta);
+            const streamUrl = cat === "video" ? await api.documents.streamUrl(resolvedDocumentId).catch(() => null) : null;
             if (streamUrl) {
               if (!isCurrentRequest()) return;
               replaceDownloadUrl(streamUrl);
@@ -7504,162 +7508,102 @@ function FileViewerDocument() {
   return (
     <div className="manor-editor-shell manor-editor-viewer-shell animate-fade-in">
       {/* Header */}
-      <div className="manor-editor-header" style={{ justifyContent: "space-between", flexWrap: "wrap" }}>
+      <div className="manor-editor-header">
         <div className="manor-editor-header-main">
           <button
             type="button"
+            className="page-header-back"
             onClick={goBack}
             aria-label={t("page.file_viewer.go_back")}
             title={t("page.file_viewer.go_back")}
-            style={{
-              flexShrink: 0, width: 36, height: 36, borderRadius: 12,
-              background: "rgba(255,255,255,0.6)", border: "1px solid rgba(28,25,23,0.06)",
-              display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer",
-            }}
           >
-            <IconArrowLeft size={16} className="text-stone-600" />
+            <IconArrowLeft size={16} />
           </button>
-          <div style={{ minWidth: 0 }}>
-            <PageHeaderTitle variant="editor" title={doc?.name || t("page.file_viewer.document")}>
-              {doc?.name || t("page.file_viewer.document")}
-            </PageHeaderTitle>
-            <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8, rowGap: 4, marginTop: 2 }}>
-              <StatusBadge type={categoryBadgeType(category)}>{categoryLabel(category)}</StatusBadge>
-              {doc?.file_size != null && (
-                <span style={{ fontSize: 12, color: "#a8a29e" }}>
-                  {doc.file_size < 1024 ? `${doc.file_size} B` :
-                   doc.file_size < 1048576 ? `${(doc.file_size / 1024).toFixed(1)} KB` :
-                   `${(doc.file_size / 1048576).toFixed(1)} MB`}
-                </span>
-              )}
-              {!isTaskOutputPreview && doc && (
-                <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-                  <span aria-hidden="true" style={{ fontSize: 12, color: "var(--text-muted)" }}>&middot;</span>
-                  <Link
-                    to={parentFolderPath}
-                    title={doc.folder_id ? t("page.file_viewer.go_to_parent_folder") : t("page.file_viewer.open_library")}
-                    className="hover:underline focus-visible:underline underline-offset-2"
-                    style={{ fontSize: 12, fontWeight: 500, color: "var(--accent)", whiteSpace: "nowrap" }}
-                  >
-                    {doc.folder_id ? t("page.file_viewer.parent_folder") : t("page.file_viewer.open_library")}
-                  </Link>
-                </span>
-              )}
-            </div>
-          </div>
+          <PageHeaderTitle variant="editor" title={doc?.name || t("page.file_viewer.document")}>
+            {doc?.name || t("page.file_viewer.document")}
+          </PageHeaderTitle>
         </div>
         <div className="manor-editor-actions">
-          {!isTaskOutputPreview && canEditCurrentDoc && (category === "pdf" || category === "image" || category === "audio") && (
+          {!isTaskOutputPreview && canEditCurrentDoc && category === "audio" && (
             <AiEditButton
               onClick={handleOpenAiEdit}
-              disabled={category === "pdf" ? !pdfLiveEditBridge : category === "image" ? !imageLiveEditBridge : !audioLiveEditBridge}
-              title={(category === "pdf" ? !pdfLiveEditBridge : category === "image" ? !imageLiveEditBridge : !audioLiveEditBridge) ? t("status.loading") : undefined}
+              disabled={!audioLiveEditBridge}
+              label={t("ui.ai_edit")}
               iconSize={16}
             />
+          )}
+          {!isTaskOutputPreview && canEditCurrentDoc && (category === "pdf" || category === "image") && (
+            <button
+              type="button"
+              className={editorToolButtonClass()}
+              onClick={() => setEditToolsOpen((open) => !open)}
+            >
+              {editToolsOpen ? t("ui.done_editing") : <><IconEdit size={15} /> {t("action.edit")}</>}
+            </button>
           )}
           {isEditable(category, doc) && !isTaskOutputPreview && canEditCurrentDoc && (
             <Link
               to={`/editor/${currentDocumentId}`}
               state={location.state}
-              className={editorToolButtonClass({ icon: true })}
-              aria-label={t("action.edit")}
-              title={t("action.edit")}
+              className={editorToolButtonClass()}
             >
-              <IconEdit size={16} />
+              <IconEdit size={15} /> {t("action.edit")}
             </Link>
           )}
           {!isTaskOutputPreview && canEditCurrentDoc && (category === "video" || doc?.name.toLowerCase().endsWith(".video-edit.json")) && (
             <Link
               to={`/video-editor/${currentDocumentId}`}
               state={location.state}
-              className={editorToolButtonClass({ icon: true })}
-              aria-label="Edit video"
-              title="Edit video"
+              className={editorToolButtonClass()}
             >
-              <IconEdit size={16} />
+              <IconEdit size={15} /> {t("action.edit")}
             </Link>
           )}
           {!isTaskOutputPreview && canEditCurrentDoc && category === "html" && (
             <SitePublishAction doc={doc} />
           )}
-          {!isTaskOutputPreview && canSendSignatureRequest && (
-            category === "pdf" && (
-              <button
-                onClick={() => setSignatureDialogOpen(true)}
-                className={editorToolButtonClass({ icon: true })}
-                aria-label={t("signature.send")}
-                title={t("signature.send")}
-              >
-                <IconSignature size={16} />
+          <Dropdown
+            align="right"
+            trigger={(
+              <button type="button" className={editorToolButtonClass({ icon: true })} aria-label={t("nav.more")} title={t("nav.more")}>
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                  <circle cx="3.5" cy="8" r="1.3" /><circle cx="8" cy="8" r="1.3" /><circle cx="12.5" cy="8" r="1.3" />
+                </svg>
               </button>
-            )
-          )}
-          {!isTaskOutputPreview && canShareCurrentDoc && (
-            <button
-              onClick={() => setShareDialogOpen(true)}
-              className={editorToolButtonClass({ icon: true })}
-              aria-label={t("page.file_viewer.share")}
-              title={t("page.file_viewer.share")}
-            >
-              <IconShare size={16} />
-            </button>
-          )}
-          {!isTaskOutputPreview && doc && (
-            <button
-              onClick={handleToggleComments}
-              className={editorToolButtonClass({ icon: true })}
-              style={commentsOpen ? {
-                background: "#f5f5f4",
-                borderColor: "#d6d3d1",
-                color: "#44403c",
-              } : undefined}
-              aria-label={t("page.tasks.comments")}
-              title={t("page.tasks.comments")}
-            >
-              <IconComment size={16} />
-            </button>
-          )}
-          <button
-            onClick={() => {
-              setDetailsOpen((open) => {
-                const next = !open;
-                if (next) setCommentsOpen(false);
-                return next;
-              });
+            )}
+            items={[
+              ...(!isTaskOutputPreview && canEditCurrentDoc && (category === "pdf" || category === "image") ? [{
+                key: "ai",
+                label: t("ui.ai_edit"),
+                icon: <IconSparkles size={15} />,
+                disabled: category === "pdf" ? !pdfLiveEditBridge : !imageLiveEditBridge,
+              }] : []),
+              ...(!isTaskOutputPreview && canSendSignatureRequest && category === "pdf" ? [{ key: "signature", label: t("signature.send"), icon: <IconSignature size={15} /> }] : []),
+              ...(!isTaskOutputPreview && canShareCurrentDoc ? [{ key: "share", label: t("page.file_viewer.share"), icon: <IconShare size={15} /> }] : []),
+              ...(!isTaskOutputPreview && doc ? [{ key: "comments", label: t("page.tasks.comments"), icon: <IconComment size={15} /> }] : []),
+              { key: "details", label: t("page.file_viewer.details_panel.title"), icon: <IconInfo size={15} /> },
+              { key: "download", label: t("page.file_viewer.download"), icon: <IconDownload size={15} />, disabled: Boolean(restrictDownload || downloadInProgress) },
+              ...(!isTaskOutputPreview && doc ? [{
+                key: "folder",
+                label: t("ui.show_in_knowledge"),
+                icon: <IconFolder size={15} />,
+              }] : []),
+            ]}
+            onSelect={(key) => {
+              if (key === "ai") handleOpenAiEdit();
+              if (key === "signature") setSignatureDialogOpen(true);
+              if (key === "share") setShareDialogOpen(true);
+              if (key === "comments") handleToggleComments();
+              if (key === "details") {
+                setDetailsOpen((open) => {
+                  if (!open) setCommentsOpen(false);
+                  return !open;
+                });
+              }
+              if (key === "download" && !restrictDownload && !downloadInProgress) handleDownload();
+              if (key === "folder") navigate(parentFolderPath);
             }}
-            aria-label={detailsOpen ? t("page.file_viewer.details_panel.toggle_close") : t("page.file_viewer.details_panel.toggle_open")}
-            title={detailsOpen ? t("page.file_viewer.details_panel.toggle_close") : t("page.file_viewer.details_panel.toggle_open")}
-            className={editorToolButtonClass({ icon: true, active: detailsOpen })}
-          >
-            <IconInfo size={16} />
-          </button>
-          <button
-            onClick={restrictDownload || downloadInProgress ? undefined : handleDownload}
-            disabled={Boolean(restrictDownload || downloadInProgress)}
-            aria-busy={downloadInProgress}
-            aria-label={t("page.file_viewer.download")}
-            title={restrictDownload ? (doc?.classification === "restricted" ? t("page.file_viewer.download_blocked.restricted") : doc?.quarantine_status && doc.quarantine_status !== "clean" ? t("page.file_viewer.download_blocked.quarantine") : t("permissions.banner.viewer_only")) : t("page.file_viewer.download")}
-            className={editorToolButtonClass({ icon: true })}
-            style={{
-              opacity: restrictDownload || downloadInProgress ? 0.45 : 1,
-              cursor: restrictDownload || downloadInProgress ? "not-allowed" : "pointer",
-            }}
-          >
-            {downloadInProgress ? <LoadingSpinner size={16} /> : <IconDownload size={16} />}
-          </button>
-          <button
-            type="button"
-            onClick={goBack}
-            aria-label={t("action.close")}
-            title={t("action.close")}
-            style={{
-              width: 36, height: 36, borderRadius: 10, background: "transparent",
-              border: "none", cursor: "pointer", display: "flex", alignItems: "center",
-              justifyContent: "center", color: "#a8a29e", transition: "color 0.15s",
-            }}
-          >
-            <IconClose size={18} />
-          </button>
+          />
         </div>
       </div>
 
@@ -7750,6 +7694,7 @@ function FileViewerDocument() {
             onSaved={handleImageSaved}
             onLiveEditBridgeChange={setImageLiveEditBridge}
             canEdit={canEditCurrentDoc}
+            toolsOpen={editToolsOpen}
           />
         )}
 
@@ -7789,10 +7734,11 @@ function FileViewerDocument() {
                 onSaved={handlePdfSaved}
                 onLiveEditBridgeChange={setPdfLiveEditBridge}
                 canEdit={canEditCurrentDoc}
+                toolsOpen={editToolsOpen}
               />
             ) : (
               <div style={{ textAlign: "center", padding: "64px 0" }}>
-                <p style={{ color: "#78716c", marginBottom: 16 }}>{t("page.file_viewer.pdf_preview_requires_downloading_the_file")}</p>
+                <p style={{ color: "var(--text-muted)", marginBottom: 16 }}>{t("page.file_viewer.pdf_preview_requires_downloading_the_file")}</p>
                 <button onClick={handleDownload} className="btn-manor">{t("page.file_viewer.download_to_view")}</button>
               </div>
             )}
@@ -7814,7 +7760,7 @@ function FileViewerDocument() {
         )}
 
         {!previewError && category === "xlsx" && downloadUrl && (
-          <XlsxViewer url={downloadUrl} blob={downloadBlob} />
+          <div className="file-viewer-sheet"><XlsxViewer url={downloadUrl} blob={downloadBlob} /></div>
         )}
 
         {!previewError && category === "pptx" && (
@@ -7831,13 +7777,13 @@ function FileViewerDocument() {
         {!previewError && category === "csv" && (() => {
           const rows = parseDelimitedText(content).rows;
           if (rows.length === 0 || (rows.length === 1 && rows[0].length === 1 && rows[0][0] === "")) {
-            return <p style={{ color: "#78716c" }}>{t("page.file_viewer.empty_csv_file")}</p>;
+            return <p style={{ color: "var(--text-muted)" }}>{t("page.file_viewer.empty_csv_file")}</p>;
           }
           const columnCount = Math.max(1, ...rows.map((row) => row.length));
           const header = Array.from({ length: columnCount }, (_, column) => rows[0]?.[column] ?? "");
           const body = rows.slice(1);
           return (
-            <div style={{ overflow: "hidden", borderRadius: 12 }}>
+            <div className="file-viewer-sheet file-viewer-csv">
               <table className="glass-table">
                 <thead>
                   <tr>{header.map((cell, i) => <th key={i}>{cell}</th>)}</tr>
@@ -7887,7 +7833,7 @@ function FileViewerDocument() {
       {commentsOpen && doc && !isTaskOutputPreview && (
         <aside className="glass-panel manor-editor-viewer-details manor-editor-comments-panel">
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-            <h2 style={{ fontSize: 14, fontWeight: 700, color: "#292524", margin: 0 }}>
+            <h2 style={{ fontSize: 14, fontWeight: 700, color: "var(--text-strong)", margin: 0 }}>
               {t("page.tasks.comments")}
             </h2>
             <button
@@ -7895,7 +7841,7 @@ function FileViewerDocument() {
               aria-label={t("page.file_viewer.details_panel.close")}
               style={{
                 width: 24, height: 24, borderRadius: 6, background: "transparent",
-                border: "none", cursor: "pointer", color: "#a8a29e",
+                border: "none", cursor: "pointer", color: "#aeaeb2",
                 display: "flex", alignItems: "center", justifyContent: "center",
               }}
             >
@@ -7919,7 +7865,7 @@ function FileViewerDocument() {
           className="glass-panel manor-editor-viewer-details"
         >
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-            <h2 style={{ fontSize: 14, fontWeight: 700, color: "#292524", margin: 0 }}>
+            <h2 style={{ fontSize: 14, fontWeight: 700, color: "var(--text-strong)", margin: 0 }}>
               {t("page.file_viewer.details_panel.title")}
             </h2>
             <button
@@ -7927,7 +7873,7 @@ function FileViewerDocument() {
               aria-label={t("page.file_viewer.details_panel.close")}
               style={{
                 width: 24, height: 24, borderRadius: 6, background: "transparent",
-                border: "none", cursor: "pointer", color: "#a8a29e",
+                border: "none", cursor: "pointer", color: "#aeaeb2",
                 display: "flex", alignItems: "center", justifyContent: "center",
               }}
             >
@@ -7935,21 +7881,26 @@ function FileViewerDocument() {
             </button>
           </div>
 
+          <DetailRow label={t("ui.file_type")}>
+            <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{categoryLabel(category)}</span>
+          </DetailRow>
           <DetailRow label={t("page.file_viewer.details.classification")}>
             <ClassificationBadge level={doc.classification} size="sm" />
           </DetailRow>
           <DetailRow label={t("page.file_viewer.details.visibility")}>
-            <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12, color: "#57534e" }}>
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text-muted)" }}>
               <VisibilityIcon visibility={doc.visibility} size={13} />
-              {doc.visibility ?? "—"}
+              {doc.visibility ? t(`permissions.visibility.${doc.visibility}.label`) : "—"}
             </span>
           </DetailRow>
-          <DetailRow label={t("page.file_viewer.details.owner")}>
-            <span style={{ fontSize: 12, color: "#57534e" }}>{doc.owner_id ?? "—"}</span>
-          </DetailRow>
+          {doc.owner_id === currentUser?.id && (
+            <DetailRow label={t("page.file_viewer.details.owner")}>
+              <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{t("ui.you")}</span>
+            </DetailRow>
+          )}
           {doc.file_size != null && (
             <DetailRow label={t("page.file_viewer.details.size")}>
-              <span style={{ fontSize: 12, color: "#57534e" }}>
+              <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
                 {doc.file_size < 1024 ? `${doc.file_size} B`
                   : doc.file_size < 1048576 ? `${(doc.file_size / 1024).toFixed(1)} KB`
                   : `${(doc.file_size / 1048576).toFixed(1)} MB`}
@@ -7958,7 +7909,7 @@ function FileViewerDocument() {
           )}
           {doc.created_at && (
             <DetailRow label={t("page.file_viewer.details.uploaded")}>
-              <span style={{ fontSize: 12, color: "#57534e" }}>
+              <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
                 {new Date(doc.created_at).toLocaleString(undefined, { timeZone: getPreferredTimeZone() })}
               </span>
             </DetailRow>
@@ -7984,7 +7935,7 @@ function FileViewerDocument() {
           )}
 
           {canShareCurrentDoc && (
-            <div style={{ borderTop: "1px solid rgba(28,25,23,0.06)", paddingTop: 12 }}>
+            <div style={{ borderTop: "0.5px solid rgba(29, 29, 31,0.06)", paddingTop: 12 }}>
               <button
                 onClick={() => setShareDialogOpen(true)}
                 className="btn-manor-outline"
@@ -8152,14 +8103,14 @@ function FileViewerDocument() {
           position: relative;
           padding: clamp(32px, 6vh, 64px) clamp(16px, 4vw, 56px) 64px;
           box-sizing: border-box;
-          background: var(--surface-muted);
+          background: var(--file-stage);
         }
         .docx-comment-anchor-bar {
           width: min(100%, 816px);
           margin: 0 auto 16px;
           padding: 12px;
           box-sizing: border-box;
-          border: 1px solid var(--border-subtle);
+          border: 0.5px solid var(--border-subtle);
           border-radius: var(--radius-card);
           background: var(--surface-panel);
           box-shadow: var(--shadow-sm);
@@ -8255,11 +8206,11 @@ function FileViewerDocument() {
         }
         .docx-preview { overflow-wrap: anywhere; }
         .docx-preview table { border-collapse: collapse; width: 100%; margin: 12px 0; }
-        .docx-preview td, .docx-preview th { border: 1px solid #e7e5e4; padding: 8px 12px; font-size: 14px; }
-        .docx-preview th { background: #fafaf9; font-weight: 600; }
+        .docx-preview td, .docx-preview th { border: 0.5px solid #e5e5ea; padding: 8px 12px; font-size: 14px; }
+        .docx-preview th { background: #fafafa; font-weight: 600; }
         .docx-preview img { max-width: 100%; border-radius: 8px; margin: 8px 0; }
         .docx-preview p { margin: 0 0 12px; }
-        .docx-preview h1, .docx-preview h2, .docx-preview h3 { margin: 20px 0 10px; color: #1c1917; line-height: 1.25; }
+        .docx-preview h1, .docx-preview h2, .docx-preview h3 { margin: 20px 0 10px; color: #1d1d1f; line-height: 1.25; }
         .docx-preview h1 { font-size: 28px; }
         .docx-preview h2 { font-size: 22px; }
         .docx-preview h3 { font-size: 18px; }
@@ -8268,12 +8219,12 @@ function FileViewerDocument() {
           margin: 14px 0;
           padding: 10px 14px;
           border-left: 3px solid #ccded9;
-          color: #57534e;
-          background: #fafaf9;
+          color: #6e6e73;
+          background: #fafafa;
         }
         .docx-preview hr {
           border: 0;
-          border-top: 1px solid #e7e5e4;
+          border-top: 0.5px solid #e5e5ea;
           margin: 22px 0;
         }
         @media (max-width: 760px) {

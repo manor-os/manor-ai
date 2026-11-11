@@ -55,7 +55,44 @@ from packages.core.services.knowledge_media_analysis import (
     mark_media_analysis_pending,
     schedule_media_analysis,
 )
+from packages.core.services.media_urls import media_signing_enabled
+from packages.core.services.media_variants import schedule_display_variants_after_commit
 from packages.core.services.tool_cache_version import bump_tool_cache_version
+
+# Hash display media inline only up to this size; the variant task backfills
+# larger files on the heavy queue.
+_INLINE_CONTENT_HASH_MAX_BYTES = 64 * 1024 * 1024
+
+
+async def _display_media_content_sha256(
+    file_descriptor: int,
+    *,
+    size: int,
+    source: str,
+    extension: str | None,
+    mime_type: str | None,
+    known: str | None,
+) -> str | None:
+    """SHA-256 of the pinned snapshot naming its display-media version, when cheap to know."""
+    from types import SimpleNamespace
+
+    from packages.core.services.media_urls import sha256_descriptor, thumbnail_source_kind
+
+    if not media_signing_enabled():
+        return None
+    if thumbnail_source_kind(SimpleNamespace(name="", file_type=extension, mime_type=mime_type)) is None:
+        return None
+    if known:
+        # The snapshot already verified the caller's expected digest.
+        return known
+    # Reconcile re-projects every file on disk; never hash a whole tree there.
+    if source == "filesystem_reconcile" or size > _INLINE_CONTENT_HASH_MAX_BYTES:
+        return None
+    try:
+        return await asyncio.to_thread(sha256_descriptor, file_descriptor)
+    except OSError:
+        return None
+
 
 def _schedule_document_reembed(document_id: str | None) -> None:
     """Best-effort re-embed after a byte change; the periodic sweep of
@@ -209,6 +246,14 @@ async def sync_file_to_knowledge(
             detected = detect_file_type(
                 snapshot.descriptor_path,
                 declared_name=os.path.basename(rel_path),
+            )
+            content_sha256 = await _display_media_content_sha256(
+                snapshot.file_descriptor,
+                size=file_stat.st_size,
+                source=source,
+                extension=detected.extension,
+                mime_type=detected.mime_type,
+                known=snapshot.content_sha256 or None,
             )
     except EntityFilesystemError:
         return KnowledgeSyncResult(False, reason="source_changed")
@@ -428,6 +473,8 @@ async def sync_file_to_knowledge(
         )
         media_analysis_queued = False
         if content_changed:
+            # Set in the same flush as the size, so the model's guard keeps it.
+            doc.content_sha256 = content_sha256
             doc.vector_status = VectorStatus.PENDING
             stale_meta = dict(doc.metadata_ or {})
             stale_meta.pop("content_text", None)
@@ -487,6 +534,7 @@ async def sync_file_to_knowledge(
         await sync_db.flush()
         if content_changed:
             await _invalidate_document_previews(entity_root, getattr(doc, "id", None))
+            schedule_display_variants_after_commit(sync_db, doc)
         if owns_session or commit:
             await sync_db.commit()
             if content_changed:

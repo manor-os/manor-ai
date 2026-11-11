@@ -50,10 +50,8 @@ export function serializeWorkflowLiveEdit(source: WorkflowLiveEditSource): strin
       : [],
     steps: Array.isArray(source.steps) ? source.steps : [],
   };
-  const formatted = `${JSON.stringify(document, null, 2)}\n`;
-  // Keep large graphs within the editor's document limit when only indentation
-  // causes the overflow. Never truncate nodes, schemas, or prompt contents.
-  return formatted.length <= 200_000 ? formatted : `${JSON.stringify(document)}\n`;
+  // Always indented: AI edit reads large documents by line.
+  return `${JSON.stringify(document, null, 2)}\n`;
 }
 
 export function parseWorkflowLiveEdit(content: string): WorkflowLiveEditUpdate {

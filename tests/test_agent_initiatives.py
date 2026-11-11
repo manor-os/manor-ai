@@ -368,6 +368,7 @@ async def test_personal_agent_initiative_crud_and_driver_boundary(
     assert driver.execution_target["subscription_id"] == subscription["id"]
     assert driver.conversation_id == conversation_id
     assert driver.payload_message is None
+    assert driver.execution_script is None
     driver_id = driver.id
 
     # The ScheduledJob is a private clock driver, not a second product object.
@@ -428,6 +429,12 @@ async def test_personal_agent_initiative_crud_and_driver_boundary(
     driver = await db_session.get(ScheduledJob, driver_id)
     assert driver is not None and driver.enabled is False
     assert driver.next_run_at is None
+    # Drivers created before Initiatives ran on the Task agent loop kept a
+    # copy of the old prompt, which asked for bare JSON text instead of a
+    # submitted result; every such run ended Blocked.
+    legacy_prompt = "Your final response MUST be one JSON object and nothing else."
+    driver.execution_script = legacy_prompt
+    await db_session.commit()
 
     from packages.core.tasks import ai_tasks, scheduler_tasks
 
@@ -470,6 +477,20 @@ async def test_personal_agent_initiative_crud_and_driver_boundary(
     child_dispatch = published_dispatches.pop()
     assert child_dispatch["kind"] == "agent_task"
     task_id = child_dispatch["args"][0]
+    from packages.core.models.task import Task
+    from packages.core.services.agent_initiative_service import (
+        initiative_execution_script,
+    )
+
+    db_session.expire_all()
+    child_task = await db_session.get(Task, task_id)
+    current_row = await db_session.get(AgentInitiative, initiative["id"])
+    assert child_task is not None and current_row is not None
+    current_prompt = initiative_execution_script(current_row)
+    assert child_task.description == current_prompt
+    assert child_task.details["execution_script"] == current_prompt
+    assert legacy_prompt not in child_task.description
+    assert child_task.details["result_schema"]
     from packages.core.models.scheduler import ScheduledJobRun
     from packages.core.services.scheduled_run_lifecycle import (
         MANUAL_AGENT_INITIATIVE_ADMISSION_KEY,

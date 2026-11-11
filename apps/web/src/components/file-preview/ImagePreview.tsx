@@ -21,7 +21,7 @@ export default function ImagePreview({ src, alt, imageClassName, onError }: {
   </>;
 }
 
-function ImagePreviewDialog({ src, alt, onClose, onError }: {
+export function ImagePreviewDialog({ src, alt, onClose, onError }: {
   src: string; alt: string; onClose: () => void; onError?: () => void;
 }) {
   const viewport = useRef<HTMLDivElement>(null);

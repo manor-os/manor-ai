@@ -21,7 +21,7 @@ seed_chats = storage_tests.seed_chats
 
 
 def entry(source, content="Use Chinese in weekly reports"):
-    return {"scope": "preference", "title": "Reports", "body": content,
+    return {"scope": "preference", "layer": "preferences", "title": "Reports", "body": content,
             "source_message_id": source, "confidence": 0.7}
 
 
@@ -58,8 +58,9 @@ async def test_schedule_and_compact_share_admission_and_receipts(client, memory_
     assert worker.await_count == 1
     async with database.async_session() as db:
         candidate = (await db.scalars(select(AgentLearningCandidate))).one()
-        assert candidate.status == "proposed" and candidate.user_id == "u_one"
+        assert candidate.status == "applied" and candidate.user_id == "u_one"
         assert candidate.payload["source_message_id"] == "m_u_one"
+        assert candidate.payload["target"] == "my_preferences"
         assert len((await db.scalars(select(RuntimeEvidence))).all()) == 1
         assert not (await db.scalars(select(AgentMemory))).all()
         receipt = (await db.get(Message, "m_u_one")).meta[compaction.RECEIPTS][compaction._receipt_key(ctx)]
@@ -287,7 +288,7 @@ async def test_db_prompt_rechecks_record_after_selection_worker(client, memory_f
 
 
 @pytest.mark.asyncio
-async def test_extract_api_returns_reviewable_candidate_and_rejects_impersonation(client, memory_fs, monkeypatch):
+async def test_extract_api_returns_written_memory_and_rejects_impersonation(client, memory_fs, monkeypatch):
     from tests.test_memories import _auth
 
     headers = await _auth(client, "unified_extract")
@@ -305,7 +306,7 @@ async def test_extract_api_returns_reviewable_candidate_and_rejects_impersonatio
     result = await client.post("/api/v1/memories/extract", headers=headers, json={"conversation_id": "api_memory_conv"})
     assert result.status_code == 200, result.text
     candidate = result.json()[0]
-    assert candidate["status"] == "proposed" and candidate["metadata"]["review_required"]
+    assert candidate["status"] == "applied" and not candidate["metadata"]["review_required"]
     assert candidate["id"] == candidate["metadata"]["learning_candidate_id"]
     async with database.async_session() as db:
         assert not (await db.scalars(select(AgentMemory).where(AgentMemory.entity_id == entity_id))).all()

@@ -1059,6 +1059,12 @@ and **Pass criteria**. A skipped category needs a reason.
 
 ## WS-08: HITL and resume
 
+- Conversation review scope: run `tests/test_conversation_approval_holds.py`.
+  Historical approval acknowledgements and conditional review instructions must
+  not stop a new internal file; explicit file holds and existing ask/deny policy
+  remain authoritative. Verify non-openable creation targets, readable existing
+  files, and independent Workflow review artifact links.
+
 - Browser Chat continuation: run `tests/test_chat_input_continuation.py`,
   `tests/test_runtime_human_input.py`, `tests/test_runtime_request_input_tool.py`,
   `tests/test_chat_runtime_runs.py`, and `tests/test_runtime_capability_refresh.py`.

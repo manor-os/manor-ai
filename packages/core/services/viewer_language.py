@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from packages.core.services.workflow_contracts import workflow_step_label
+
 I18N_KEY = "i18n"
 # The languages Workspaces are translated into (workspace_translation); a
 # viewer of any other language reads English.
@@ -35,6 +37,14 @@ _TEXT_KEYS = frozenset({
     "eyebrow", "summary", "caption", "alt_text", "use_when", "outcome_summary", "message",
     "review_title", "labels", "descriptions", "entries", "prompts", "presets", "forms",
     "x-enum-labels", "x-enum-descriptions", "x-example-labels", "x-example-groups", "stage_labels", "empty_message",
+    "collection_title",
+})
+# Keys naming the data a view reads (field paths). They can sit below a text
+# key (a record title is ``{"source": ..., "field": [...]}``) and are never
+# text, so neither a stored overlay nor machine translation touches them.
+DATA_PATH_KEYS = frozenset({
+    "field", "secondary", "date_field", "label_fields", "record_path", "document_path",
+    "parent_state_path", "execution_run_id_path",
 })
 # Keys that identify or configure something. A translation never touches them,
 # even below a text key (a form field's ``key`` or ``type``).
@@ -42,7 +52,32 @@ _STRUCTURAL_KEYS = frozenset({
     "id", "key", "type", "enum", "const", "required", "hidden", "target", "targets", "hero", "asks",
     "next", "true_next", "false_next", "binding_id", "workflow_id", "workflow_slug", "tool", "skill",
     "source", "mode", "format", "pattern", "prefill", "path", "terminal_step_id", "version", "url",
-})
+}) | DATA_PATH_KEYS
+
+
+def without_machine_translations(value: Any) -> Any:
+    """``value`` without the overlays a machine wrote (``AUTO_KEY``), on a copy.
+
+    What a person configured stays, their own translations included; what
+    Workspace translation added on its own does not count as an edit.
+    """
+    if isinstance(value, list):
+        return [without_machine_translations(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    out: dict[str, Any] = {}
+    for key, item in value.items():
+        if key == I18N_KEY and isinstance(item, dict):
+            kept = {
+                locale: without_machine_translations(overlay)
+                for locale, overlay in item.items()
+                if not (isinstance(overlay, dict) and AUTO_KEY in overlay)
+            }
+            if kept:
+                out[key] = kept
+            continue
+        out[key] = without_machine_translations(item)
+    return out
 
 
 def viewer_locale(locale: str | None) -> str | None:
@@ -77,12 +112,15 @@ def _overlay_language(overlays: dict[str, Any], language: str) -> str | None:
     return None if language in TRANSLATED_LANGUAGES else "en"
 
 
-def localized(value: Any, locale: str | None) -> Any:
+def localized(value: Any, locale: str | None, *, extra_text_keys: frozenset[str] = frozenset()) -> Any:
     """A copy of ``value`` in the viewer's language, without its overlays.
 
     With no locale the value comes back unchanged (overlays included), so
-    model-facing callers keep reading what was authored.
+    model-facing callers keep reading what was authored. ``extra_text_keys``
+    lets a caller whose objects carry other reader-facing text (a chat
+    message's ``body``) translate it too; stored configuration never does.
     """
+    text_keys = _TEXT_KEYS | extra_text_keys
     language = viewer_locale(locale)
     if language is None:
         return value
@@ -96,7 +134,9 @@ def localized(value: Any, locale: str | None) -> Any:
         result = {key: resolve(child) for key, child in item.items() if key != I18N_KEY}
         if isinstance(overlays, dict):
             # Stored overlays are trusted no further than written ones.
-            overlay = _sanitize_overlay(result, overlays.get(_overlay_language(overlays, language) or ""))
+            overlay = _sanitize_overlay(
+                result, overlays.get(_overlay_language(overlays, language) or ""), text_keys=text_keys,
+            )
             if overlay:
                 result = _overlay(result, overlay)
         return result
@@ -104,7 +144,7 @@ def localized(value: Any, locale: str | None) -> Any:
     return resolve(value)
 
 
-def _sanitize_overlay(base: Any, overlay: Any, *, text: bool = False) -> Any:
+def _sanitize_overlay(base: Any, overlay: Any, *, text: bool = False, text_keys: frozenset[str] = _TEXT_KEYS) -> Any:
     """Keep only same-typed replacements of text the base already has."""
     if isinstance(base, dict) and isinstance(overlay, dict):
         result = {}
@@ -112,12 +152,12 @@ def _sanitize_overlay(base: Any, overlay: Any, *, text: bool = False) -> Any:
             if key == AUTO_KEY and (value is True or (isinstance(value, str) and len(value) <= 64)):
                 result[key] = value
             elif key in base and key not in _STRUCTURAL_KEYS and key != I18N_KEY:
-                cleaned = _sanitize_overlay(base[key], value, text=text or key in _TEXT_KEYS)
+                cleaned = _sanitize_overlay(base[key], value, text=text or key in text_keys, text_keys=text_keys)
                 if cleaned is not None:
                     result[key] = cleaned
         return result or None
     if isinstance(base, list) and isinstance(overlay, list) and len(base) == len(overlay):
-        cleaned = [_sanitize_overlay(item, value, text=text) for item, value in zip(base, overlay)]
+        cleaned = [_sanitize_overlay(item, value, text=text, text_keys=text_keys) for item, value in zip(base, overlay)]
         if any(isinstance(item, (dict, list)) for item in base):
             return [item if item is not None else {} for item in cleaned] if any(cleaned) else None
         return cleaned if all(item is not None for item in cleaned) else None
@@ -200,14 +240,15 @@ def run_display_translations(
         if not isinstance(step, dict) or not str(step.get("id") or "").strip():
             continue
         config = step.get("config") if isinstance(step.get("config"), dict) else {}
-        base = {"name": str(step.get("name") or step.get("id")),
+        base = {"name": workflow_step_label(step),
                 "config": {key: config[key] for key in ("review_title",) if isinstance(config.get(key), str)}}
         for code, overlay in (step.get(I18N_KEY) or {}).items() if isinstance(step.get(I18N_KEY), dict) else ():
             cleaned = _sanitize_overlay(base, overlay)
             language = viewer_locale(code if isinstance(code, str) else None)
             if not cleaned or not language:
                 continue
-            if cleaned.get("name", "").strip():
+            # A step id carried over as its "translation" is no name to show.
+            if cleaned.get("name", "").strip() not in {"", str(step["id"])}:
                 result.setdefault(language, {}).setdefault("node_names", {})[str(step["id"])] = cleaned["name"].strip()
                 _add_text(result, language, base["name"], cleaned["name"])
             _add_text(result, language, base["config"].get("review_title"), (cleaned.get("config") or {}).get("review_title"))

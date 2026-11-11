@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any
@@ -114,6 +115,10 @@ PUBLIC_APPROVAL_ORIGIN_NOT_EXECUTABLE_MESSAGE = (
 PUBLIC_WORKFLOW_ORIGIN_NOT_EXECUTABLE_MESSAGE = (
     "This workflow is missing, paused, stopped, or outside the current actor's scope."
 )
+PUBLIC_WORKSPACE_SETUP_INCOMPLETE_MESSAGE = (
+    "This step needs setup the Workspace has not finished yet. Open the "
+    "Workspace's setup to see what is missing; nothing was done."
+)
 PUBLIC_CHROME_TABS_ALREADY_FINALIZED_MESSAGE = (
     "The Chrome browser task already finished. Start a new Chrome task before doing more browser work."
 )
@@ -131,6 +136,7 @@ _PUBLIC_TYPED_ERROR_MESSAGES = {
     "tool_outcome_unconfirmed": PUBLIC_TOOL_OUTCOME_UNCONFIRMED_MESSAGE,
     "approval_origin_not_executable": PUBLIC_APPROVAL_ORIGIN_NOT_EXECUTABLE_MESSAGE,
     "workflow_origin_not_executable": PUBLIC_WORKFLOW_ORIGIN_NOT_EXECUTABLE_MESSAGE,
+    "workspace_setup_incomplete": PUBLIC_WORKSPACE_SETUP_INCOMPLETE_MESSAGE,
     "chrome_tabs_already_finalized": PUBLIC_CHROME_TABS_ALREADY_FINALIZED_MESSAGE,
     LLM_PROVIDER_UNAVAILABLE_ERROR_CODE: PUBLIC_LLM_PROVIDER_UNAVAILABLE_MESSAGE,
 }
@@ -211,6 +217,8 @@ _WORKSPACE_DRAFT_PUBLIC_KEYS = (
     "assistant_reply",
     "title",
     "next_step",
+    # The architect's question: answer buttons under the chat reply.
+    "question",
 )
 _PRIVATE_FAILURE_FIELD_RE = re.compile(
     r"^(?:"
@@ -514,12 +522,30 @@ def runtime_assistant_result_meta(result) -> dict | None:
     return meta or None
 
 
+# A message's tool output is stored in several fields, and every read of a chat
+# page walks them all. The verdict depends only on the text, so it is kept per
+# digest; digests, so that tool output is not retained in process memory.
+_INTERNAL_FAILURE_VERDICTS_MAX = 4096
+_internal_failure_verdicts: dict[bytes, bool] = {}
+
+
 def runtime_is_internal_tool_contract_failure(value: Any) -> bool:
     """Return whether a failure exposes runtime tool routing internals."""
 
     if value is None:
         return False
     text = str(value)
+    digest = hashlib.blake2b(text.encode("utf-8", "surrogatepass"), digest_size=16).digest()
+    verdict = _internal_failure_verdicts.get(digest)
+    if verdict is None:
+        verdict = _scan_internal_tool_contract_failure(text)
+        if len(_internal_failure_verdicts) >= _INTERNAL_FAILURE_VERDICTS_MAX:
+            _internal_failure_verdicts.clear()
+        _internal_failure_verdicts[digest] = verdict
+    return verdict
+
+
+def _scan_internal_tool_contract_failure(text: str) -> bool:
     had_executor_prefix = bool(_TOOL_ERROR_PREFIX_RE.search(text))
     detail = _TOOL_ERROR_PREFIX_RE.sub("", text).strip()
     if had_executor_prefix:
@@ -1232,7 +1258,7 @@ def runtime_public_assistant_message_content(
         )
         if (
             (
-                message_meta.get("error") == "tool_error"
+                message_meta.get("error") in {"tool_error", "sandbox_allocation_failed", "sandbox_queue_timeout", "sandbox_capacity_timeout", "sandbox_runner_unavailable", "sandbox_allocation_rejected"}
                 or limit_detail.get("reason") == "tool_outcome_unconfirmed"
             )
             and keepable_summary

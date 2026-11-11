@@ -10,7 +10,7 @@ import { createPortal } from "react-dom";
 import { IconPlus } from "../icons";
 
 const PAGE_HEADER_TITLE_CLASS =
-  "page-header-title m-0 flex h-10 min-w-0 items-center overflow-hidden text-ellipsis whitespace-nowrap text-2xl font-bold leading-[1.2] tracking-[-0.014em] text-[color:var(--text-strong)] md:text-[28px]";
+  "page-header-title m-0 flex h-10 min-w-0 items-center overflow-hidden text-ellipsis whitespace-nowrap text-[22px] font-semibold leading-[1.2] tracking-[-0.02em] text-[color:var(--text-strong)] md:text-[26px]";
 const EDITOR_HEADER_TITLE_CLASS =
   "page-header-title manor-editor-title m-0 min-w-0 max-w-[58vw] flex-auto overflow-hidden text-ellipsis whitespace-nowrap text-base font-[750] leading-5 tracking-[-0.014em] text-[color:var(--text-strong)] 2xl:max-w-[760px]";
 const PAGE_HEADER_SUBTITLE_CLASS =
@@ -96,7 +96,7 @@ export function PageHeaderAddButton({
   return (
     <button
       type="button"
-      className={`inline-flex h-9 min-w-[152px] max-w-full shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-[10px] border-0 bg-manor-700 px-3 text-[13px] font-semibold text-white transition-colors hover:bg-manor-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-manor-700/25 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-55 ${className}`}
+      className={`page-header-add-button inline-flex h-9 min-w-[152px] max-w-full shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-[10px] border-0 bg-manor-700 px-3 text-[13px] font-semibold text-white transition-colors hover:bg-manor-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-manor-700/25 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-55 ${className}`}
       disabled={disabled}
       {...props}
     >
@@ -137,17 +137,22 @@ export default function PageHeader({
 }: PageHeaderProps) {
   const portalContext = useContext(PageHeaderPortalContext);
   const hasControls = tabs || toolbar || children || actions;
-  const frameClass =
-    "flex w-full flex-col gap-3 2xl:flex-row 2xl:items-start 2xl:justify-between 2xl:gap-6";
+  // Tabs or a search need their own line on a narrow page; a lone action never does.
+  const actionsOnly = Boolean(actions) && !tabs && !toolbar && !children;
+  const frameClass = actionsOnly
+    ? "page-header-frame flex w-full flex-row items-center justify-between gap-3 xl:gap-6"
+    : "page-header-frame flex w-full flex-col gap-3 xl:flex-row xl:items-center xl:justify-between xl:gap-6";
   // The title column takes all the space the controls don't need — a fixed
   // cap truncated long titles while the row had plenty of room.
-  const titleClass = "min-w-0 text-left 2xl:flex-1";
+  const titleClass = "page-header-identity min-w-0 text-left xl:flex-1";
   const controlsClass =
-    "flex w-full min-w-0 flex-row flex-wrap items-center justify-start gap-2.5 2xl:mt-1 2xl:flex-1 2xl:flex-nowrap 2xl:justify-end";
+    `page-header-controls flex min-w-0 flex-row items-center gap-2.5 ${actionsOnly
+      ? "flex-none justify-end"
+      : "w-full flex-wrap justify-start xl:w-auto xl:flex-none xl:flex-nowrap xl:justify-end"}`;
   const groupClass =
     "flex min-w-0 max-w-full flex-none flex-wrap items-center gap-2.5 md:flex-nowrap md:justify-end";
   const actionsClass =
-    "flex min-w-0 max-w-full flex-wrap items-center gap-2.5 self-end md:flex-none md:justify-end";
+    "ml-auto flex min-w-0 max-w-full flex-wrap items-center gap-2.5 self-end md:flex-none md:justify-end";
 
   const header = (
     <header
@@ -165,9 +170,12 @@ export default function PageHeader({
       <div className={frameClass}>
         <div className={titleClass}>
           <PageHeaderTitle>{title}</PageHeaderTitle>
-          <PageHeaderSubtitle className={!subtitle ? "invisible" : ""}>
-            {subtitle || <span aria-hidden="true">&nbsp;</span>}
-          </PageHeaderSubtitle>
+          {/* App-level headers are title + controls only: the explanatory
+              line repeated what the page itself shows. Inline section
+              headers keep their subtitle. */}
+          {subtitle && (!portalContext || inline) && (
+            <PageHeaderSubtitle>{subtitle}</PageHeaderSubtitle>
+          )}
           {meta && (
             <div className={PAGE_HEADER_META_CLASS}>
               <div className="flex min-w-0 flex-wrap items-center gap-2">{meta}</div>
@@ -179,7 +187,7 @@ export default function PageHeader({
         {hasControls && (
           <div className={controlsClass}>
             {tabs && (
-              <div className="min-w-0 flex-none overflow-x-auto overflow-y-hidden">
+              <div className="page-header-tabs min-w-0 flex-none overflow-x-auto overflow-y-hidden">
                 {tabs}
               </div>
             )}

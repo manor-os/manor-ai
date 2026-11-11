@@ -23,6 +23,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from apps.api.middleware import setup_middleware
+from apps.api.middleware.json_compression import JSONCompressionMiddleware
 from packages.core.observability.log_redaction import (
     SensitiveQueryStringFilter as SensitiveQueryStringFilter,
     install_sensitive_log_filter,
@@ -200,7 +201,8 @@ async def lifespan(app: FastAPI):
         # Register the platform feature flags the code gates on, so they show
         # up in the admin Flags page at their safe default instead of ops
         # having to guess the exact key. Only creates missing rows — an
-        # ops-set default or an archived flag is never overwritten.
+        # ops-set default or an archived flag is never overwritten. Cloud
+        # registers them in the post-rollout publish job instead.
         try:
             from packages.core.database import async_session
             from packages.core.services.feature_flags import seed_known_flags
@@ -593,6 +595,7 @@ def create_app() -> FastAPI:
 
     # Production middleware (request ID, logging, rate limiting, error handling)
     setup_middleware(app)
+    app.add_middleware(JSONCompressionMiddleware)
 
 
     # Global exception handler: CreditExhaustedError → 402
@@ -648,7 +651,7 @@ def create_app() -> FastAPI:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
 
     # ── Core routers (always loaded) ──
-    from apps.api.routers import llm_gateway, auth, health, entities, workspaces, workspace_stats, workspace_drafts, tasks, chat, chat_rooms, messages, agents, agent_initiatives, documents, integrations, notifications, admin, admin_oauth, oauth_provider, people, usage, goals, workspace_chat, workers, scheduler, ws, search, dashboard, bulk, activity, webhooks, api_keys, templates, backup, skills, custom_fields, memories, comments, quotas, favorites, tags, presence, workflows, reports, portal, orders, docgen, browser, staff_management, calendar_settings, filesystem, nango_oauth, nango_webhooks, platform_public, audio, media, permissions as permissions_router, permissions_v1, document_permissions, folder_permissions, client_errors, sites
+    from apps.api.routers import llm_gateway, auth, health, entities, workspaces, workspace_stats, workspace_drafts, tasks, chat, chat_history, chat_rooms, messages, agents, agent_initiatives, documents, integrations, notifications, admin, admin_oauth, oauth_provider, people, usage, goals, workspace_chat, workers, scheduler, ws, search, dashboard, bulk, activity, webhooks, api_keys, templates, backup, skills, custom_fields, memories, comments, quotas, favorites, tags, presence, workflows, reports, portal, orders, docgen, browser, staff_management, calendar_settings, filesystem, nango_oauth, nango_webhooks, platform_public, audio, media, permissions as permissions_router, permissions_v1, document_permissions, folder_permissions, client_errors, sites
     from apps.api.routers import internal_capacity
     from apps.api.routers import sandbox_cli
     from apps.api.routers.channels import wechat as wechat_channel
@@ -676,6 +679,7 @@ def create_app() -> FastAPI:
     app.include_router(tasks.router)
     app.include_router(calendar_settings.router)
     app.include_router(chat.router)
+    app.include_router(chat_history.router)
     app.include_router(chat_rooms.router)
     from apps.api.routers import room_file_downloads
     app.include_router(room_file_downloads.router)

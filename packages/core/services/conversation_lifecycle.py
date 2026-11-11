@@ -21,6 +21,35 @@ from packages.core.services.reusable_resource_locks import (
 )
 
 
+async def _delete_editor_document_snapshots(
+    db: AsyncSession, entity_id: str, conversation_id: str,
+) -> None:
+    """Remove this session's unsaved editor snapshots; chat-upload retention is the backstop."""
+    import logging
+
+    from packages.core.ai.runtime.editor_document import (
+        EDITOR_DOCUMENT_SNAPSHOT_KEY,
+        delete_editor_snapshot,
+    )
+    from packages.core.ai.runtime.file_actions import runtime_entity_file_root
+
+    root = runtime_entity_file_root(entity_id)
+    if not root:
+        return
+    payloads = await db.scalars(
+        select(RuntimeRun.execution_payload).where(
+            RuntimeRun.entity_id == entity_id,
+            RuntimeRun.conversation_id == conversation_id,
+        )
+    )
+    for payload in payloads:
+        editor_context = (payload or {}).get("editor_context") or {}
+        try:
+            delete_editor_snapshot(root, editor_context.get(EDITOR_DOCUMENT_SNAPSHOT_KEY))
+        except OSError:
+            logging.getLogger(__name__).warning("editor snapshot cleanup failed", exc_info=True)
+
+
 async def ensure_active_workspace(
     db: AsyncSession,
     *,
@@ -288,6 +317,7 @@ async def delete_conversation(
         # AI Edit runs can contain the entire temporary editor document. Keep
         # the durable run/status audit row, but remove document-bearing data as
         # part of the same deletion transaction as the session and messages.
+        await _delete_editor_document_snapshots(db, entity_id, conversation_id)
         await db.execute(
             update(RuntimeRun).where(
                 RuntimeRun.entity_id == entity_id,

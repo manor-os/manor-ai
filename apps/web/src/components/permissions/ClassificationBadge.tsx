@@ -18,8 +18,8 @@ const CLASSIFICATION_STYLES: Record<
   { bg: string; fg: string; labelKey: string; tooltipKey: string; pulse?: boolean }
 > = {
   public: {
-    bg: "#f5f5f4",
-    fg: "#57534e",
+    bg: "#f5f5f7",
+    fg: "#6e6e73",
     labelKey: "permissions.classification.public.label",
     tooltipKey: "permissions.classification.public.tooltip",
   },

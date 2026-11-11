@@ -173,7 +173,10 @@ async def runtime_rag_action(
             "net_ids": net_ids,
             "evidence_mode": "none",
             "content_evidence_available": False,
-            "message": f"No indexed content found for: {question!r}.",
+            "message": (
+                f"No indexed content found for: {question!r}."
+                + (" Search covered this Workspace only." if scope == "workspace" else "")
+            ),
         })
 
     context_parts = []

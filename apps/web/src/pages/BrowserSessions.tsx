@@ -1,3 +1,5 @@
+import { displayReadInterval } from "../lib/readRefreshPolicy";
+import { usePageVisible } from "../lib/usePageVisible";
 import { useState, useCallback } from "react";
 import { useParams, Link, useNavigate } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -75,21 +77,12 @@ function SessionList() {
         <div style={{ padding: "80px 0" }}>
           <EmptyState
             icon={
-              <svg style={{ width: 48, height: 48, color: "#d6d3d1" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1}>
+              <svg style={{ width: 48, height: 48, color: "var(--text-faint)" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M9 17.25v1.007a3 3 0 01-.879 2.122L7.5 21h9l-.621-.621A3 3 0 0115 18.257V17.25m6-12V15a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 15V5.25m18 0A2.25 2.25 0 0018.75 3H5.25A2.25 2.25 0 003 5.25m18 0V12a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 12V5.25" />
               </svg>
             }
             title={t("page.browser_sessions.no_sessions")}
             description={t("page.browser_sessions.no_sessions_desc")}
-            action={
-              <Button
-                variant="primary"
-                onClick={() => createMutation.mutate()}
-                disabled={createMutation.isPending}
-              >
-                {createMutation.isPending ? t("page.browser_sessions.creating") : t("page.browser_sessions.new_session")}
-              </Button>
-            }
           />
         </div>
       ) : (
@@ -103,13 +96,13 @@ function SessionList() {
             <GlassCard key={session.session_id}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 12 }}>
                 <div style={{ minWidth: 0, flex: 1 }}>
-                  <p style={{ fontSize: 14, fontWeight: 700, color: "#292524", marginBottom: 4, fontFamily: "monospace" }}>
+                  <p style={{ fontSize: 14, fontWeight: 700, color: "var(--text-strong)", marginBottom: 4, fontFamily: "var(--font-mono)" }}>
                     {session.session_id.slice(0, 12)}...
                   </p>
                   {session.current_url && (
                     <p style={{
                       fontSize: 12,
-                      color: "#78716c",
+                      color: "var(--text-muted)",
                       overflow: "hidden",
                       textOverflow: "ellipsis",
                       whiteSpace: "nowrap",
@@ -124,7 +117,7 @@ function SessionList() {
               </div>
 
               {session.created_at && (
-                <p style={{ fontSize: 11, color: "#a8a29e", marginBottom: 12 }}>
+                <p style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 12 }}>
                   {t("page.browser_sessions.created")} {formatTime(session.created_at)}
                 </p>
               )}
@@ -168,6 +161,7 @@ function SessionList() {
 /* ------------------------------------------------------------------ */
 
 function SessionDetail({ sessionId }: { sessionId: string }) {
+  const visible = usePageVisible();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [navUrl, setNavUrl] = useState("");
@@ -175,8 +169,11 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
 
   const { data: session, isLoading, error } = useQuery({
     queryKey: ["browser-session", sessionId],
-    queryFn: () => api.browser.getSession(sessionId),
-    refetchInterval: 5000,
+    queryFn: ({ signal }) => api.browser.getSession(sessionId, AbortSignal.any([signal, AbortSignal.timeout(15_000)])),
+    enabled: visible,
+    retry: false,
+    refetchOnWindowFocus: "always",
+    refetchInterval: (query) => displayReadInterval(query.state, 15_000),
   });
 
   const navigateMutation = useMutation({
@@ -281,7 +278,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
             padding: "4px 4px 4px 14px",
             gap: 8,
           }}>
-            <svg style={{ width: 14, height: 14, color: "#a8a29e", flexShrink: 0 }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <svg style={{ width: 14, height: 14, color: "var(--text-muted)", flexShrink: 0 }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M12 21a9.004 9.004 0 008.716-6.747M12 21a9.004 9.004 0 01-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m0 0a8.997 8.997 0 017.843 4.582M12 3a8.997 8.997 0 00-7.843 4.582m15.686 0A11.953 11.953 0 0112 10.5c-2.998 0-5.74-1.1-7.843-2.918m15.686 0A8.959 8.959 0 0121 12c0 .778-.099 1.533-.284 2.253m0 0A17.919 17.919 0 0112 16.5c-3.162 0-6.133-.815-8.716-2.247m0 0A9.015 9.015 0 013 12c0-1.605.42-3.113 1.157-4.418" />
             </svg>
             <input
@@ -296,7 +293,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
                 fontSize: 13,
                 outline: "none",
                 border: "none",
-                color: "#44403c",
+                color: "var(--text-muted)",
               }}
             />
             <Button
@@ -331,11 +328,11 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
               />
             ) : (
               <div style={{ textAlign: "center" }}>
-                <svg style={{ width: 48, height: 48, color: "#d6d3d1", margin: "0 auto 12px" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1}>
+                <svg style={{ width: 48, height: 48, color: "var(--text-faint)", margin: "0 auto 12px" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M9 17.25v1.007a3 3 0 01-.879 2.122L7.5 21h9l-.621-.621A3 3 0 0115 18.257V17.25m6-12V15a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 15V5.25m18 0A2.25 2.25 0 0018.75 3H5.25A2.25 2.25 0 003 5.25m18 0V12a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 12V5.25" />
                 </svg>
-                <p style={{ fontSize: 14, fontWeight: 600, color: "#78716c", marginBottom: 4 }}>{t("page.browser_sessions.browser_preview")}</p>
-                <p style={{ fontSize: 12, color: "#a8a29e", marginBottom: 12 }}>{t("page.browser_sessions.take_screenshot_desc")}</p>
+                <p style={{ fontSize: 14, fontWeight: 600, color: "var(--text-muted)", marginBottom: 4 }}>{t("page.browser_sessions.browser_preview")}</p>
+                <p style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 12 }}>{t("page.browser_sessions.take_screenshot_desc")}</p>
                 <Button
                   variant="primary"
                   onClick={() => screenshotMutation.mutate()}
@@ -354,27 +351,27 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
         <div className="lg:grid lg:grid-cols-3 lg:gap-4">
           <div className="lg:col-span-2 mb-4 lg:mb-0">
             <GlassCard hoverable={false}>
-              <h3 style={{ fontSize: 14, fontWeight: 700, color: "#292524", marginBottom: 12 }}>{t("page.browser_sessions.session_details")}</h3>
+              <h3 style={{ fontSize: 14, fontWeight: 700, color: "var(--text-strong)", marginBottom: 12 }}>{t("page.browser_sessions.session_details")}</h3>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 240px), 1fr))", gap: 12 }}>
                 <div>
-                  <span style={{ fontSize: 11, color: "#a8a29e", display: "block", marginBottom: 2 }}>{t("page.browser_sessions.session_id")}</span>
-                  <p style={{ fontSize: 14, fontWeight: 600, color: "#57534e", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "monospace" }}>
+                  <span style={{ fontSize: 11, color: "var(--text-muted)", display: "block", marginBottom: 2 }}>{t("page.browser_sessions.session_id")}</span>
+                  <p style={{ fontSize: 14, fontWeight: 600, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--font-mono)" }}>
                     {session?.session_id || sessionId}
                   </p>
                 </div>
                 <div>
-                  <span style={{ fontSize: 11, color: "#a8a29e", display: "block", marginBottom: 2 }}>{t("page.browser_sessions.status")}</span>
-                  <p style={{ fontSize: 14, fontWeight: 600, color: "#57534e" }}>{session?.status || t("page.browser_sessions.unknown")}</p>
+                  <span style={{ fontSize: 11, color: "var(--text-muted)", display: "block", marginBottom: 2 }}>{t("page.browser_sessions.status")}</span>
+                  <p style={{ fontSize: 14, fontWeight: 600, color: "var(--text-muted)" }}>{session?.status || t("page.browser_sessions.unknown")}</p>
                 </div>
                 <div>
-                  <span style={{ fontSize: 11, color: "#a8a29e", display: "block", marginBottom: 2 }}>{t("page.browser_sessions.current_url")}</span>
-                  <p style={{ fontSize: 14, fontWeight: 600, color: "#57534e", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  <span style={{ fontSize: 11, color: "var(--text-muted)", display: "block", marginBottom: 2 }}>{t("page.browser_sessions.current_url")}</span>
+                  <p style={{ fontSize: 14, fontWeight: 600, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     {session?.current_url || t("page.browser_sessions.no_url")}
                   </p>
                 </div>
                 <div>
-                  <span style={{ fontSize: 11, color: "#a8a29e", display: "block", marginBottom: 2 }}>{t("page.browser_sessions.created_at")}</span>
-                  <p style={{ fontSize: 14, fontWeight: 600, color: "#57534e" }}>
+                  <span style={{ fontSize: 11, color: "var(--text-muted)", display: "block", marginBottom: 2 }}>{t("page.browser_sessions.created_at")}</span>
+                  <p style={{ fontSize: 14, fontWeight: 600, color: "var(--text-muted)" }}>
                     {session?.created_at ? formatTime(session.created_at) : t("page.browser_sessions.na")}
                   </p>
                 </div>
@@ -383,7 +380,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
           </div>
 
           <GlassCard hoverable={false}>
-            <h3 style={{ fontSize: 14, fontWeight: 700, color: "#292524", marginBottom: 12 }}>{t("page.browser_sessions.controls")}</h3>
+            <h3 style={{ fontSize: 14, fontWeight: 700, color: "var(--text-strong)", marginBottom: 12 }}>{t("page.browser_sessions.controls")}</h3>
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               <Button
                 variant="primary"

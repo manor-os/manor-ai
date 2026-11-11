@@ -298,7 +298,14 @@ async def _generate_file(
             return json.dumps({"error": "Conflicting file_type in top-level arguments and params"})
         if not name or not requested_type or (kind is GenerateFileKind.PDF and requested_type != "pdf"):
             return json.dumps({"error": "source conversion requires a new output name and matching target file_type"})
-        if kind is GenerateFileKind.IMAGE:
+        if "url" in source and kind is not GenerateFileKind.IMAGE:
+            return json.dumps({"error": "source.url saves a public web image; use kind=image"})
+        if kind is GenerateFileKind.IMAGE and "url" in source:
+            from packages.core.contracts.file_engine import IMAGE_CONVERSION_TARGETS
+
+            if requested_type not in IMAGE_CONVERSION_TARGETS:
+                return json.dumps({"error": "kind=image source.url is saved as PNG/JPEG/WebP"})
+        elif kind is GenerateFileKind.IMAGE:
             from packages.core.contracts.file_engine import IMAGE_CONVERSION_TARGETS, IMAGE_CONVERSION_TYPES
 
             if file_type_from_path(str(source.get("path") or "")) not in IMAGE_CONVERSION_TYPES or requested_type not in IMAGE_CONVERSION_TARGETS:

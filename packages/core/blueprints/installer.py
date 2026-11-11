@@ -275,6 +275,14 @@ def validate_portable_recipe_resources(recipe: Mapping[str, Any]) -> None:
     portable = {"workflows": list(recipe.get("workflows") or []), "scheduled_jobs": list(recipe.get("scheduled_jobs") or [])}
     _validate_workflows(portable)
     _validate_scheduled_jobs(portable)
+    # Install binds no trigger_type=schedule Workflow, so a Job could not run it.
+    unbound = {str(row.get("slug")) for row in portable["workflows"]
+               if isinstance(row, dict) and row.get("trigger_type") == "schedule"}
+    for job in portable["scheduled_jobs"]:
+        slug = str(((job or {}).get("execution_target") or {}).get("workflow_slug") or "") if isinstance(job, dict) else ""
+        if slug in unbound:
+            raise PayloadError(f"scheduled job {job.get('job_id')!r} runs workflow {slug!r}, whose trigger_type "
+                               "schedule is never bound; omit its trigger_type so the Job can run it")
     for workflow in portable["workflows"]:
         if isinstance(workflow, dict):
             _blueprint_workflow_definition_values(workflow)
@@ -742,7 +750,10 @@ async def _bind_blueprint_channel_configs(
 
         binding_config = {
             "channel_config_id": channel_config.id,
-            "blueprint_requirement_key": requirement_key,
+            # An installed requirement keeps the key it was installed under.
+            "blueprint_requirement_key": str(
+                requirement.get("blueprint_requirement_key") or requirement_key
+            ),
             "role": str(
                 requirement.get("role") or "primary_external"
             ).strip(),
@@ -1406,11 +1417,9 @@ async def install_blueprint(
     if governance_rules:
         workspace_operating_model["blueprint_governance_rules"] = governance_rules
 
+    # A simulation keeps its real name; ``settings.sandbox`` marks it in the
+    # Workspace list and chat, and promotion changes nothing about the name.
     name = workspace_name or manifest.get("title") or "Untitled workspace"
-    if mode == InstallMode.SIMULATE:
-        # Distinguish in the workspace list — but we keep the underlying
-        # `kind` so promote() can restore.
-        name = f"[SIM] {name}"
 
     workspace = await create_workspace(
         db, entity_id,
@@ -1943,9 +1952,9 @@ async def install_blueprint(
             )
         else:
             result.notes.append(
-                "Simulation started — the first Strategist task proposal is "
-                "auto-approved, plans default to dry_run, and measurements are "
-                "simulated. Promote when ready."
+                "Simulation started in Workspace Chat. It walks through the "
+                "Workspace with sample data and changes nothing outside Manor. "
+                "Promote when ready."
             )
     else:
         if workspace.heartbeat_enabled:
@@ -2509,6 +2518,11 @@ async def _resolve_blueprint_skill_target(
     return skill
 
 
+def _scheduled_job_display_name(job_id: str) -> str:
+    words = re.sub(r"[_\-:.]+", " ", str(job_id or "")).strip()
+    return (words[:1].upper() + words[1:]) if words else "Scheduled job"
+
+
 async def _install_scheduled_job(
     db: AsyncSession, *, entity_id: str, workspace_id: str,
     sj: dict[str, Any], user_id: Optional[str], mode: InstallMode,
@@ -2652,7 +2666,8 @@ async def _install_scheduled_job(
         job_id=job_id,
         entity_id=entity_id,
         workspace_id=workspace_id,
-        name=sj.get("name"),
+        # A Job without a name drops out of every list that shows Jobs by name.
+        name=str(sj.get("name") or "").strip() or _scheduled_job_display_name(base_job_id),
         job_type=sj.get("job_type", "cron"),
         schedule_kind=sj.get("schedule_kind"),
         cron_expr=sj.get("cron_expr"),
@@ -3890,6 +3905,10 @@ def _blueprint_workflow_definition_values(w: dict[str, Any]) -> dict[str, Any]:
             step["meta"] = s["meta"]
         if "chat_projection" in s:
             step["chat_projection"] = deepcopy(s["chat_projection"])
+        # Step translations overlay the step itself (its name and config
+        # labels), so they stay beside it rather than inside its config.
+        if isinstance(s.get("i18n"), dict):
+            step["i18n"] = deepcopy(s["i18n"])
         if isinstance(s.get("position"), dict):
             position = s["position"]
             if all(
@@ -3908,10 +3927,26 @@ def _blueprint_workflow_definition_values(w: dict[str, Any]) -> dict[str, Any]:
     ):
         existing_ids = {str(step.get("id")) for step in runtime_steps}
         start_id = "start" if "start" not in existing_ids else "blueprint_start"
+        # A step another step routes to is not a root, whether the DSL wrote
+        # the edge as its depends_on or as the predecessor's next.
+        routed_ids = {
+            target
+            for step in runtime_steps
+            for route_key in ("next", "true_next", "false_next")
+            for target in step.get(route_key) or []
+        }
+        # So is one only a failure, a switch case or its default leads to.
+        for step in runtime_steps:
+            config = step.get("config") or {}
+            routed_ids.update(str(target) for target in config.get("error_next") or [])
+            routed_ids.update(str(target) for target in config.get("default_next") or [])
+            routed_ids.update(str(target) for case in config.get("cases") or [] if isinstance(case, dict)
+                              for target in case.get("next") or [])
         root_ids = [
             str(s.get("id"))
             for s in bp_steps
             if isinstance(s, dict) and s.get("id") and not s.get("depends_on")
+            and str(s.get("id")) not in routed_ids
         ]
         if not root_ids and runtime_steps:
             root_ids = [str(runtime_steps[0]["id"])]
@@ -3919,16 +3954,12 @@ def _blueprint_workflow_definition_values(w: dict[str, Any]) -> dict[str, Any]:
             "trigger_type": w.get("trigger_type") or "manual",
             **_blueprint_workflow_trigger_config(w),
         }
-        # How the run's production shows travels on the trigger, beside its inputs.
-        if isinstance(w.get("production"), dict):
-            trigger_config["production"] = dict(w["production"])
         if isinstance(w.get("run_inputs"), list):
             run_inputs = [
                 dict(item)
                 for item in w["run_inputs"]
                 if isinstance(item, dict)
             ]
-            trigger_config["run_inputs"] = run_inputs
             trigger_config["outputs"] = [
                 {
                     "key": str(item.get("key") or item.get("name")).strip(),
@@ -3956,6 +3987,21 @@ def _blueprint_workflow_definition_values(w: dict[str, Any]) -> dict[str, Any]:
             "next": root_ids,
         })
 
+    # The Workflow's production and run_inputs are the source of truth. An entry
+    # step the package wrote keeps its own copy, which can predate later edits,
+    # so the copy is replaced rather than stored as-is.
+    entry_step = next(
+        (step for step in runtime_steps if step.get("type") in ("trigger", "webhook")),
+        None,
+    )
+    if entry_step is not None:
+        entry_config = dict(entry_step.get("config") or {})
+        if isinstance(w.get("production"), dict):
+            entry_config["production"] = dict(w["production"])
+        if isinstance(w.get("run_inputs"), list):
+            entry_config["run_inputs"] = [dict(item) for item in w["run_inputs"] if isinstance(item, dict)]
+        entry_step["config"] = entry_config
+
     if w.get("explicit_data_contracts"):
         from packages.core.services.workflow_contracts import (
             explicit_workflow_step_contracts,
@@ -3963,9 +4009,11 @@ def _blueprint_workflow_definition_values(w: dict[str, Any]) -> dict[str, Any]:
 
         runtime_steps = explicit_workflow_step_contracts(runtime_steps)
 
-    from packages.core.services.workflow_service import validate_workflow_steps
+    from packages.core.services.workflow_service import validate_workflow_steps, workflow_variable_names
 
-    validation = validate_workflow_steps(runtime_steps)
+    validation = validate_workflow_steps(
+        runtime_steps, variable_names=workflow_variable_names(w.get("variables")),
+    )
     if not validation["valid"]:
         messages = "; ".join(error["message"] for error in validation["errors"])
         raise InstallError(f"workflow {slug!r} is invalid: {messages}")
@@ -4274,6 +4322,7 @@ def _blueprint_runtime_step_config(
         "meta",
         "position",
         "chat_projection",
+        "i18n",
     }
     for key, value in step.items():
         if key not in excluded:

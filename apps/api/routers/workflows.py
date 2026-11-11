@@ -14,6 +14,7 @@ from sqlalchemy import exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.ai.workflow_failure import user_facing_run_error
+from packages.core.services.decision_recommendation import project_recommendation
 from packages.core.ai.workflow_import import UnknownWorkflowFormat, import_workflow
 from packages.core.ai.workflow_runner import (
     WorkflowRunner,
@@ -26,6 +27,7 @@ from packages.core.models.permission import Capability, ResourceType, Visibility
 from packages.core.models.user import User
 from packages.core.models.workflow import WorkflowDefinition, WorkflowProject, WorkflowTemplateInstallation
 from packages.core.models.workspace import Workspace
+from packages.core.revisions import StaleRevisionError
 from packages.core.services import workflow_service as svc
 from packages.core.services.workflow_service import ScheduledWorkflowInputsError
 from packages.core.services.workspace_workflow_router import WorkflowRunInputError
@@ -49,6 +51,7 @@ from packages.core.services.workspace_access import (
 )
 from apps.api.collaborator_boundary import collaborator_scope
 from apps.api.deps import get_current_user
+from apps.api.errors import CodedError
 from packages.core.services.collaborator_scope import (
     require_collaborator_references,
     require_collaborator_workflow_steps,
@@ -211,6 +214,9 @@ class WorkflowUpdateRequest(BaseModel):
     is_active: bool | None = None
     status: str | None = None
     validate_steps: bool = False
+    # The ``version`` this edit started from; the save is refused with 409 if
+    # the workflow has been saved since. Omitted, the save applies as before.
+    expected_version: int | None = Field(None, ge=1)
 
 
 class WorkflowTemplateInstallRequest(BaseModel):
@@ -229,6 +235,8 @@ class WorkflowResponse(BaseModel):
     trigger_type: str
     trigger_config: dict = {}
     steps: list[dict] = []
+    # Only on summaries, which leave `steps` empty.
+    step_count: int | None = None
     variables: dict = {}
     category: str | None = None
     tags: list[str] = []
@@ -295,6 +303,8 @@ class RunStartRequest(BaseModel):
     # /{workflow_id}/run: true = run inline to completion, false = create only
     # (manual /step). /bindings/{id}/run always queues the run on a worker.
     execute: bool = True
+    # /{workflow_id}/run: hand the run to a worker and return at once.
+    queue: bool = False
 
 
 class RunResponse(BaseModel):
@@ -359,6 +369,15 @@ class WorkflowEffectReviewRequest(BaseModel):
     project_revisions: dict[str, int] = Field(default_factory=dict)
 
 
+class SuppliedStepOutputRequest(BaseModel):
+    """Work finished outside the run that stands in for one step's result."""
+    step_id: str = Field(min_length=1, max_length=200)
+    # Must match the step's declared output_schema and name every document.
+    output: dict
+    document_ids: list[str] = Field(min_length=1, max_length=20)
+    note: str = Field(default="", max_length=2000)
+
+
 class RetryRunRequest(BaseModel):
     from_step_id: str | None = None
     variables: dict | None = None
@@ -368,6 +387,9 @@ class RetryRunRequest(BaseModel):
     # checkpoint on the Workflow as it is now. "original" replays the
     # definition the failed attempt ran.
     definition: Literal["current", "original"] = "current"
+    # Accept a file made elsewhere (in chat, by hand) as this step's output and
+    # continue from there: the steps after it, its QA included, still run.
+    supplied_output: SuppliedStepOutputRequest | None = None
 
 
 class ReviseRunRequest(BaseModel):
@@ -514,7 +536,7 @@ def _run_to_dict(
 
         from packages.core.i18n import get_locale
 
-        response_data["resume_action"] = run_resume_action(run, locale=get_locale())
+        response_data["resume_action"] = project_recommendation(run_resume_action(run, locale=get_locale()))
     if summary:
         response_data.update(compact_state or {})
     if include_detail:
@@ -779,10 +801,21 @@ def _compact_workflow_run_state(run, *, restartable: bool = False) -> dict:
                 "options": ["review"],
                 **review,
             }
-    elif native_action and native_action.get("kind") in {"workflow_input", "workflow_approval"}:
+    elif native_action and (
+        native_action.get("kind") in {"workflow_input", "workflow_approval"}
+        or native_action.get("connection_provider")
+    ):
         # Native input and approval waits need the same App entry as their
-        # chat-backed forms. The dialog rechecks the frozen request on opening.
+        # chat-backed forms, and a connection wait its connect entry. The
+        # dialog rechecks the frozen request on opening.
         intervention = summarize_trace_value(native_action)
+        if native_action.get("connection_provider"):
+            intervention = {
+                **intervention,
+                "workflow_binding_id": run.binding_id,
+                "observed_problem": native_action.get("prompt"),
+                "options": ["resume", "cancel"],
+            }
     elif (
         run.status == "paused"
         and run.current_step_id
@@ -832,7 +865,7 @@ def _compact_workflow_run_state(run, *, restartable: bool = False) -> dict:
         "business_outcome": business_outcome,
         "error": error,
         "retry_from_step_id": retry_from_step_id or None,
-        "intervention": intervention,
+        "intervention": project_recommendation(intervention),
     }
 
 
@@ -910,6 +943,78 @@ async def _deepest_retryable_subworkflow_run(
         depth += 1
 
     return cursor
+
+
+async def _run_waiting_action(db: AsyncSession, run) -> dict | None:
+    """The decision a paused run itself waits on: its chat card or native wait."""
+    from sqlalchemy import select
+
+    from packages.core.i18n import get_locale
+    from packages.core.models.task import Conversation, Message
+    from packages.core.services.workflow_run_control import run_resume_action
+
+    action = await _message_backed_workflow_intervention(db, run, full=True)
+    if action and action.get("runtime_approval_id"):
+        return action
+    if action and (
+        (
+            action.get("step_id") == run.current_step_id
+            and (
+                action.get("kind") == PendingActionKind.WORKFLOW_APPROVAL
+                or (
+                    action.get("kind") == PendingActionKind.WORKFLOW_INPUT
+                    and isinstance(action.get("inputs"), list)
+                )
+            )
+        )
+        # A run launched without its required inputs waits on the
+        # starter form before any step runs; answer that same card here.
+        or (
+            action.get("kind") == PendingActionKind.WORKFLOW_STARTER_INPUT
+            and isinstance(action.get("inputs"), list)
+            and not run.step_results
+        )
+    ):
+        result = (run.step_results or {}).get(run.current_step_id) or {}
+        return {
+            **action,
+            "message_workspace_id": await db.scalar(
+                select(Conversation.workspace_id)
+                .join(Message, Message.conversation_id == Conversation.id)
+                .where(Message.id == action["message_id"])
+            ),
+            "prompt": result.get("output"),
+            "review": result.get("review"),
+            "review_title": result.get("review_title"),
+        }
+    return project_recommendation(run_resume_action(run, locale=get_locale()))
+
+
+async def _descendant_waiting_action(db: AsyncSession, run) -> dict | None:
+    """The first decision a paused descendant of ``run`` waits on, oldest first.
+
+    Its ``workflow_run_id`` names that descendant, which is the run answered.
+    """
+    from sqlalchemy import select
+
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workflow_run_control import active_subworkflow_descendant_ids
+
+    descendant_ids = await active_subworkflow_descendant_ids(db, run)
+    if not descendant_ids:
+        return None
+    waiting = (await db.execute(
+        select(WorkflowRun).where(
+            WorkflowRun.entity_id == run.entity_id,
+            WorkflowRun.id.in_(descendant_ids),
+            WorkflowRun.status == "paused",
+        ).order_by(WorkflowRun.created_at, WorkflowRun.id)
+    )).scalars().all()
+    for descendant in waiting:
+        action = await _run_waiting_action(db, descendant)
+        if action:
+            return {**action, "workflow_run_id": descendant.id}
+    return None
 
 
 async def _native_workflow_approval_intervention(db: AsyncSession, run) -> dict | None:
@@ -1179,6 +1284,7 @@ async def _require_run_control(db: AsyncSession, run, user: User) -> None:
 
 @router.get("", response_model=list[WorkflowResponse])
 async def list_workflows(
+    summary: bool = Query(False, description="Leave out steps and variables, for pickers and name lookups."),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1221,7 +1327,10 @@ async def list_workflows(
     workspace_names = dict((await db.execute(
         select(Workspace.id, Workspace.name).where(Workspace.id.in_(workspace_ids))
     )).all()) if workspace_ids else {}
-    return [_wf_to_dict(w, workspace_name=workspace_names.get(w.workspace_id)) for w in visible]
+    rows = [_wf_to_dict(w, workspace_name=workspace_names.get(w.workspace_id)) for w in visible]
+    if not summary:
+        return rows
+    return [{**row, "steps": [], "step_count": len(row["steps"] or []), "variables": {}} for row in rows]
 
 
 @router.get(
@@ -1231,47 +1340,28 @@ async def list_workflows(
 async def list_workflow_project_candidates(
     workspace_id: str = Query(..., min_length=1),
     project_type: str = Query(..., min_length=1, max_length=80),
-    stage: list[str] = Query(...),
-    limit: int = Query(50, ge=1, le=100),
+    stage: list[str] | None = Query(None),
+    limit: int = Query(50, ge=1, le=500),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """Projects a ``workflow_project_select`` picker offers; no ``stage`` offers every stage."""
+    from packages.core.services.workflow_project_select import list_projects, project_title
+
     await _require_binding_workspace_read(db, user, workspace_id)
-    stages = {str(value or "").strip() for value in stage}
+    stages = {str(value or "").strip() for value in stage or []}
     stages.discard("")
-    if not stages or len(stages) > 20 or any(len(value) > 40 for value in stages):
-        raise HTTPException(422, "One to twenty valid project stages are required")
+    if len(stages) > 20 or any(len(value) > 40 for value in stages):
+        raise HTTPException(422, "Up to twenty valid project stages are allowed")
 
-    projects = (await db.execute(
-        select(WorkflowProject)
-        .where(
-            WorkflowProject.entity_id == user.entity_id,
-            WorkflowProject.workspace_id == workspace_id,
-            WorkflowProject.project_type == project_type,
-            WorkflowProject.current_stage.in_(stages),
-        )
-        .order_by(WorkflowProject.updated_at.desc(), WorkflowProject.id.desc())
-        .limit(limit)
-    )).scalars().all()
-
+    projects = await list_projects(
+        db, entity_id=user.entity_id, workspace_id=workspace_id,
+        project_type=project_type, stages=sorted(stages), limit=limit,
+    )
     candidates: list[WorkflowProjectCandidateResponse] = []
     for project in projects:
         state = project.state if isinstance(project.state, dict) else {}
-        publication = state.get("publication")
-        topic = state.get("topic")
         youtube = state.get("youtube")
-        title = (
-            str(publication.get("title") or "").strip()
-            if isinstance(publication, dict)
-            else ""
-        )
-        if not title and isinstance(topic, dict):
-            title = str(topic.get("selected_topic") or "").strip()
-        title = title or str(state.get("title") or "").strip() or str(project.project_key or "").strip() or project.id
-        # A numbered project (a series episode) reads as "E01 · title".
-        code = str(state.get("code") or "").strip()
-        if code and not title.startswith(code):
-            title = f"{code} · {title}"
         youtube_video_id = (
             str(youtube.get("video_id") or "").strip()
             if isinstance(youtube, dict)
@@ -1281,7 +1371,7 @@ async def list_workflow_project_candidates(
             id=project.id,
             project_type=project.project_type,
             current_stage=project.current_stage,
-            title=title[:200],
+            title=project_title(project),
             youtube_video_id=youtube_video_id[:128] or None,
             created_at=project.created_at,
             updated_at=project.updated_at,
@@ -2202,10 +2292,15 @@ async def get_run(
                 ):
                     child_state = _compact_workflow_run_state(child)
                     child_intervention = child_state.get("intervention")
+                    # A parent paused on a sub-flow owns no decision: it offers the
+                    # one its child waits on (a resume, a review or a form).
                     if (
                         isinstance(child_intervention, dict)
-                        and child_intervention.get("kind")
-                        == "workflow_resume"
+                        and child_intervention.get("kind") in {
+                            "workflow_resume",
+                            PendingActionKind.WORKFLOW_APPROVAL,
+                            PendingActionKind.WORKFLOW_INPUT,
+                        }
                     ):
                         compact_state["intervention"] = child_intervention
                         compact_state["error"] = child_state.get("error")
@@ -2242,6 +2337,21 @@ async def get_run(
                     **compact_intervention,
                     "message_id": message_intervention["message_id"],
                     "source": message_intervention["source"],
+                }
+            elif (
+                isinstance(compact_intervention, dict)
+                and message_intervention.get("kind") == PendingActionKind.WORKFLOW_RETRY
+                and compact_intervention.get("kind") == PendingActionKind.WORKFLOW_RETRY
+            ):
+                # The card keeps its message; the target is resolved from the run now,
+                # not the one frozen when the card was drawn.
+                compact_state["intervention"] = {
+                    **message_intervention,
+                    **{
+                        key: compact_intervention[key]
+                        for key in ("step_id", "retry_from_step_id", "retry_from_step_name", "retry_segment_ids")
+                        if key in compact_intervention
+                    },
                 }
             else:
                 compact_state["intervention"] = message_intervention
@@ -2281,6 +2391,28 @@ async def get_run(
                     (await workflow_released_project_reviews(db, intervention_run)).items()}}
                    if "review_applied" in options else {}),
             }
+        retry_action = compact_state.get("intervention")
+        if isinstance(retry_action, dict) and retry_action.get("kind") == PendingActionKind.WORKFLOW_RETRY:
+            # A step that ended because its Agent's integration is not connected
+            # is fixed by connecting it, then continuing from that step.
+            from packages.core.services.workspace_connection_status import workflow_step_connection_need
+
+            retry_step_id = str(retry_action.get("step_id") or retry_action.get("retry_from_step_id") or "")
+            need = await workflow_step_connection_need(
+                db, run=intervention_run, step_id=retry_step_id, user_id=user.id,
+            )
+            if need:
+                stored = (intervention_run.step_results or {}).get(retry_step_id)
+                compact_state["intervention"] = {
+                    **retry_action,
+                    "connection_provider": need["provider"],
+                    "connection_label": need["label"],
+                    # A step that stopped to ask a person keeps its own words.
+                    **({} if isinstance(stored, dict) and stored.get("needs_person") else {
+                        "observed_problem": f"{need['label']} is not connected, so this step could not finish.",
+                        "required_change": f"Connect {need['label']}, then continue from this step.",
+                    }),
+                }
     response_data = _run_to_dict(
         run,
         include_detail=detail,
@@ -2297,35 +2429,12 @@ async def get_run(
             response_data["intervention"] = None
     if detail:
         if response_data.get("capabilities", {}).get("can_control") and run.status == "paused":
-            from sqlalchemy import select
-            from packages.core.models.task import Conversation, Message
-
-            action = await _message_backed_workflow_intervention(db, run, full=True)
-            if action and action.get("runtime_approval_id"):
-                response_data["resume_action"] = action
-            elif (
-                action
-                and action.get("step_id") == run.current_step_id
-                and (
-                    action.get("kind") == PendingActionKind.WORKFLOW_APPROVAL
-                    or (
-                        action.get("kind") == PendingActionKind.WORKFLOW_INPUT
-                        and isinstance(action.get("inputs"), list)
-                    )
-                )
-            ):
-                result = (run.step_results or {}).get(run.current_step_id) or {}
-                response_data["resume_action"] = {
-                    **action,
-                    "message_workspace_id": await db.scalar(
-                        select(Conversation.workspace_id)
-                        .join(Message, Message.conversation_id == Conversation.id)
-                        .where(Message.id == action["message_id"])
-                    ),
-                    "prompt": result.get("output"),
-                    "review": result.get("review"),
-                    "review_title": result.get("review_title"),
-                }
+            # A run paused on a nested Flow owns no decision: the person
+            # answers the one its child (or a deeper descendant) waits on.
+            response_data["resume_action"] = (
+                await _run_waiting_action(db, run)
+                or await _descendant_waiting_action(db, run)
+            )
         from packages.core.services.workflow_review_files import attach_review_document_ids
 
         # Reviews recorded before files were linked still open their Documents.
@@ -2352,6 +2461,24 @@ async def get_run(
     ))
     production = workflow_run_production(workflow_steps, run.variables, locale=get_locale())
     if production is not None:
+        # Units the run family rendered locally (no media job): finished like a generated clip.
+        from packages.core.models.workflow import WorkflowRun
+        from packages.core.services.workflow_production import clip_unit_id, workflow_run_local_clips
+
+        root = run.lineage_root_run_id or run.id
+        family_ids = list((await db.scalars(select(WorkflowRun.id).where(
+            WorkflowRun.entity_id == run.entity_id,
+            WorkflowRun.workflow_id == run.workflow_id,
+            or_(WorkflowRun.id == root, WorkflowRun.lineage_root_run_id == root),
+        ).limit(svc.RUN_FAMILY_MAX_RUNS))).all())
+        unit_ids = [unit["id"] for unit in production["units"]]
+        production["units_made_locally"] = [
+            {"unit_id": unit_id, "document_id": clip["document_id"], "name": clip["output_name"]}
+            for clip in await workflow_run_local_clips(
+                db, entity_id=run.entity_id, run_ids=[*family_ids, run.id],
+            )
+            if clip["kind"] == production["media"] and (unit_id := clip_unit_id(clip, unit_ids))
+        ]
         response_data["production"] = production
     return response_data
 
@@ -2633,6 +2760,14 @@ async def retry_run(
         db,
         existing_run,
     )
+    # A second click (or a second tab) must not start a parallel attempt while
+    # the first retry of this run is still going.
+    if latest_visible_attempt.status in {"pending", "running"}:
+        raise HTTPException(
+            409,
+            f"A retry of this run is already running as {latest_visible_attempt.id}. "
+            "Wait for it to finish instead of starting another.",
+        )
     retry_target = await _deepest_retryable_subworkflow_run(
         db,
         latest_visible_attempt,
@@ -2645,6 +2780,8 @@ async def retry_run(
     from packages.core.services.workflow_run_trace import workflow_run_stalled
 
     if retry_target.id == existing_run.id and workflow_run_stalled(existing_run):
+        if body and body.supplied_output:
+            raise HTTPException(409, "A stalled run starts over; it can't accept a supplied output")
         return await _restart_stalled_run(db, existing_run, body, user)
     try:
         run = await svc.retry_workflow_run(
@@ -2659,6 +2796,7 @@ async def retry_run(
             expected_owner_status=latest_visible_attempt.status,
             effect_review=body.effect_review.model_dump() if body and body.effect_review else None,
             definition=body.definition if body else "current",
+            supplied_output=body.supplied_output.model_dump() if body and body.supplied_output else None,
         )
     except ValueError as exc:
         message = str(exc)
@@ -2713,7 +2851,7 @@ async def revise_run(
     from sqlalchemy import select
 
     from packages.core.models.workflow import WorkflowDefinition
-    from packages.core.services.workflow_production import workflow_production_config
+    from packages.core.services.workflow_production import production_revision_inputs, workflow_production_config
 
     run = await svc.get_run(db, run_id, user.entity_id)
     if not run:
@@ -2741,9 +2879,7 @@ async def revise_run(
     from_step = next((step for step in revise["from_step"] if step in reached), None)
     if from_step is None:
         raise HTTPException(409, "This run did not reach the step its revisions start from")
-    variables = {revise["notes_input"]: notes}
-    if revise.get("versions_input"):
-        variables[revise["versions_input"]] = versions
+    variables = production_revision_inputs(revise, run.variables or {}, notes=notes, unit_versions=versions)
     try:
         revised = await svc.retry_workflow_run(
             db, run_id=run.id, entity_id=user.entity_id, started_by=user.id,
@@ -2795,11 +2931,14 @@ async def list_workflow_record_choices(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Options of a ``record_select`` run input, read from its Workspace Ledger.
+    """Options of a ``record_select`` or ``workflow_project_select`` run input.
 
-    The source comes from the saved Workflow, never from the caller. A Ledger
-    that is not installed or has no matching rows yields no options.
+    A ``record_select`` reads its Workspace Ledger; a ``workflow_project_select``
+    offers the Workspace's projects of its type (value = project id). The
+    source comes from the saved Workflow, never from the caller. A Ledger that
+    is not installed or has no matching rows yields no options.
     """
+    from packages.core.services.workflow_project_select import load_project_choices, project_select
     from packages.core.services.workflow_record_source import (
         RecordSourceUnavailable,
         load_record_choices,
@@ -2813,6 +2952,9 @@ async def list_workflow_record_choices(
     if wf.workspace_id != workspace_id and workspace_id not in workspaces.get(wf.id, set()):
         raise HTTPException(404, "Workflow not found in this Workspace")
     item = next((row for row in workflow_run_inputs(wf) if row["key"] == input_key), None)
+    picker = project_select(item.get("schema")) if item else None
+    if picker is not None:
+        return await load_project_choices(db, picker, entity_id=user.entity_id, workspace_id=workspace_id)
     source = record_select_source(item.get("schema")) if item else None
     if source is None:
         raise HTTPException(404, "Run input has no record choices")
@@ -2846,6 +2988,7 @@ async def update_workflow(
     current = await _require_workflow(db, user, workflow_id, Capability.EDIT)
     changes = body.model_dump(exclude_none=True)
     require_valid_steps = bool(changes.pop("validate_steps", False))
+    expected_version = changes.pop("expected_version", None)
     if "steps" in changes:
         await require_collaborator_workflow_steps(
             db, user_id=user.id, entity_id=user.entity_id, workspace_id=current.workspace_id,
@@ -2857,8 +3000,19 @@ async def update_workflow(
             workflow_id,
             user.entity_id,
             require_valid_steps=require_valid_steps,
+            expected_version=expected_version,
             **changes,
         )
+    except StaleRevisionError as exc:
+        raise CodedError(
+            409,
+            code="workflow.error.edited_elsewhere",
+            message=(
+                f"This workflow was saved by someone else after version {exc.expected} "
+                f"(it is now at version {exc.actual}). Load it again and reapply your change."
+            ),
+            vars={"expected": exc.expected, "actual": exc.actual},
+        ) from exc
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     if not wf:
@@ -2935,7 +3089,8 @@ async def start_run(
         raise HTTPException(422, str(e))
     except ValueError as e:
         raise HTTPException(404 if "not found" in str(e).lower() else 409, str(e))
-    execute = body is None or body.execute
+    queue = body is not None and body.queue
+    execute = not queue and (body is None or body.execute)
     cache_index = await _prime_run_cache(db, workflow_id, run.id) if execute else {}
     # Commit ends the request transaction: the runner needs its own database
     # admission slot, and the API may have only one per loop.
@@ -2951,6 +3106,9 @@ async def start_run(
         except Exception:
             logger.exception("inline workflow run failed: %s", run_id)
         await db.refresh(run)
+    elif queue:
+        # A failed publish is not lost: dispatch recovery republishes the unclaimed run.
+        WorkflowRunner.enqueue(run.id)
     return _run_to_dict(run)
 
 

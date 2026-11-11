@@ -43,6 +43,10 @@ DEFAULT_RUNTIME_PROMPT_SECTIONS: tuple[RuntimePromptSectionSpec, ...] = (
         "Base agent identity and file-based supplements.",
     ),
     RuntimePromptSectionSpec(
+        "workspace_charter", ("full",), "identity",
+        "The master agent's role inside a Workspace, in place of its company-wide role.",
+    ),
+    RuntimePromptSectionSpec(
         "response_language_guidance",
         ("full", "minimal"),
         "identity",
@@ -69,6 +73,15 @@ DEFAULT_RUNTIME_PROMPT_SECTIONS: tuple[RuntimePromptSectionSpec, ...] = (
         ("full",),
         "memory",
         "Workspace and workspace-agent operating memory.",
+    ),
+    RuntimePromptSectionSpec(
+        "memory_layers", ("full",), "memory",
+        "Organization, Workspace and (in the person's own chat) personal memory layers.",
+    ),
+    RuntimePromptSectionSpec(
+        "speaker_memory", ("full",), "memory",
+        "The speaking person's profile and preferences in a shared conversation.",
+        turn_scoped=True,
     ),
     RuntimePromptSectionSpec(
         "available_tools_section",
@@ -157,6 +170,7 @@ def runtime_turn_scoped_prompt_section_names() -> frozenset[str]:
 
 
 def agent_identity(ctx: Any) -> str | None:
+    from packages.core.ai.runtime.memory import runtime_identity_file_filter
     from packages.core.ai.runtime.prompt_context import runtime_agent_identity_prompt
     from packages.core.ai.runtime.profiles import RuntimeProfile
 
@@ -168,6 +182,7 @@ def agent_identity(ctx: Any) -> str | None:
         RuntimeProfile.EXTERNAL_CUSTOMER_SAFE.value,
         RuntimeProfile.EXTERNAL_CHANNEL_SAFE.value,
     }
+    user_id = getattr(ctx, "user_id", None)
     rendered = runtime_agent_identity_prompt(
         agent_system_prompt=(
             agent.system_prompt
@@ -176,12 +191,13 @@ def agent_identity(ctx: Any) -> str | None:
         ),
         entity_id=getattr(ctx, "entity_id", None),
         agent_id=getattr(ctx, "agent_id", None),
-        user_id=getattr(ctx, "user_id", None),
+        user_id=user_id,
         allow_agent_files=allow_agent_files,
+        file_allowed=runtime_identity_file_filter(runtime_envelope, user_id),
     )
     ctx.prompt_source = rendered.source
     ctx.agent_files_loaded = dict(rendered.agent_files_loaded or {})
-    ctx.runtime_identity_sections = list(getattr(rendered, "sections", None) or [])
+    ctx.runtime_section_outputs["agent_identity"] = list(getattr(rendered, "sections", None) or [])
     return rendered.prompt
 
 
@@ -257,15 +273,40 @@ def workspace_operating_memory(ctx: Any) -> str | None:
         runtime_workspace_operating_memory_prompt,
     )
 
-    ctx.runtime_workspace_memory_sections = []
+    sections: list[dict] = []
+    ctx.runtime_section_outputs["workspace_operating_memory"] = sections
     return runtime_workspace_operating_memory_prompt(
         envelope=getattr(ctx, "runtime_envelope", None),
         entity_id=getattr(ctx, "entity_id", None),
         workspace_id=getattr(ctx, "workspace_id", None),
         workspace=getattr(ctx, "workspace", None),
         agent_id=getattr(ctx, "agent_id", None),
-        sections_out=ctx.runtime_workspace_memory_sections,
+        sections_out=sections,
     )
+
+
+def workspace_charter(ctx: Any) -> str | None:
+    from packages.core.memory.layer_prompt import workspace_charter_text
+
+    return workspace_charter_text(ctx)
+
+
+async def _memory_block(ctx: Any, name: str, *, per_speaker: bool) -> str | None:
+    from packages.core.memory.layer_prompt import memory_layer_sections
+
+    sections = await memory_layer_sections(ctx, per_speaker=per_speaker)
+    if not sections:
+        return None
+    ctx.runtime_section_outputs[name] = sections
+    return "\n\n".join(section["content"] for section in sections)
+
+
+async def memory_layers(ctx: Any) -> str | None:
+    return await _memory_block(ctx, "memory_layers", per_speaker=False)
+
+
+async def speaker_memory(ctx: Any) -> str | None:
+    return await _memory_block(ctx, "speaker_memory", per_speaker=True)
 
 
 def available_tools_section(ctx: Any) -> str | None:
@@ -571,6 +612,7 @@ def runtime_prompt_section_renderers() -> dict[str, RuntimePromptSectionFn]:
         "workspace_operation_skills": workspace_operation_skill_guidance,
         "workspace_operation_selected_guides": workspace_operation_selected_guides,
         "agent_identity": agent_identity,
+        "workspace_charter": workspace_charter,
         "response_language_guidance": response_language_guidance,
         "output_discipline": output_discipline,
         "user_context": user_context,
@@ -578,6 +620,8 @@ def runtime_prompt_section_renderers() -> dict[str, RuntimePromptSectionFn]:
         "workspace_context": workspace_context,
         "workspace_agent_mode": workspace_agent_mode,
         "workspace_operating_memory": workspace_operating_memory,
+        "memory_layers": memory_layers,
+        "speaker_memory": speaker_memory,
         "available_tools_section": available_tools_section,
         "integration_account_context": integration_account_context,
         "runtime_approval_resume_guidance": runtime_approval_resume_guidance,

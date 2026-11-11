@@ -152,6 +152,45 @@ async def test_external_audience_does_not_inherit_owner_language(monkeypatch, la
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("parent_surface", [None, "agent_dm"])
+async def test_workspace_architect_replies_in_message_language_and_saves_in_setting(
+    monkeypatch, language_calls, parent_surface,
+):
+    _, _, calls = language_calls
+
+    async def loop(**kwargs):
+        await completions.runtime_execute_text_completion(
+            [{"role": "user", "content": "Name this Workspace"}], entity_id="entity", user_id="bob",
+        )
+        return SimpleNamespace(usage={})
+
+    monkeypatch.setattr("packages.core.ai.agentic_loop.agentic_loop", loop)
+
+    async def architect_turn():
+        await harness.runtime_execute_agentic_loop(
+            runtime_envelope=SimpleNamespace(user_id="bob", profile=None, surface="workspace_draft_architect"),
+            entity_id="entity", agent_id=None, system_prompt="Architect",
+            user_message="我有个餐厅我需要帮我管理我的客户", tools=[],
+        )
+
+    if parent_surface is None:
+        await architect_turn()
+    else:
+        # Invoked from a chat turn that already froze the saved setting.
+        parent = await language_runtime.resolve_runtime_response_language(
+            entity_id="entity", user_id="bob", surface=parent_surface,
+        )
+        with language_runtime.runtime_response_language_scope(parent):
+            await architect_turn()
+
+    guidance = calls[-1][0][0]["content"]
+    assert "language the person writes in" in guidance
+    assert "options you offer" in guidance
+    assert "French (fr), the user's saved language setting" in guidance
+    assert "takes precedence over language inferred from the latest message" not in guidance
+
+
+@pytest.mark.asyncio
 async def test_verified_internal_channel_actor_uses_saved_language(language_calls):
     _, _, calls = language_calls
     await completions.runtime_execute_text_completion(

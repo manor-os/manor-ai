@@ -50,6 +50,18 @@ def test_legacy_failure_metadata_needs_no_diagnostic_shape(detail):
     }) == "Sorry, I couldn't confirm whether your request was completed. You can ask me to follow up."
 
 
+@pytest.mark.parametrize("reason", ["sandbox_allocation_failed", "sandbox_queue_timeout"])
+def test_resource_failure_keeps_model_summary_for_history_and_stream_end(reason):
+    from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.services.chat_service import _chat_result_public_error, _chat_result_visible_content
+
+    summary = "I have your details, but the PDF could not be prepared because the file tools could not start."
+    result = SimpleNamespace(error=reason, stop_reason="error", content=summary)
+    for surface in (ChatSurface.GLOBAL_OWNER_CHAT, ChatSurface.AGENT_DM, ChatSurface.WORKSPACE_CHAT, ChatSurface.PUBLIC_CUSTOMER_CHAT):
+        assert _chat_result_visible_content(result, surface) == summary
+        assert _chat_result_public_error(result, surface) == summary
+
+
 def test_validated_user_result_and_actionable_errors_are_unchanged():
     from packages.core.ai.runtime.output_policy import PUBLIC_BYOK_PROVIDER_FAILURE_MESSAGE
 

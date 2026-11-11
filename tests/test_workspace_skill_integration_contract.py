@@ -232,7 +232,8 @@ async def test_chat_gateway_add_remove_restore_and_revoked_connection_are_durabl
         assert (await db_session.get(Integration, integration_id)).status == "active"
 
     # A new binding was reviewed while connected, then the actor revoked the
-    # account. The exact durable review must fail rather than apply stale grants.
+    # account. The reviewed change still applies (no credentials ride along:
+    # the binding waits for a connection), and the Workspace asks to connect.
     review = await gateway({"action": "create_draft", "patches": [{
         "op": "capability_binding.upsert", "payload": {"binding": {
             "binding_key": "narrowed_linkedin", "owner_scope": "workspace_agent", "capability_type": "mcp",
@@ -242,12 +243,19 @@ async def test_chat_gateway_add_remove_restore_and_revoked_connection_are_durabl
     assert review.get("__hitl__") is True, review
     disconnected = await client.delete(f"/api/v1/integrations/{integration_id}", headers=headers)
     assert disconnected.status_code in {200, 204}, disconnected.text
-    rejected = await approve(review)
-    assert rejected.status_code in {400, 409}, rejected.text
+    applied = await approve(review)
+    assert applied.status_code == 200, applied.text
     db_session.expire_all()
-    assert (await db_session.get(Workspace, workspace_id)).operation_revision == 3
+    saved = await db_session.get(Workspace, workspace_id)
+    assert saved.operation_revision == 4
+    assert [flag["provider"] for flag in saved.settings["flagged_integrations"]] == ["linkedin"]
     draft_id = review["operation"]["draft_id"]
-    assert (await db_session.get(WorkspaceOperationDraft, draft_id)).status == "open"
+    assert (await db_session.get(WorkspaceOperationDraft, draft_id)).status == "applied"
+    asks = [
+        row.pending_action for row in (await db_session.execute(select(Message))).scalars().all()
+        if (row.pending_action or {}).get("provider_key") == "linkedin"
+    ]
+    assert [ask["kind"] for ask in asks] == ["needs_login"]
 
 
 @pytest.mark.parametrize("payload,valid", [

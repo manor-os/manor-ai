@@ -137,7 +137,7 @@ export default function InteractiveResponseSurface({
     }, locale)}\n<!-- response-surface-revision:${documentRevision} -->`,
     [documentRevision, locale, relevantReceipts, surface, theme],
   );
-  const preview = useIsolatedHtmlPreview(html);
+  const preview = useIsolatedHtmlPreview(html, true, { lockNavigation: true });
 
   const finishViewTransition = useCallback((targetFocused: boolean, preserveLate = false) => {
     const pending = pendingViewTransitionRef.current;
@@ -476,7 +476,7 @@ export default function InteractiveResponseSurface({
         className={["response-surface-frame", frameClassName].filter(Boolean).join(" ")}
         style={focused ? { height: "100%" } : (frameStyle || { height: frameHeight })}
       />
-      {preview.previewError && (
+      {(preview.previewError || preview.navigatedAway) && (
         <div className="response-surface-fallback">
           <ChatMarkdown content={surface.fallback_markdown} />
         </div>

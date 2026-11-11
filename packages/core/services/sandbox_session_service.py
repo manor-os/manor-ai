@@ -408,7 +408,8 @@ class SandboxBinding:
     # ticket for the run instead of failing when no runner is free yet.
     workflow_run_id: str | None = None
     # The prompt skill whose nested loop is acquiring. Set only inside such a
-    # loop; see ``acquire_sandbox_session`` for why it refuses a reservation.
+    # loop; see ``acquire_sandbox_session`` for why, inside a durable run, it
+    # refuses a reservation.
     parent_skill: str | None = None
     # Owner of the skill whose stored credentials the bundle carries; recorded
     # on the conversation's sandbox context (credential provenance).
@@ -422,11 +423,15 @@ class SandboxBinding:
     def waits_for_ticket(self) -> bool:
         """A background requester (task, Workflow run, service) can wait for a runner.
 
-        A prompt skill's nested loop cannot (it cannot be suspended), and a
-        caller outside both runtimes allocates now or not at all.
+        A prompt skill's nested loop inside a durable run cannot (it cannot be
+        suspended); under a task or Workflow run there is no run to suspend, so
+        it waits in place like its caller. A caller outside both runtimes
+        allocates now or not at all.
         """
 
-        return not self.parent_skill and bool(self.task_id or self.workflow_run_id or self.background_requester)
+        if self.parent_skill and self.runtime_run_id:
+            return False
+        return bool(self.task_id or self.workflow_run_id or self.background_requester)
 
 
 @dataclass(frozen=True)
@@ -439,12 +444,23 @@ class SandboxSessionError:
     # The code the create was refused with (the runner's, or
     # ``isolation_unavailable``), so a caller can tell its user why; "" otherwise.
     cause: str = ""
+    # The runner's code the create last failed with, under the queue's own
+    # label (``cause`` ``sandbox_allocation_failed`` after retries of
+    # ``egress_unverified``); "" when no runner answered.
+    runner_code: str = ""
+    # The ticket's (or the create's) error as recorded, for operators.
+    detail: str = ""
 
     @classmethod
-    def of(cls, code: str, message: str, *, cause: str = "") -> "SandboxSessionError":
+    def of(
+        cls, code: str, message: str, *, cause: str = "", runner_code: str = "", detail: str = "",
+    ) -> "SandboxSessionError":
         if code not in SANDBOX_SESSION_ERROR_CODES:
             raise ValueError(f"unknown sandbox session error code: {code}")
-        return cls(code=code, message=message, retryable=code in _RETRYABLE_CODES, cause=cause)
+        return cls(
+            code=code, message=message, retryable=code in _RETRYABLE_CODES, cause=cause,
+            runner_code=runner_code or cause, detail=detail,
+        )
 
 
 _ERROR_LABEL = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -1476,8 +1492,11 @@ async def _create_session(
             return SandboxSessionError.of("capacity_full", _CAPACITY_MESSAGE.format(exc=exc))
         except SandboxError as exc:
             logger.warning("[sandbox.session] create failed skill=%s: %s", bundle.skill_name, exc)
+            from packages.core.services.sandbox_queue_service import classify_allocation_error
+
             return SandboxSessionError.of(
                 "create_failed", _CREATE_FAILED_MESSAGE.format(exc=exc), cause=str(exc.code or ""),
+                detail=classify_allocation_error(exc)[1],
             )
         except Exception as exc:  # noqa: BLE001 - transport errors are admission outcomes
             logger.warning(
@@ -2560,6 +2579,8 @@ async def _wait_for_task_allocation(
                     detail=f" Details: {detail}" if detail else "",
                 ),
                 cause=_ticket_error_cause(detail),
+                runner_code=sandbox_queue_service.last_runner_code(detail),
+                detail=detail,
             )
         if clock() >= deadline:
             ticket_left = _ticket_seconds_left(ticket)
@@ -3289,7 +3310,7 @@ async def _acquire_in_scope(
                     register=True,
                     scope=scope,
                 )
-            if binding.parent_skill:
+            if binding.parent_skill and (bundle.lifetime is SandboxLifetime.WARM or not binding.waits_for_ticket):
                 # A prompt skill's nested loop runs inside the durable run's
                 # tool call: a reservation queued here would suspend the outer
                 # run at that call, and resuming re-runs the whole nested loop
@@ -3298,6 +3319,8 @@ async def _acquire_in_scope(
                 # so refuse before one is written; the parent agent can invoke
                 # the sandbox skill directly and be parked the normal way. A
                 # container Postgres knows (the registry missed it) is used.
+                # A tool-owned container under a task or Workflow run has no
+                # run to suspend and waits on its ticket below.
                 known = await _scope_container_in_postgres(owner, scope=scope, exclude_sandbox_ids=frozenset(dead))
                 if known is not None:
                     existing = await _session_for_container(
@@ -3545,8 +3568,8 @@ async def _acquire_unscoped(
             )
         if tool_owned:
             # A task (a workflow run) waits on its own ticket; a prompt
-            # skill's nested loop, or a caller outside both runtimes,
-            # allocates now or not at all.
+            # skill's nested loop inside a durable run, or a caller outside
+            # both runtimes, allocates now or not at all.
             return await _acquire_polled_unscoped(
                 owner=owner, bundle=bundle, binding=binding, settings=settings, sleep=sleep, clock=clock,
                 immediate=not binding.waits_for_ticket,

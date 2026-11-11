@@ -102,7 +102,8 @@ WORKSPACE_AGENT_SCHEMA = {
                         "For operation pass params.action ("
                         + "/".join(WORKSPACE_OPERATION_ACTIONS)
                         + "), optional draft_id, and patches as [{op, payload}]; design_app takes "
-                        "brief and optional feedback instead of patches. "
+                        "brief and optional audience and feedback instead of patches; test_app takes only an "
+                        "optional draft_id. "
                         "Use operation action=get_current first for read-only source "
                         "rule keys/types/patterns and live governance before changing restrictions. "
                         "create_draft requires nonempty patches in the same call. "
@@ -313,7 +314,10 @@ WORKSPACE_CREATE_TASK_SCHEMA = {
                         "opening, phases, rubric, completion criteria, or source context."
                     ),
                 },
-                "assignee_id": {"type": "string", "description": "Optional user/staff assignee id."},
+                "assignee_id": {
+                    "type": "string",
+                    "description": "User/staff id, only when the user names a person to do it; the Task then waits for them.",
+                },
                 "agent_id": {"type": "string", "description": "Optional agent id to associate with the task."},
                 "agent_type": {"type": "string", "description": "Optional agent type/service key hint."},
                 "deadline": {"type": "string", "description": "Optional ISO-8601 deadline."},
@@ -384,7 +388,10 @@ WORKSPACE_CREATE_TASK_SCHEMA = {
                 },
                 "start": {
                     "type": "boolean",
-                    "description": "Set true when the user wants the work to begin now, not just be tracked.",
+                    "description": (
+                        "In Chat the Task starts by default and the Workspace Agent assigns it. "
+                        "Set false only when the user says it is for later or not to start yet."
+                    ),
                 },
             },
             "required": ["title"],
@@ -440,6 +447,11 @@ WORKSPACE_UPDATE_TASK_RUNTIME_SCHEMA = {
                 "start": {
                     "type": "boolean",
                     "description": "Start this pending Task's own run now (e.g. one drafted earlier).",
+                },
+                "depends_on_task_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Earlier stages' task ids: this pending Task starts when they complete.",
                 },
             },
             "required": ["task_id"],
@@ -667,14 +679,17 @@ WORKSPACE_OPERATION_SCHEMA = {
                         "For a user's request to stop using an integration in this "
                         "Workspace, use integration.remove with payload.provider. "
                         "To restore a previously disabled provider, use "
-                        "integration.enable. To add an integration, first discover "
-                        "the user's existing connected provider and then use "
+                        "integration.enable. To add an integration, discover "
+                        "the provider's server_key and then use "
                         "capability_binding.upsert with payload.binding fields "
                         "owner_scope (workspace_agent/service/agent/task; "
                         "omit it or use workspace_agent unless a specific "
                         "service_key/agent_id/task_id owns the binding), "
                         "capability_type='mcp', integration_key='<server_key>'. "
-                        "An unconnected provider cannot be added. Only include allowed_tools when the user wants to "
+                        "A provider the user has not connected yet can still be added: "
+                        "validation warns integration_pending_connection, the draft "
+                        "applies with it waiting, and the Workspace asks in its chat to "
+                        "connect it. Keep the user's rules for it. Only include allowed_tools when the user wants to "
                         "narrow that server's actions. Add "
                         "rule.add patches for approval/review requirements."
                     ),
@@ -685,6 +700,9 @@ WORKSPACE_OPERATION_SCHEMA = {
                 },
                 "brief": {"type": "string", "description": (
                     "design_app only: what the person wants to do from the App page, in their words."
+                )},
+                "audience": {"type": "string", "description": (
+                    "design_app only: who the page is for and what they act on first, as the person chose it."
                 )},
                 "feedback": {"type": "string", "description": (
                     "design_app only: why the last design was sent back and what to change; pass its draft_id too."
@@ -705,7 +723,9 @@ WORKSPACE_RESOLVE_HITL_SCHEMA = {
             "message is semantically answering it. Use the Open Workspace HITL "
             "Requests context to choose the target; do not call this for unrelated "
             "chat or unclear intent. Use respond with response for human_input/needs_input cards, "
-            "and approve/reject only for workspace_operation_review cards. Other kinds "
+            "and approve/reject for workspace_operation_review cards. For a failed Workflow's "
+            "workflow_retry card, approve retries that run with its original inputs and brief "
+            "(the user asks to continue or finish it) and reject cancels it. Other kinds "
             "keep their dedicated card controls; never resolve authorization with a reply."
         ),
         "parameters": {
@@ -860,6 +880,7 @@ async def _workspace_agent_handler(
         WorkspaceToolAction.RESOLVE_HITL: _workspace_resolve_hitl_handler,
         WorkspaceToolAction.ANSWER_TASK_BLOCKER: _answer_task_blocker_handler,
         WorkspaceToolAction.VISUALIZE_LEDGERS: _workspace_visualize_ledgers_handler,
+        WorkspaceToolAction.LIST_ATTENTION: _workspace_list_attention_handler,
     }
     handler = handlers.get(action)
     if not handler:
@@ -1139,6 +1160,17 @@ async def _workspace_delegate_service_handler(
     conversation_id: str = "",
     **kwargs: Any,
 ) -> str:
+    from packages.core.ai.runtime.workspace_delegation_actions import runtime_settled_delegation
+
+    return await runtime_settled_delegation(_workspace_delegate_service(
+        entity_id=entity_id, user_id=user_id, workspace_id=workspace_id,
+        conversation_id=conversation_id, **kwargs,
+    ))
+
+
+async def _workspace_delegate_service(
+    *, entity_id: str, user_id: str, workspace_id: str, conversation_id: str, **kwargs: Any,
+) -> str:
     if isinstance(kwargs.get("tasks"), list):
         shared = {key: value for key, value in kwargs.items() if key != "tasks"}
         return await _run_delegation_tasks(
@@ -1190,6 +1222,42 @@ async def _workspace_request_strategist_review_handler(
         user_id=user_id or None,
         params=kwargs,
     )
+
+
+async def _workspace_list_attention_handler(
+    entity_id: str = "",
+    user_id: str = "",
+    workspace_id: str = "",
+    conversation_id: str = "",
+    **kwargs: Any,
+) -> str:
+    """Open situations in this Workspace that may need a person."""
+    from packages.core.attention.query import list_open_attention, serialize_attention_item
+    from packages.core.database import async_session
+
+    target = workspace_id or str(kwargs.get("workspace_id") or "")
+    if not target:
+        return _dumps({"error": "workspace_id is required"})
+    try:
+        limit = int(kwargs.get("limit") or 50)
+    except (TypeError, ValueError):
+        limit = 50
+    async with async_session() as db:
+        items = [
+            serialize_attention_item(item)
+            for item in await list_open_attention(
+                db, entity_id=entity_id, workspace_id=target, limit=limit,
+            )
+        ]
+    return _dumps({
+        "items": items,
+        "count": len(items),
+        "note": (
+            "Kept in step with the Workspace every few minutes: waiting approvals and "
+            "inputs, proposals waiting for a decision, accounts to reconnect, unfinished "
+            "setup, paused automations, budget used, goals off pace, blocked or overdue work."
+        ),
+    })
 
 
 async def _workspace_get_goal_status_handler(
@@ -1295,13 +1363,16 @@ async def _delegate_to_agent_handler(
     **kwargs: Any,
 ) -> str:
     """Hand tasks to Workspace agents named as people see them."""
-    from packages.core.ai.runtime.workspace_delegation_actions import runtime_delegation_tool_arguments
+    from packages.core.ai.runtime.workspace_delegation_actions import (
+        runtime_delegation_tool_arguments,
+        runtime_settled_delegation,
+    )
 
     tasks, shared = runtime_delegation_tool_arguments(kwargs)
-    return await _run_delegation_tasks(
+    return await runtime_settled_delegation(_run_delegation_tasks(
         entity_id=entity_id, user_id=user_id, workspace_id=workspace_id,
         conversation_id=conversation_id, tasks=tasks, shared=shared,
-    )
+    ))
 
 
 def get_tools():

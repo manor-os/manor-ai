@@ -19,6 +19,22 @@ async def _register(client: AsyncClient, username: str = "learnuser") -> tuple[s
     return token, {"Authorization": f"Bearer {token}"}
 
 
+async def _legacy_memory_candidate(db, evidence, content: str):
+    """A memory candidate left for review before remember wrote memory at chat time."""
+    from packages.core.models.runtime_learning import AgentLearningCandidate
+
+    candidate = AgentLearningCandidate(
+        entity_id=evidence.entity_id, workspace_id=evidence.workspace_id, agent_id=evidence.agent_id,
+        user_id=evidence.user_id, candidate_type="memory", scope="user", title="Remember user guidance",
+        summary="Review before applying as agent memory.", evidence_ids=[evidence.id], confidence=0.72,
+        payload={"memory_type": "instruction", "content": content, "source": "runtime_evidence",
+                 "apply_target": "agent_memory"},
+    )
+    db.add(candidate)
+    await db.flush()
+    return candidate
+
+
 def test_runtime_evidence_response_normalizes_legacy_failed_plan_success():
     from apps.api.routers.workspaces import _runtime_evidence_response
 
@@ -281,7 +297,7 @@ async def test_agent_runtime_learning_endpoints_show_only_that_agent(client: Asy
             stop_reason="completed",
         )
         assert evidence is not None
-        assert candidates
+        await _legacy_memory_candidate(db, evidence, "以后请始终先给出简短结论，再展示细节。")
 
         other_evidence, other_candidates = await record_chat_run_evidence(
             db,
@@ -299,7 +315,7 @@ async def test_agent_runtime_learning_endpoints_show_only_that_agent(client: Asy
             stop_reason="completed",
         )
         assert other_evidence is not None
-        assert other_candidates
+        await _legacy_memory_candidate(db, other_evidence, "以后使用另一套输出格式。")
         await db.commit()
 
     evidence_resp = await client.get(
@@ -370,8 +386,7 @@ async def test_workspace_runtime_learning_endpoints(client: AsyncClient, tmp_pat
                 stop_reason="completed",
             )
             assert evidence is not None
-            assert candidates
-            candidate_id = candidates[0].id
+            candidate_id = (await _legacy_memory_candidate(db, evidence, "以后发 post 必须先给我审核批准。")).id
             await db.commit()
 
         evidence_resp = await client.get(f"/api/v1/workspaces/{workspace_id}/runtime/evidence", headers=headers)

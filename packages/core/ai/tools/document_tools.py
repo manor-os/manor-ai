@@ -9,11 +9,23 @@ from packages.core.ai.runtime import (
     runtime_list_documents_action,
     runtime_search_documents_action,
 )
-from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_handler
+from packages.core.ai.runtime.tool_context import (
+    runtime_tool_call_context_from_handler,
+    runtime_tool_call_context_is_person_chat,
+)
 
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
+
+DOCUMENT_SCOPE_PROPERTY = {
+    "type": "string",
+    "enum": ["workspace", "all_knowledge"],
+    "description": (
+        "In a Workspace, results stay in it. all_knowledge: only when the "
+        "person asks in chat to look outside it."
+    ),
+}
 
 DOCUMENT_QUERY_FILTER_PROPERTIES = {
     "workspace_ids": {
@@ -104,6 +116,7 @@ SEARCH_DOCUMENTS_SCHEMA = {
                     "type": "string",
                     "description": "Search text to match against document names.",
                 },
+                "scope": DOCUMENT_SCOPE_PROPERTY,
                 **DOCUMENT_QUERY_FILTER_PROPERTIES,
                 "limit": {
                     "type": "integer",
@@ -148,6 +161,7 @@ LIST_DOCUMENTS_SCHEMA = {
                     "type": "string",
                     "description": "Optional filename and metadata search.",
                 },
+                "scope": DOCUMENT_SCOPE_PROPERTY,
                 **DOCUMENT_QUERY_FILTER_PROPERTIES,
                 "limit": {
                     "type": "integer",
@@ -191,6 +205,7 @@ async def _search_documents(entity_id: str, user_id: str = "", **kwargs: Any) ->
         user_id=runtime_context.user_id,
         workspace_id=runtime_context.workspace_id,
         params=kwargs,
+        person_in_chat=runtime_tool_call_context_is_person_chat(runtime_context),
     )
 
 
@@ -201,6 +216,7 @@ async def _list_documents(entity_id: str, user_id: str = "", **kwargs: Any) -> s
         user_id=runtime_context.user_id,
         workspace_id=runtime_context.workspace_id,
         params=kwargs,
+        person_in_chat=runtime_tool_call_context_is_person_chat(runtime_context),
     )
 
 

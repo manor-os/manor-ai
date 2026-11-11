@@ -34,6 +34,8 @@ const IsolatedHtmlPreviewFrame = forwardRef<
     if (preview.previewUrl) onLoad?.(event);
   };
 
+  if (preview.navigatedAway) return null;
+
   return (
     <>
       <iframe

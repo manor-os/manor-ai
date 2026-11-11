@@ -16,7 +16,9 @@ WORKSPACE_SEARCH_SCHEMA = {
         "description": (
             "Search this workspace's goals, tasks, agents, knowledge, "
             "generated artifacts/files, execution plans, rules, runtime evidence, "
-            "learning candidates, decision history, and Need Input answers. "
+            "learning candidates, decision history, Need Input answers, and the "
+            "records its Workflows keep (category 'records': menu items, campaigns, "
+            "batches, cases, with their current fields). "
             "Use when the user asks about workspace status, progress, specific items, "
             "or anything about what's happening in this workspace."
         ),

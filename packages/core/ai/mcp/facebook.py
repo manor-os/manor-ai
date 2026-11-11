@@ -621,6 +621,14 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         },
         "required": ["page_id", "ig_user_id", "creation_id"],
     },
+    "list_recent_instagram_comments": {
+        "description": "List the comments on the latest media of every linked IG account, newest media first.",
+        "properties": {
+            "media_limit": _prop("Latest media per account, 1-10, default 5", "integer"),
+            "limit": _prop("Comments per media, 1-50, default 25", "integer"),
+        },
+        "required": [],
+    },
     "list_instagram_comments": {
         "description": "List comments on an IG media.",
         "properties": {
@@ -1419,6 +1427,25 @@ async def _list_instagram_comments(user_token: str, args: Dict[str, Any]) -> Dic
     )
 
 
+async def _list_recent_instagram_comments(user_token: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """One call for what is new on an account: comments live under each media, under each account."""
+    media_limit = max(1, min(10, int(args.get("media_limit") or 5)))
+    limit = max(1, min(50, int(args.get("limit") or 25)))
+    comments: List[Dict[str, Any]] = []
+    for account in (await _list_instagram_accounts(user_token, {}))["accounts"]:
+        page_id, ig_user_id = account["page_id"], account["ig_user_id"]
+        media = await _list_instagram_media(user_token, {"page_id": page_id, "ig_user_id": ig_user_id, "limit": media_limit})
+        for row in media.get("data") or []:
+            if not row.get("comments_count"):
+                continue
+            found = await _list_instagram_comments(user_token, {"page_id": page_id, "media_id": row["id"], "limit": limit})
+            comments.extend({"id": comment.get("id"), "text": comment.get("text"), "username": comment.get("username"),
+                             "timestamp": comment.get("timestamp"), "media_id": row["id"],
+                             "permalink": row.get("permalink"), "page_id": page_id, "ig_user_id": ig_user_id}
+                            for comment in found.get("data") or [])
+    return {"count": len(comments), "comments": comments}
+
+
 async def _reply_instagram_comment(user_token: str, args: Dict[str, Any]) -> Dict[str, Any]:
     page_token = await _resolve_page_token(user_token, args["page_id"])
     return await _graph_post(
@@ -1499,6 +1526,7 @@ _HANDLERS = {
     "create_instagram_media": _create_instagram_media,
     "publish_instagram_media": _publish_instagram_media,
     "list_instagram_comments": _list_instagram_comments,
+    "list_recent_instagram_comments": _list_recent_instagram_comments,
     "reply_instagram_comment": _reply_instagram_comment,
     "delete_instagram_comment": _delete_instagram_comment,
     "get_instagram_insights": _get_instagram_insights,

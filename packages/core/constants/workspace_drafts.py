@@ -3,6 +3,7 @@
 WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD = "_draft_schema_version"
 CURRENT_WORKSPACE_DRAFT_SCHEMA_VERSION = 4
 CREATION_PREFERENCES_FIELD = "_creation_preferences"
+STAFF_REQUEST_TEXT_FIELD = "_staff_request_text"
 
 
 def uses_ui_runtime_mode(fields: dict) -> bool:

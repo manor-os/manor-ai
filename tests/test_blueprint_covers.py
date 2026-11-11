@@ -15,6 +15,7 @@ from packages.core.blueprints.catalogue import get_platform_blueprints
 
 PUBLIC = Path(__file__).resolve().parents[1] / "apps/web/public"
 EVIDENCE = {
+    "creative-gif-v1": [],
     "recording-shorts-v1": [
         "/blueprints/recording/coffee-shorts-preview.png",
         "/blueprints/recording/coffee-shorts-review.jpg",

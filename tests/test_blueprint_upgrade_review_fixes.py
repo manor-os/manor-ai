@@ -135,6 +135,33 @@ async def test_legacy_digest_is_backfilled_only_after_confirmed_upgrade(db_sessi
     assert record[MATERIALIZED_UPGRADE_UNSUPPORTED_FINGERPRINT_KEY] == blueprint_upgrade_unsupported_fingerprint(source)
 
 
+@pytest.mark.parametrize("new_guide", ["Review the complete product announcement.", None])
+async def test_upgrade_syncs_usage_guide_and_undo_preserves_later_edits(db_session, new_guide):
+    source = _payload()
+    source["manifest"]["usage_guide"] = new_guide
+    workspace, account, _subscription = await channel_fixture(db_session, "telegram")
+    workspace.settings = _settings(source)
+    workspace.settings[BLUEPRINT_SETTINGS_KEY]["usage_guide"] = "Review the old outline."
+    await db_session.flush()
+
+    await apply(db_session, workspace=workspace, payload=source, current_version="1.0.1")
+    await db_session.refresh(workspace)
+    assert workspace.settings[BLUEPRINT_SETTINGS_KEY]["usage_guide"] == new_guide
+    upgraded = copy.deepcopy(workspace.settings)
+    edited = copy.deepcopy(upgraded)
+    edited[BLUEPRINT_SETTINGS_KEY]["usage_guide"] = "A later operator edit."
+    workspace.settings = edited
+    await db_session.flush()
+    with pytest.raises(BlueprintUpgradePlanChangedError):
+        await revert(db_session, workspace=workspace, by_user_id=account.owner_user_id)
+
+    workspace.settings = upgraded
+    await db_session.flush()
+    await revert(db_session, workspace=workspace, by_user_id=account.owner_user_id)
+    await db_session.refresh(workspace)
+    assert workspace.settings[BLUEPRINT_SETTINGS_KEY]["usage_guide"] == "Review the old outline."
+
+
 @pytest.mark.parametrize("explicit_selection", [False, True])
 async def test_upgrade_api_binds_resolved_channel_and_preserves_live_guard(db_session, monkeypatch, explicit_selection):
     from apps.api.routers import workspaces as routes

@@ -17,16 +17,16 @@ export const TOOL_SURFACE_BADGES: Record<
   external_mcp: {
     label: "MCP",
     compactLabel: "MCP",
-    bg: "#f5f5f4",
-    color: "#57534e",
-    border: "#e7e5e4",
+    bg: "#f5f5f7",
+    color: "#6e6e73",
+    border: "#e5e5ea",
   },
   external_tool: {
     label: "Tool",
     compactLabel: "Tool",
-    bg: "#fafaf9",
-    color: "#78716c",
-    border: "#e7e5e4",
+    bg: "#fafafa",
+    color: "#8e8e93",
+    border: "#e5e5ea",
   },
 };
 

@@ -114,6 +114,20 @@ async def test_existing_operation_dispatch_and_safe_errors(monkeypatch, tool, se
 
 
 @pytest.mark.asyncio
+async def test_a_collection_check_can_wait_for_apify_to_finish(monkeypatch):
+    from packages.core.services import apify_client, apify_collections
+
+    assert apify.WAIT_SECONDS_MAX == apify_client.WAIT_SECONDS_MAX
+    get = AsyncMock(return_value={"status": "succeeded"})
+    monkeypatch.setattr(apify_collections, "get_collection", get)
+    await apify.call_tool("get_instagram_collection", {"collection_id": "saved", "wait_seconds": 30}, "secret")
+    await apify.call_tool("get_instagram_collection", {"collection_id": "saved"}, "secret")
+    assert [call.kwargs["wait_seconds"] for call in get.await_args_list] == [30, 0]
+    too_long = await apify.call_tool("get_instagram_collection", {"collection_id": "saved", "wait_seconds": 46}, "secret")
+    assert _payload(too_long)["code"] == "invalid_arguments" and get.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_concurrent_calls_keep_actor_context_separate(monkeypatch):
     from packages.core.services import apify_collections
 

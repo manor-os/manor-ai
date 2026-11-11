@@ -9,7 +9,7 @@
  * the stages, the unit's name, its fields and the lanes under it all come from
  * the Workflow's configuration.
  */
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { api, resolveDisplayMediaUrl, type MediaJob } from "../../lib/api";
 import { t } from "../../lib/i18n";
@@ -19,6 +19,11 @@ import Button from "./Button";
 import Textarea from "./Textarea";
 import MediaJobCard, { phaseOf, remainingLabel } from "./MediaJobCard";
 import { clipLines } from "./RunMediaClips";
+import "./RunProduction.css";
+import { displayReadInterval } from "../../lib/readRefreshPolicy";
+import { usePageVisible } from "../../lib/usePageVisible";
+import { scheduleMediaRunRead } from "../../lib/mediaRunReadScheduler";
+import { runPercent, stageShare, stageStates, type StepState } from "../../lib/runProductionProgress";
 
 export type RunProductionConfig = {
   /** What the run makes: its units' media jobs are of this kind and its finished whole plays as one. */
@@ -29,41 +34,14 @@ export type RunProductionConfig = {
   units: Array<{ id: string; title: string; duration_s: number | null; lanes: Record<string, string> }>;
   /** The finished whole, once the run has saved it to Knowledge. */
   final?: { document_id: string; name: string };
+  /** Units the run rendered itself (a still end card): finished without a media job. */
+  units_made_locally?: Array<{ unit_id: string; document_id: string; name: string }>;
   /** How a finished result is changed (a later version starts from this step). */
   revise?: { from_step: string[]; notes_input: string; versions_input?: string };
 };
 
-type StepState = { id: string; status: string };
-type StageState = "done" | "active" | "failed" | "stopped" | "pending";
-
 /** How far into making one clip a job is, when its model gives no percentage. */
 const PHASE_SHARE: Record<string, number> = { queued: 0, submitting: 0.1, generating: 0.5, saving: 0.9, done: 1 };
-
-function stageStates(config: RunProductionConfig, steps: StepState[], currentStepId: string | null, status: string): StageState[] {
-  const byId = new Map(steps.map((step) => [step.id, step.status]));
-  const reached = config.stages.map((stage) => stage.steps.some((id) => byId.has(id)));
-  const finished = status === "completed";
-  const states: StageState[] = config.stages.map((stage, index) => {
-    const statuses = stage.steps.map((id) => byId.get(id)).filter(Boolean) as string[];
-    if (statuses.includes("failed")) return "failed";
-    if (finished) return "done";
-    // "pending" is a step not started yet: only one at work makes its stage active.
-    if (stage.steps.includes(currentStepId || "") || statuses.some((value) => value === "running" || value === "paused")) return "active";
-    // A stage the run went past (or around) is behind it.
-    if (reached.slice(index + 1).some(Boolean)) return "done";
-    return statuses.length > 0 && statuses.every((value) => value === "completed" || value === "skipped") ? "done" : "pending";
-  });
-  // A run that failed or was cancelled at a step no stage lists (a stop after
-  // a check) ended in the stage it stopped at, or else the last one it reached.
-  if ((status === "failed" && !states.includes("failed")) || status === "cancelled") {
-    const at = config.stages.findIndex((stage) => stage.steps.includes(currentStepId || ""));
-    const index = at >= 0 ? at : reached.lastIndexOf(true);
-    if (index >= 0) states[index] = status === "failed" ? "failed" : "stopped";
-    // Nothing after where it stopped was made.
-    if (status === "cancelled") states.forEach((state, later) => { if (later > index && state !== "pending") states[later] = "pending"; });
-  }
-  return states;
-}
 
 /** The newest finished version of a unit's clip: what plays for it. */
 function latestFinished(line: { root: MediaJob; latest: MediaJob }, jobs: MediaJob[]): MediaJob | undefined {
@@ -178,8 +156,23 @@ function PreviewPlayer({ units, current, onCurrent }: {
  * match clips named another way; a revision suffix ("scene-03-r01") is not it.
  */
 function unitNumber(id: string): number | null {
-  const match = /(\d+)\D*$/.exec(id.replace(/\.[a-z0-9]+$/i, "").replace(/-r\d+$/i, ""));
+  const match = /(\d+)\D*$/.exec(id.replace(/\.[a-z0-9]+$/i, "").replace(/-(r|take)\d+$/i, ""));
   return match ? Number(match[1]) : null;
+}
+
+/**
+ * Which planned unit a clip is (as the server's clip_unit_id): its recorded unit id, the unit id its
+ * saved name spells out as a whole word (`song-S05-take2`), or else the unit's number.
+ */
+function clipUnitFor(job: MediaJob, unitIds: string[]): string | null {
+  const key = clipUnitKey(job);
+  if (unitIds.includes(key)) return key;
+  const named = unitIds.filter((id) => new RegExp(
+    `(?<![A-Za-z0-9])${id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![A-Za-z0-9])`, "i").test(key));
+  if (named.length === 1) return named[0];
+  const number = unitNumber(key);
+  const numbered = unitIds.filter((id) => number != null && unitNumber(id) === number);
+  return numbered.length === 1 ? numbered[0] : null;
 }
 
 /** Which unit a clip is: its unit id, else the name it was saved under. */
@@ -232,6 +225,11 @@ function RevisePanel({ runId, changed, unitVersions, onStarted }: {
   </div>;
 }
 
+function combineFamilyClips(results: Array<{ data?: MediaJob[] }>): MediaJob[] {
+  return results.flatMap((query) => query.data || [])
+    .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+}
+
 type FamilyRun = { id: string; status: string; started_at?: string | null; created_at?: string | null; completed_at?: string | null };
 
 export default function RunProduction({
@@ -251,41 +249,111 @@ export default function RunProduction({
   onOpenRun?: (runId: string) => void;
 }) {
   const finished = status === "completed";
+  // A paused run (waiting on media, a timer or a review) still reads as working;
+  // only its own reads slow down.
   const running = !["completed", "failed", "cancelled"].includes(status);
+  const paused = status === "paused";
+  const advancing = running && !paused;
+  const visible = usePageVisible();
+  const queryClient = useQueryClient();
   // A stopped run's panel already says so; how far it got shows in its stages.
   const stopped = status === "failed" || status === "cancelled";
   // Every version of this result is a run of one family; a later version reuses
   // the units it did not change, so their clips come from the earlier runs.
   const family = useQuery({
     queryKey: ["workflow-run-family", runId],
-    queryFn: () => api.workflows.getRunFamily(runId) as Promise<FamilyRun[]>,
-    staleTime: running ? 0 : 30_000,
-    refetchInterval: running ? 10_000 : false,
+    queryFn: ({ signal }) => api.workflows.getRunFamily(runId, AbortSignal.any([signal, AbortSignal.timeout(15_000)])) as Promise<FamilyRun[]>,
+    enabled: visible,
+    staleTime: advancing ? 0 : 30_000,
+    // A completed parent can later gain a retried family member. Reconcile its
+    // membership at a low rate so that member becomes eligible for a read.
+    refetchInterval: (query) => displayReadInterval(query.state, advancing ? 20_000 : paused ? 60_000 : 120_000),
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: true,
   });
   const familyIds = useMemo(() => {
     const ids = (family.data || []).map((item) => item.id);
     return ids.includes(runId) ? ids : [...ids, runId];
   }, [family.data, runId]);
-  const clips = useQuery({
-    queryKey: ["media-jobs", "run-family", familyIds],
-    queryFn: async () => (await Promise.all(familyIds.map((id) => api.mediaJobs.forRun(id)))).flat()
-      .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || ""))),
-    refetchInterval: running ? 5000 : false,
+  const familyById = useMemo(() => new Map((family.data || []).map((member) => [member.id, member])), [family.data]);
+  const terminalReconcileMs = familyIds.length > 12 ? 300_000 : familyIds.length > 4 ? 180_000 : 120_000;
+  const eventTimer = useRef<number | null>(null);
+  const pendingEventRuns = useRef(new Set<string>());
+  const pendingUnknownEvent = useRef(false);
+  const lastUnknownReconcileAt = useRef(0);
+  // Per-run keys let this family view share its current run's read with
+  // RunMediaClips instead of maintaining a second aggregate cache.
+  const data = useQueries({
+    combine: combineFamilyClips,
+    queries: familyIds.map((id) => ({
+      queryKey: ["media-jobs", "run", id],
+      queryFn: ({ signal }: { signal: AbortSignal }) => scheduleMediaRunRead(
+        signal,
+        () => api.mediaJobs.forRun(id, AbortSignal.any([signal, AbortSignal.timeout(15_000)])),
+        id === runId || ["pending", "queued", "running"].includes(familyById.get(id)?.status || "") ? 0 : 1,
+      ),
+      enabled: visible,
+      refetchInterval: (query: { state: { data?: MediaJob[]; status?: string; error?: unknown } }) => {
+        const mediaActive = query.state.data?.some((job) => ["pending", "processing"].includes(job.status));
+        const runActive = ["pending", "queued", "running"].includes(familyById.get(id)?.status || "");
+        const current = id === runId;
+        const normal = mediaActive || (current && advancing) || runActive
+          ? 15_000
+          : current && paused ? 60_000 : terminalReconcileMs;
+        return displayReadInterval(query.state, normal);
+      },
+      refetchIntervalInBackground: false,
+      refetchOnWindowFocus: true,
+    })),
   });
-  const { data, refetch } = clips;
-  // A job this view has not seen may be a new unit's clip: look now, not at the next poll.
+  // Event subscription reads the latest values through refs so a re-render
+  // (the elapsed clock ticks every second) never clears a pending flush.
+  const eventScope = useRef({ known: new Set<string>(), familyIds, runId, visible });
+  eventScope.current = { known: new Set(data.map((job) => job.id)), familyIds, runId, visible };
+  // Socket messages can arrive in bursts. Coalesce a matching family update;
+  // messages without a run id only cause one bounded current-run reconciliation.
   useEffect(() => {
-    const known = new Set((data || []).map((job) => job.id));
+    const flush = () => {
+      eventTimer.current = null;
+      const ids = [...pendingEventRuns.current];
+      pendingEventRuns.current.clear();
+      const { runId } = eventScope.current;
+      for (const id of ids) void queryClient.invalidateQueries({ queryKey: ["media-jobs", "run", id] }, { cancelRefetch: false });
+      if (pendingUnknownEvent.current) {
+        pendingUnknownEvent.current = false;
+        void queryClient.invalidateQueries({ queryKey: ["workflow-run-family", runId] }, { cancelRefetch: false });
+        void queryClient.invalidateQueries({ queryKey: ["media-jobs", "run", runId] }, { cancelRefetch: false });
+      }
+    };
+    const schedule = () => {
+      if (eventTimer.current !== null) return;
+      eventTimer.current = window.setTimeout(flush, 500);
+    };
     const onEvent = (event: Event) => {
-      const id = (event as CustomEvent).detail?.id;
-      if (id && !known.has(id)) void refetch();
+      const update = (event as CustomEvent<Partial<MediaJob>>).detail;
+      const { known, familyIds, visible } = eventScope.current;
+      if (!visible || !update) return;
+      if (update.run_id && update.id && !known.has(update.id) && familyIds.includes(update.run_id)) {
+        pendingEventRuns.current.add(update.run_id);
+        schedule();
+        return;
+      }
+      if (!update.run_id && Date.now() - lastUnknownReconcileAt.current >= 15_000) {
+        lastUnknownReconcileAt.current = Date.now();
+        pendingUnknownEvent.current = true;
+        schedule();
+      }
     };
     window.addEventListener("manor:media-job-update", onEvent);
-    return () => window.removeEventListener("manor:media-job-update", onEvent);
-  }, [data, refetch]);
+    return () => {
+      window.removeEventListener("manor:media-job-update", onEvent);
+      if (eventTimer.current !== null) window.clearTimeout(eventTimer.current);
+      eventTimer.current = null;
+    };
+  }, [queryClient]);
 
   const media = config.media || "video";
-  const lines = useMemo(() => clipLines((data || []).filter((job) => job.kind === media)), [data, media]);
+  const lines = useMemo(() => clipLines(data.filter((job) => job.kind === media)), [data, media]);
   // Units come from the run's plan; a clip finds its unit by id, by the number
   // its id ends with, or else by order. The newest clip of a unit wins.
   const units = useMemo(() => {
@@ -294,52 +362,50 @@ export default function RunProduction({
       id: clipUnitKey(line.root) || String(index + 1), title: "", duration_s: line.root.duration_seconds || null,
       lanes: {} as Record<string, string>,
     }));
-    const byId = new Map<string, (typeof lines)[number]>();
-    const byNumber = new Map<number, (typeof lines)[number]>();
+    const unitIds = planned.map((unit) => unit.id);
+    const byUnit = new Map<string, (typeof lines)[number]>();
     for (const line of oldestFirst) {
-      const id = clipUnitKey(line.root);
-      if (id) byId.set(id, line);
-      const number = unitNumber(id);
-      if (number != null) byNumber.set(number, line);
+      const id = clipUnitFor(line.root, unitIds);
+      if (id) byUnit.set(id, line);
     }
-    return planned.map((unit, index) => {
-      const number = unitNumber(unit.id);
-      const line = byId.get(unit.id) || (number != null ? byNumber.get(number) : undefined)
-        || (byId.size === 0 ? oldestFirst[index] : undefined);
-      return { ...unit, line };
-    });
+    const keyed = oldestFirst.some((line) => clipUnitKey(line.root));
+    return planned.map((unit, index) => ({
+      ...unit, line: byUnit.get(unit.id) || (!keyed ? oldestFirst[index] : undefined),
+    }));
   }, [config.units, lines]);
-  const finishedIds = new Set((data || []).filter((job) => job.status === "completed").map((job) => job.lineage_root || job.id));
+  const finishedIds = new Set(data.filter((job) => job.status === "completed").map((job) => job.lineage_root || job.id));
   const unitShare = (line?: { root: MediaJob; latest: MediaJob }) => !line ? 0
     : finishedIds.has(line.root.id) ? 1 : PHASE_SHARE[phaseOf(line.latest)] ?? 0;
 
-  const states = stageStates(config, steps, currentStepId, status);
+  const states = stageStates(config.stages, steps, currentStepId, status);
   // A unit with no media of its own (a song's section, made in one go with the
   // track) is made once the run is, or once the stage that makes units is done.
   const unitsMade = finished || states.some((state, index) => config.stages[index].counts_units && state === "done");
-  const doneUnits = units.filter((unit) => unit.line ? finishedIds.has(unit.line.root.id) : unitsMade).length;
+  const madeLocally = new Set((config.units_made_locally || []).map((item) => item.unit_id));
+  const unitDone = (unit: { id: string; line?: { root: MediaJob } }) =>
+    unit.line ? finishedIds.has(unit.line.root.id) || madeLocally.has(unit.id) : unitsMade || madeLocally.has(unit.id);
+  const doneUnits = units.filter(unitDone).length;
   const unitStarts = units.reduce<number[]>((starts, unit, index) =>
     [...starts, index ? starts[index - 1] + (units[index - 1].duration_s || 0) : 0], []);
   const [seek, setSeek] = useState<{ at: number; n: number } | null>(null);
-  const totalWeight = config.stages.reduce((sum, stage) => sum + stage.weight, 0) || 1;
-  const stageShare = (index: number) => {
-    if (states[index] === "done") return 1;
-    if (states[index] !== "active") return 0;
-    if (config.stages[index].counts_units && units.length) {
-      return units.reduce((sum, unit) => sum + unitShare(unit.line), 0) / units.length;
-    }
-    return 0.4;
-  };
-  const percent = finished ? 100 : Math.round(config.stages.reduce((sum, stage, index) => sum + stage.weight * stageShare(index), 0) / totalWeight * 100);
+  const unitsShare = (index: number) => config.stages[index].counts_units && units.length
+    ? units.reduce((sum, unit) => sum + (madeLocally.has(unit.id) ? 1 : unitShare(unit.line)), 0) / units.length
+    : null;
+  const shares = config.stages.map((stage, index) => stageShare(stage, states[index], steps, unitsShare(index)));
+  const percent = finished ? 100 : runPercent(config.stages, shares);
 
   // Time left while units are being made: the slowest clip in flight, plus the
   // units not started at the pace finished clips took, as many at once as now.
   const inFlight = units.filter((unit) => unit.line && !finishedIds.has(unit.line.root.id) && unit.line.latest.status !== "failed");
-  const notStarted = units.filter((unit) => !unit.line).length;
+  const notStarted = units.filter((unit) => !unit.line && !madeLocally.has(unit.id)).length;
   const took = (data || []).filter((job) => job.status === "completed" && job.started_at && job.completed_at)
     .map((job) => (new Date(job.completed_at!).getTime() - new Date(job.started_at!).getTime()) / 1000);
   const pace = took.length ? took.reduce((a, b) => a + b, 0) / took.length : null;
-  const activeCounts = states.some((state, index) => state === "active" && config.stages[index].counts_units);
+  const activeIndex = states.findIndex((state, index) => state === "active" && config.stages[index].counts_units);
+  const activeCounts = activeIndex >= 0;
+  // The estimate covers making the units only; the checks and reviews after
+  // them are named instead of being left out of a whole-run "time left".
+  const nextStage = activeCounts ? config.stages.slice(activeIndex + 1).find((_, offset) => states[activeIndex + 1 + offset] !== "done") : undefined;
   const remaining = running && activeCounts && (inFlight.length || notStarted)
     ? Math.max(0, ...inFlight.map((unit) => unit.line!.latest.eta_seconds ?? pace ?? 0))
       + (notStarted && pace ? Math.ceil(notStarted / Math.max(1, inFlight.length)) * pace : 0)
@@ -410,14 +476,15 @@ export default function RunProduction({
     {!stopped && <div className="run-production__head">
       <strong className="mono">{shownPercent}%</strong>
       <span>{finished ? t("component.run_production.finished")
-        : remaining != null && remaining > 0 ? remainingLabel(remaining)
+        : remaining != null && remaining > 0
+          ? `${config.unit.name}: ${remainingLabel(remaining)}${nextStage ? ` · ${t("component.run_production.then_stage", { stage: nextStage.label })}` : ""}`
           : status === "queued" ? t("component.workspace_app_view.queued")
             : running ? t("component.run_production.working") : ""}</span>
       {elapsed != null && running && <span className="mono run-production__elapsed">{Math.floor(elapsed / 60)}:{String(Math.floor(elapsed % 60)).padStart(2, "0")}</span>}
     </div>}
     <ol className="run-production__stages">
       {config.stages.map((stage, index) => <li key={stage.label} data-state={states[index]} style={{ flexGrow: stage.weight }}>
-        <span className="run-production__bar"><span style={{ width: `${Math.round(stageShare(index) * 100)}%` }} /></span>
+        <span className="run-production__bar"><span style={{ width: `${Math.round(shares[index] * 100)}%` }} /></span>
         <span className="run-production__stage-label">{stage.label}</span>
         <span className="sr-only">{t(`component.run_production.stage_${states[index]}`)}</span>
       </li>)}
@@ -431,7 +498,7 @@ export default function RunProduction({
       <div className="run-production__timeline" role="listbox" aria-label={config.unit.name}>
         {units.map((unit, index) => {
           const line = unit.line;
-          const done = Boolean(line && finishedIds.has(line.root.id)) || (!line && unitsMade);
+          const done = unitDone(unit);
           const failed = line?.latest.status === "failed";
           const share = unitShare(line);
           const state = done ? "done" : failed ? "failed" : line ? "making" : "planned";

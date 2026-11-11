@@ -232,7 +232,7 @@ export function AiBuildConversation({
                   justifyContent: "flex-end",
                   gap: 8,
                   padding: "10px 12px",
-                  borderTop: "1px solid var(--border-subtle)",
+                  borderTop: "0.5px solid var(--border-subtle)",
                   background: "var(--surface-sunken)",
                 }}
               >
@@ -241,7 +241,7 @@ export function AiBuildConversation({
                   onClick={handleReviseReview}
                   disabled={confirming}
                   style={{
-                    border: "1px solid var(--border-subtle)",
+                    border: "0.5px solid var(--border-subtle)",
                     borderRadius: 8,
                     background: "var(--surface-panel)",
                     color: "var(--text-muted)",

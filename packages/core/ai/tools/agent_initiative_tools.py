@@ -884,11 +884,10 @@ def _delivery_policy_schema() -> dict:
                                 "wechat",
                                 "slack",
                                 "discord",
-                                "whatsapp",
                             ],
                         },
                         "minItems": 1,
-                        "maxItems": 7,
+                        "maxItems": 6,
                         "uniqueItems": True,
                     },
                     "content_mode": {
@@ -973,9 +972,9 @@ def get_tools():
             },
             "notification_channels": {
                 "type": "array",
-                "items": {"type": "string", "enum": ["inapp", "email", "telegram", "wechat", "slack", "discord", "whatsapp"]},
+                "items": {"type": "string", "enum": ["inapp", "email", "telegram", "wechat", "slack", "discord"]},
                 "minItems": 1,
-                "maxItems": 7,
+                "maxItems": 6,
                 "uniqueItems": True,
                 "description": (
                     "Secondary notification routes only; these do not choose the "

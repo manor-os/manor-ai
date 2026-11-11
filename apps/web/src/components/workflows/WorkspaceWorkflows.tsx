@@ -8,17 +8,18 @@ import { workflowPath, workflowRunPath } from "../../lib/workflowRoutes";
 import { formatUserFacingLabel, formatUserFacingText } from "../../lib/taskDisplay";
 import { useToastStore } from "../../stores/toast";
 import { workflowRunInputs } from "../../lib/workflowRunInputs";
+import { displayReadInterval } from "../../lib/readRefreshPolicy";
+import { usePageVisible } from "../../lib/usePageVisible";
+import { workflowRunListRefetchInterval } from "../../lib/workspaceLiveRefresh";
 import { IconClock, IconFlow, IconPlay, IconStop, IconTrash } from "../icons";
 import Button from "../ui/Button";
-import CompactCard from "../ui/CompactCard";
 import ConfirmDialog from "../ui/ConfirmDialog";
 import EmptyState from "../ui/EmptyState";
+import { ConfigAddRow, ConfigBlock, ConfigGroup, ConfigRow } from "../ui/GroupedList";
 import IconTile from "../ui/IconTile";
 import LoadingSpinner from "../ui/LoadingSpinner";
 import Modal from "../ui/Modal";
-import PageHeader, { PageHeaderAddButton } from "../ui/PageHeader";
 import Select from "../ui/Select";
-import TabSwitcher from "../ui/TabSwitcher";
 import WorkflowRunInputModal from "./WorkflowRunInputModal";
 import {
   canCancelWorkflowRun,
@@ -79,11 +80,13 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const toast = useToastStore();
+  const visible = usePageVisible();
   const [attachOpen, setAttachOpen] = useState(false);
   const [selectedWorkflowId, setSelectedWorkflowId] = useState("");
   const [detachTarget, setDetachTarget] = useState<WorkflowBinding | null>(null);
   const [cancelTarget, setCancelTarget] = useState<WorkflowHistoryRun | null>(null);
   const [runInputBinding, setRunInputBinding] = useState<WorkflowBinding | null>(null);
+  const [runInputFlow, setRunInputFlow] = useState<any>(null);
   const requestedWorkflowView = searchParams.get("workflow_view");
   const requestedRunId = searchParams.get("workflow_run") || "";
   const [section, setSection] = useState<"attached" | "history">(
@@ -97,12 +100,14 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
   const bindingsKey = useMemo(() => ["workflow-bindings", workspaceId], [workspaceId]);
   const runsKey = useMemo(() => ["workspace-workflow-runs", workspaceId], [workspaceId]);
   const { data: workflows = [], isLoading: workflowsLoading } = useQuery({
-    queryKey: ["workflows"],
-    queryFn: () => api.workflows.list(),
+    queryKey: ["workflows", "summary"],
+    queryFn: () => api.workflows.listSummaries(),
+    enabled: visible,
   });
   const { data: bindings = [], isLoading: bindingsLoading } = useQuery({
     queryKey: bindingsKey,
     queryFn: () => api.workflows.listBindings({ workspace_id: workspaceId }),
+    enabled: visible,
   });
   const {
     data: runs = [],
@@ -111,12 +116,17 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
     error: runsError,
   } = useQuery({
     queryKey: runsKey,
-    queryFn: () => api.workflows.listRuns({ workspace_id: workspaceId, limit: 100 }),
+    queryFn: ({ signal }) => api.workflows.listRuns({ workspace_id: workspaceId, limit: 100 }, signal),
+    enabled: visible,
+    retry: false,
     refetchInterval: (query) => {
       const items = (query.state.data as WorkflowHistoryRun[] | undefined) || [];
-      return items.some((run) => run.status === "running" || run.status === "pending") ? 1_000 : false;
+      return displayReadInterval(
+        query.state,
+        workflowRunListRefetchInterval(items),
+      );
     },
-    refetchIntervalInBackground: true,
+    refetchOnWindowFocus: "always",
   });
 
   const attachedBindings = useMemo(
@@ -136,6 +146,12 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
     ),
     [attachedWorkflowIds, workflows],
   );
+  // Older runs never recorded their step's name, so only those need the graphs.
+  const { data: fullWorkflows = [] } = useQuery({
+    queryKey: ["workflows"],
+    queryFn: () => api.workflows.list(),
+    enabled: (runs as WorkflowHistoryRun[]).some((run) => run.current_step_id && !run.current_step_name),
+  });
   const workflowById = useMemo(
     () => new Map((workflows as WorkflowSummary[]).map((workflow) => [workflow.id, workflow])),
     [workflows],
@@ -206,10 +222,22 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
       translateApiError(error, "The workflow service is unavailable. Refresh and try again."),
     ),
   });
-  const requestWorkflowRun = (binding: WorkflowBinding) => {
-    const workflow = workflowById.get(binding.workflow_id);
-    if (!workflow) return;
+  const requestWorkflowRun = async (binding: WorkflowBinding) => {
+    if (!workflowById.has(binding.workflow_id)) return;
+    // The list has no graph, and what a run asks for lives in it.
+    let workflow;
+    try {
+      workflow = await queryClient.fetchQuery({
+        queryKey: ["workflow-definition", binding.workflow_id],
+        queryFn: () => api.workflows.get(binding.workflow_id),
+        staleTime: 0,
+      });
+    } catch (error) {
+      toast.error(translateApiError(error, "The workflow service is unavailable. Refresh and try again."));
+      return;
+    }
     if (workflowRunInputs(workflow).length) {
+      setRunInputFlow(workflow);
       setRunInputBinding(binding);
       return;
     }
@@ -272,94 +300,71 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
 
   return (
     <div className="workspace-workflows">
-      <PageHeader
-        inline
-        title="Workflows"
-        subtitle="Attach reusable workflows to this workspace, run them directly, and use them from tasks, agents, APIs, or automations."
-        actions={canManage && section === "attached" ? <PageHeaderAddButton label="Attach workflow" onClick={openAttach} /> : undefined}
-      />
-
-      <div className="workspace-workflow-section-tabs" aria-label={t("component.workflow_run_history.views")}>
-        <TabSwitcher
-          size="sm"
-          value={section}
-          onChange={(nextSection) => {
-            setSection(nextSection as "attached" | "history");
-            updateHistoryLocation(nextSection as "attached" | "history");
-          }}
-          tabs={[
-            { key: "attached", label: t("component.workflow_run_history.attached"), count: attachedBindings.length },
-            { key: "history", label: t("component.workflow_run_history.history"), count: historyFamilies.length },
-          ]}
-        />
-      </div>
-
-      {section === "attached" ? (
-        isLoading ? (
-          <div className="workspace-workflows-loading"><LoadingSpinner size={24} /></div>
+      <ConfigGroup title={t("nav.flows")}>
+        {isLoading ? (
+          <ConfigBlock><LoadingSpinner size={20} /></ConfigBlock>
         ) : attachedBindings.length === 0 ? (
-          <EmptyState
-            icon={<IconFlow size={30} />}
-            title="No workflows attached"
-            description="Attach a workflow to make it available in this workspace without requiring an automation."
-            action={canManage ? <Button size="sm" onClick={openAttach}>Attach workflow</Button> : undefined}
-          />
-        ) : (
-          <div className="workspace-workflows-grid">
-            {attachedBindings.map((binding) => {
-              const workflow = workflowById.get(binding.workflow_id);
-              const lastRun = latestRunByBinding.get(binding.id);
-              const running = lastRun?.status === "running" || lastRun?.status === "pending";
-              const duration = runDuration(lastRun);
-              const runLabel = lastRun
-                ? `${lastRun.status}${duration ? ` · ${duration}` : ""}${lastRun.started_at ? ` · ${relativeTime(lastRun.started_at)}` : ""}`
-                : "Not run in this workspace yet";
-              return (
-                <CompactCard
-                  key={binding.id}
-                  className="workspace-workflow-card"
-                  onClick={() => navigate(workflowPath(binding.workflow_id))}
-                  icon={<IconTile size={36}><IconFlow size={18} /></IconTile>}
-                  title={formatUserFacingText(binding.name || workflow?.name || "Workspace workflow")}
-                  subtitle={String(lastRun?.error || workflow?.description || (runsUnavailable ? "Run history unavailable" : runLabel))}
-                  meta={(
-                    <span className={`workspace-workflow-run-state is-${lastRun?.status || "idle"}`}>
-                      {runLabel}
-                    </span>
+          <ConfigBlock><p className="config-empty">{t("page.workspace_detail.no_workflows_attached")}</p></ConfigBlock>
+        ) : attachedBindings.map((binding) => {
+          const workflow = workflowById.get(binding.workflow_id);
+          const lastRun = latestRunByBinding.get(binding.id);
+          const running = lastRun?.status === "running" || lastRun?.status === "pending";
+          const duration = runDuration(lastRun);
+          const runLabel = lastRun
+            ? `${lastRun.status}${duration ? ` · ${duration}` : ""}${lastRun.started_at ? ` · ${relativeTime(lastRun.started_at)}` : ""}`
+            : workflow?.description || "";
+          return (
+            <ConfigRow
+              key={binding.id}
+              label={(
+                <Link className="config-row-link" to={workflowPath(binding.workflow_id)} state={{ returnTo: `${location.pathname}${location.search}` }}>
+                  {formatUserFacingText(binding.name || workflow?.name || "Workspace workflow")}
+                </Link>
+              )}
+              note={String(lastRun?.error || runLabel) || undefined}
+              control={(
+                <span className="config-row-actions">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    loading={running || (runMutation.isPending && runMutation.variables?.bindingId === binding.id)}
+                    disabled={!canManage || !workflow || !["active", "paused"].includes(binding.status)}
+                    onClick={() => requestWorkflowRun(binding)}
+                    ariaLabel={`Run ${binding.name || workflow?.name || "workflow"}`}
+                    title={t("ui.run_in_this_workspace")}
+                    style={{ width: 30, padding: 0 }}
+                  ><IconPlay size={14} /></Button>
+                  {canManage && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setDetachTarget(binding)}
+                      ariaLabel={`Detach ${binding.name || workflow?.name || "workflow"}`}
+                      title={t("ui.detach_from_workspace")}
+                      style={{ width: 30, padding: 0 }}
+                    ><IconTrash size={13} /></Button>
                   )}
-                  action={(
-                    <span className="workspace-workflow-card-actions">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          loading={running || (runMutation.isPending && runMutation.variables?.bindingId === binding.id)}
-                          disabled={!canManage || !workflow || !["active", "paused"].includes(binding.status)}
-                          onClick={() => requestWorkflowRun(binding)}
-                          ariaLabel={`Run ${binding.name || workflow?.name || "workflow"}`}
-                          title="Run in this workspace"
-                          style={{ width: 30, padding: 0 }}
-                        ><IconPlay size={14} /></Button>
-                        {canManage && (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => setDetachTarget(binding)}
-                            ariaLabel={`Detach ${binding.name || workflow?.name || "workflow"}`}
-                            title="Detach from workspace"
-                          style={{ width: 30, padding: 0 }}
-                        ><IconTrash size={13} /></Button>
-                        )}
-                    </span>
-                  )}
-                />
-              );
-            })}
-          </div>
-        )
-      ) : runsLoading || workflowsLoading ? (
+                </span>
+              )}
+            />
+          );
+        })}
+        {canManage && <ConfigAddRow label={t("page.workspace_detail.attach_workflow")} onClick={openAttach} />}
+        <ConfigRow
+          label={`${t("component.workflow_run_history.history")} · ${historyFamilies.length}`}
+          expanded={section === "history"}
+          onClick={() => {
+            const nextSection = section === "history" ? "attached" : "history";
+            setSection(nextSection);
+            updateHistoryLocation(nextSection);
+          }}
+        />
+      </ConfigGroup>
+
+      {section !== "history" ? null : runsLoading || workflowsLoading ? (
         <div className="workspace-workflows-loading" aria-live="polite">
           <LoadingSpinner size={24} />
-          <span>{t("component.workflow_run_history.loading")}</span>
+          <span className="sr-only">{t("component.workflow_run_history.loading")}</span>
         </div>
       ) : runsUnavailable ? (
         <div className="workflow-run-history-list-state is-error" role="alert">
@@ -382,7 +387,9 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
               businessOutcome: family.businessOutcome,
             });
             const workflow = workflowById.get(family.latestRun.workflow_id || "");
-            const currentNode = workflow?.steps?.find((step) => step.id === run.current_step_id);
+            const currentNode = (fullWorkflows as { id: string; steps?: { id: string; name?: string }[] }[])
+              .find((item) => item.id === family.latestRun.workflow_id)
+              ?.steps?.find((step) => step.id === run.current_step_id);
             const immutableListMetadata = workflowRunHasImmutableListMetadata(run);
             const progressPercent = workflowRunProgressPercent(family.processedCount, family.totalCount, family.status);
             const workflowName = run.workflow_name || workflow?.name || t("component.workflow_run_history.unknown_workflow");
@@ -468,7 +475,7 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
       )}
 
       <WorkflowRunInputModal
-        flow={runInputBinding ? workflowById.get(runInputBinding.workflow_id) || null : null}
+        flow={runInputBinding ? runInputFlow : null}
         workspaceId={workspaceId}
         busy={runMutation.isPending}
         onClose={() => { if (!runMutation.isPending) setRunInputBinding(null); }}
@@ -482,26 +489,26 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
       <Modal
         open={attachOpen}
         onClose={() => setAttachOpen(false)}
-        title="Attach workflow"
+        title={t("ui.attach_workflow")}
         footer={(
           <>
-            <Button variant="outline" onClick={() => setAttachOpen(false)}>Cancel</Button>
+            <Button variant="outline" onClick={() => setAttachOpen(false)}>{t("ui.cancel")}</Button>
             <Button
               onClick={() => attachMutation.mutate(selectedWorkflowId)}
               disabled={!selectedWorkflowId}
               loading={attachMutation.isPending}
-            >Attach workflow</Button>
+            >{t("ui.attach_workflow")}</Button>
           </>
         )}
       >
         {availableWorkflows.length > 0 ? (
           <div className="workspace-workflows-attach-form">
-            <label className="manor-label">Workflow</label>
+            <label className="manor-label">{t("ui.workflow")}</label>
             <Select
               value={selectedWorkflowId}
               onChange={setSelectedWorkflowId}
               filterable
-              placeholder="Select a workflow"
+              placeholder={t("ui.select_a_workflow")}
               options={availableWorkflows.map((workflow) => ({ value: workflow.id, label: workflow.name }))}
             />
             <p>Attaching gives this workflow the Workspace context, connectors, knowledge, approvals, and budget when it runs.</p>
@@ -509,9 +516,9 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
         ) : (
           <EmptyState
             icon={<IconFlow size={28} />}
-            title="All available workflows are attached"
-            description="Create another workflow or detach an existing one first."
-            action={<Link to="/flows">Open Workflows</Link>}
+            title={t("ui.all_available_workflows_are_attached")}
+            description={t("ui.create_another_workflow_or_detach_an_existing_on")}
+            action={<Link to="/flows">{t("ui.open_workflows")}</Link>}
           />
         )}
       </Modal>
@@ -538,7 +545,7 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
         open={!!detachTarget}
         onClose={() => setDetachTarget(null)}
         onConfirm={() => { if (detachTarget) detachMutation.mutate(detachTarget.id); }}
-        title="Detach workflow"
+        title={t("ui.detach_workflow")}
         message="This removes the workflow from this workspace. Remove any automations that reference it before detaching. The workflow definition is kept."
         confirmLabel="Detach"
         danger

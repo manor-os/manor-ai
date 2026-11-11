@@ -398,8 +398,6 @@ export function ImportSkillsDialog({
         inset: 0,
         zIndex: 20000,
         background: "var(--modal-overlay-bg)",
-        backdropFilter: "blur(5px)",
-        WebkitBackdropFilter: "blur(5px)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -412,12 +410,9 @@ export function ImportSkillsDialog({
         className="manor-dialog import-skills-dialog"
         style={{
           background: "var(--modal-bg)",
-          backdropFilter: "blur(20px) saturate(1.08)",
-          WebkitBackdropFilter: "blur(20px) saturate(1.08)",
-          borderRadius: 24,
+          borderRadius: "var(--modal-radius)",
           width: "100%",
           maxWidth: 700,
-          border: "1px solid var(--modal-border)",
           boxShadow: "var(--modal-shadow)",
           display: "flex",
           flexDirection: "column",
@@ -479,8 +474,8 @@ export function ImportSkillsDialog({
                   alignItems: "flex-start",
                   gap: 12,
                   padding: "12px 16px",
-                  background: "rgba(28,25,23,0.06)",
-                  border: "1px solid rgba(28,25,23,0.2)",
+                  background: "rgba(29, 29, 31,0.06)",
+                  border: "1px solid rgba(29, 29, 31,0.2)",
                   borderRadius: 12,
                   marginBottom: 16,
                 }}
@@ -489,7 +484,7 @@ export function ImportSkillsDialog({
                   style={{
                     width: 16,
                     height: 16,
-                    color: "#57534e",
+                    color: "var(--text-muted)",
                     flexShrink: 0,
                     marginTop: 1,
                   }}
@@ -510,7 +505,7 @@ export function ImportSkillsDialog({
                       margin: "0 0 2px",
                       fontSize: 12,
                       fontWeight: 700,
-                      color: "#292524",
+                      color: "var(--text-strong)",
                     }}
                   >
                     {t("page.import_skills_dialog.supported_formats")}
@@ -519,7 +514,7 @@ export function ImportSkillsDialog({
                     style={{
                       margin: 0,
                       fontSize: 12,
-                      color: "#78716c",
+                      color: "var(--text-muted)",
                       lineHeight: 1.6,
                     }}
                   >
@@ -536,25 +531,25 @@ export function ImportSkillsDialog({
                 onDragOver={(e) => e.preventDefault()}
                 onDrop={handleDrop}
                 style={{
-                  border: "3px dashed rgba(28,25,23,0.06)",
+                  border: "3px dashed rgba(29, 29, 31,0.06)",
                   borderRadius: 20,
                   padding: "48px 24px",
                   textAlign: "center",
                   cursor: "pointer",
                   transition: "all 0.2s",
                   background:
-                    "linear-gradient(180deg, rgba(255,255,255,0.5) 0%, #fafaf9 100%)",
+                    "linear-gradient(180deg, rgba(255,255,255,0.5) 0%, #fafafa 100%)",
                 }}
                 onMouseEnter={(e) => {
                   (e.currentTarget as HTMLElement).style.borderColor =
-                    "rgba(28,25,23,0.4)";
+                    "rgba(29, 29, 31,0.4)";
                   (e.currentTarget as HTMLElement).style.background =
-                    "rgba(28,25,23,0.03)";
+                    "rgba(29, 29, 31,0.03)";
                 }}
                 onMouseLeave={(e) => {
-                  (e.currentTarget as HTMLElement).style.borderColor = "#e7e5e4";
+                  (e.currentTarget as HTMLElement).style.borderColor = "#e5e5ea";
                   (e.currentTarget as HTMLElement).style.background =
-                    "linear-gradient(180deg, rgba(255,255,255,0.5) 0%, #fafaf9 100%)";
+                    "linear-gradient(180deg, rgba(255,255,255,0.5) 0%, #fafafa 100%)";
                 }}
               >
                 <input
@@ -570,7 +565,7 @@ export function ImportSkillsDialog({
                   style={{
                     width: 64,
                     height: 64,
-                    background: "#f5f5f4",
+                    background: "var(--surface-muted)",
                     borderRadius: "50%",
                     display: "flex",
                     alignItems: "center",
@@ -580,7 +575,7 @@ export function ImportSkillsDialog({
                   }}
                 >
                   <svg
-                    style={{ width: 28, height: 28, color: "#a8a29e" }}
+                    style={{ width: 28, height: 28, color: "var(--text-muted)" }}
                     fill="none"
                     viewBox="0 0 24 24"
                     stroke="currentColor"
@@ -597,13 +592,13 @@ export function ImportSkillsDialog({
                   style={{
                     fontSize: 14,
                     fontWeight: 700,
-                    color: "#44403c",
+                    color: "var(--text-muted)",
                     margin: "0 0 4px",
                   }}
                 >
                   {t("page.import_skills_dialog.click_to_select_a_folder")}
                 </p>
-                <p style={{ fontSize: 12, color: "#a8a29e", margin: 0 }}>
+                <p style={{ fontSize: 12, color: "var(--text-muted)", margin: 0 }}>
                   {t("page.import_skills_dialog.or_drag_drop_files_here")}
                 </p>
               </div>
@@ -616,7 +611,7 @@ export function ImportSkillsDialog({
                     justifyContent: "center",
                     gap: 8,
                     padding: 16,
-                    color: "#78716c",
+                    color: "var(--text-muted)",
                     fontSize: 13,
                   }}
                 >
@@ -659,7 +654,7 @@ export function ImportSkillsDialog({
                 style={{
                   fontSize: 15,
                   fontWeight: 700,
-                  color: "#292524",
+                  color: "var(--text-strong)",
                   margin: "0 0 6px",
                 }}
               >
@@ -668,7 +663,7 @@ export function ImportSkillsDialog({
               <p
                 style={{
                   fontSize: 12,
-                  color: "#78716c",
+                  color: "var(--text-muted)",
                   margin: "0 0 16px",
                   lineHeight: 1.6,
                 }}
@@ -693,7 +688,7 @@ export function ImportSkillsDialog({
                 }}
               >
                 <span
-                  style={{ fontSize: 13, fontWeight: 700, color: "#44403c" }}
+                  style={{ fontSize: 13, fontWeight: 700, color: "var(--text-default)" }}
                 >
                   {t("page.import_skills_dialog.found_skills_count").replace(
                     "{count}",
@@ -719,7 +714,7 @@ export function ImportSkillsDialog({
                   style={{
                     marginLeft: "auto",
                     fontSize: 12,
-                    color: "#78716c",
+                    color: "var(--text-muted)",
                     background: "none",
                     border: "none",
                     cursor: "pointer",
@@ -748,7 +743,7 @@ export function ImportSkillsDialog({
 
               <div
                 style={{
-                  border: "1px solid rgba(28,25,23,0.06)",
+                  border: "0.5px solid rgba(29, 29, 31,0.06)",
                   borderRadius: 12,
                   overflow: "hidden",
                   maxHeight: 320,
@@ -765,8 +760,8 @@ export function ImportSkillsDialog({
                   <thead>
                     <tr
                       style={{
-                        background: "#fafaf9",
-                        borderBottom: "1px solid rgba(28,25,23,0.06)",
+                        background: "var(--surface-muted)",
+                        borderBottom: "0.5px solid rgba(29, 29, 31,0.06)",
                       }}
                     >
                       <th
@@ -798,9 +793,7 @@ export function ImportSkillsDialog({
                             textAlign: "left",
                             fontSize: 11,
                             fontWeight: 700,
-                            color: "#78716c",
-                            textTransform: "uppercase",
-                            letterSpacing: "0.05em",
+                            color: "var(--text-muted)",
                           }}
                         >
                           {h}
@@ -813,7 +806,7 @@ export function ImportSkillsDialog({
                       <tr
                         key={idx}
                         style={{
-                          borderBottom: "1px solid #f5f5f4",
+                          borderBottom: "1px solid #f5f5f7",
                           background: item.valid ? "#fff" : "#f8f0ef",
                         }}
                       >
@@ -833,7 +826,7 @@ export function ImportSkillsDialog({
                           style={{
                             padding: "10px 12px",
                             fontWeight: 600,
-                            color: item.valid ? "#292524" : "#a8a29e",
+                            color: item.valid ? "#2c2c2e" : "#aeaeb2",
                             maxWidth: 180,
                           }}
                         >
@@ -842,7 +835,7 @@ export function ImportSkillsDialog({
                         <td
                           style={{
                             padding: "10px 12px",
-                            color: "#78716c",
+                            color: "var(--text-muted)",
                             fontSize: 12,
                             maxWidth: 200,
                             overflow: "hidden",
@@ -919,7 +912,7 @@ export function ImportSkillsDialog({
             justifyContent: "flex-end",
             gap: 10,
             padding: "16px 24px",
-            borderTop: "1px solid #f5f5f4",
+            borderTop: "1px solid #f5f5f7",
           }}
         >
           <Button variant="outline" onClick={onClose}>

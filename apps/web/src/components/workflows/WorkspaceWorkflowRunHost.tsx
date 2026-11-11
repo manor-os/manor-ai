@@ -11,9 +11,11 @@ import { useLocation } from "react-router-dom";
 import { t } from "../../lib/i18n";
 import { workflowPath, workflowRunPath } from "../../lib/workflowRoutes";
 import {
-  ACTIVE_WORKFLOW_FAMILY_POLL_MS,
-  ACTIVE_WORKFLOW_RUN_POLL_MS,
+  selectedWorkflowRunRefetchInterval,
+  workflowRunListRefetchInterval,
 } from "../../lib/workspaceLiveRefresh";
+import { displayReadInterval } from "../../lib/readRefreshPolicy";
+import { usePageVisible } from "../../lib/usePageVisible";
 import { IconPause, IconStop } from "../icons";
 import ConfirmDialog from "../ui/ConfirmDialog";
 import LoadingSpinner from "../ui/LoadingSpinner";
@@ -900,6 +902,7 @@ export default function WorkspaceWorkflowRunHost({
   onInvalidate,
   onRunChange,
 }: WorkspaceWorkflowRunHostProps) {
+  const visible = usePageVisible();
   const queryClient = useQueryClient();
   const location = useLocation();
   const attentionMessageId = new URLSearchParams(location.search).has("attention") && location.hash.startsWith("#workspace-chat-message-")
@@ -914,13 +917,13 @@ export default function WorkspaceWorkflowRunHost({
     queries: familyQueryGroups.map((group) => ({
       queryKey: ["workspace-chat-workflow-run-family", group.id],
       queryFn: ({ signal }) => api.workflows.getRunFamily(group.id, signal),
-      refetchInterval: (query: { state: { data?: WorkflowHistoryRun[] } }) => {
+      enabled: visible,
+      retry: false,
+      refetchInterval: (query: { state: { data?: WorkflowHistoryRun[]; status?: string; error?: unknown } }) => {
         const latestRun = latestWorkflowFamilyAttempt(query.state.data || []);
-        return latestRun && ["pending", "running"].includes(
-          nonEmptyString(latestRun.status).toLowerCase(),
-        ) ? ACTIVE_WORKFLOW_FAMILY_POLL_MS : false;
+        return displayReadInterval(query.state, workflowRunListRefetchInterval(latestRun ? [latestRun] : []));
       },
-      refetchIntervalInBackground: false,
+      refetchOnWindowFocus: "always" as const,
     })),
   });
   const familyRunsByGroupId = useMemo(
@@ -1001,7 +1004,8 @@ export default function WorkspaceWorkflowRunHost({
   const runQuery = useQuery({
     queryKey: ["workflow-run", foregroundRunId],
     queryFn: ({ signal }) => api.workflows.getRun(foregroundRunId, false, signal),
-    enabled: Boolean(foregroundRunId),
+    enabled: Boolean(foregroundRunId) && visible,
+    retry: false,
     refetchInterval: (query) => {
       if (!foregroundProjection) return false;
       const currentRun = mergeWorkflowRunView(
@@ -1009,11 +1013,9 @@ export default function WorkspaceWorkflowRunHost({
         foregroundProjection,
         foregroundProjectionUpdatedAt,
       );
-      return isWorkflowRunActive(currentRun)
-        ? ACTIVE_WORKFLOW_RUN_POLL_MS
-        : false;
+      return displayReadInterval(query.state, selectedWorkflowRunRefetchInterval(currentRun.status));
     },
-    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: "always",
   });
   const selectedRunDetail = selectWorkspaceWorkflowRunDetail(
     runQuery.data,
@@ -1055,7 +1057,7 @@ export default function WorkspaceWorkflowRunHost({
   const approvalReviewQuery = useQuery({
     queryKey: ["workflow-run-review", approvalReviewRunId, approvalReviewStepId, approvalReviewActionId],
     queryFn: ({ signal }) => api.workflows.getRun(approvalReviewRunId, true, signal),
-    enabled: Boolean(approvalReviewRunId && hydratesApprovalReview),
+    enabled: Boolean(approvalReviewRunId && hydratesApprovalReview) && visible,
     staleTime: Infinity,
   });
   const approvalReview = workflowApprovalReviewFromRunDetail(

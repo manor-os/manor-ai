@@ -590,7 +590,7 @@ async def test_context_memories_use_relevance_ranking_when_available(
 
 @pytest.mark.asyncio
 async def test_entity_chat_insights_cover_workspaceless_conversations(
-    client, monkeypatch
+    client, monkeypatch, tmp_path
 ):
     from packages.core.memory import chat_extractor
     from packages.core.models.memory import AgentMemory
@@ -599,6 +599,13 @@ async def test_entity_chat_insights_cover_workspaceless_conversations(
     from sqlalchemy import select
 
     start = datetime.now(timezone.utc) - timedelta(hours=1)
+    from packages.core.config import get_settings
+    from packages.core.memory.layers import personal_memory_path
+    from packages.core.services.entity_fs import provision_entity_filesystem
+
+    monkeypatch.setattr(get_settings(), "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(get_settings(), "MANOR_FS_ENABLED", True)
+    provision_entity_filesystem("ent_chat_extract", "Extract Test Entity")
 
     async with db_module.async_session() as db:
         db.add(Entity(id="ent_chat_extract", name="Extract Test Entity"))
@@ -625,8 +632,10 @@ async def test_entity_chat_insights_cover_workspaceless_conversations(
         assert user_id == "user_extract"
         assert source_message_ids == ["msg_entity_pref"]
         assert existing == []
+        assert payload["layers"] == ["profile", "preferences", "private"]
         return {"entries": [{
             "scope": "preference",
+            "layer": "preferences",
             "title": "Reports in Chinese",
             "body": "The operator wants all reports written in Chinese.",
             "tags": [],
@@ -651,10 +660,12 @@ async def test_entity_chat_insights_cover_workspaceless_conversations(
         )).scalars().all()
         assert len(rows) == 1
         assert rows[0].user_id == "user_extract"
-        assert rows[0].status == "proposed"
-        assert rows[0].payload["memory_type"] == "preference"
+        assert rows[0].status == "applied" and rows[0].created_by == "extractor"
+        assert rows[0].payload["target"] == "my_preferences"
         assert "Chinese" in rows[0].summary
         assert rows[0].payload["source_message_id"] == "msg_entity_pref"
+        with open(personal_memory_path("ent_chat_extract", "user_extract", "preferences"), encoding="utf-8") as f:
+            assert "all reports written in Chinese" in f.read()
         assert not (await db.scalars(select(AgentMemory).where(AgentMemory.entity_id == "ent_chat_extract"))).all()
 
         entity = await db.get(Entity, "ent_chat_extract")

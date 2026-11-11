@@ -229,10 +229,10 @@ export default function PeoplePicker({
             right: 0,
             maxHeight: 280,
             overflowY: "auto",
-            background: "#ffffff",
-            border: "1px solid rgba(28,25,23,0.06)",
+            background: "var(--surface-panel)",
+            border: "0.5px solid rgba(29, 29, 31,0.06)",
             borderRadius: 8,
-            boxShadow: "0 8px 24px rgba(28,25,23,0.08)",
+            boxShadow: "0 8px 24px rgba(29, 29, 31,0.08)",
             zIndex: 1000,
           }}
         >
@@ -262,15 +262,15 @@ export default function PeoplePicker({
                 >
                   <UserAvatar name={s.name} avatarUrl={s.avatar_url} size={28} />
                   <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 13, fontWeight: 600, color: "#292524", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-strong)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                       {s.name}
                       {!s.user_id && (
-                        <span style={{ marginLeft: 6, fontSize: 10, color: "#a8a29e", fontWeight: 500 }}>
+                        <span style={{ marginLeft: 6, fontSize: 10, color: "var(--text-muted)", fontWeight: 500 }}>
                           {t("permissions.picker.no_account_hint")}
                         </span>
                       )}
                     </div>
-                    <div style={{ fontSize: 11, color: "#78716c", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    <div style={{ fontSize: 11, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                       {s.email || t("permissions.picker.no_email")}
                       {s.department && ` · ${s.department}`}
                       {s.title && ` · ${s.title}`}
@@ -295,10 +295,10 @@ export default function PeoplePicker({
                 >
                   <UserAvatar name={query.trim()} avatarUrl={null} size={28} />
                   <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 13, fontWeight: 600, color: "#292524" }}>
-                      {t("permissions.picker.invite_external", { email: query.trim() })} <span style={{ color: "#a8a29e", fontWeight: 500 }}>{t("permissions.picker.external_tag")}</span>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-strong)" }}>
+                      {t("permissions.picker.invite_external", { email: query.trim() })} <span style={{ color: "var(--text-muted)", fontWeight: 500 }}>{t("permissions.picker.external_tag")}</span>
                     </div>
-                    <div style={{ fontSize: 11, color: "#a8a29e" }}>
+                    <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
                       {t("permissions.picker.external_hint")}
                     </div>
                   </div>
@@ -327,6 +327,6 @@ const ROW_STYLE: React.CSSProperties = {
 const EMPTY_STATE_STYLE: React.CSSProperties = {
   padding: "16px 14px",
   fontSize: 12,
-  color: "#a8a29e",
+  color: "var(--text-faint)",
   textAlign: "center",
 };

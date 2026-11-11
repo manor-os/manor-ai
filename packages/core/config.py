@@ -187,6 +187,9 @@ class Settings:
     BASH_SANDBOX_STAGE_MAX_FILES: int = int(
         os.getenv("BASH_SANDBOX_STAGE_MAX_FILES", "2000")
     )
+    # App self-check: a read that fails on a designer's page sends it back, instead of warning.
+    WORKSPACE_APP_SELF_CHECK_BLOCKS: bool = _env_bool("WORKSPACE_APP_SELF_CHECK_BLOCKS")
+
 
 
     # Deployment
@@ -213,6 +216,12 @@ class Settings:
     # Each site is served at {slug}.{MANOR_SITES_DOMAIN}; the domain is also the
     # CNAME target for user-owned custom domains. Empty disables site hosting.
     MANOR_SITES_DOMAIN: str = os.getenv("MANOR_SITES_DOMAIN", "")
+    # How visitors reach {slug}.{MANOR_SITES_DOMAIN}. Production serves it over
+    # https on the default port; local development without a TLS proxy uses
+    # e.g. scheme "http" and the web dev server's port ("5213"). Host routing
+    # ignores the port, so these only shape the published address.
+    MANOR_SITES_PUBLIC_SCHEME: str = os.getenv("MANOR_SITES_PUBLIC_SCHEME", "https")
+    MANOR_SITES_PUBLIC_PORT: str = os.getenv("MANOR_SITES_PUBLIC_PORT", "")
 
     # Public base URL — used to construct channel webhook URLs (Telegram,
     # WhatsApp, WeChat, …). Must be an https endpoint reachable from the
@@ -273,6 +282,13 @@ class Settings:
         self.DEGRADED_DISABLE_SANDBOX = _env_bool("DEGRADED_DISABLE_SANDBOX", "true")
         self.DEGRADED_DISABLE_MEDIA_GENERATION = _env_bool("DEGRADED_DISABLE_MEDIA_GENERATION", "true")
         self.DEGRADED_DISABLE_LARGE_UPLOADS = _env_bool("DEGRADED_DISABLE_LARGE_UPLOADS", "true")
+        # Signed display-media URLs served by the DB-free manor-media origin
+        # (docs/design/document-media-delivery-zh.md). Off by default; local
+        # and OSS deployments keep the per-file API paths.
+        self.MEDIA_SIGNED_URLS_ENABLED = _env_bool("MEDIA_SIGNED_URLS_ENABLED")
+        # "kid=secret[,kid=secret]": the first key signs, every listed key
+        # verifies (rotation). Never the JWT secret.
+        self.MEDIA_URL_SIGNING_KEYS = os.getenv("MEDIA_URL_SIGNING_KEYS", "")
 
 
 @lru_cache()

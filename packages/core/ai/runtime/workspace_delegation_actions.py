@@ -11,7 +11,7 @@ from hashlib import sha256
 from inspect import isawaitable
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterator
 
 if TYPE_CHECKING:
@@ -210,7 +210,8 @@ def _publish_delegated_child_ledger(run_id: str, result: Any) -> bool:
     parent model. Bookkeeping only: a ledger bug never turns a delegation
     that ran into a reported failure. True only when a calling tool call
     received the child's ledger (a listening sink, a ledger to hand over, no
-    error).
+    error). Otherwise the child is still accounted for, as unknown: an
+    effect-floor marker keeps its effects unconfirmed in the parent.
     """
     from packages.core.ai.runtime import tool_evidence as evidence
 
@@ -219,8 +220,17 @@ def _publish_delegated_child_ledger(run_id: str, result: Any) -> bool:
         published = evidence.runtime_publish_child_evidence(runtime_child_ledger_items(run_id, state))
     except Exception:
         logger.warning("Delegated child ledger hand-off failed: run=%s", run_id, exc_info=True)
-        return False
-    return bool(published) and isinstance(state, dict)
+        published = False
+    if published and isinstance(state, dict):
+        return True
+    try:
+        evidence.runtime_publish_child_floor(run_id)
+    except Exception:
+        # The parent then gets no settled marker either (see
+        # runtime_settled_delegation): its reply decides, as before.
+        logger.warning("Delegated child floor hand-off failed: run=%s", run_id, exc_info=True)
+        _mark_delegation_unaccounted()
+    return False
 
 
 def _delegated_pause_result(pause_payload: dict[str, Any], *, published: bool) -> str:
@@ -236,6 +246,19 @@ def _delegated_hitl_result(result: Any) -> dict[str, Any] | None:
     from packages.core.constants.hitl_envelope import parse_hitl_envelope
 
     return parse_hitl_envelope(result)
+
+
+def _child_callback_hitl(result: Any) -> dict[str, Any] | None:
+    """The approval a child's tool callback reports, with its request id as the token.
+
+    The loop strips ``approval_token`` from callback results. It equals the
+    request id, which only names the request: a resume still needs it GRANTED.
+    """
+    parsed = _delegated_hitl_result(result)
+    request = parsed.get("hitl") if parsed else None
+    if isinstance(request, dict) and _clean(request.get("id")) and not parsed.get("approval_token"):
+        return {**parsed, "approval_token": _clean(request.get("id"))}
+    return parsed
 
 
 def _raw_tool_call_name(tool_call: dict[str, Any]) -> str:
@@ -1246,7 +1269,11 @@ async def _resolve_workspace_service_agent(
     workspace_id: str,
     raw_params: dict[str, Any],
 ) -> tuple[Any | None, Any | None, list[dict[str, Any]], str | None]:
+    from sqlalchemy import and_, or_
+
+    from packages.core.constants.agents import MANOR_AGENT_ID, is_master_agent
     from packages.core.models.workspace import Agent, AgentSubscription
+    from packages.core.services.agent_subscription_service import ensure_default_subscription
 
     available = await _workspace_service_options(
         db,
@@ -1263,19 +1290,35 @@ async def _resolve_workspace_service_agent(
     )
     agent_id = _clean(raw_params.get("agent_id"))
 
+    if agent_id and is_master_agent(agent_id) and not subscription_id and not service_key:
+        # The entity's Manor AI identity, as group rooms use: it works here
+        # without becoming a member of the Workspace.
+        sub = await ensure_default_subscription(db, entity_id=entity_id, agent_id=MANOR_AGENT_ID)
+        await db.commit()
+        # Resolve through the same active-subscription/Agent checks as a pinned
+        # identity; finding an existing default does not reactivate it.
+        subscription_id = sub.id
+
+    in_workspace = AgentSubscription.workspace_id == workspace_id
     filters = [
         AgentSubscription.entity_id == entity_id,
-        AgentSubscription.workspace_id == workspace_id,
         AgentSubscription.status == "active",
     ]
     selector = ""
     if subscription_id:
         filters.append(AgentSubscription.id == subscription_id)
+        filters.append(or_(in_workspace, and_(
+            AgentSubscription.agent_id == MANOR_AGENT_ID,
+            AgentSubscription.workspace_id.is_(None),
+            AgentSubscription.owner_user_id.is_(None),
+        )))
         selector = "agent_subscription_id"
     elif service_key:
+        filters.append(in_workspace)
         filters.append(AgentSubscription.service_key == service_key)
         selector = "service_key"
     elif agent_id:
+        filters.append(in_workspace)
         filters.append(AgentSubscription.agent_id == agent_id)
         selector = "agent_id"
     else:
@@ -1307,6 +1350,15 @@ async def _resolve_workspace_service_agent(
 
 
 DELEGATE_TO_AGENT_TOOL_NAME = "delegate_to_agent"
+# Manor AI reviews work nobody else was assigned to review. Its own Agent has
+# every tool, so here it only reads: asking for a review must not widen what
+# the asking agent can do.
+MANOR_REVIEW_TOOL_NAMES = ("read_file", "list_files", "search_documents", "probe_media", "analyze_audio")
+MANOR_REVIEW_MAX_ROUNDS = 12
+MANOR_REVIEW_SUMMARY = (
+    "Reviews finished work and reports what is wrong. It can only read: "
+    "give it the brief and the files to check."
+)
 # Manor -> agent -> one more agent. Deeper chains are refused: each level is a
 # blocking nested loop, and a cycle would never return.
 MAX_DELEGATION_DEPTH = 2
@@ -1314,6 +1366,41 @@ MAX_DELEGATION_DEPTH = 2
 MAX_PARALLEL_DELEGATIONS = 20
 PARALLEL_DELEGATION_STAGGER_SECONDS = 0.2
 _delegation_depth: "ContextVar[int]" = ContextVar("workspace_delegation_depth", default=0)
+# One delegation call's accounting, shared with its parallel children (they
+# run in copies of this context, holding the same dict).
+_delegation_accounting: "ContextVar[dict[str, bool] | None]" = ContextVar(
+    "workspace_delegation_accounting", default=None,
+)
+
+
+def _mark_delegation_unaccounted() -> None:
+    accounting = _delegation_accounting.get()
+    if accounting is not None:
+        accounting["unaccounted"] = True
+
+
+async def runtime_settled_delegation(run: Awaitable[str]) -> str:
+    """Run one delegation tool call and settle it through its children.
+
+    A delegation changes nothing itself: each child it started hands its whole
+    ledger (or, when that is unknown, an effect floor) to the calling tool
+    call. Once every child is accounted for, the call is declared settled, so
+    its reply (a child that ended ``partial`` or ``blocked`` after only
+    reading, a refusal before any child ran) is never read as an unconfirmed
+    effect of its own. A call that raised, or a child left unaccounted, stays
+    judged by its reply.
+    """
+    from packages.core.ai.runtime.tool_evidence import runtime_publish_children_settled
+
+    accounting = {"unaccounted": False}
+    token = _delegation_accounting.set(accounting)
+    try:
+        result = await run
+    finally:
+        _delegation_accounting.reset(token)
+    if not accounting["unaccounted"]:
+        runtime_publish_children_settled()
+    return result
 
 
 @contextmanager
@@ -1344,10 +1431,11 @@ async def runtime_workspace_delegation_targets(
     """Every agent in the Workspace another agent can hand work to.
 
     Labels are the names people see (deployment name, else agent name), made
-    unique with the service key or a short id. Manor itself and the calling
-    agent are not targets.
+    unique with the service key or a short id. The calling agent is not a
+    target. Manor AI is one for every other agent, to review their work; it
+    needs no deployment in the Workspace, so its entry names no subscription.
     """
-    from packages.core.constants.agents import is_master_agent
+    from packages.core.constants.agents import MANOR_AGENT_ID, MANOR_AGENT_NAME, is_master_agent
     from packages.core.models.workspace import Agent, AgentSubscription
 
     rows = (await db.execute(
@@ -1381,6 +1469,14 @@ async def runtime_workspace_delegation_targets(
             "agent_id": agent.id,
             "service_key": sub.service_key,
             "summary": summary[:200],
+        })
+    if exclude_agent_id and not is_master_agent(exclude_agent_id):
+        targets.append({
+            "label": MANOR_AGENT_NAME,
+            "agent_subscription_id": "",
+            "agent_id": MANOR_AGENT_ID,
+            "service_key": None,
+            "summary": MANOR_REVIEW_SUMMARY,
         })
     # By the label people see: same-named agents created together have no stable
     # creation order, and the tool schema must not change between turns.
@@ -1629,7 +1725,7 @@ async def runtime_delegation_batch(
     A task names its agent as listed (``agent``) or by subscription id,
     service key or agent id, and carries its instructions in ``task`` or
     ``prompt``. Listed names are matched against the Workspace's agents
-    (never Manor, never the caller). With ``pin_targets`` every task is then
+    (never the caller; Manor AI only for another agent). With ``pin_targets`` every task is then
     resolved to one active subscription, duplicates and empty tasks are
     refused, and each task gets its answer budget; chat defers that step to
     its parallel runner so a lone task keeps its own resolution path.
@@ -1674,7 +1770,10 @@ async def runtime_delegation_batch(
                     "available_agents": [item["label"] for item in targets],
                     "action_executed": False,
                 }))
-            params["agent_subscription_id"] = target["agent_subscription_id"]
+            if target["agent_subscription_id"]:
+                params["agent_subscription_id"] = target["agent_subscription_id"]
+            else:
+                params["agent_id"] = target["agent_id"]
             label = target["label"]
         else:
             params.update(explicit)
@@ -1688,6 +1787,17 @@ async def runtime_delegation_batch(
 
 
 def _service_prompt_appendix(sub: Any, agent: Any, caller: str = "Manor AI") -> str:
+    from packages.core.constants.agents import is_master_agent
+
+    if is_master_agent(getattr(sub, "agent_id", None)):
+        return (
+            f"You are reviewing work at the request of {caller}. Judge it against the "
+            "brief in the request, using only the read tools you have here: inspect the "
+            "files and frames it names, and say what you could not check. You cannot "
+            "change, render, publish or delegate anything, and no person is available to "
+            "ask. Answer with a verdict of pass or fail, then each defect with its file "
+            "or timestamp and the evidence."
+        )
     service_key = _clean(getattr(sub, "service_key", None))
     service_label = (
         service_key
@@ -2090,6 +2200,9 @@ async def runtime_workspace_delegate_parallel(
     for result in raws:
         if isinstance(result, asyncio.CancelledError):
             raise result
+        if isinstance(result, BaseException):
+            # It escaped its own accounting: what it ran is unknown.
+            _mark_delegation_unaccounted()
     raws = [
         _dumps({"error": "workspace_service_delegation_failed", "message": str(result)})
         if isinstance(result, BaseException) else result
@@ -2200,12 +2313,15 @@ async def runtime_delegated_child_setup(
     """
     from packages.core.ai.agentic_loop import DEFAULT_MAX_ROUNDS
     from packages.core.ai.context import build_agent_context
+    from packages.core.ai.runtime.envelope import RuntimeDiscoveredToolGrants
     from packages.core.ai.runtime.human_input import (
         REQUEST_INPUT_TOOL_NAME,
         runtime_request_input_tool_schema,
     )
     from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.ai.runtime.tool_registry import runtime_tool_schemas_for_names
     from packages.core.ai.runtime.turn_policy import runtime_turn_max_rounds
+    from packages.core.constants.agents import is_master_agent
 
     sub, agent, available_services, error = await _resolve_workspace_service_agent(
         db,
@@ -2302,6 +2418,30 @@ async def runtime_delegated_child_setup(
             raw_params.get("max_rounds"), default=chat_max_rounds, upper=chat_max_rounds,
         )
 
+    if is_master_agent(sub.agent_id):
+        # Execution enforces the envelope, so narrowing the tool list alone
+        # would leave every Manor AI tool callable.
+        tools = runtime_tool_schemas_for_names(MANOR_REVIEW_TOOL_NAMES)
+        ctx.tools = tools
+        ctx.allowed_tool_names = set(MANOR_REVIEW_TOOL_NAMES)
+        if ctx.runtime_envelope is not None:
+            ctx.runtime_envelope = replace(
+                ctx.runtime_envelope,
+                tool_names=MANOR_REVIEW_TOOL_NAMES,
+                allowed_tool_names=MANOR_REVIEW_TOOL_NAMES,
+                mcp_provider_scopes=(),
+                mcp_scope_unrestricted=False,
+                discovered_tool_grants=RuntimeDiscoveredToolGrants(),
+            )
+        return RuntimeDelegatedChildSetup(
+            sub=sub,
+            agent=agent,
+            ctx=ctx,
+            tools=tools,
+            allowed_tool_names=list(MANOR_REVIEW_TOOL_NAMES),
+            max_rounds=min(max_rounds, MANOR_REVIEW_MAX_ROUNDS),
+        )
+
     tools = list(ctx.tools)
     if not any(
         _clean((tool.get("function") or {}).get("name"))
@@ -2338,8 +2478,8 @@ def runtime_delegated_child_billing(
     workspace_id: str,
     conversation_id: str | None,
     fallback_model: str | None,
-    byok: bool,
     payer_entity_id: str | None = None,
+    task_id: str | None = None,
 ) -> Iterator[tuple[Callable[..., Any], Callable[..., Any]]]:
     """Per-call durable billing for one invocation of a delegated child.
 
@@ -2350,17 +2490,12 @@ def runtime_delegated_child_billing(
     fresh nonce per invocation so that real provider work repeated after a
     crash is not hidden by the settlement idempotency fence of an earlier
     process. ``payer_entity_id`` (``resolve_run_payer``) pins who pays for
-    the invocation in both the callbacks and the bound context.
+    the invocation in both the callbacks and the bound context. ``task_id``
+    names the Task the child works for, so its usage rows are tied to it.
     """
-    from packages.core.ai.runtime.billing import (
-        runtime_release_billing_context,
-        runtime_set_suppressed_billing_context,
-    )
-    from packages.core.services.usage_service import (
-        build_durable_llm_billing_callbacks,
-    )
+    from packages.core.ai.runtime.billing import runtime_durable_loop_billing
 
-    reserve_llm_call, settle_llm_call = build_durable_llm_billing_callbacks(
+    with runtime_durable_loop_billing(
         source_prefix=f"delegation:{run_id}:{invocation_id}",
         entity_id=entity_id,
         user_id=user_id,
@@ -2368,22 +2503,10 @@ def runtime_delegated_child_billing(
         workspace_id=workspace_id,
         conversation_id=conversation_id,
         fallback_model=fallback_model,
-        byok=byok,
         payer_entity_id=payer_entity_id,
-    )
-    billing_handle = runtime_set_suppressed_billing_context(
-        entity_id=entity_id,
-        user_id=user_id,
-        agent_id=agent_id,
-        workspace_id=workspace_id,
-        conversation_id=conversation_id,
-        durable_per_call=True,
-        payer_entity_id=payer_entity_id,
-    )
-    try:
-        yield reserve_llm_call, settle_llm_call
-    finally:
-        runtime_release_billing_context(billing_handle)
+        task_id=task_id,
+    ) as callbacks:
+        yield callbacks
 
 
 def runtime_delegated_tool_outcome(name: str, raw_result: Any) -> dict[str, Any]:
@@ -2661,6 +2784,14 @@ def _delegated_input_pause_payload(
                 else {}
             ),
         })
+    recommended = input_payload.get("recommendation")
+    if isinstance(recommended, dict) and recommended.get("option"):
+        # The child's recommended answer leads its own question's choices.
+        for entry in questions:
+            if recommended["option"] in (entry.get("options") or []):
+                entry["recommended"] = recommended["option"]
+                entry["recommendation_reason"] = recommended.get("reason")
+                break
     pending_action = PendingAction.needs_input(
         questions=questions,
         title=question or "Input required",
@@ -2750,13 +2881,22 @@ async def _runtime_workspace_delegate_service_action(
     # The child loop's result, once it returned: a later failure still hands
     # over the ledger of what the child already did.
     result = None
+    # Once the child loop started, every exit accounts for it in the parent.
+    loop_started = False
     try:
         from packages.core.ai.agentic_loop import LOOP_COMPACT_RATIO
         from packages.core.services.model_context_window import effective_context_window_tokens
         from packages.core.ai.runtime.context_window import runtime_context_window_usage, context_tool_manifest
+        from packages.core.ai.chat_logger import (
+            DELEGATION_TOOL_CALL_SOURCE,
+            safe_tool_args,
+            schedule_tool_call_log,
+        )
         from packages.core.ai.runtime.harness import runtime_execute_chat_agent_loop
         from packages.core.ai.runtime.streams import (
             runtime_tool_arguments_for_chat,
+            runtime_tool_call_error,
+            runtime_tool_call_outcome,
             runtime_tool_status_for_chat,
             runtime_tool_stream_sink_var,
         )
@@ -2940,7 +3080,24 @@ async def _runtime_workspace_delegate_service_action(
             # Observe only this turn's receipts. Historical failed attempts in
             # the private session must not poison a later successful turn.
             current_tool_results.append(runtime_delegated_tool_outcome(name, result))
-            parsed_hitl = _delegated_hitl_result(result)
+            tool_error = runtime_tool_call_error(result)
+            schedule_tool_call_log(
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                agent_id=sub.agent_id,
+                user_id=user_id or None,
+                conversation_id=conversation_id or None,
+                tool_name=name,
+                round_num=None,
+                duration_ms=int(duration_ms),
+                result_chars=len(result or ""),
+                success=tool_error is None,
+                error=tool_error,
+                tool_args=safe_tool_args(args),
+                source=DELEGATION_TOOL_CALL_SOURCE,
+                outcome=runtime_tool_call_outcome(name, result),
+            )
+            parsed_hitl = _child_callback_hitl(result)
             if parsed_hitl is not None and isinstance(args, dict):
                 nested_hitl.append((name, dict(args), parsed_hitl))
             signature = _tool_event_signature(name, args)
@@ -3019,12 +3176,13 @@ async def _runtime_workspace_delegate_service_action(
             workspace_id=workspace_id,
             conversation_id=conversation_id,
             fallback_model=ctx.model,
-            byok=bool(getattr(ctx, "byok", False)),
             payer_entity_id=await resolve_run_payer(
                 None, entity_id=entity_id, workspace_id=workspace_id,
             ),
+            task_id=task_id or ctx.task_id,
         ) as (reserve_llm_call, settle_llm_call):
             with runtime_tool_effect_intent_scope(on_tool_effect_intent):
+                loop_started = True
                 result = await runtime_execute_chat_agent_loop(
                     runtime_envelope=ctx.runtime_envelope,
                     prompt_context=getattr(ctx, "prompt_context", None),
@@ -3067,6 +3225,9 @@ async def _runtime_workspace_delegate_service_action(
                         "turn_context": answer_budget_note}
                        if answer_budget is not None and output_schema is None else {}),
                     runtime_run_id=delegation_idempotency_key or None,
+                    # A Task child keeps the Task's identity, so a retried Task
+                    # finds the approvals of its earlier attempt.
+                    performance_run_id=None if task_id or ctx.task_id else run_id or None,
                     forced_tool_calls=(
                         _delegation_resume_forced_calls(
                             delegation_resume,
@@ -3270,7 +3431,8 @@ async def _runtime_workspace_delegate_service_action(
         _publish_delegated_child_ledger(run_id, result)
         return _dumps(child.payload)
     except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001
-        if result is not None and getattr(result, "tool_evidence", None):
+        if loop_started:
+            # Its ledger when the loop returned one, else unknown (a floor).
             _publish_delegated_child_ledger(run_id, result)
         if session_id and run_id:
             try:

@@ -406,6 +406,18 @@ class MessageLog(Base, TimestampMixin):
                 "AND external_id IS NOT NULL"
             ),
         ),
+        # Keyed by the bot's update_id ("update:<id>"). Older Telegram rows
+        # hold a per-chat message_id, which is not unique per bot.
+        Index(
+            "uq_message_logs_telegram_inbound_update",
+            "channel_config_id",
+            "external_id",
+            unique=True,
+            postgresql_where=sql_text(
+                "channel_type = 'telegram' AND direction = 'inbound' "
+                "AND external_id LIKE 'update:%'"
+            ),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)

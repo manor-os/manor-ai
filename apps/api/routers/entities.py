@@ -37,13 +37,15 @@ class EntityUpdateRequest(BaseModel):
 
 def _entity_response(entity) -> EntityResponse:
     if isinstance(entity, dict):
-        return EntityResponse(**{k: entity.get(k) for k in EntityResponse.model_fields if k in entity})
-    return EntityResponse(
-        id=entity.id, name=entity.name, slug=entity.slug,
-        address=entity.address, phone=entity.phone, email=entity.email,
-        logo_url=entity.logo_url, llm_model=entity.llm_model,
-        settings=entity.settings or {},
-    )
+        response = EntityResponse(**{k: entity.get(k) for k in EntityResponse.model_fields if k in entity})
+    else:
+        response = EntityResponse(
+            id=entity.id, name=entity.name, slug=entity.slug,
+            address=entity.address, phone=entity.phone, email=entity.email,
+            logo_url=entity.logo_url, llm_model=entity.llm_model,
+            settings=entity.settings or {},
+        )
+    return response
 
 
 @router.get("/me", response_model=EntityResponse)

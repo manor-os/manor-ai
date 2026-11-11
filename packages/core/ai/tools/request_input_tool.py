@@ -29,6 +29,7 @@ from packages.core.ai.runtime.control import (
 from packages.core.ai.runtime.human_input import (
     HUMAN_INPUT_MODE_SUSPEND,
     INPUT_FIELD_TYPES,
+    LINE_ITEM_COLUMN_TYPES,
     REQUEST_INPUT_DEADLINE_HOURS,
     REQUEST_INPUT_JUSTIFICATION_SCHEMA,
     REQUEST_INPUT_TOOL_NAME,
@@ -52,10 +53,15 @@ async def _request_input(
     fields: list[dict[str, Any]] | None = None,
     context: str | None = None,
     justification: dict[str, Any] | None = None,
+    recommended: str | None = None,
+    recommendation_reason: str | None = None,
     **kwargs: Any,
 ) -> Any:
     arguments: dict[str, Any] = {"question": question}
-    for key, value in (("options", options), ("fields", fields), ("context", context), ("justification", justification)):
+    for key, value in (
+        ("options", options), ("fields", fields), ("context", context), ("justification", justification),
+        ("recommended", recommended), ("recommendation_reason", recommendation_reason),
+    ):
         if value is not None:
             arguments[key] = value
     invalid = validate_runtime_tool_arguments(arguments=arguments, tool_schema=REQUEST_INPUT_SCHEMA)
@@ -69,6 +75,7 @@ async def _request_input(
     try:
         payload = normalize_input_request(
             question=question, options=options, fields=fields, context=context, justification=justification,
+            recommended=recommended, recommendation_reason=recommendation_reason,
         )
     except ValueError as exc:
         return RuntimePreflightValidationError(RuntimeToolInputValidationFailure(
@@ -114,35 +121,29 @@ REQUEST_INPUT_SCHEMA: dict[str, Any] = {
     "function": {
         "name": REQUEST_INPUT_TOOL_NAME,
         "description": (
-            "Ask for user-only facts, material, or decisions; resume with the answer. "
-            "Ask only when it changes work; batch questions in `fields`; documents go in a "
-            "`file` field. Check context "
-            "and authorized tools first; infer what you can. Include `justification`: human-only reason and "
-            "checks made. Handle tool errors, execution checks, file writes, and "
-            "acceptance validation yourself. For `file_review`, cite exact existing "
-            "`file_refs` and ask for human judgment, not write verification. Rationale "
-            "does not prove execution or authorize action. Never ask for tool access or "
-            "Agent configuration; a person's yes cannot create a binding. For a missing "
-            "tool, use `search_tools`, then `acquire_capabilities` when offered; if "
-            "acquisition fails or is unavailable, stop as blocked naming the capability "
-            "and purpose (in a Task, complete_task(outcome=blocked)). For tools, only "
-            "ask to connect an external account."
+            "Request missing information from the user, or ask for a decision or material; resume with the answer. "
+            "Set `recommended` and `recommendation_reason`; max 3 choices. "
+            "Batch fields; use a `file` field for Documents. "
+            "Never ask for tool access or Agent configuration: consent cannot create a binding. "
+            "Use search_tools, then acquire_capabilities if offered; otherwise stop as blocked and name "
+            "the capability and purpose (Task: complete_task(outcome=blocked))."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "question": {
                     "type": "string",
-                    "description": "The question, in the user's language, self-contained.",
+                    "description": "Self-contained question in the user's language.",
                 },
                 "options": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Choices to pick from.",
                 },
+                "recommended": {"type": "string"},
+                "recommendation_reason": {"type": "string"},
                 "fields": {
                     "type": "array",
-                    "description": "Structured fields to collect at once.",
+                    "description": "select/multi_select: options; record/records: project_type; line_items: columns.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -151,6 +152,21 @@ REQUEST_INPUT_SCHEMA: dict[str, Any] = {
                             "type": {"type": "string", "enum": list(INPUT_FIELD_TYPES)},
                             "required": {"type": "boolean"},
                             "options": {"type": "array", "items": {"type": "string"}},
+                            "project_type": {"type": "string"},
+                            "columns": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "label": {"type": "string"},
+                                        "type": {"type": "string", "enum": list(LINE_ITEM_COLUMN_TYPES)},
+                                        "options": {"type": "array", "items": {"type": "string"}},
+                                    },
+                                    "required": ["name"],
+                                },
+                            },
+                            "description": {"type": "string"},
                         },
                         "required": ["name"],
                     },
@@ -161,7 +177,7 @@ REQUEST_INPUT_SCHEMA: dict[str, Any] = {
                 },
                 "justification": REQUEST_INPUT_JUSTIFICATION_SCHEMA,
             },
-            "required": ["question", "justification"],
+            "required": ["question", "justification", "recommended", "recommendation_reason"],
         },
     },
 }

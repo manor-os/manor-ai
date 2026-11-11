@@ -1,9 +1,19 @@
 (() => {
   document.documentElement.dataset.shellScript = "started";
-  const token = new URLSearchParams(window.location.search).get("preview") || "";
+  const params = new URLSearchParams(window.location.search);
+  const token = params.get("preview") || "";
   const preview = document.getElementById("manor-generated-preview");
   const parentOrigin = window.location.origin;
   let renderRequested = false;
+
+  // frame-src on this document is the only policy that stops the inner frame
+  // navigating itself to a URL carrying its data; about:srcdoc stays exempt.
+  if (params.get("navigation") === "locked") {
+    const policy = document.createElement("meta");
+    policy.httpEquiv = "Content-Security-Policy";
+    policy.content = "frame-src 'none'";
+    document.head.appendChild(policy);
+  }
 
   const notifyParent = (message) => {
     window.parent.postMessage({ ...message, token }, parentOrigin);
@@ -31,6 +41,9 @@
       return;
     }
     if (event.source === preview.contentWindow) {
+      // The inner document can read the token from document.baseURI, so only
+      // this script may speak the shell's own protocol to the host.
+      if (String(event.data?.type).startsWith("manor-html-preview:")) return;
       window.parent.postMessage(event.data, parentOrigin);
     }
   });

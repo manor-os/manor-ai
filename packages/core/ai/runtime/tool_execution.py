@@ -6,7 +6,7 @@ from collections.abc import Callable, Iterable
 import inspect
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Mapping
 
 if TYPE_CHECKING:
     from packages.core.ai.runtime.dynamic_mcp import (
@@ -31,7 +31,7 @@ from packages.core.ai.runtime.authorization_receipts import (
     RuntimeToolAuthorizationLease,
     RuntimeToolAuthorizationLeaseFactory,
     runtime_begin_tool_authorization_scope,
-    runtime_workflow_receipt_is_executable,
+    runtime_workflow_receipt_block_result,
     runtime_end_tool_authorization_scope,
     runtime_capture_tiktok_publish_consent,
     runtime_capture_chrome_publication_binding,
@@ -65,6 +65,7 @@ from packages.core.ai.runtime.tool_input_validation import (
     validate_runtime_tool_arguments,
 )
 from packages.core.ai.runtime.tool_error_contract import tool_error_payload
+from packages.core.ai.runtime.file_context import editor_document_snapshot_for_path
 from packages.core.ai.runtime.tool_context import (
     RUNTIME_TOOL_CONTEXT_KEYS,
     RuntimeToolCallContext,
@@ -95,6 +96,7 @@ def _output_scope(context: RuntimeToolCallContext, tool_name: str, arguments: di
     return WorkspaceArtifactScope(
         context.entity_id, context.workspace_id,
         context.workflow_run_id, context.workflow_lineage_root_run_id, shared,
+        workflow_project_root=context.workflow_project_root,
     )
 
 
@@ -124,6 +126,7 @@ RUNTIME_ENVELOPE_AWARE_TOOLS = (
             "search_tools",
             "resident_maintenance_status",
             "resident_maintenance_draft",
+            "remember",
             "website_content",
             "workspace_agent",
             "workspace_request_strategist_review",
@@ -248,6 +251,23 @@ _FILE_REFERENCE_ARGUMENTS: dict[str, tuple[str, ...]] = {
     "delete_file": ("path",),
     "replace_file": ("source_path", "target_path"),
 }
+
+
+def _runtime_project_storage_scope(arguments: dict[str, Any], context: RuntimeToolCallContext) -> dict[str, Any]:
+    """A run working on a WorkflowProject keeps the files it shares in the project's folder.
+
+    ``storage_scope: "workspace"`` asks for a file others can find ("make the
+    handoff note available"); in such a run that is the project's folder, where
+    its App view and reviews look. A named Workspace asset stays one.
+    """
+    params = arguments.get("params") if isinstance(arguments.get("params"), dict) else {}
+    if (
+        not context.workflow_project_root
+        or str(arguments.get("storage_scope") or "").strip().lower() != "workspace"
+        or arguments.get("workspace_asset_key") or params.get("workspace_asset_key")
+    ):
+        return arguments
+    return {**arguments, "storage_scope": "task"}
 
 
 async def _runtime_canonical_file_arguments(
@@ -470,6 +490,26 @@ def runtime_preflight_tool_resolution(
     return RuntimeToolResolutionPreflight(context=context, harness=harness)
 
 
+_CONVERSATION_SURFACES = frozenset({
+    "global_owner_chat", "agent_dm", "workspace_chat", "public_customer_chat",
+    "external_channel_chat", "file_editor_chat", "voice_chat",
+})
+
+
+def runtime_approval_origin_task_id(context: RuntimeToolCallContext, envelope: Any | None) -> str | None:
+    """The Task a call runs for, which the approval gate holds to account.
+
+    A conversation turn runs for no Task: a ``task_id`` there is the Task a
+    tool such as get_task_details reads or changes, and judging it as the
+    origin refused every such call once that Task had completed.
+    """
+
+    surface = getattr(getattr(envelope, "surface", None), "value", getattr(envelope, "surface", None))
+    if surface in _CONVERSATION_SURFACES and not getattr(envelope, "task_id", None):
+        return None
+    return context.task_id
+
+
 def _runtime_tool_approval_request(
     *,
     tool_name: str,
@@ -496,7 +536,7 @@ def _runtime_tool_approval_request(
         # Sandbox-bound tools are also authorized against their sandbox
         # binding, so a conversation-less Task or Workflow run has a scope.
         sandbox_binding_key=runtime_authorization_sandbox_binding_key(context, tool_name),
-        task_id=context.task_id,
+        task_id=runtime_approval_origin_task_id(context, envelope),
         step_id=step_id,
         envelope=envelope,
         declared_effect=(
@@ -929,8 +969,8 @@ async def runtime_execute_prepared_tool_handler(
             conversation_id=context.conversation_id,
         )
     try:
-        if not await runtime_workflow_receipt_is_executable(prepared.authorization_receipt):
-            blocked = json.dumps({"error": "workflow_origin_not_executable", "action_executed": False})
+        blocked = await runtime_workflow_receipt_block_result(prepared.authorization_receipt)
+        if blocked is not None:
             if harness is not None:
                 harness.record_tool_block_result(tool_name, blocked)
             return blocked
@@ -1135,13 +1175,16 @@ async def runtime_execute_scoped_dynamic_tool_handler(
     step_id: str | None = None,
     active_user_message: str | None = None,
     allowed_tool_names: set[str] | None = None,
+    gate_context: Mapping[str, Any] | None = None,
 ) -> str | RuntimeToolSuspension:
     """Execute a runtime-scoped dynamic handler outside the global registry.
 
     Some entrypoints add per-run tools whose handlers are closures rather than
     registered ToolPool handlers. They still traverse the same hard
     authorization, governance, and HITL boundary as registered tools, but do
-    not receive hidden registry context kwargs.
+    not receive hidden registry context kwargs. ``gate_context`` is what that
+    boundary reads about the run (a Workflow step's run id); the handler never
+    sees it.
     """
 
     def envelope_value(name: str, explicit: str | None) -> str | None:
@@ -1151,7 +1194,7 @@ async def runtime_execute_scoped_dynamic_tool_handler(
 
     prepared = await runtime_prepare_tool_execution(
         tool_name=tool_name,
-        arguments=arguments,
+        arguments={**arguments, **(gate_context or {})},
         entity_id=envelope_value("entity_id", entity_id),
         user_id=envelope_value("user_id", user_id),
         agent_id=envelope_value("agent_id", agent_id),
@@ -1213,8 +1256,8 @@ async def runtime_execute_scoped_dynamic_tool_handler(
             conversation_id=envelope_value("conversation_id", conversation_id),
         )
     try:
-        if not await runtime_workflow_receipt_is_executable(prepared.authorization_receipt):
-            blocked = json.dumps({"error": "workflow_origin_not_executable", "action_executed": False})
+        blocked = await runtime_workflow_receipt_block_result(prepared.authorization_receipt)
+        if blocked is not None:
             if harness is not None:
                 harness.record_tool_block_result(tool_name, blocked)
             return blocked
@@ -1276,7 +1319,9 @@ async def runtime_execute_scoped_dynamic_tool_handler(
             approval_request_id=prepared.consumed_approval_request_id,
         )
         with workspace_artifact_scope(prepared.artifact_scope):
-            result = handler(prepared_arguments)
+            result = handler({
+                key: value for key, value in prepared_arguments.items() if key not in (gate_context or {})
+            })
             if hasattr(result, "__await__"):
                 result = await result
         if isinstance(result, RuntimeToolSuspension):
@@ -1621,6 +1666,7 @@ async def runtime_prepare_tool_execution(
     resolved_arguments = await _runtime_canonical_file_arguments(
         tool_name, resolved_arguments, entity_id=context.entity_id,
     )
+    resolved_arguments = _runtime_project_storage_scope(resolved_arguments, context)
     policy_arguments = _runtime_policy_arguments(
         tool_name,
         resolved_arguments,
@@ -1710,7 +1756,12 @@ async def runtime_prepare_tool_execution(
         prepared_arguments.pop("approval_token", None)
 
     if inject_runtime_context:
-        envelope_aware = tool_name in RUNTIME_ENVELOPE_AWARE_TOOLS
+        envelope_aware = tool_name in RUNTIME_ENVELOPE_AWARE_TOOLS or (
+            # These read this turn's editor snapshot instead of the saved file.
+            tool_name in {"read_file", "grep_files"}
+            and editor_document_snapshot_for_path(runtime_envelope, str(resolved_arguments.get("path") or ""))
+            is not None
+        )
         llm_metadata_aware = tool_name in RUNTIME_LLM_METADATA_AWARE_TOOLS
         injected_runtime_envelope = runtime_envelope if envelope_aware else None
         prepared_arguments.update(

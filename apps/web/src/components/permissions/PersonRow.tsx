@@ -74,7 +74,7 @@ export default function PersonRow({
           style={{
             fontSize: 13,
             fontWeight: 600,
-            color: "#292524",
+            color: "var(--text-strong)",
             overflow: "hidden",
             textOverflow: "ellipsis",
             whiteSpace: "nowrap",
@@ -90,7 +90,7 @@ export default function PersonRow({
         <div
           style={{
             fontSize: 11,
-            color: "#78716c",
+            color: "var(--text-muted)",
             overflow: "hidden",
             textOverflow: "ellipsis",
             whiteSpace: "nowrap",
@@ -103,7 +103,7 @@ export default function PersonRow({
       </div>
 
       {locked ? (
-        <span style={{ fontSize: 12, color: "#a8a29e", textAlign: "center" }}>
+        <span style={{ fontSize: 12, color: "var(--text-muted)", textAlign: "center" }}>
           {roleOpts.find((r) => r.value === role)?.label ?? role}
         </span>
       ) : (
@@ -130,7 +130,7 @@ export default function PersonRow({
             background: "transparent",
             border: "none",
             cursor: "pointer",
-            color: "#a8a29e",
+            color: "var(--text-faint)",
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
@@ -141,7 +141,7 @@ export default function PersonRow({
           }}
           onMouseLeave={(e) => {
             (e.currentTarget as HTMLElement).style.background = "transparent";
-            (e.currentTarget as HTMLElement).style.color = "#a8a29e";
+            (e.currentTarget as HTMLElement).style.color = "#aeaeb2";
           }}
         >
           <IconTrash size={14} />

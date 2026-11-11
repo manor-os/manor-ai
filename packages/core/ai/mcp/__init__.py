@@ -31,7 +31,6 @@ from . import (
     ms_excel,
     nango,
     quickbooks,
-    stripe,
     twitter_x,
     wechat_official,
     wechat_personal,
@@ -95,7 +94,6 @@ BUILTIN_MCP_MODULES: dict[str, MCPModule] = {
     # connected" error when absent.
     "nango": nango,
     "quickbooks": quickbooks,
-    "stripe": stripe,
     "twitter_x": twitter_x,
     "email": email_module,
     "wechat_official": wechat_official,

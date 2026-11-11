@@ -1,0 +1,205 @@
+.run-production { display: grid; gap: 14px; min-width: 0; }
+
+.run-production__head { display: flex; align-items: baseline; gap: 10px; color: var(--text-muted); font-size: 13px; }
+
+.run-production__head strong { color: var(--text-strong); font-size: 28px; font-weight: 600; line-height: 1; }
+
+.run-production__elapsed { margin-left: auto; font-size: 12px; }
+
+.run-production__stages { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; list-style: none; }
+
+.run-production__stages > li { display: grid; gap: 6px; flex-basis: 0; min-width: max-content; }
+
+.run-production__bar { display: block; height: 4px; overflow: hidden; border-radius: 2px; background: var(--border-default, rgba(29, 29, 31,0.08)); }
+
+.run-production__bar > span { display: block; height: 100%; border-radius: 2px; background: var(--ink, var(--text-strong)); transition: width .4s ease; }
+
+.run-production__stages > li[data-state="failed"] .run-production__bar > span { width: 100% !important; background: var(--danger, #b42318); }
+
+.run-production__stages > li[data-state="stopped"] .run-production__bar > span { width: 100% !important; background: var(--text-faint); }
+
+.run-production__stage-label { overflow: hidden; color: var(--text-muted); font-size: 11px; white-space: nowrap; text-overflow: ellipsis; }
+
+.run-production__stages > li[data-state="active"] .run-production__stage-label,
+.run-production__stages > li[data-state="done"] .run-production__stage-label { color: var(--text-strong); }
+
+.run-production__stages > li[data-state="active"] .run-production__stage-label { font-weight: 600; }
+
+.run-production__timeline { display: flex; gap: 6px; overflow-x: auto; padding: 3px 3px 6px; scroll-snap-type: x proximity; }
+
+.run-production__unit {
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  flex-basis: 0;
+  min-width: 132px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  scroll-snap-align: start;
+}
+
+.run-production__frame {
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  overflow: hidden;
+  aspect-ratio: 16 / 9;
+  border-radius: 8px;
+  background: var(--surface-muted);
+  outline: 1.5px solid transparent;
+  outline-offset: 2px;
+}
+
+.run-production__unit[aria-selected="true"] .run-production__frame { outline-color: var(--accent); }
+
+.run-production__unit[data-playing] .run-production__frame { outline-color: var(--text-strong); }
+
+.run-production__final, .run-production__player { width: 100%; max-width: 720px; }
+
+.run-production__screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  aspect-ratio: 16 / 9;
+  border-radius: 12px;
+  background: #000000;
+}
+
+.run-production__screen video { width: 100%; height: 100%; object-fit: contain; }
+
+.run-production__screen-text { max-width: 80%; margin: 0; color: rgba(255, 255, 255, 0.82); font-size: 15px; line-height: 1.5; text-align: center; }
+
+.run-production__player-bar { display: flex; align-items: center; gap: 12px; margin-top: 8px; color: var(--text-muted); font-size: 12px; }
+
+.run-production__player-bar button {
+  padding: 6px 12px;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: var(--surface-muted);
+  color: var(--text-strong);
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.run-production__player-bar button:focus-visible { outline: 0; box-shadow: 0 0 0 3px var(--accent-ring); }
+
+.run-production__versions { display: flex; flex-wrap: wrap; gap: 4px; }
+
+.run-production__versions button {
+  padding: 3px 10px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.run-production__versions button[aria-pressed="true"] { background: var(--ink, var(--text-strong)); color: var(--surface-panel, #fff); }
+
+.run-production__versions button:focus-visible { outline: 0; box-shadow: 0 0 0 3px var(--accent-ring); }
+
+.run-production__revise { display: grid; gap: 8px; width: 100%; max-width: 720px; }
+
+.run-production__changed { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; color: var(--text-strong); font-size: 13px; }
+
+.run-production__revise-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+
+.run-production__revise-actions small { color: var(--text-muted); font-size: 11px; }
+
+.run-production__error { margin: 0; color: var(--danger, #b42318); font-size: 12px; }
+
+.run-production__unit:focus-visible { outline: 0; }
+
+.run-production__unit:focus-visible .run-production__frame { box-shadow: 0 0 0 3px var(--accent-ring); }
+
+.run-production__frame video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #000; }
+
+.run-production__sketch {
+  display: -webkit-box;
+  overflow: hidden;
+  padding: 8px 8px 12px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.run-production__unit[data-state="planned"] .run-production__frame { background: repeating-linear-gradient(135deg, var(--surface-muted) 0 8px, transparent 8px 16px); }
+
+.run-production__index {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(29, 29, 31, 0.55);
+  color: #fff;
+  font-size: 10px;
+}
+
+.run-production__unit-bar { position: absolute; right: 0; bottom: 0; left: 0; height: 3px; background: rgba(29, 29, 31, 0.08); }
+
+.run-production__unit-bar > span { display: block; height: 100%; background: var(--ink, var(--text-strong)); transition: width .4s ease; }
+
+.run-production__unit[data-state="making"] .run-production__frame { animation: run-production-pulse 2s ease-in-out infinite; }
+
+.run-production__bar { position: relative; }
+
+.run-production[data-running] .run-production__stages > li[data-state="active"] .run-production__bar::after {
+  content: ""; position: absolute; inset: 0; width: 40%;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--ink, var(--text-strong)) 35%, transparent), transparent);
+  animation: run-production-glint 1.6s ease-in-out infinite;
+}
+
+.run-production__unit { animation: run-production-enter .45s cubic-bezier(.2, .7, .3, 1) both; animation-delay: calc(var(--unit-index, 0) * 70ms); }
+
+.run-production[data-running] .run-production__unit[data-state="planned"] .run-production__frame {
+  animation: run-production-stripes 1.2s linear infinite;
+}
+
+.run-production__unit[data-state="making"] .run-production__frame::before {
+  content: ""; position: absolute; inset: 0; z-index: 1; pointer-events: none;
+  background: linear-gradient(105deg, transparent 35%, rgba(255, 255, 255, 0.55) 50%, transparent 65%);
+  background-size: 250% 100%;
+  animation: run-production-sheen 2.2s ease-in-out infinite;
+}
+
+.run-production__frame video { animation: run-production-arrive .5s ease-out both; }
+
+.run-production__unit-state { color: var(--text-strong); font-size: 11px; font-weight: 500; }
+
+.run-production__unit[data-state="failed"] .run-production__unit-state { color: var(--danger, #b42318); }
+
+.run-production__lane {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.run-production__unit-detail { display: grid; gap: 8px; padding: 12px; border-radius: var(--radius-card, 12px); background: var(--glass-card); box-shadow: var(--shadow-sm); }
+
+.run-production__unit-detail p { margin: 0; font-size: 13px; }
+
+.run-production__unit-detail small, .run-production__hint { color: var(--text-muted); font-size: 11px; }
+
+@media (prefers-reduced-motion: reduce) {
+.run-production__unit[data-state="making"] .run-production__frame,
+  .run-production__unit[data-state="making"] .run-production__frame::before,
+  .run-production[data-running] .run-production__unit[data-state="planned"] .run-production__frame,
+  .run-production[data-running] .run-production__stages > li[data-state="active"] .run-production__bar::after,
+  .run-production__unit,
+  .run-production__frame video { animation: none; } }

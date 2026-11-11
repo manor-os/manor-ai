@@ -864,3 +864,78 @@ async def test_cleanup_migration_closes_existing_stale_workflow_cards(client, db
     assert cards["report_failed"].resolution == {"choice": "superseded"}
     assert cards["song_workflow_starter_input"].resolution == {"choice": "stopped"}
     assert cards["video1"].meta["hitl_requests"][0]["resolved"] is True
+
+
+@pytest.mark.asyncio
+async def test_open_decisions_are_found_through_the_open_card_index(client, db_session):
+    # Catches: the open-card filter drifting from the index condition (or being
+    # sent as bound parameters), which leaves the index unusable and reads every
+    # message's metadata on the Workspace list and each chat page.
+    import importlib.util
+    from pathlib import Path
+
+    from sqlalchemy import event, text
+
+    from packages.core.models.task import MESSAGE_OPEN_CARD_CONDITION
+    from packages.core.workspace_chat.pending_actions import pending_actions_by_workspace
+    from packages.core.workspace_chat.service import unresolved_pending_messages
+
+    path = Path(__file__).resolve().parents[1] / (
+        "packages/core/migrations/versions/20261111_01_message_open_cards_index.py"
+    )
+    spec = importlib.util.spec_from_file_location("open_cards_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    assert migration._CONDITION == MESSAGE_OPEN_CARD_CONDITION
+    headers = await _register(client, "ws_open_card_index")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    workspace_id = await _workspace(client, headers)
+    main_id, _ = await _seed(db_session, me["entity_id"], workspace_id)
+    db_session.add(_card(main_id, "approval", created_at=BASE))
+    # Another company's open cards, on both halves of the condition, stay out.
+    other_headers = await _register(client, "ws_open_card_other")
+    other = (await client.get("/api/v1/auth/me", headers=other_headers)).json()
+    other_main, _ = await _seed(db_session, other["entity_id"], await _workspace(client, other_headers))
+    db_session.add(_card(other_main, "approval", created_at=BASE))
+    db_session.add(Message(
+        id=generate_ulid(), conversation_id=other_main, role="assistant", content="Tools",
+        author_kind="agent", message_kind="message", created_at=BASE,
+        meta={"hitl_requests": [{"id": generate_ulid(), "prompt": "Approve?"}]},
+    ))
+    # Ordinary history, so the planner weighs the indexes as it does on real chats.
+    db_session.add_all(
+        Message(
+            id=generate_ulid(), conversation_id=main_id, role="user", content=f"Note {index}",
+            created_at=BASE + timedelta(minutes=index),
+        )
+        for index in range(100)
+    )
+    await db_session.commit()
+    await db_session.execute(text("ANALYZE messages"))
+
+    sent: list[tuple[str, tuple]] = []
+
+    def record(_conn, _cursor, statement, parameters, *_args):
+        if "FROM messages" in statement:
+            sent.append((statement, tuple(parameters or ())))
+
+    engine = db_session.bind.sync_engine
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        counts = await pending_actions_by_workspace(
+            db_session, entity_id=me["entity_id"], workspace_ids=[workspace_id],
+        )
+        pinned = await unresolved_pending_messages(
+            db_session, entity_id=me["entity_id"], workspace_id=workspace_id,
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    assert list(counts) == [workspace_id] and len(counts[workspace_id]) == 1
+    assert [message.conversation_id for message in pinned] == [main_id]
+
+    raw = (await (await db_session.connection()).get_raw_connection()).driver_connection
+    await raw.execute("SET LOCAL enable_seqscan = off")
+    assert len(sent) == 2
+    for statement, parameters in sent:
+        plan = "\n".join(row[0] for row in await raw.fetch("EXPLAIN " + statement, *parameters))
+        assert "ix_messages_open_cards" in plan, plan

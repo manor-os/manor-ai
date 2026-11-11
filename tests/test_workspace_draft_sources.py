@@ -269,14 +269,16 @@ def test_ws_read_source_is_registered_everywhere():
     assert "ws_read_source" in CORE_CAPABILITIES["workspace.architect"].tool_names
 
 
-def test_ws_flag_missing_integration_is_not_exposed():
+def test_ws_flag_missing_integration_is_registered_everywhere():
+    from packages.core.ai.runtime.approval_classifier import classify_runtime_tool_action
     from packages.core.ai.runtime.capabilities import CORE_CAPABILITIES
     from packages.core.ai.tools.workspace_arch_tools import ALL_TOOL_SCHEMAS, HANDLERS
 
     name = "ws_flag_missing_integration"
-    assert name not in {schema["function"]["name"] for schema in ALL_TOOL_SCHEMAS}
-    assert name not in HANDLERS
-    assert name not in CORE_CAPABILITIES["workspace.architect"].tool_names
+    assert name in {schema["function"]["name"] for schema in ALL_TOOL_SCHEMAS}
+    assert name in HANDLERS
+    assert name in CORE_CAPABILITIES["workspace.architect"].tool_names
+    assert classify_runtime_tool_action(name, {}).action_key == "workspace.operation.draft"
 
 
 def test_architect_prompt_requires_reading_sources_first():

@@ -340,7 +340,7 @@ export default function AgentInitiativeForm({
             autoFocus
           />
           <div>
-            <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-stone-500">
+            <label className="mb-1.5 block text-xs font-semibold text-stone-500">
               {t("page.agent_initiative.schedule")}
             </label>
             <Select
@@ -354,7 +354,7 @@ export default function AgentInitiativeForm({
             <div className="grid gap-4 sm:grid-cols-2">
               {draft.schedule.mode === "weekly" ? (
                 <div>
-                  <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-stone-500">
+                  <label className="mb-1.5 block text-xs font-semibold text-stone-500">
                     {t("page.agent_initiative.weekday")}
                   </label>
                   <Select
@@ -366,7 +366,7 @@ export default function AgentInitiativeForm({
                 </div>
               ) : <div />}
               <div>
-                <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-stone-500">
+                <label className="mb-1.5 block text-xs font-semibold text-stone-500">
                   {t("page.agent_initiative.time")}
                 </label>
                 <DateTimePicker
@@ -398,7 +398,7 @@ export default function AgentInitiativeForm({
           ) : null}
           {draft.schedule.mode === "at" ? (
             <div>
-              <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-stone-500">
+              <label className="mb-1.5 block text-xs font-semibold text-stone-500">
                 {t("page.agent_initiative.run_at")}
               </label>
               <DateTimePicker
@@ -480,13 +480,13 @@ export default function AgentInitiativeForm({
             <p className="mt-1 text-sm leading-relaxed text-stone-500">{t("page.agent_initiative.step_deliver_description")}</p>
           </div>
           <div className="rounded-xl bg-stone-100/80 p-3">
-            <p className="m-0 text-xs font-semibold uppercase tracking-wide text-stone-500">
+            <p className="m-0 text-xs font-semibold text-stone-500">
               {t("page.agent_initiative.agent_instance")}
             </p>
             <p className="mt-1 text-sm font-semibold text-stone-800">{scope.label}</p>
           </div>
           <div>
-            <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-stone-500">
+            <label className="mb-1.5 block text-xs font-semibold text-stone-500">
               {t("page.agent_initiative.chat_destination")}
             </label>
             <Select
@@ -526,7 +526,7 @@ export default function AgentInitiativeForm({
           </div>
           {draft.notificationEnabled ? (
             <div>
-              <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-stone-500">
+              <label className="mb-1.5 block text-xs font-semibold text-stone-500">
                 {t("page.agent_initiative.notification_channel")}
               </label>
               <Select
@@ -546,7 +546,7 @@ export default function AgentInitiativeForm({
           ) : null}
           <div className="space-y-3 rounded-xl bg-stone-100/80 p-3">
             <div>
-              <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-stone-500">
+              <label className="mb-1.5 block text-xs font-semibold text-stone-500">
                 {t("page.agent_initiative.quiet_hours")}
               </label>
               <Select
@@ -566,7 +566,7 @@ export default function AgentInitiativeForm({
             {draft.quietMode === "custom" ? (
               <div className="grid gap-3 sm:grid-cols-2">
                 <div>
-                  <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-stone-500">
+                  <label className="mb-1.5 block text-xs font-semibold text-stone-500">
                     {t("page.agent_initiative.quiet_hours_start")}
                   </label>
                   <DateTimePicker
@@ -577,7 +577,7 @@ export default function AgentInitiativeForm({
                   />
                 </div>
                 <div>
-                  <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-stone-500">
+                  <label className="mb-1.5 block text-xs font-semibold text-stone-500">
                     {t("page.agent_initiative.quiet_hours_end")}
                   </label>
                   <DateTimePicker

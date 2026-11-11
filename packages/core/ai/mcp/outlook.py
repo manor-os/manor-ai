@@ -14,6 +14,8 @@ re-learning. Calling conventions stay close to Microsoft Graph
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 from typing import Any, Dict, List, Optional
@@ -21,10 +23,15 @@ from urllib.parse import quote
 
 import httpx
 
+from packages.core.ai.mcp import _email_message as readable
+
 logger = logging.getLogger(__name__)
 
 _API = "https://graph.microsoft.com/v1.0"
 _MAX_CHARS = 12_000
+_call_context = readable.CallContext("outlook_mcp_call_context")
+set_call_context = _call_context.set
+clear_call_context = _call_context.clear
 
 
 def _path_segment(value: Any) -> str:
@@ -52,11 +59,19 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         },
     },
     "get_message": {
-        "description": "Fetch a single message by Graph id (headers + body).",
+        "description": (
+            "Read one message by Graph id: sender, recipients, subject, date, the "
+            "body as text and its attachments. A long body comes in pages; when "
+            "next_offset is set, call again with that offset to read the rest."
+        ),
         "required": ["message_id"],
         "properties": {
             "message_id": {"type": "string"},
-            "select": {"type": "string", "description": "Comma-separated fields to return"},
+            "select": {
+                "type": "string",
+                "description": "Comma-separated raw Graph fields to return instead of the readable message.",
+            },
+            "offset": {"type": "integer", "description": "Body character offset to continue from (default 0)."},
         },
     },
     # ── Messages: write ───────────────────────────────────────────────────
@@ -188,10 +203,22 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "required": ["message_id"],
         "properties": {"message_id": {"type": "string"}},
     },
+    "save_attachment_to_workspace": {
+        "description": (
+            "Save one file attachment to the current Workspace (or Knowledge without "
+            "a Workspace) and return its readable text and a document link. Use this "
+            "to read or keep an attachment."
+        ),
+        "required": ["message_id", "attachment_id"],
+        "properties": {
+            "message_id": {"type": "string"},
+            "attachment_id": {"type": "string"},
+        },
+    },
     "download_attachment": {
         "description": (
-            "Fetch a single file attachment as base64. The Graph response "
-            "embeds ``contentBytes`` for fileAttachment types — for "
+            "Fetch a single file attachment as base64 (``contentBytes``); prefer "
+            "save_attachment_to_workspace to read or keep a file. For "
             "itemAttachments (forwarded emails / events) the response "
             "is a structured object instead."
         ),
@@ -262,6 +289,23 @@ async def _api(
     body: Optional[Dict] = None,
     params: Optional[Dict] = None,
 ) -> str:
+    data = await _request(token, method, path, body=body, params=params)
+    if isinstance(data, str):
+        return data[:_MAX_CHARS]
+    out = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+    if len(out) > _MAX_CHARS:
+        return out[:_MAX_CHARS] + "\n… (truncated)"
+    return out
+
+
+async def _request(
+    token: str,
+    method: str,
+    path: str,
+    body: Optional[Dict] = None,
+    params: Optional[Dict] = None,
+) -> Any:
+    """Call Graph and return the parsed JSON (or the raw text) uncut."""
     url = f"{_API}/{path.lstrip('/')}" if not path.startswith("http") else path
     headers = {
         "Authorization": f"Bearer {token}",
@@ -280,20 +324,16 @@ async def _api(
     if resp.status_code == 404:
         raise RuntimeError("Not found.")
     if resp.status_code in (202, 204):
-        return json.dumps({"success": True})
+        return {"success": True}
     if not resp.is_success:
         raise RuntimeError(f"Outlook API error ({resp.status_code}): {resp.text[:300]}")
 
     if not resp.text:
-        return json.dumps({"success": True})
+        return {"success": True}
     try:
-        data = resp.json()
+        return resp.json()
     except Exception:
-        return resp.text[:_MAX_CHARS]
-    out = json.dumps(data, ensure_ascii=False, indent=2, default=str)
-    if len(out) > _MAX_CHARS:
-        return out[:_MAX_CHARS] + "\n… (truncated)"
-    return out
+        return resp.text
 
 
 def _to_recipients(value: Any) -> List[Dict[str, Dict[str, str]]]:
@@ -365,13 +405,58 @@ async def _list_messages(token: str, args: Dict) -> str:
     )
 
 
+def _addresses(value: Any) -> str:
+    items = value if isinstance(value, list) else [value] if value else []
+    out = []
+    for item in items:
+        address = item.get("emailAddress") if isinstance(item, dict) else None
+        address = address if isinstance(address, dict) else {}
+        name, email = address.get("name") or "", address.get("address") or ""
+        out.append(f"{name} <{email}>" if name and email and name != email else email or name)
+    return ", ".join(part for part in out if part)
+
+
 async def _get_message(token: str, args: Dict) -> str:
-    params: Dict[str, Any] = {}
+    message_path = f"me/messages/{_path_segment(args['message_id'])}"
     if args.get("select"):
-        params["$select"] = args["select"]
-    return await _api(
-        token, "GET", f"me/messages/{_path_segment(args['message_id'])}", params=params,
-    )
+        return await _api(token, "GET", message_path, params={"$select": args["select"]})
+    offset = readable.page_offset(args.get("offset"))
+    data = await _request(token, "GET", message_path)
+    if not isinstance(data, dict):
+        raise RuntimeError("Outlook returned an unreadable message.")
+    attachments: List[Dict[str, Any]] = []
+    if data.get("hasAttachments"):
+        listed = await _request(
+            token, "GET", f"{message_path}/attachments",
+            params={"$select": "id,name,contentType,size,isInline"},
+        )
+        attachments = [
+            {
+                "attachment_id": item.get("id"),
+                "filename": item.get("name") or "attachment",
+                "content_type": item.get("contentType") or "application/octet-stream",
+                "size": item.get("size") or 0,
+                "inline": bool(item.get("isInline")),
+            }
+            for item in (listed.get("value") if isinstance(listed, dict) else None) or []
+            if isinstance(item, dict)
+        ]
+    body = data.get("body") if isinstance(data.get("body"), dict) else {}
+    content = str(body.get("content") or "")
+    is_html = str(body.get("contentType") or "").lower() == "html"
+    fields = {
+        "message_id": data.get("id"),
+        "conversation_id": data.get("conversationId"),
+        "from": _addresses(data.get("from")),
+        "to": _addresses(data.get("toRecipients")),
+        "cc": _addresses(data.get("ccRecipients")),
+        "subject": data.get("subject") or "",
+        "date": data.get("receivedDateTime") or data.get("sentDateTime") or "",
+        "is_read": data.get("isRead"),
+        "attachments": attachments,
+    }
+    text = readable.body_text("" if is_html else content, content if is_html else "")
+    return json.dumps(readable.paged_message(fields, text, offset=offset), ensure_ascii=False)
 
 
 # Messages: write
@@ -508,11 +593,40 @@ async def _list_attachments(token: str, args: Dict) -> str:
     )
 
 
-async def _download_attachment(token: str, args: Dict) -> str:
-    return await _api(
+async def _fetch_attachment(token: str, args: Dict) -> Any:
+    return await _request(
         token, "GET",
         f"me/messages/{_path_segment(args['message_id'])}/attachments/{_path_segment(args['attachment_id'])}",
     )
+
+
+async def _download_attachment(token: str, args: Dict) -> str:
+    # Lossless: a cut contentBytes payload would be a corrupt file.
+    data = await _fetch_attachment(token, args)
+    return data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
+
+
+async def _save_attachment_to_workspace(token: str, args: Dict) -> str:
+    data = await _fetch_attachment(token, args)
+    encoded = data.get("contentBytes") if isinstance(data, dict) else None
+    if not encoded:
+        raise RuntimeError(
+            "This attachment is a forwarded email or calendar item, not a file; "
+            "read it with download_attachment."
+        )
+    try:
+        content = base64.b64decode(str(encoded), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise RuntimeError("Downloaded attachment data is invalid.") from exc
+    saved = await readable.save_attachment(
+        _call_context.get(),
+        data=content,
+        filename=str(data.get("name") or "attachment"),
+        content_type=str(data.get("contentType") or "application/octet-stream"),
+        source={"message_id": args["message_id"], "attachment_id": args["attachment_id"]},
+        tool_name="mcp__outlook__save_attachment_to_workspace",
+    )
+    return json.dumps(saved, ensure_ascii=False)
 
 
 # User profile
@@ -543,6 +657,7 @@ _HANDLERS = {
     "list_folders": _list_folders,
     "create_folder": _create_folder,
     "list_attachments": _list_attachments,
+    "save_attachment_to_workspace": _save_attachment_to_workspace,
     "download_attachment": _download_attachment,
     "get_profile": _get_profile,
 }

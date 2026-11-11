@@ -96,7 +96,7 @@ export function PropertyRow({
     }}>
       <div className="task-property-label" style={{
         width: v.labelW, display: "flex", alignItems: "center", gap: variant === "compact" ? 6 : 8,
-        color: "#78716c", fontSize: v.fontSize, fontWeight: 500, flexShrink: 0,
+        color: "var(--text-muted)", fontSize: v.fontSize, fontWeight: 500, flexShrink: 0,
       }}>
         {icon}
         <span>{label}</span>
@@ -115,7 +115,7 @@ export function PropertyRow({
               flexShrink: 0,
               color: "#8a8178",
               background: "rgba(255,255,255,0.72)",
-              border: "1px solid rgba(28,25,23,0.1)",
+              border: "0.5px solid rgba(29, 29, 31,0.1)",
               cursor: "help",
             }}
           >
@@ -455,7 +455,7 @@ export function AssigneePicker({
           ...(open ? { borderColor: "var(--accent)", boxShadow: "0 0 0 3px var(--accent-ring)", background: "var(--surface-panel)" } : {}),
         }}
       >
-        <UserAvatar name={displayName || t("component.task_properties_panel.unassigned")} type={displayType} avatarUrl={displayAvatar} size={24} />
+        {displayName && <UserAvatar name={displayName} type={displayType} avatarUrl={displayAvatar} size={24} />}
         <span
           className="task-assignee-picker-name"
           title={displayName || t("component.task_properties_panel.unassigned")}
@@ -647,7 +647,7 @@ export default function TaskPropertiesPanel({
                 avatarUrl={requesterAvatar}
                 size={variant === "compact" ? 22 : 26}
               />
-              <span style={{ fontSize: v.fontSize, color: "#292524", fontWeight: 500 }}>
+              <span style={{ fontSize: v.fontSize, color: "var(--text-strong)", fontWeight: 500 }}>
                 {requesterDisplayName}
               </span>
             </span>
@@ -679,7 +679,7 @@ export default function TaskPropertiesPanel({
                 avatarUrl={task.author_agent_avatar || matchedAuthorAgent?.avatar_url}
                 size={variant === "compact" ? 22 : 26}
               />
-              <span style={{ fontSize: v.fontSize, color: "#292524", fontWeight: 500 }}>
+              <span style={{ fontSize: v.fontSize, color: "var(--text-strong)", fontWeight: 500 }}>
                 {authorAgentName}
               </span>
             </span>
@@ -792,7 +792,7 @@ export default function TaskPropertiesPanel({
       key: "sla",
       node: (
         <PropertyRow label={t("page.task_detail.sla")} variant={variant} icon={<IconClock size={v.iconSize} />}>
-          <span style={{ fontSize: v.fontSize, color: "#a8a29e" }}>
+          <span style={{ fontSize: v.fontSize, color: "var(--text-muted)" }}>
             {(task as any).sla_policy_id || t("page.workspace_detail.none")}
           </span>
         </PropertyRow>
@@ -803,15 +803,15 @@ export default function TaskPropertiesPanel({
   const wrapperStyle: React.CSSProperties = framed
     ? {
         display: "flex", flexDirection: "column", gap: 0,
-        background: "#fafaf9", borderRadius: 12, padding: "4px 12px",
-        border: "1px solid rgba(28,25,23,0.06)",
+        background: "var(--surface-muted)", borderRadius: 12, padding: "4px 12px",
+        border: "0.5px solid rgba(29, 29, 31,0.06)",
       }
     : { display: "flex", flexDirection: "column", gap: 0 };
 
   return (
-    <div style={wrapperStyle}>
+    <div className="task-properties-chips" style={wrapperStyle}>
       {rows.map((r, i) => (
-        <div key={r.key} style={i === rows.length - 1 ? { borderBottom: "none" } : undefined}>
+        <div key={r.key} data-property={r.key} style={i === rows.length - 1 ? { borderBottom: "none" } : undefined}>
           {/* PropertyRow's divider applies its own border-bottom; we don't
               need to override unless this is the last row. We let the row
               draw its border, then nullify on the last via wrapper override

@@ -41,6 +41,7 @@ import WorkflowApprovalReview, {
   EditableWorkflowApprovalReview,
   workflowReviewArtifacts,
   workflowReviewIsEditable,
+  workflowReviewIsRevisionChoice,
 } from "../workflows/WorkflowApprovalReview";
 import InlineFileReferenceCard from "../InlineFileReferenceCard";
 import TikTokPublishReview, { isTikTokPublishApproval } from "../workflows/TikTokPublishReview";
@@ -61,6 +62,16 @@ import Button from "./Button";
 import CompactCard from "./CompactCard";
 import Textarea from "./Textarea";
 import ApprovalSaveRuleAction from "../approvals/ApprovalSaveRuleAction";
+import {
+  ALWAYS_ALLOW_CHOICE,
+  optionDetailLabel,
+  orderedOptions,
+  recommendationOf,
+  recommendationReason,
+  type RecommendedQuestion,
+} from "../../lib/recommendedOptions";
+import { alwaysAllow } from "../../lib/alwaysAllow";
+import { useToastStore } from "../../stores/toast";
 
 export interface ApprovalHITLRequest {
   id: string;
@@ -77,6 +88,8 @@ export interface ApprovalHITLRequest {
   review?: unknown;
   review_title?: string;
   review_read_only?: boolean;
+  review_editable_fields?: string[];
+  review_revision_field?: string;
   workflow?: {
     id?: string;
     name?: string;
@@ -87,6 +100,9 @@ export interface ApprovalHITLRequest {
   workflow_run_id?: string;
   workflow_step_id?: string;
   options?: string[];
+  recommendation?: RecommendedQuestion["recommendation"];
+  option_details?: RecommendedQuestion["option_details"];
+  batch_key?: string;
   resolved?: boolean;
   resolution?: string;
 }
@@ -104,7 +120,9 @@ type PendingApproval = {
 interface Props {
   messages: ChatMessageWithHITL[];
   disabled?: boolean;
-  onResolve: (hitlId: string, choice: string, review?: unknown) => void;
+  /** ``receipt`` is the choice the card records when it differs from the
+   * decision sent: Always allow approves, but the card says "Always". */
+  onResolve: (hitlId: string, choice: string, review?: unknown, receipt?: string) => void | Promise<void>;
   /**
    * Visual context for width alignment with the composer below.
    *
@@ -129,6 +147,7 @@ export default function ApprovalActionBar({
   const [completedIds, setCompletedIds] = useState<Set<string>>(() => new Set());
   const pending = useMemo(() => collectPendingApprovals(messages).filter(item => !completedIds.has(item.hitl.id)), [messages, completedIds]);
   const [selectedApprovalId, setSelectedApprovalId] = useState<string | null>(null);
+  const [alwaysError, setAlwaysError] = useState("");
 
   const requestedIndex = selectedApprovalId
     ? pending.findIndex((item) => item.hitl.id === selectedApprovalId)
@@ -150,7 +169,32 @@ export default function ApprovalActionBar({
   const hasReview = current.review != null;
   const materialFiles = approvalMaterialFiles(current);
   const editablePublishReview = isEditablePublishApproval(current);
-  const options = currentApprovalOptions(current.options);
+  const recommendation = recommendationOf(current);
+  const options = orderedOptions(currentApprovalOptions(current.options), recommendation);
+  const primaryOption = recommendation && options.includes(recommendation.option)
+    ? recommendation.option
+    : options.find((option) => approvalOptionTone(option) === "approve");
+  const reason = recommendationReason(recommendation);
+  // Several open approvals of the same kind are one question: approve them
+  // all at once, or step through them with the queue arrows.
+  const batch = current.batch_key && pending.length > 1
+    && pending.every((item) => item.hitl.batch_key === current.batch_key)
+    ? pending
+    : null;
+  const choose = (option: string) => {
+    if (workflowReviewIsRevisionChoice(option)) {
+      openRevisionRequest(current, onResolve, disabled, option);
+      return;
+    }
+    if (option === ALWAYS_ALLOW_CHOICE) {
+      setAlwaysError("");
+      alwaysAllow(current.id, () => onResolve(current.id, "approve", undefined, ALWAYS_ALLOW_CHOICE))
+        .then(() => setCompletedIds(ids => new Set([...ids, current.id])))
+        .catch(() => setAlwaysError(t("recommendation.always_error")));
+      return;
+    }
+    onResolve(current.id, option);
+  };
   const workflowHref = workflowApprovalHref(current);
   const chromePublication = chromePublicationSummary(current);
   const hasCompactSummary = !workflowHref && (chromePublication !== null || materialFiles.length === 0);
@@ -265,6 +309,7 @@ export default function ApprovalActionBar({
                 key={file.key}
                 reference={file.reference}
                 label={file.label}
+                creationTarget={file.creationTarget}
                 returnTo={sourceReturnTo}
                 trustedReference={file.trusted}
                 display="card"
@@ -320,22 +365,16 @@ export default function ApprovalActionBar({
           ) : (
             options.map((option) => {
               const tone = approvalOptionTone(option);
-              const variant = tone === "approve" ? "primary" : tone === "reject" ? "ghost" : "outline";
+              const variant = option === primaryOption ? "primary" : tone === "reject" ? "ghost" : "outline";
               const button = (
                 <Button
                   variant={variant}
                   size="sm"
                   className={`approval-action-bar__btn approval-action-bar__btn--${tone}`}
                   disabled={disabled}
-                  onClick={() => {
-                    if (option === "revise") {
-                      openRevisionRequest(current, onResolve, disabled);
-                      return;
-                    }
-                    onResolve(current.id, option);
-                  }}
+                  onClick={() => choose(option)}
                 >
-                  {approvalOptionLabel(option)}
+                  {optionDetailLabel(current, option) || approvalOptionLabel(option)}
                 </Button>
               );
               return (
@@ -348,8 +387,24 @@ export default function ApprovalActionBar({
               );
             })
           )}
-          {!hasReview && <ApprovalSaveRuleAction key={current.id} requestId={current.id} scopeLabel={current.workspace?.name} disabled={disabled} onCompleted={() => setCompletedIds(ids => new Set([...ids, current.id]))} />}
+          {batch && !hasReview && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="approval-action-bar__btn"
+              disabled={disabled}
+              onClick={() => batch.forEach((item) => onResolve(item.hitl.id, "approve"))}
+            >
+              {t("recommendation.batch.approve_all")} · {batch.length}
+            </Button>
+          )}
+          {!hasReview && !options.includes(ALWAYS_ALLOW_CHOICE) && <ApprovalSaveRuleAction key={current.id} requestId={current.id} scopeLabel={current.workspace?.name} disabled={disabled} onCompleted={() => setCompletedIds(ids => new Set([...ids, current.id]))} />}
         </div>
+        {(reason || alwaysError) && (
+          <p className="chat-hitl-recommendation-reason approval-action-bar__reason" role={alwaysError ? "alert" : undefined}>
+            {alwaysError || t("recommendation.reason_prefix", { reason })}
+          </p>
+        )}
       </div>
     </div>
   );
@@ -378,21 +433,21 @@ function collectPendingApprovals(
 
 function approvalMaterialFiles(hitl: ApprovalHITLRequest) {
   const seen = new Set<string>();
-  const files: Array<{ key: string; reference: string; label?: string; trusted?: boolean }> = [];
-  const add = (reference: unknown, label?: string, trusted = false) => {
+  const files: Array<{ key: string; reference: string; label?: string; trusted?: boolean; creationTarget?: boolean }> = [];
+  const add = (reference: unknown, label?: string, trusted = false, creationTarget = false) => {
     const normalized = String(reference || "").trim();
     if (!normalized || seen.has(normalized)) return;
     const isDocumentId = /^[0-9A-HJKMNP-TV-Z]{26}$/i.test(normalized);
     const isDocumentRoute = /^\/(?:viewer|documents)\//.test(normalized);
     if (!looksLikeFileReference(normalized) && !isDocumentId && !isDocumentRoute) return;
     seen.add(normalized);
-    files.push({ key: normalized, reference: normalized, label, trusted });
+    files.push({ key: normalized, reference: normalized, label, trusted, creationTarget });
   };
 
   // Approval paths are storage paths, which free-text file detection refuses.
   hitl.paths?.forEach((path) => {
     const storagePath = entityStoragePath(path);
-    add(storagePath || path, undefined, Boolean(storagePath));
+    add(storagePath || path, undefined, Boolean(storagePath), Boolean(storagePath) && hitl.action === "workspace.file.create");
   });
   workflowReviewArtifacts(hitl.review).forEach((artifact) => {
     add(artifact.reference, artifact.label);
@@ -529,15 +584,29 @@ function openApprovalReview(
     return;
   }
   const editable = isEditablePublishApproval(hitl);
+  const revisionField = typeof hitl.review_revision_field === "string"
+    ? hitl.review_revision_field
+    : "";
   const options = currentApprovalOptions(hitl.options)
-    .filter((choice) => !editable || choice !== "revise");
+    .filter((choice) => !editable || revisionField || !workflowReviewIsRevisionChoice(choice));
   let currentDraft = cloneReviewRecord(hitl.review);
   let currentDraftIsValid = true;
-  const resolve = (choice: string) => {
-    const sendsReview = editable && ["approve", "always_approve"].includes(choice);
+  const resolve = async (choice: string) => {
+    if (!editable && workflowReviewIsRevisionChoice(choice)) {
+      openRevisionRequest(hitl, onResolve, disabled, choice);
+      return;
+    }
+    const sendsReview = editable && (["approve", "always_approve"].includes(choice) || workflowReviewIsRevisionChoice(choice));
     if (sendsReview && !currentDraftIsValid) return;
-    closeDetail();
-    onResolve(hitl.id, choice, sendsReview ? currentDraft : undefined);
+    if (workflowReviewIsRevisionChoice(choice) && revisionField && !String(currentDraft[revisionField] ?? "").trim()) return;
+    try {
+      await onResolve(hitl.id, choice, sendsReview ? currentDraft : undefined);
+      closeDetail();
+    } catch (error) {
+      useToastStore.getState().error(
+        error instanceof Error ? error.message : t("lib.api.chat_failed"),
+      );
+    }
   };
   openDetail({
     key: `workflow-review:${hitl.id}`,
@@ -554,6 +623,8 @@ function openApprovalReview(
           review={hitl.review}
           reviewTitle={hitl.review_title}
           disabled={disabled}
+          editableFields={hitl.review_editable_fields}
+          revisionField={revisionField || undefined}
           onDraftState={(draft, valid) => {
             currentDraft = draft;
             currentDraftIsValid = valid;
@@ -580,7 +651,7 @@ function openApprovalReview(
               key={choice}
               type="button"
               className={className}
-              onClick={() => resolve(choice)}
+              onClick={() => void resolve(choice)}
               disabled={disabled}
             >
               {approvalOptionLabel(choice)}
@@ -612,6 +683,7 @@ function openRevisionRequest(
   hitl: ApprovalHITLRequest,
   onResolve: Props["onResolve"],
   disabled?: boolean,
+  choice = "revise",
 ) {
   openDetail({
     key: `approval-revision:${hitl.id}`,
@@ -625,6 +697,7 @@ function openRevisionRequest(
     body: (
       <RevisionRequestForm
         hitl={hitl}
+        choice={choice}
         onResolve={onResolve}
         disabled={disabled}
       />
@@ -635,10 +708,12 @@ function openRevisionRequest(
 
 function RevisionRequestForm({
   hitl,
+  choice,
   onResolve,
   disabled,
 }: {
   hitl: ApprovalHITLRequest;
+  choice: string;
   onResolve: Props["onResolve"];
   disabled?: boolean;
 }) {
@@ -647,7 +722,7 @@ function RevisionRequestForm({
     const value = revisionRequest.trim();
     if (!value || disabled) return;
     closeDetail();
-    onResolve(hitl.id, "revise", { revision_request: value });
+    onResolve(hitl.id, choice, { revision_request: value });
   };
   return (
     <div className="approval-revision-request">
@@ -656,6 +731,7 @@ function RevisionRequestForm({
       </p>
       <Textarea
         label={t("component.approval_action_bar.revision_instructions")}
+        ariaLabel={t("component.approval_action_bar.revision_instructions")}
         value={revisionRequest}
         onChange={(event) => setRevisionRequest(event.target.value)}
         onKeyDown={(event) => {
@@ -692,7 +768,7 @@ function RevisionRequestForm({
 
 function approvalOptionTone(option: string): "approve" | "standing" | "revise" | "reject" {
   if (option === "always_approve") return "standing";
-  if (option === "revise") return "revise";
+  if (workflowReviewIsRevisionChoice(option)) return "revise";
   return ["reject", "cancel", "deny", "decline"].includes(option) ? "reject" : "approve";
 }
 

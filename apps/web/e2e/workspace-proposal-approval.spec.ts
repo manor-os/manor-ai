@@ -138,7 +138,8 @@ test("concurrent cards retry independently without unlocking a pending approval"
   await second.getByRole("button", { name: "Approve all", exact: true }).click();
   await expect.poll(() => state.requests.length).toBe(2);
   await state.finish("proposal-b", 503);
-  await expect(page.getByText("Reconnecting...", { exact: true })).toBeVisible();
+  // Reconnecting is a quiet dot on the sidebar avatar, not a toast.
+  await expect(page.getByRole("status", { name: "Reconnecting...", exact: true })).toBeVisible();
   await expect(second.getByRole("button", { name: "Approve all", exact: true })).toBeEnabled();
   await expect(first.getByRole("button", { name: /Approve/ })).toHaveCount(0);
   await expect(first.getByRole("checkbox").first()).toBeDisabled();

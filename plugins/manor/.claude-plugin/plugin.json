@@ -1,7 +1,7 @@
 {
   "name": "manor",
   "displayName": "Manor",
-  "version": "0.9.1",
+  "version": "0.23.0",
   "icon": "./assets/logo.png",
   "description": "Build, version, test and deliver Manor Workspaces for your customers from Claude Code.",
   "author": {

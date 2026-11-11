@@ -1,3 +1,4 @@
+import { startVisiblePolling } from "../lib/visiblePolling";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useParams } from "react-router-dom";
 
@@ -133,8 +134,8 @@ function embeddedThemeVariables(enabled: boolean): React.CSSProperties {
     "surface",
     mode === "dark" ? "#151823" : "#ffffff",
   );
-  const text = embedThemeColor(params, "text", mode === "dark" ? "#f7f7fb" : "#1c1917");
-  const muted = embedThemeColor(params, "muted", mode === "dark" ? "#b8c0d9" : "#78716c");
+  const text = embedThemeColor(params, "text", mode === "dark" ? "#f7f7fb" : "#1d1d1f");
+  const muted = embedThemeColor(params, "muted", mode === "dark" ? "#b8c0d9" : "#8e8e93");
   const rawFont = (params.get("font") || "").replace(/[;{}<>]/g, "").slice(0, 180);
   const variables: Record<string, string> = {
     "--public-chat-accent": accent,
@@ -142,10 +143,10 @@ function embeddedThemeVariables(enabled: boolean): React.CSSProperties {
     "--public-chat-surface": surface,
     "--public-chat-text": text,
     "--public-chat-muted": muted,
-    "--public-chat-faint": mode === "dark" ? "rgba(247,247,251,0.58)" : "#a8a29e",
-    "--public-chat-soft": mode === "dark" ? "rgba(255,255,255,0.08)" : "#f5f5f4",
+    "--public-chat-faint": mode === "dark" ? "rgba(247,247,251,0.58)" : "#aeaeb2",
+    "--public-chat-soft": mode === "dark" ? "rgba(255,255,255,0.08)" : "#f5f5f7",
     "--public-chat-soft-strong": mode === "dark" ? "rgba(255,255,255,0.13)" : "#efede8",
-    "--public-chat-line": mode === "dark" ? "rgba(255,255,255,0.14)" : "rgba(28,25,23,0.06)",
+    "--public-chat-line": mode === "dark" ? "rgba(255,255,255,0.14)" : "rgba(29, 29, 31,0.06)",
     "--public-chat-input": mode === "dark" ? "rgba(255,255,255,0.08)" : "#ffffff",
     "--public-chat-font": rawFont || "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
   };
@@ -178,7 +179,7 @@ export default function PublicChat() {
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollRef = useRef<ReturnType<typeof startVisiblePolling> | null>(null);
   const lastServerMessageIdRef = useRef("");
   const pendingServerMessageIdsRef = useRef(new Set<string>());
   const lastActivityAtRef = useRef(Date.now());
@@ -191,7 +192,7 @@ export default function PublicChat() {
   const clearSensitiveView = useCallback(() => {
     setMessages([]); setInput(""); setAttachedFiles([]);
     lastServerMessageIdRef.current = ""; pendingServerMessageIdsRef.current.clear();
-    if (pollRef.current) clearTimeout(pollRef.current);
+    pollRef.current?.stop();
     sendingRef.current = false; setSending(false);
     cancelAudio.current(); setAudioGeneration(value => value + 1);
   }, []);
@@ -424,11 +425,11 @@ export default function PublicChat() {
     pendingServerMessageIdsRef.current.clear();
     lastActivityAtRef.current = Date.now();
     const nextDelay = () => {
-      if (document.visibilityState === "hidden") return 15_000;
-      return Date.now() - lastActivityAtRef.current < 60_000 ? 2_000 : 8_000;
+      return Date.now() - lastActivityAtRef.current < 60_000 ? 2_000 : 15_000;
     };
-    const poll = async () => {
+    const poll = startVisiblePolling(async (signal) => {
       const request = requestFence.begin();
+      const isCurrent = () => active && request.isCurrent() && !signal.aborted;
       try {
         const lastId = lastServerMessageIdRef.current;
         const params = new URLSearchParams({ session_id: sessionId, after: lastId });
@@ -437,11 +438,12 @@ export default function PublicChat() {
         }
         const res = await fetch(
           `${API_BASE}/${token}/messages?${params}`,
-          { headers: authHeaders(), credentials: "include", cache: "no-store", signal: request.signal }
+          { headers: authHeaders(), credentials: "include", cache: "no-store", signal: AbortSignal.any([request.signal, signal]) }
         );
-        if (!active || !request.isCurrent()) return;
+        if (!isCurrent()) return;
         if (res.status === 401) {
           const code = await publicChatForbiddenCode(res);
+          if (!isCurrent()) return;
           resident.invalidate();
           if (code === "resident_auth_required") return;
           setCurrentUser(null);
@@ -450,6 +452,7 @@ export default function PublicChat() {
         }
         if (res.status === 403) {
           const code = await publicChatForbiddenCode(res);
+          if (!isCurrent()) return;
           resident.invalidate();
           if (!active) return;
           if (code === "session_mismatch") {
@@ -464,11 +467,20 @@ export default function PublicChat() {
           return;
         }
         if (!res.ok) {
-          if (res.status === 503 && await publicChatForbiddenCode(res) === "resident_unavailable") resident.invalidate("unavailable");
-          return;
+          if (res.status === 503) {
+            const code = await publicChatForbiddenCode(res);
+            if (!isCurrent()) return;
+            if (code === "resident_unavailable") resident.invalidate("unavailable");
+          }
+          const retryAfter = res.headers.get("Retry-After");
+          const seconds = retryAfter ? Number(retryAfter) : NaN;
+          throw Object.assign(new Error(`Messages unavailable (${res.status})`), {
+            status: res.status,
+            retryAfterMs: Number.isFinite(seconds) ? seconds * 1000 : retryAfter ? Math.max(0, Date.parse(retryAfter) - Date.now()) : 0,
+          });
         }
         const data = await res.json();
-        if (!active || !request.isCurrent()) return;
+        if (!isCurrent()) return;
         const canApply = (msg: ChatMessage) => !(sendingRef.current && msg.role === "assistant");
         const serverMessages: ChatMessage[] = [];
         for (const msg of (data.messages || []) as ChatMessage[]) {
@@ -490,17 +502,14 @@ export default function PublicChat() {
           if (next !== prev) lastActivityAtRef.current = Date.now();
           return next;
         });
-      } catch {
-        // Session status rechecks separately; failed reads never populate the view.
       } finally {
-        if (active && request.isCurrent()) pollRef.current = setTimeout(poll, nextDelay());
         request.release();
       }
-    };
-    poll();
+    }, nextDelay, { errorBackoffMs: 5_000, maxErrorBackoffMs: 60_000 });
+    pollRef.current = poll;
     return () => {
       active = false;
-      if (pollRef.current) clearTimeout(pollRef.current);
+      poll.stop();
     };
   }, [token, sessionId, error, customerText, resident.historyAllowed, resident.invalidate, requestFence]);
 
@@ -843,7 +852,7 @@ export default function PublicChat() {
     return (
       <div className={shellClassName} style={shellStyle}>
         <div style={cardStyle}>
-          <div style={{ textAlign: "center", padding: 40, color: "var(--public-chat-faint, #a8a29e)" }}>
+          <div style={{ textAlign: "center", padding: 40, color: "var(--public-chat-faint, #aeaeb2)" }}>
             {customerText("status.loading")}
           </div>
         </div>
@@ -855,7 +864,7 @@ export default function PublicChat() {
     return (
       <div className={shellClassName} style={shellStyle}>
         <div style={cardStyle}>
-          <div style={{ textAlign: "center", padding: 40, color: "var(--public-chat-faint, #a8a29e)" }}>
+          <div style={{ textAlign: "center", padding: 40, color: "var(--public-chat-faint, #aeaeb2)" }}>
             {customerText("status.loading")}
           </div>
         </div>
@@ -883,14 +892,14 @@ export default function PublicChat() {
             <div style={{ textAlign: "center" }}>
               <div style={styles.authPill}>{customerText("page.public_chat.secure_chat")}</div>
             </div>
-            <h1 style={{ fontSize: 22, fontWeight: 850, color: "var(--public-chat-text, #1c1917)", margin: "10px 0 6px", textAlign: "center" }}>
+            <h1 style={{ fontSize: 22, fontWeight: 850, color: "var(--public-chat-text, #1d1d1f)", margin: "10px 0 6px", textAlign: "center" }}>
               {isVerify
                 ? customerText("page.public_chat.verify_customer_email")
                 : isRegister
                 ? customerText("page.public_chat.create_customer_account")
                 : customerText("page.public_chat.customer_sign_in")}
             </h1>
-            <p style={{ fontSize: 13, color: "var(--public-chat-muted, #78716c)", margin: "0 auto 18px", lineHeight: 1.6, maxWidth: 320, textAlign: "center" }}>
+            <p style={{ fontSize: 13, color: "var(--public-chat-muted, #8e8e93)", margin: "0 auto 18px", lineHeight: 1.6, maxWidth: 320, textAlign: "center" }}>
               {isVerify
                 ? customerText("page.public_chat.verify_customer_email_desc", { email: customerPendingEmail })
                 : info.auth_hint || customerText("page.public_chat.sign_in_required_desc")}
@@ -1018,7 +1027,7 @@ export default function PublicChat() {
             )}
 
             {info.workspace_name && (
-              <p style={{ fontSize: 12, color: "var(--public-chat-faint, #a8a29e)", margin: "18px 0 0", textAlign: "center" }}>
+              <p style={{ fontSize: 12, color: "var(--public-chat-faint, #aeaeb2)", margin: "18px 0 0", textAlign: "center" }}>
                 {info.workspace_name}
               </p>
             )}
@@ -1047,20 +1056,20 @@ export default function PublicChat() {
               shape="rounded"
               style={{ margin: "0 auto 12px" }}
             />
-            <h1 style={{ fontSize: 20, fontWeight: 800, color: "var(--public-chat-text, #1c1917)", margin: "0 0 4px" }}>
+            <h1 style={{ fontSize: 20, fontWeight: 800, color: "var(--public-chat-text, #1d1d1f)", margin: "0 0 4px" }}>
               {info.channel_name}
             </h1>
             {info.workspace_name && (
-              <p style={{ fontSize: 13, color: "var(--public-chat-muted, #78716c)", margin: "0 0 8px" }}>{info.workspace_name}</p>
+              <p style={{ fontSize: 13, color: "var(--public-chat-muted, #8e8e93)", margin: "0 0 8px" }}>{info.workspace_name}</p>
             )}
             {info.purpose && (
-              <p style={{ fontSize: 12, color: "var(--public-chat-faint, #a8a29e)", margin: "0 0 20px", lineHeight: 1.5 }}>{info.purpose}</p>
+              <p style={{ fontSize: 12, color: "var(--public-chat-faint, #aeaeb2)", margin: "0 0 20px", lineHeight: 1.5 }}>{info.purpose}</p>
             )}
             <div style={{ maxWidth: 280, margin: "0 auto" }}>
               {info.login_required ? (
                 <div style={styles.signedInBox}>
-                  <span style={{ color: "var(--public-chat-muted, #78716c)" }}>{customerText("page.public_chat.continue_as")}</span>
-                  <strong style={{ color: "var(--public-chat-text, #1c1917)" }}>{currentUserName || currentUser?.email}</strong>
+                  <span style={{ color: "var(--public-chat-muted, #8e8e93)" }}>{customerText("page.public_chat.continue_as")}</span>
+                  <strong style={{ color: "var(--public-chat-text, #1d1d1f)" }}>{currentUserName || currentUser?.email}</strong>
                 </div>
               ) : (
                 <input
@@ -1100,7 +1109,7 @@ export default function PublicChat() {
             shape="rounded"
           />
           <div>
-            <div style={{ fontSize: 14, fontWeight: 700, color: "var(--public-chat-text, #1c1917)" }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: "var(--public-chat-text, #1d1d1f)" }}>
               {info.agent_name || info.channel_name}
             </div>
             {sending ? (
@@ -1113,7 +1122,7 @@ export default function PublicChat() {
                 <span>{customerText("component.embedded_chat.replying")}</span>
               </div>
             ) : info.workspace_name && (
-              <div style={{ fontSize: 11, color: "var(--public-chat-faint, #a8a29e)" }}>{info.workspace_name}</div>
+              <div style={{ fontSize: 11, color: "var(--public-chat-faint, #aeaeb2)" }}>{info.workspace_name}</div>
             )}
           </div>
         </div>
@@ -1315,7 +1324,7 @@ const styles: Record<string, React.CSSProperties> = {
     padding: 0,
     background: "transparent",
     overflow: "hidden",
-    color: "var(--public-chat-text, #1c1917)",
+    color: "var(--public-chat-text, #1d1d1f)",
     fontFamily: "var(--public-chat-font, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif)",
   },
   card: {
@@ -1324,7 +1333,7 @@ const styles: Record<string, React.CSSProperties> = {
     background: "rgba(255,255,255,0.85)",
     backdropFilter: "blur(20px)",
     borderRadius: 20,
-    border: "1px solid rgba(28,25,23,0.06)",
+    border: "0.5px solid rgba(29, 29, 31,0.06)",
     boxShadow: "0 8px 32px rgba(0,0,0,0.06)",
     overflow: "hidden",
   },
@@ -1342,14 +1351,14 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: "center",
     gap: 10,
     padding: "14px 18px",
-    borderBottom: "1px solid var(--public-chat-line, rgba(28,25,23,0.06))",
+    borderBottom: "1px solid var(--public-chat-line, rgba(29, 29, 31,0.06))",
     background: "var(--public-chat-soft, rgba(250,250,249,0.6))",
   },
   replyingStatus: {
     display: "inline-flex",
     alignItems: "center",
     gap: 5,
-    color: "var(--public-chat-muted, #78716c)",
+    color: "var(--public-chat-muted, #8e8e93)",
     fontSize: 11,
     lineHeight: 1.2,
   },
@@ -1361,7 +1370,7 @@ const styles: Record<string, React.CSSProperties> = {
   systemMsg: {
     textAlign: "center" as const,
     fontSize: 12,
-    color: "var(--public-chat-faint, #a8a29e)",
+    color: "var(--public-chat-faint, #aeaeb2)",
     margin: "0 0 16px",
     lineHeight: 1.5,
   },
@@ -1376,20 +1385,22 @@ const styles: Record<string, React.CSSProperties> = {
     wordBreak: "break-word" as const,
   },
   userBubble: {
+    // Sent text takes its color from this token, not from the bubble.
+    ...({ "--message-bubble-user-fg": "var(--public-chat-on-accent, #fff)" } as React.CSSProperties),
     background: "var(--public-chat-accent, #5d7f77)",
     color: "var(--public-chat-on-accent, #fff)",
     borderBottomRightRadius: 4,
   },
   agentBubble: {
-    background: "var(--public-chat-soft, #f5f5f4)",
-    color: "var(--public-chat-text, #1c1917)",
+    background: "var(--public-chat-soft, #f5f5f7)",
+    color: "var(--public-chat-text, #1d1d1f)",
     borderBottomLeftRadius: 4,
   },
   noticeBubble: {
     maxWidth: "86%",
-    background: "var(--public-chat-soft, #fafaf9)",
-    color: "var(--public-chat-muted, #78716c)",
-    border: "1px solid var(--public-chat-line, rgba(28,25,23,0.06))",
+    background: "var(--public-chat-soft, #fafafa)",
+    color: "var(--public-chat-muted, #8e8e93)",
+    border: "1px solid var(--public-chat-line, rgba(29, 29, 31,0.06))",
     borderRadius: 12,
     fontSize: 12,
     textAlign: "center" as const,
@@ -1406,7 +1417,7 @@ const styles: Record<string, React.CSSProperties> = {
     width: 26,
     height: 26,
     borderRadius: 8,
-    background: "#1c1917",
+    background: "#1d1d1f",
     color: "#fff",
     display: "flex",
     alignItems: "center",
@@ -1428,7 +1439,7 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "4px 7px",
     borderRadius: 8,
     background: "rgba(255,255,255,0.18)",
-    border: "1px solid rgba(28,25,23,0.06)",
+    border: "0.5px solid rgba(29, 29, 31,0.06)",
     fontSize: 11,
     lineHeight: 1.2,
     overflow: "hidden",
@@ -1436,7 +1447,7 @@ const styles: Record<string, React.CSSProperties> = {
     whiteSpace: "nowrap" as const,
   },
   composer: {
-    borderTop: "1px solid var(--public-chat-line, rgba(28,25,23,0.06))",
+    borderTop: "1px solid var(--public-chat-line, rgba(29, 29, 31,0.06))",
     background: "var(--public-chat-soft, rgba(250,250,249,0.4))",
   },
   attachmentTray: {
@@ -1453,8 +1464,8 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "5px 7px 5px 9px",
     borderRadius: 9,
     background: "var(--public-chat-soft, #f1f6f5)",
-    border: "1px solid var(--public-chat-line, rgba(28,25,23,0.06))",
-    color: "var(--public-chat-text, #1c1917)",
+    border: "1px solid var(--public-chat-line, rgba(29, 29, 31,0.06))",
+    color: "var(--public-chat-text, #1d1d1f)",
     fontSize: 11,
     fontWeight: 650,
   },
@@ -1489,9 +1500,9 @@ const styles: Record<string, React.CSSProperties> = {
     width: 38,
     height: 38,
     borderRadius: 12,
-    border: "1px solid var(--public-chat-line, rgba(28,25,23,0.06))",
+    border: "1px solid var(--public-chat-line, rgba(29, 29, 31,0.06))",
     background: "var(--public-chat-input, #fff)",
-    color: "var(--public-chat-muted, #78716c)",
+    color: "var(--public-chat-muted, #8e8e93)",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
@@ -1503,13 +1514,13 @@ const styles: Record<string, React.CSSProperties> = {
     minHeight: 38,
     maxHeight: 160,
     padding: "10px 14px",
-    border: "1px solid var(--public-chat-line, rgba(28,25,23,0.06))",
+    border: "1px solid var(--public-chat-line, rgba(29, 29, 31,0.06))",
     borderRadius: 12,
     fontSize: 13,
     lineHeight: 1.4,
     outline: "none",
     background: "var(--public-chat-input, #fff)",
-    color: "var(--public-chat-text, #1c1917)",
+    color: "var(--public-chat-text, #1d1d1f)",
     resize: "none" as const,
     overflowY: "auto" as const,
     overscrollBehavior: "contain" as const,
@@ -1532,7 +1543,7 @@ const styles: Record<string, React.CSSProperties> = {
   nameInput: {
     width: "100%",
     padding: "12px 16px",
-    border: "1px solid var(--public-chat-line, rgba(28,25,23,0.06))",
+    border: "1px solid var(--public-chat-line, rgba(29, 29, 31,0.06))",
     borderRadius: 12,
     fontSize: 14,
     outline: "none",
@@ -1540,7 +1551,7 @@ const styles: Record<string, React.CSSProperties> = {
     textAlign: "center" as const,
     boxSizing: "border-box" as const,
     background: "var(--public-chat-input, #fff)",
-    color: "var(--public-chat-text, #1c1917)",
+    color: "var(--public-chat-text, #1d1d1f)",
   },
   startBtn: {
     width: "100%",
@@ -1567,24 +1578,24 @@ const styles: Record<string, React.CSSProperties> = {
     justifyContent: "center",
     color: "var(--public-chat-accent, #5d7f77)",
     background: "var(--public-chat-soft, #f2f6f5)",
-    border: "1px solid var(--public-chat-line, rgba(28,25,23,0.06))",
+    border: "1px solid var(--public-chat-line, rgba(29, 29, 31,0.06))",
   },
   errorTitle: {
     margin: "0 0 8px",
-    color: "var(--public-chat-text, #1c1917)",
+    color: "var(--public-chat-text, #1d1d1f)",
     fontSize: 20,
     lineHeight: 1.25,
     fontWeight: 800,
   },
   errorCopy: {
     margin: 0,
-    color: "var(--public-chat-muted, #57534e)",
+    color: "var(--public-chat-muted, #6e6e73)",
     fontSize: 14,
     lineHeight: 1.55,
   },
   errorHint: {
     margin: "10px 0 0",
-    color: "var(--public-chat-faint, #a8a29e)",
+    color: "var(--public-chat-faint, #aeaeb2)",
     fontSize: 12,
     lineHeight: 1.5,
   },
@@ -1625,7 +1636,6 @@ const styles: Record<string, React.CSSProperties> = {
     color: "var(--public-chat-accent, #3f7361)",
     fontSize: 11,
     fontWeight: 800,
-    letterSpacing: "0.02em",
   },
   authBtn: {
     minWidth: 128,
@@ -1652,14 +1662,14 @@ const styles: Record<string, React.CSSProperties> = {
     gap: 6,
     padding: 4,
     borderRadius: 12,
-    background: "var(--public-chat-soft, #f5f5f4)",
+    background: "var(--public-chat-soft, #f5f5f7)",
     marginBottom: 14,
   },
   customerAuthTab: {
     border: "none",
     borderRadius: 9,
     background: "transparent",
-    color: "var(--public-chat-muted, #78716c)",
+    color: "var(--public-chat-muted, #8e8e93)",
     padding: "9px 8px",
     fontSize: 12,
     fontWeight: 800,
@@ -1667,8 +1677,8 @@ const styles: Record<string, React.CSSProperties> = {
   },
   customerAuthTabActive: {
     background: "var(--public-chat-input, #fff)",
-    color: "var(--public-chat-text, #1c1917)",
-    boxShadow: "0 1px 3px rgba(28,25,23,0.08)",
+    color: "var(--public-chat-text, #1d1d1f)",
+    boxShadow: "0 1px 3px rgba(29, 29, 31,0.08)",
   },
   customerAuthForm: {
     display: "flex",
@@ -1678,19 +1688,18 @@ const styles: Record<string, React.CSSProperties> = {
   customerInput: {
     width: "100%",
     padding: "11px 13px",
-    border: "1px solid var(--public-chat-line, rgba(28,25,23,0.06))",
+    border: "1px solid var(--public-chat-line, rgba(29, 29, 31,0.06))",
     borderRadius: 12,
     fontSize: 13,
     outline: "none",
     background: "var(--public-chat-input, #fff)",
-    color: "var(--public-chat-text, #1c1917)",
+    color: "var(--public-chat-text, #1d1d1f)",
     boxSizing: "border-box" as const,
   },
   customerCodeInput: {
     textAlign: "center" as const,
     fontSize: 22,
     fontWeight: 800,
-    letterSpacing: 8,
   },
   customerAuthError: {
     padding: "10px 12px",
@@ -1706,11 +1715,10 @@ const styles: Record<string, React.CSSProperties> = {
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
-    color: "var(--public-chat-faint, #a8a29e)",
+    color: "var(--public-chat-faint, #aeaeb2)",
     fontSize: 11,
     fontWeight: 700,
     margin: "14px 0 10px",
-    textTransform: "uppercase" as const,
   },
   googleAuthBtn: {
     width: "100%",
@@ -1720,9 +1728,9 @@ const styles: Record<string, React.CSSProperties> = {
     gap: 8,
     padding: "11px 14px",
     borderRadius: 12,
-    border: "1px solid var(--public-chat-line, rgba(28,25,23,0.06))",
+    border: "1px solid var(--public-chat-line, rgba(29, 29, 31,0.06))",
     background: "var(--public-chat-input, #fff)",
-    color: "var(--public-chat-text, #1c1917)",
+    color: "var(--public-chat-text, #1d1d1f)",
     fontSize: 13,
     fontWeight: 800,
     cursor: "pointer",
@@ -1734,7 +1742,7 @@ const styles: Record<string, React.CSSProperties> = {
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
-    border: "1px solid rgba(28,25,23,0.06)",
+    border: "0.5px solid rgba(29, 29, 31,0.06)",
     color: "#4285f4",
     fontWeight: 900,
     fontSize: 12,
@@ -1742,7 +1750,7 @@ const styles: Record<string, React.CSSProperties> = {
   customerTextButton: {
     border: "none",
     background: "transparent",
-    color: "var(--public-chat-muted, #78716c)",
+    color: "var(--public-chat-muted, #8e8e93)",
     fontSize: 12,
     fontWeight: 700,
     cursor: "pointer",
@@ -1751,7 +1759,7 @@ const styles: Record<string, React.CSSProperties> = {
   branding: {
     marginTop: 12,
     fontSize: 11,
-    color: "var(--public-chat-faint, #a8a29e)",
+    color: "var(--public-chat-faint, #aeaeb2)",
     textAlign: "center" as const,
   },
   embedBranding: {

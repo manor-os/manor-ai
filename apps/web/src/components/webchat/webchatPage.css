@@ -11,7 +11,7 @@
 .webchat-page-stack { display: flex; flex-direction: column; gap: 12px; }
 .webchat-page-module.glass-card {
   padding: 14px; overflow-wrap: anywhere; min-width: 0;
-  background: var(--surface-panel); border: 1px solid var(--border-subtle); box-shadow: none;
+  background: var(--surface-panel); border: 0.5px solid var(--border-subtle); box-shadow: none;
   transition: border-color 140ms ease;
 }
 .webchat-page-module.glass-card:focus-within { border-color: var(--border-strong); }
@@ -47,13 +47,13 @@
 }
 .webchat-page-guidance p { margin: 0; color: var(--text-muted); font-size: 11px; line-height: 1.5; }
 .webchat-page-guidance p:first-child { color: var(--text-default); font-weight: 500; }
-.webchat-page-guidance p + p { padding-left: 14px; border-left: 1px solid var(--border-subtle); }
+.webchat-page-guidance p + p { padding-left: 14px; border-left: 0.5px solid var(--border-subtle); }
 .webchat-page-editor .webchat-page-stage {
   padding: 10px 0 0; border: 0; border-radius: 0; background: transparent;
 }
 .webchat-page-edit-label {
-  color: var(--text-muted); font-size: 10px; font-weight: 700; letter-spacing: .08em;
-  text-transform: uppercase; margin: 0 0 10px;
+  color: var(--text-muted); font-size: 10px; font-weight: 700; letter-spacing: normal;
+  text-transform: none; margin: 0 0 10px;
 }
 .webchat-page-module-bar { display: flex; align-items: center; gap: 4px; margin: -6px -6px 10px; color: var(--text-muted); }
 .webchat-page-module-bar > span { flex: 1; font-size: 11px; }
@@ -66,12 +66,12 @@
 .webchat-page-drop-end > button:hover { background: var(--surface-muted); }
 .webchat-page-drop-end.is-drop-target { background: var(--surface-muted); box-shadow: inset 0 -1px 0 var(--text-default); }
 .webchat-page-builder-panel {
-  padding: 18px 0 0; border: 0; border-top: 1px solid var(--border-subtle); border-radius: 0;
+  padding: 18px 0 0; border: 0; border-top: 0.5px solid var(--border-subtle); border-radius: 0;
   background: transparent; box-shadow: none;
 }
 .webchat-page-builder-panel-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
 .webchat-page-builder-panel-header > div { min-width: 0; }
-.webchat-page-builder-panel-header span { display: block; margin-bottom: 3px; color: var(--text-muted); font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.webchat-page-builder-panel-header span { display: block; margin-bottom: 3px; color: var(--text-muted); font-size: 10px; font-weight: 700; letter-spacing: normal; text-transform: none; }
 .webchat-page-builder-panel-header strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
 .webchat-page-palette { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
 .webchat-page-palette button { min-height: 38px; justify-content: flex-start; border-color: transparent; background: var(--surface-muted); box-shadow: none; }
@@ -80,16 +80,16 @@
 .webchat-page-inspector-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .webchat-page-inspector-fields > .webchat-page-item-fields,
 .webchat-page-inspector-fields > .webchat-page-note { grid-column: 1 / -1; }
-.webchat-page-config-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 4px; margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border-subtle); }
+.webchat-page-config-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 4px; margin-top: 14px; padding-top: 10px; border-top: 0.5px solid var(--border-subtle); }
 .webchat-page-config .manor-input, .webchat-page-config .manor-textarea { min-width: 0; width: 100%; }
 .webchat-page-inspector-fields .manor-input, .webchat-page-inspector-fields .manor-textarea { min-width: 0; width: 100%; }
 .webchat-page-inspector-fields > button { width: auto; justify-self: start; background: transparent; box-shadow: none; }
-.webchat-page-item-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding: 0 0 12px; border: 0; border-bottom: 1px solid var(--border-subtle); background: transparent; border-radius: 0; }
+.webchat-page-item-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding: 0 0 12px; border: 0; border-bottom: 0.5px solid var(--border-subtle); background: transparent; border-radius: 0; }
 .webchat-page-item-fields > button { justify-self: start; }
 .webchat-page-empty { font-size: 12px; color: var(--text-muted); padding: 10px 0; }
 .webchat-page-error { color: var(--status-danger, #c14a44); font-size: 12px; }
-.webchat-page-preview { width: 100%; max-width: 420px; height: 540px; display: flex; flex-direction: column; background: var(--surface-panel); border: 1px solid var(--border-subtle); border-radius: 16px; box-shadow: none; overflow: hidden; }
-.webchat-page-preview-header { display: flex; align-items: center; gap: 10px; padding: 14px 18px; border-bottom: 1px solid var(--border-subtle); background: transparent; }
+.webchat-page-preview { width: 100%; max-width: 420px; height: 540px; display: flex; flex-direction: column; background: var(--surface-panel); border: 0.5px solid var(--border-subtle); border-radius: 16px; box-shadow: none; overflow: hidden; }
+.webchat-page-preview-header { display: flex; align-items: center; gap: 10px; padding: 14px 18px; border-bottom: 0.5px solid var(--border-subtle); background: transparent; }
 .webchat-page-preview-header strong { display: block; font-size: 14px; }
 .webchat-page-preview-header small { font-size: 11px; color: var(--text-muted); }
 .webchat-page-preview-body { flex: 1; padding: 16px 18px; text-align: center; color: var(--text-muted); font-size: 12px; white-space: pre-line; }

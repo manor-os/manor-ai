@@ -3,6 +3,19 @@ import { api } from "../../lib/api";
 import { chatFeedbackCoordinator } from "../../lib/chat-feedback-queue.mjs";
 import type { ChatMessageFeedbackRating } from "./ChatMessageActions";
 
+// The page chat and the floating chat can open the same conversation at once.
+const feedbackLoads = new Map<string, ReturnType<typeof api.chat.listFeedback>>();
+
+function loadFeedback(conversationId: string) {
+  const inFlight = feedbackLoads.get(conversationId);
+  if (inFlight) return inFlight;
+  const load = api.chat.listFeedback(conversationId).finally(() => {
+    feedbackLoads.delete(conversationId);
+  });
+  feedbackLoads.set(conversationId, load);
+  return load;
+}
+
 export default function useChatMessageFeedback(userId?: string | null) {
   const scope = userId || null;
   const [state, setState] = useState<{
@@ -41,7 +54,7 @@ export default function useChatMessageFeedback(userId?: string | null) {
   const hydrateConversation = useCallback(
     async (conversationId: string) => {
       if (!scope || !conversationId) return;
-      const records = await api.chat.listFeedback(conversationId);
+      const records = await loadFeedback(conversationId);
       chatFeedbackCoordinator.hydrate(scope, records);
     },
     [scope],

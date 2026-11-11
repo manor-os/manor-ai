@@ -1,5 +1,5 @@
 /**
- * Toggle — glassmorphism toggle switch with teal gradient.
+ * Toggle — the one on/off switch.
  *
  * Usage:
  *   <Toggle checked={enabled} onChange={() => setEnabled(!enabled)} />
@@ -40,9 +40,8 @@ export default function Toggle({ checked, onChange, size = "md", disabled, "aria
         flexShrink: 0,
         appearance: "none",
         WebkitAppearance: "none",
-        transition: "all 0.25s cubic-bezier(0.4,0,0.2,1)",
-        background: checked ? "linear-gradient(135deg, #4f7d75, #436b65)" : "#e7e5e4",
-        boxShadow: checked ? "0 0 10px rgba(79,125,117,0.25)" : "none",
+        transition: "background 0.2s ease",
+        background: checked ? "var(--accent-fill)" : "rgba(120, 120, 128, 0.24)",
         opacity: disabled ? 0.5 : 1,
       }}
     >
@@ -51,7 +50,7 @@ export default function Toggle({ checked, onChange, size = "md", disabled, "aria
         top: pad,
         left: checked ? w - dot - pad : pad,
         width: dot, height: dot, borderRadius: "50%",
-        background: "#fff",
+        background: "var(--toggle-knob, #fff)",
         transition: "left 0.25s cubic-bezier(0.4,0,0.2,1)",
         boxShadow: "0 1px 3px rgba(0,0,0,0.12)",
       }} />

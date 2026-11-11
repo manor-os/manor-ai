@@ -14,6 +14,12 @@ import {
 } from "../lib/fileReferences";
 import InlineFileReferenceCard from "./InlineFileReferenceCard";
 import GeneratedResultFiles from "./GeneratedResultFiles";
+import { PublishedSiteCards } from "./PublishedSiteCard";
+import {
+  isSiteAttachment,
+  publishedSitesFromAttachments,
+  type PublishedSiteAttachment,
+} from "../lib/publishedSites";
 import { partitionGeneratedResultFiles, prioritizeGeneratedResultFiles } from "../lib/resultFiles";
 import {
   displayContentForAssistantMessage,
@@ -50,6 +56,8 @@ export type ParsedUserMessageDisplay = {
   cleanContent: string;
   chips: ChatMessageDisplayChip[];
   references: ChatMessageDisplayReference[];
+  /** Websites an assistant reply published (never files; see lib/publishedSites). */
+  sites: PublishedSiteAttachment[];
 };
 
 export type ChatMessageDisplayProjectionOptions = {
@@ -327,6 +335,8 @@ export function chatMessageReferencesFromAttachments(
   const references: ChatMessageDisplayReference[] = [];
   for (const value of attachments) {
     if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    // A published website is shown as a site card, never as a file.
+    if (isSiteAttachment(value)) continue;
     const attachment = value as Record<string, unknown>;
     const ref = normalizeFileRef(attachment);
     pushReference(references, {
@@ -588,6 +598,7 @@ function computeUserMessageDisplay(
     references: msg.role === "assistant"
       ? prioritizeGeneratedResultFiles(visibleReferences).map((ref) => ({ ...ref, isOutput: true }))
       : visibleReferences,
+    sites: msg.role === "assistant" ? publishedSitesFromAttachments(msg.attachments) : [],
   };
 }
 
@@ -687,17 +698,27 @@ function ChatMessageReferenceThumb({ refItem }: { refItem: ChatMessageDisplayRef
 
 export function ChatMessageReferenceStrip({
   references,
+  sites,
   align = "left",
   onOpenReference,
   inlineFileCards = false,
   returnTo,
 }: {
   references: ChatMessageDisplayReference[];
+  /** Websites the reply published, shown above its files. */
+  sites?: PublishedSiteAttachment[];
   align?: "left" | "right";
   onOpenReference?: (refItem: ChatMessageDisplayReference) => void;
   inlineFileCards?: boolean;
   returnTo?: string;
 }) {
+  if (sites?.length) {
+    return <>
+      <PublishedSiteCards sites={sites} />
+      <ChatMessageReferenceStrip references={references} align={align}
+        onOpenReference={onOpenReference} inlineFileCards={inlineFileCards} returnTo={returnTo} />
+    </>;
+  }
   if (!references.length) return null;
   if (inlineFileCards && references.some((ref) => ref.isOutput)) {
     const files = references.slice(0, CHAT_MESSAGE_REFERENCE_CARD_LIMIT).flatMap((ref) => {

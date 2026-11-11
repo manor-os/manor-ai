@@ -7,9 +7,11 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Iterable
 
-from sqlalchemy import select
+from sqlalchemy import case, cast, func, select
+from sqlalchemy.dialects.postgresql import JSONB, JSONPATH
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.contracts.json_schema import SchemaContractValidatorFactory
@@ -232,6 +234,37 @@ def _run_input_prefill(value: Any) -> dict[str, Any] | None:
     }
 
 
+def _entry_steps(workflow: Any, locale: str | None) -> list[dict[str, Any]]:
+    """A Flow's entry nodes (trigger/webhook), in the viewer's language.
+
+    Only these are translated: a translation never changes a node's ``type``,
+    and translating every node of every Flow on each list dominated the cost.
+    """
+    steps = getattr(workflow, "steps", None)
+    if not isinstance(steps, list):
+        return []
+    return [
+        localized(step, locale) if locale else without_i18n(step)
+        for step in steps
+        if isinstance(step, dict) and str(step.get("type") or "").lower() in {"trigger", "webhook"}
+    ]
+
+
+# The same test as _entry_steps, run by Postgres: listing entry points reads a
+# Flow's entry nodes instead of its whole step graph.
+_ENTRY_STEPS_PATH = '$[*] ? (@.type like_regex "^(trigger|webhook)$" flag "i")'
+
+
+def entry_steps_column():
+    """A Flow's entry nodes as a select column (None when ``steps`` is no list)."""
+    return case((
+        func.jsonb_typeof(WorkflowDefinition.steps) == "array",
+        func.jsonb_path_query_array(
+            WorkflowDefinition.steps, cast(_ENTRY_STEPS_PATH, JSONPATH), type_=JSONB,
+        ),
+    )).label("entry_steps")
+
+
 def workflow_run_input_rules(workflow: Any, *, locale: str | None = None) -> tuple[dict[str, Any], ...]:
     """Rules across a Flow's run inputs, declared on its entry node as ``input_rules``.
 
@@ -240,12 +273,8 @@ def workflow_run_input_rules(workflow: Any, *, locale: str | None = None) -> tup
     shown on every input the rule names. The form checks them before starting
     and the run is refused without them, so a run never starts only to fail on them.
     """
-    steps = getattr(workflow, "steps", None)
-    steps = localized(steps, locale) if locale else without_i18n(steps)
     rules: list[dict[str, Any]] = []
-    for step in steps if isinstance(steps, list) else []:
-        if not isinstance(step, dict) or str(step.get("type") or "").lower() not in {"trigger", "webhook"}:
-            continue
+    for step in _entry_steps(workflow, locale):
         for rule in _mapping(step.get("config")).get("input_rules") or []:
             if isinstance(rule, dict) and rule:
                 rules.append(deepcopy(rule))
@@ -292,15 +321,9 @@ def workflow_run_inputs(workflow: Any, *, locale: str | None = None) -> tuple[di
     With the viewer's ``locale`` the labels, hints and defaults are theirs.
     """
     variables = _mapping(getattr(workflow, "variables", None))
-    steps = getattr(workflow, "steps", None)
-    steps = localized(steps, locale) if locale else without_i18n(steps)
-    if not isinstance(steps, list):
-        return ()
     seen: set[str] = set()
     result: list[dict[str, Any]] = []
-    for step in steps:
-        if not isinstance(step, dict) or str(step.get("type") or "").lower() not in {"trigger", "webhook"}:
-            continue
+    for step in _entry_steps(workflow, locale):
         config = _mapping(step.get("config"))
         # The run is validated against input_schema; the form reads each input's
         # schema, so its constraints travel with the input and the form refuses
@@ -793,7 +816,7 @@ async def check_declared_workflow_record_selections(
     entity_id: str,
     workspace_id: str | None,
 ) -> None:
-    """Reject ``record_select`` keys that the input's record source no longer offers."""
+    """Reject picked record keys or Workspace project ids the input does not offer."""
     from packages.core.services.workflow_record_source import record_selection_errors
 
     run_inputs, values = _declared_run_input_values(
@@ -1173,8 +1196,13 @@ async def list_workspace_chat_entrypoints(
             WorkflowBinding.status == "active",
             WorkflowDefinition.status == "active",
         )
+    # Only the Flow fields an entry point reads; its entry nodes stand in for
+    # the step graph, which can be megabytes per Flow.
     rows = (await db.execute(
-        select(WorkflowBinding, WorkflowDefinition)
+        select(
+            WorkflowBinding, WorkflowDefinition.id, WorkflowDefinition.name,
+            WorkflowDefinition.description, WorkflowDefinition.variables, entry_steps_column(),
+        )
         .join(WorkflowDefinition, WorkflowDefinition.id == WorkflowBinding.workflow_id)
         .where(
             WorkflowBinding.entity_id == entity_id,
@@ -1186,9 +1214,11 @@ async def list_workspace_chat_entrypoints(
     )).all()
     entrypoints = [
         normalized
-        for binding, workflow in rows
+        for binding, *flow in rows
         if (normalized := normalize_chat_entrypoint(
-            binding, workflow, include_unpublished=include_unpublished, locale=locale,
+            binding,
+            SimpleNamespace(**dict(zip(("id", "name", "description", "variables", "steps"), flow))),
+            include_unpublished=include_unpublished, locale=locale,
         )) is not None
         and (not intent_only or normalized.intent_enabled)
     ]
@@ -1212,8 +1242,8 @@ async def list_global_chat_flow_entrypoints(
     """
     from packages.core.models.workspace import Workspace
     from packages.core.services.workspace_access import (
-        user_can_read_workspace,
-        user_can_write_workspace_artifacts,
+        user_readable_workspace_ids,
+        user_writable_workspace_ids,
     )
 
     if user is None or str(getattr(user, "entity_id", "") or "") != entity_id:
@@ -1235,23 +1265,30 @@ async def list_global_chat_flow_entrypoints(
     if workspace_id:
         query = query.where(WorkflowBinding.workspace_id == workspace_id)
     rows = (await db.execute(query)).all()
-    visible: list[
-        tuple[WorkspaceChatEntrypoint, WorkflowBinding, WorkflowDefinition, Any]
-    ] = []
-    for binding, workflow, workspace in rows:
-        entrypoint = normalize_chat_entrypoint(binding, workflow)
-        if entrypoint is None:
-            continue
-        if not await user_can_read_workspace(db, workspace=workspace, user=user):
-            continue
-        if require_control and not await user_can_write_workspace_artifacts(
+    candidates = [
+        (entrypoint, binding, workflow, workspace)
+        for binding, workflow, workspace in rows
+        if (entrypoint := normalize_chat_entrypoint(binding, workflow)) is not None
+    ]
+    # Many Flows share a Workspace: decide each Workspace once, by the same
+    # read and control policy the launch applies.
+    workspace_ids = {str(item[3].id) for item in candidates}
+    allowed = await user_readable_workspace_ids(
+        db,
+        entity_id=entity_id,
+        user_id=user.id,
+        role=user.role,
+        workspace_ids=workspace_ids,
+    ) if workspace_ids else set()
+    if require_control and allowed:
+        allowed &= await user_writable_workspace_ids(
             db,
-            workspace_id=workspace.id,
+            entity_id=entity_id,
+            workspace_ids=allowed,
             user_id=user.id,
-            entity_role=user.role,
-        ):
-            continue
-        visible.append((entrypoint, binding, workflow, workspace))
+            role=user.role,
+        )
+    visible = [item for item in candidates if str(item[3].id) in allowed]
     return sorted(
         visible,
         key=lambda item: (
@@ -1344,7 +1381,26 @@ def pending_action_reply_matches(
         "stop",
         "this looks good",
         "yes",
+        # Chinese replies, written without the spaces the prefix check needs.
+        "继续",
+        "继续完成",
+        "继续做",
+        "接着做",
+        "重试",
+        "再试一次",
+        "确认",
+        "同意",
+        "批准",
+        "可以",
+        "好的",
+        "取消",
+        "停止",
+        "跳过",
+        "不用了",
     }
+    # Only phrases about finishing the work already under way: "继续写一首新歌"
+    # (go on and write a new song) is new work, not a reply to a card.
+    cjk_reply_prefixes = ("继续完成", "接着完成", "继续做完", "接着做完", "重试", "再试一次")
     for action in pending_actions:
         if not isinstance(action, dict) or not action.get("kind"):
             continue
@@ -1358,6 +1414,8 @@ def pending_action_reply_matches(
         if action["kind"] in {"workflow_input", "workflow_starter_input"} and not include_workflow_free_text:
             continue
         if any(text.startswith(f"{phrase} ") for phrase in reply_phrases):
+            return True
+        if text.startswith(cjk_reply_prefixes) and len(text) <= 40:
             return True
         if str(action.get("kind")) in {
             "human_input",
@@ -1590,13 +1648,32 @@ def workspace_intent_choice_prompt(
         for index, item in enumerate(items, start=1)
     )
     if any("\u4e00" <= char <= "\u9fff" for char in str(source_brief or "")):
-        intro = "匹配到多条 workflow，请回复序号或完整标题来选择要启动的那一条："
+        intro = "有几条 workflow 都能做这件事，第一条最贴近你的要求。选一条开始，或直接告诉我你的想法："
     else:
         intro = (
-            "Matched multiple workflows. Reply with a number or the full title "
-            "to choose which one to start:"
+            "A few workflows can do this; the first fits your request best. "
+            "Pick one to start, or tell me what you have in mind:"
         )
     return f"{intro}\n\n{numbered}" if numbered else intro
+
+
+def workspace_intent_choice_question(items: tuple[WorkspaceChatEntrypoint, ...]) -> dict[str, Any] | None:
+    """The choice as a question with buttons, the best match recommended.
+
+    ``answer_as: "message"``: a click sends the option as the person's reply,
+    the same text :func:`match_workspace_intent_choice` already understands,
+    so the choice resolves on the path a typed reply takes.
+    """
+    from packages.core.services.decision_recommendation import ensure_recommendation, recommendation
+
+    titles = list(dict.fromkeys(item.title for item in items if item.title))
+    if not titles:
+        return None
+    return ensure_recommendation({
+        "options": titles,
+        "recommendation": recommendation(titles[0], reason_code="best_match"),
+        "answer_as": "message",
+    })
 
 
 async def _load_intent_choice_conversation(
@@ -1683,6 +1760,7 @@ async def persist_workspace_intent_choice(
             "candidate_binding_ids": [item.binding_id for item in items],
             "source_brief": brief,
             "origin_message_id": user_message.id,
+            "question": workspace_intent_choice_question(items),
         },
     )
     return WorkspaceIntentChoicePrompt(

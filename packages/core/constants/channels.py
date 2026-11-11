@@ -14,6 +14,7 @@ class DurableInboundChannel(StrEnum):
     OUTLOOK = "outlook"
     MS_TEAMS = "ms_teams"
     WECHAT_PERSONAL = "wechat_personal"
+    TELEGRAM = "telegram"
 
 
 class ExternalMessageActionKey(StrEnum):

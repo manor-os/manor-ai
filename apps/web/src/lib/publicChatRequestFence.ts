@@ -22,6 +22,45 @@ export function createPublicChatRequestFence() {
 }
 export type PublicChatRequestFence = ReturnType<typeof createPublicChatRequestFence>;
 
+/** Coalesces repeat reads of one resident resource without sharing its security fence. */
+export function createPublicChatReadCoalescer() {
+  let generation = 0;
+  let inFlight = false;
+  let pending: (() => void | Promise<void>) | null = null;
+
+  const run = (read: () => void | Promise<void>, readGeneration: number) => {
+    inFlight = true;
+    void Promise.resolve().then(() => {
+      if (readGeneration !== generation) return;
+      return read();
+    }).catch(() => undefined).then(() => {
+      if (readGeneration !== generation) return;
+      const next = pending;
+      pending = null;
+      if (!next) {
+        inFlight = false;
+        return;
+      }
+      run(next, generation);
+    });
+  };
+
+  return {
+    request(read: () => void | Promise<void>) {
+      if (inFlight) {
+        pending = read;
+        return;
+      }
+      run(read, generation);
+    },
+    invalidate() {
+      generation++;
+      inFlight = false;
+      pending = null;
+    },
+  };
+}
+
 // The server no longer has this session's conversation: nothing private can
 // be reloaded through it, so the page may start a fresh session instead.
 export function residentStatusSessionMissing(status: number, value: unknown): boolean {

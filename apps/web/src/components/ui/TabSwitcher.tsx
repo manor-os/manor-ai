@@ -79,6 +79,9 @@ export default function TabSwitcher({
     });
   }, [value]);
 
+  // A single tab is just the page title: nothing to switch between.
+  if (tabs.length <= 1) return null;
+
   return (
     <div
       className={`manor-tab-switcher manor-tab-switcher--${appearance} ${className}`}
@@ -101,7 +104,7 @@ export default function TabSwitcher({
         WebkitOverflowScrolling: "touch",
         scrollbarWidth: "none",
         background: minimal ? "transparent" : "var(--surface-muted)",
-        border: minimal ? "none" : "1px solid var(--border-subtle)",
+        border: minimal ? "none" : "0.5px solid var(--border-subtle)",
         borderRadius: minimal ? 0 : r + 3,
       }}
     >
@@ -166,10 +169,10 @@ export default function TabSwitcher({
             )}
             {typeof tab.badge === "string" ? (
               <span style={{
-                fontSize: 9, fontWeight: 700, letterSpacing: "0.03em",
+                fontSize: 9, fontWeight: 700,
                 padding: "1px 5px", borderRadius: 4, lineHeight: 1.4,
                 background: "linear-gradient(135deg, #9079c2, #6d6fb2)",
-                color: "#fff", textTransform: "uppercase",
+                color: "#fff",
               }}>
                 {tab.badge}
               </span>

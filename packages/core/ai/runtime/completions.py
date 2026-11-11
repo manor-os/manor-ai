@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 import json
+import logging
 from typing import Any
 
 from packages.core.ai.runtime.sources import (
@@ -46,10 +47,13 @@ from packages.core.ai.runtime.sources import (
     RUNTIME_WORKFLOW_SERVICE_SOURCE,
     RUNTIME_WORKFLOW_SOURCE,
     RUNTIME_WORKSPACE_ARCHITECT_SOURCE,
+    RUNTIME_WORKSPACE_RECOMMENDATION_SOURCE,
     RUNTIME_WORKSPACE_TRANSLATION_SOURCE,
     RUNTIME_WORKSPACE_SETUP_SOURCE,
 )
 
+
+logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class RuntimeTextCompletionResult:
@@ -105,9 +109,12 @@ def runtime_prompt_with_output_schema(
 # acting again is not a blocker for the person.
 RUNTIME_FINISH_BEFORE_BLOCKING = (
     "Finish the work before you report it:\n"
+    "- A check you could not complete is not a result: gather what it needs with your tools (sample more "
+    "frames, probe or measure the file, read it back) and complete it. Never report a step as not done "
+    "because a check is unfinished.\n"
     "- When your own check finds a defect your tools can fix (a length, size or format a little off, a "
-    "file to re-render, re-encode, trim or regenerate, a step to redo), fix it and check again. Do this "
-    "up to three times before you report the step as not done.\n"
+    "file to re-render, re-encode, trim or regenerate, a step to redo), say what the check found, fix it "
+    "and check again. Do this up to three times before you report the step as not done.\n"
     "- Measured media meets its target within normal rounding: a duration within one frame or 0.05 "
     "seconds of its target meets it, and so does a size within one pixel. Never fail a result for less.\n"
     "- Report the step as not done, with its reason, only for what you cannot fix yourself: missing "
@@ -193,6 +200,8 @@ RUNTIME_TEXT_COMPLETION_SOURCE_MODEL_ROLES: dict[str, str] = {
     RUNTIME_WORKFLOW_SERVICE_SOURCE: "workflow_service",
     RUNTIME_WORKFLOW_SOURCE: "workflow",
     RUNTIME_WORKSPACE_ARCHITECT_SOURCE: "workspace_architect",
+    # The model is fixed by the caller (WORKSPACE_RECOMMENDATION_MODEL).
+    RUNTIME_WORKSPACE_RECOMMENDATION_SOURCE: "primary",
     # The model is fixed by the caller (WORKSPACE_TRANSLATION_MODEL).
     RUNTIME_WORKSPACE_TRANSLATION_SOURCE: "primary",
     RUNTIME_WORKSPACE_SETUP_SOURCE: "workspace_setup",
@@ -307,6 +316,12 @@ async def runtime_execute_agent_prompt_preview_completion(
     )
 
 
+async def _report_background_model_failure(
+    *, entity_id: str | None, source: str, model: str | None, error: Any,
+) -> None:
+    """Tell ops a model role is failing; once a week per tenant and model. Never raises."""
+
+
 async def runtime_execute_text_completion(
     messages: Iterable[dict[str, Any]],
     *,
@@ -339,6 +354,9 @@ async def runtime_execute_text_completion(
     language = await resolve_runtime_response_language(
         entity_id=entity_id, user_id=user_id, source=source, surface=runtime_surface,
     )
+    # Both attempts need the full request even when the caller supplied a
+    # one-shot iterable. Language decoration builds a fresh list per attempt.
+    messages = list(messages)
 
     resolved_model, resolved_metadata, resolved_byok = await runtime_resolve_text_completion_route(
         entity_id=entity_id,
@@ -379,6 +397,26 @@ async def runtime_execute_text_completion(
         content, usage = await chat_completion(
             response_language_messages(messages, language), **completion_kwargs,
         )
+        if (usage or {}).get("error") and not model:
+            # Staging 2026-11-03: the backend model answered 503 to every call, so memory
+            # stopped working and nothing said so. The chat model is the Workspace's own
+            # working route; background work continues on it.
+            chat_model, chat_metadata, _chat_byok = await runtime_resolve_text_completion_route(
+                entity_id=entity_id,
+                user_id=user_id,
+                source=RUNTIME_CHAT_SOURCE,
+                model=None,
+                metadata=metadata,
+                workspace_id=workspace_id,
+            )
+            if chat_model and chat_model != resolved_model:
+                await _report_background_model_failure(
+                    entity_id=entity_id, source=source, model=resolved_model, error=usage.get("error"),
+                )
+                content, usage = await chat_completion(
+                    response_language_messages(messages, language),
+                    **{**completion_kwargs, "model": chat_model, "metadata": chat_metadata},
+                )
     return RuntimeTextCompletionResult(
         content=content or "",
         usage=dict(usage or {}),

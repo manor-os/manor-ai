@@ -54,7 +54,7 @@ export default function OfficePreview({ kind, name, source, fallback }: OfficePr
           height={page.height || undefined}
           loading={page.index === 0 ? "eager" : "lazy"}
           onError={() => setError(true)}
-          style={{ display: "block", width: "100%", height: "auto", margin: "0 auto", border: "1px solid rgba(28,25,23,0.06)" }}
+          style={{ display: "block", width: "100%", height: "auto", margin: "0 auto", border: "0.5px solid rgba(29, 29, 31,0.06)" }}
         />
       ))}
     </div>
@@ -66,9 +66,9 @@ export function DocxOfficePreview({ name, source, blob }: Pick<OfficePreviewProp
 }
 
 function PreviewLoading() {
-  return <p style={{ color: "#a8a29e", textAlign: "center", padding: "24px 0" }}>{t("page.shared_doc.loading")}</p>;
+  return <p style={{ color: "var(--text-muted)", textAlign: "center", padding: "24px 0" }}>{t("page.shared_doc.loading")}</p>;
 }
 
 function PreviewFallback() {
-  return <p style={{ color: "#a8a29e", textAlign: "center", padding: "24px 0" }}>{t("page.shared_doc.preview_unavailable")}</p>;
+  return <p style={{ color: "var(--text-muted)", textAlign: "center", padding: "24px 0" }}>{t("page.shared_doc.preview_unavailable")}</p>;
 }

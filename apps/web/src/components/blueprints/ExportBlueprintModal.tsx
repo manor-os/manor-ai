@@ -4,7 +4,7 @@
  * /api/v1/workspaces/{id}/export-blueprint and navigates to the new
  * blueprint's detail page on success.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
@@ -29,6 +29,7 @@ interface Props {
   onClose: () => void;
   workspaceId: string;
   workspaceName: string;
+  publishing?: boolean;
 }
 
 interface SectionToggle {
@@ -128,16 +129,16 @@ const SECTIONS: SectionToggle[] = [
   { key: "include_goals",                 label: t("nav.goals"),                defaultOn: true,  hint: "Targets + measurement schedule. Runtime values are stripped." },
   { key: "include_stats",                 label: t("page.workspace_stats.title"), defaultOn: true,  hint: "Collection definitions only. Observation history is never exported." },
   { key: "include_scheduled_jobs",        label: t("page.blueprint_detail.scheduled_jobs"),       defaultOn: true,  hint: "Cron triggers (last_run_at dropped)." },
-  { key: "include_workflows",             label: "Workflows",                  defaultOn: true,  hint: "Workspace workflow graphs, variables, and active bindings." },
-  { key: "include_blocking_setup",        label: "Workspace setup checks",     defaultOn: true,  hint: "Carry workspace prerequisites into new installs. Turn off when the exported workflow collects these inputs at launch; the source workspace is unchanged." },
+  { key: "include_workflows",             label: t("ui.workflows"),                  defaultOn: true,  hint: "Workspace workflow graphs, variables, and active bindings." },
+  { key: "include_blocking_setup",        label: t("ui.workspace_setup_checks"),     defaultOn: true,  hint: "Carry workspace prerequisites into new installs. Turn off when the exported workflow collects these inputs at launch; the source workspace is unchanged." },
   { key: "include_custom_fields",         label: t("component.export_blueprint_modal.custom_field_defs"),    defaultOn: true,  hint: "Per-workspace field schemas for tasks/clients." },
   { key: "include_governance",            label: t("page.blueprint_detail.governance_policy"),    defaultOn: true,  hint: "Current policy snapshot — operator picks a preset overlay on install." },
   { key: "include_channel_requirements",  label: t("component.export_blueprint_modal.channel_requirements"), defaultOn: true,  hint: "Channel types and service routing; account identities and credentials are never copied." },
   { key: "include_session_requirements",  label: t("page.blueprint_detail.browser_sessions"),     defaultOn: true,  hint: "Only referenced provider+label requirements; credentials are never copied." },
-  { key: "include_embedded_agents",       label: "Private Agents",             defaultOn: true,  hint: "Embed subscribed private Agents; public Agents remain catalog requirements." },
-  { key: "include_embedded_skills",       label: "Private Skills",             defaultOn: true,  hint: "Embed private Skills bound to exported Agents." },
-  { key: "include_starter_memory",        label: "Agent starter memory",       defaultOn: false, hint: "Include eligible agent-level memory; private and confidential entries stay excluded." },
-  { key: "include_knowledge_packs",       label: "Knowledge structure",        defaultOn: true,  hint: "Export Workspace Knowledge groups and safe document paths." },
+  { key: "include_embedded_agents",       label: t("ui.private_agents"),             defaultOn: true,  hint: "Embed subscribed private Agents; public Agents remain catalog requirements." },
+  { key: "include_embedded_skills",       label: t("ui.private_skills"),             defaultOn: true,  hint: "Embed private Skills bound to exported Agents." },
+  { key: "include_starter_memory",        label: t("ui.agent_starter_memory"),       defaultOn: false, hint: "Include eligible agent-level memory; private and confidential entries stay excluded." },
+  { key: "include_knowledge_packs",       label: t("ui.knowledge_structure"),        defaultOn: true,  hint: "Export Workspace Knowledge groups and safe document paths." },
   { key: "include_memory_files",          label: t("component.export_blueprint_modal.memory_md_files"),      defaultOn: false, hint: "Include bodies only for public, clean, non-PII Markdown and CSV stored as Knowledge text." },
 ];
 
@@ -154,7 +155,18 @@ function formatPortableSize(bytes: number): string {
   return `${Math.ceil(bytes / 1024)} KB`;
 }
 
-export default function ExportBlueprintModal({ open, onClose, workspaceId, workspaceName }: Props) {
+/** Publishing asks for a name and a promise; everything with a sensible default waits behind this. */
+function PublishAdvanced({ collapsed, children }: { collapsed: boolean; children: ReactNode }) {
+  if (!collapsed) return <>{children}</>;
+  return (
+    <details className="market-publish-advanced">
+      <summary>{t("market.publish.advanced")}</summary>
+      <div>{children}</div>
+    </details>
+  );
+}
+
+export default function ExportBlueprintModal({ open, onClose, workspaceId, workspaceName, publishing = false }: Props) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const toast = useToastStore();
@@ -216,7 +228,9 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
   useEffect(() => {
     if (open) {
       setTitle(workspaceName);
-      setSlug(defaultSlug(workspaceName));
+      // A name in another script leaves nothing to slug, and the field may be out of sight.
+      const nameSlug = defaultSlug(workspaceName);
+      setSlug(nameSlug.length >= 3 ? nameSlug : `workspace-${workspaceId.slice(-8).toLowerCase()}`);
       setSummary("");
       setDescription("");
       setUsageGuide("");
@@ -299,7 +313,9 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
       queryClient.invalidateQueries({ queryKey: ["blueprint", bp.id] });
       toast.success(updatesLiveBlueprint
         ? t("component.export_blueprint_modal.new_version_saved")
-        : t("component.export_blueprint_modal.blueprint_draft_created"));
+        : publishing
+          ? t("market.publish.saved")
+          : t("component.export_blueprint_modal.blueprint_draft_created"));
       onClose();
       handleExportedBlueprint(bp);
     },
@@ -362,17 +378,21 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
     <Modal
       open={open}
       onClose={onClose}
-      title={t("component.export_blueprint_modal.export_workspace_as_blueprint")}
+      title={publishing
+        ? t("market.publish.title")
+        : t("component.export_blueprint_modal.export_workspace_as_blueprint")}
       maxWidth="640px"
       footer={
         <>
           <Button variant="outline" onClick={onClose}>{t("action.cancel")}</Button>
-          <Button
-            variant="outline"
-            disabled={title.trim().length === 0 || knowledgeSelectionUnavailable || packageMutation.isPending}
-            loading={packageMutation.isPending}
-            onClick={() => packageMutation.mutate()}
-          >{t("component.export_blueprint_modal.download_package")}</Button>
+          {!publishing && (
+            <Button
+              variant="outline"
+              disabled={title.trim().length === 0 || knowledgeSelectionUnavailable || packageMutation.isPending}
+              loading={packageMutation.isPending}
+              onClick={() => packageMutation.mutate()}
+            >{t("component.export_blueprint_modal.download_package")}</Button>
+          )}
           <Button
             variant="primary"
             disabled={!canSubmit}
@@ -381,13 +401,17 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
           >
             {updatesLiveBlueprint
               ? t("component.export_blueprint_modal.save_new_version")
-              : t("component.export_blueprint_modal.create_draft")}</Button>
+              : publishing
+                ? t("market.publish.next")
+                : t("component.export_blueprint_modal.create_draft")}</Button>
         </>
       }
     >
       <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
         <div style={{ background: "var(--surface-muted)", padding: 12, borderRadius: "var(--radius-control)", fontSize: 12, color: "var(--text-default)" }}>
-          {t("component.export_blueprint_modal.a_blueprint_is_a_portable_json_document_secrets_runtim")}</div>
+          {publishing
+            ? t("market.publish.intro")
+            : t("component.export_blueprint_modal.a_blueprint_is_a_portable_json_document_secrets_runtim")}</div>
 
         {updatesLiveBlueprint && (
           <div role="note" style={{ padding: 12, borderRadius: "var(--radius-control)", background: "var(--surface-muted)", color: "var(--text-default)", fontSize: 12 }}>
@@ -418,6 +442,10 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
           placeholder={t("component.export_blueprint_modal.x_growth_calvin_s_recipe")}
         />
 
+        <Textarea label={t("component.export_blueprint_modal.summary_one_line")} value={summary} onChange={(e) => setSummary(e.target.value)} rows={2} />
+
+
+        <PublishAdvanced collapsed={publishing}>
         <div>
           <Input
             label={t("component.export_blueprint_modal.slug_used_in_urls_when_sharing")}
@@ -432,7 +460,6 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
           )}
         </div>
 
-        <Textarea label={t("component.export_blueprint_modal.summary_one_line")} value={summary} onChange={(e) => setSummary(e.target.value)} rows={2} />
         <Textarea label={t("page.task_collections.description")} value={description} onChange={(e) => setDescription(e.target.value)} rows={4} />
         <Textarea
           label={t("page.blueprint_detail.usage_guide")}
@@ -515,7 +542,7 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
                         label={t("component.export_blueprint_modal.personalization_question_label")}
                         value={field.label}
                         onChange={(event) => updateField({ label: event.target.value })}
-                        placeholder="Company name"
+                        placeholder={t("ui.company_name")}
                         required
                       />
                       <Input
@@ -569,7 +596,7 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
             label={(
               <span>
                 <span style={{ display: "block", fontWeight: 600, color: "var(--text-strong)" }}>
-                  Replace an existing draft with this slug
+                  {t("ui.replace_an_existing_draft_with_this_slug")}
                 </span>
                 <span style={{ display: "block", marginTop: 2, fontSize: 11, color: "var(--text-muted)" }}>
                   Only an editable Blueprint previously exported from this Workspace can be replaced.
@@ -732,6 +759,7 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
             })}
           </div>
         </div>
+        </PublishAdvanced>
       </div>
     </Modal>
   );

@@ -1,7 +1,9 @@
-"""Stable Workspace setting ownership boundaries."""
+"""Stable Workspace setting ownership boundaries and lifecycle sets."""
 from __future__ import annotations
 
 from enum import Enum
+
+LIVE_WORKSPACE_STATUSES = ("active", "paused", "provisioning", "needs_setup")
 
 
 class WorkspaceServerSettingKey(str, Enum):

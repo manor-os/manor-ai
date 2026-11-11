@@ -71,13 +71,26 @@ export function getWorkspacePresentation(ws: WorkspacePresentationSource): Works
       iconName,
     };
   }
+  // No category recognised: show the name's first character rather than an
+  // unrelated glyph picked at random.
+  const initial = Array.from((ws.name || "").trim())[0] || "";
   return {
-    Icon: resolveWorkspaceIcon(iconName),
+    Icon: initial ? initialGlyph(initial) : resolveWorkspaceIcon(iconName),
     label: ws.category || t("page.workspaces.workspace"),
     bg: "#f3f1ed",
     fg: "#6f6860",
     iconIndex,
     iconName,
+  };
+}
+
+function initialGlyph(initial: string): WorkspaceIconComponent {
+  return function WorkspaceInitial({ size = 16, style }: IconProps) {
+    return (
+      <span style={{ fontSize: Number(size) * 0.92, fontWeight: 600, lineHeight: 1, ...style }}>
+        {initial.toLocaleUpperCase()}
+      </span>
+    );
   };
 }
 
@@ -101,18 +114,19 @@ export function WorkspacePresentationTile({
         height: size,
         minWidth: size,
         borderRadius: Math.round(size * 0.25),
-        background: presentation.bg,
+        // One glazed, monochrome tile for every Workspace: the glyph tells them apart.
+        background: "linear-gradient(180deg, var(--surface-panel) 0%, var(--surface-muted) 100%)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        boxShadow: "inset 0 0 0 1px rgba(28,25,23,0.035)",
+        boxShadow: "inset 0 0 0 0.5px rgba(0,0,0,0.08), inset 0 1px 0 rgba(255,255,255,0.9), 0 1px 2px rgba(0,0,0,0.05), 0 4px 10px -4px rgba(0,0,0,0.12)",
         ...style,
       }}
     >
       <span aria-hidden="true" style={{ display: "inline-flex" }}>
         <presentation.Icon
           size={iconSize}
-          style={{ color: presentation.fg }}
+          style={{ color: "var(--text-strong)" }}
         />
       </span>
     </div>

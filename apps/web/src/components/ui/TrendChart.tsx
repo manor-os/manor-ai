@@ -204,7 +204,7 @@ export default function TrendChart({
                   y1={y}
                   x2={chartW - PAD_RIGHT}
                   y2={y}
-                  stroke="var(--trend-chart-grid, #e7e5e4)"
+                  stroke="var(--trend-chart-grid, #e5e5ea)"
                   strokeWidth={1}
                   strokeDasharray="4 4"
                 />
@@ -212,7 +212,7 @@ export default function TrendChart({
                   x={PAD_LEFT - 8}
                   y={y}
                   fontSize={10}
-                  fill="var(--trend-chart-label, #a8a29e)"
+                  fill="var(--trend-chart-label, #aeaeb2)"
                   textAnchor="end"
                   dominantBaseline="middle"
                 >
@@ -321,7 +321,7 @@ export default function TrendChart({
                 x={x}
                 y={chartH - 4}
                 fontSize={10}
-                fill="var(--trend-chart-label, #a8a29e)"
+                fill="var(--trend-chart-label, #aeaeb2)"
                 textAnchor="middle"
               >
                 {d.label}
@@ -337,7 +337,7 @@ export default function TrendChart({
               y1={PAD_TOP}
               x2={tooltip.x}
               y2={PAD_TOP + plotH}
-              stroke="var(--trend-chart-crosshair, #d6d3d1)"
+              stroke="var(--trend-chart-crosshair, #d1d1d6)"
               strokeWidth={1}
               strokeDasharray="3 3"
             />
@@ -358,7 +358,7 @@ export default function TrendChart({
             backdropFilter: "blur(12px)",
             WebkitBackdropFilter: "blur(12px)",
             borderRadius: 10,
-            border: "1px solid var(--trend-chart-tooltip-border, rgba(28,25,23,0.06))",
+            border: "1px solid var(--trend-chart-tooltip-border, rgba(29, 29, 31,0.06))",
             boxShadow: "var(--trend-chart-tooltip-shadow, 0 4px 12px rgba(0,0,0,0.08))",
             padding: "6px 12px",
             pointerEvents: "none",
@@ -366,7 +366,7 @@ export default function TrendChart({
             zIndex: 10,
           }}
         >
-          <div style={{ fontSize: 11, fontWeight: 600, color: "var(--trend-chart-tooltip-label, #78716c)", marginBottom: 2 }}>
+          <div style={{ fontSize: 11, fontWeight: 600, color: "var(--trend-chart-tooltip-label, #8e8e93)", marginBottom: 2 }}>
             {tooltip.label}
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>

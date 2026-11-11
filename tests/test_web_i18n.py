@@ -55,7 +55,9 @@ def test_french_locale_is_registered_globally() -> None:
     assert "normalizeLocale(localStorage.getItem" in api_source
     assert 'fr: "fr-FR"' in timestamp_source
     assert 'fr: "fr-FR"' in format_source
-    assert 'fr: "fr"' in layout_source
+    # The avatar menu's language select is built from SUPPORTED_LOCALES, which
+    # lists fr above, so French appears in the menu without a per-locale flag map.
+    assert "SUPPORTED_LOCALES.map" in layout_source
     assert '<span>{t("component.user_guide.title")}</span>' in layout_source
 
 
@@ -75,3 +77,19 @@ def test_french_core_ui_has_native_translations() -> None:
     }
 
     assert required <= french_keys
+
+
+def test_ui_copy_is_not_written_in_capitals() -> None:
+    # The design system has no all-caps labels. Short acronyms (IMAP, SSO) and
+    # code-like names (*_CLIENT_ID) are the only capitals allowed in copy.
+    for name in (
+        "en", "zh", "es", "fr", "public",
+    ):
+        source = (I18N_DIR / f"{name}.ts").read_text(encoding="utf-8")
+        shouting = [
+            key
+            for key, value in re.findall(r'"([\w.]+)": "((?:[^"\\]|\\.)*)"', source)
+            if value == value.upper()
+            and any(len(word) > 5 and all(char.isupper() for char in word) for word in re.split(r"[\s/+]+", value))
+        ]
+        assert shouting == [], f"{name}: {shouting}"

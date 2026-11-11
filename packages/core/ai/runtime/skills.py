@@ -610,6 +610,7 @@ async def runtime_invoke_skill_action(
                         runtime_context, "workflow_lineage_root_run_id", None
                     ),
                     entity_root=get_entity_root(entity_id),
+                    workflow_project_root=getattr(runtime_context, "workflow_project_root", None),
                 )
                 runtime_tool_context["_workflow_artifact_prefix"] = archive.removeprefix(home + "/")
         is_stickman_skill = _runtime_is_stickman_skill(skill_key)
@@ -1235,15 +1236,22 @@ async def runtime_update_skill_action(
         return "Error: change_description is required."
 
     from packages.core.database import async_session
+    from packages.core.revisions import StaleRevisionError
 
     async with async_session() as db:
-        skill = await runtime_update_skill(
-            db,
-            skill_id=skill_id,
-            change_description=change_description,
-            entity_id=entity_id,
-            user_id=user_id,
-        )
+        try:
+            skill = await runtime_update_skill(
+                db,
+                skill_id=skill_id,
+                change_description=change_description,
+                entity_id=entity_id,
+                user_id=user_id,
+            )
+        except StaleRevisionError:
+            return (
+                "Error: the skill was saved by someone else while this change was being written; "
+                "nothing was saved. Read the skill again and retry the change."
+            )
         await db.commit()
     return f"Updated skill '{skill.name}' (v{skill.version})"
 

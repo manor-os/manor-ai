@@ -2,6 +2,7 @@ import { stripEditorLiveEditBlocks } from "./assistant-visible-text.mjs";
 
 export { stripEditorLiveEditBlocks } from "./assistant-visible-text.mjs";
 
+export const AI_EDIT_DELETE_QUEUE_PREFIX = "manor.ai-edit.pending-conversation-deletes.v3";
 export const EDITOR_LIVE_CHAT_EVENT = "manor:open-editor-live-chat";
 export const EDITOR_LIVE_CHAT_CLOSE_EVENT = "manor:close-editor-live-chat";
 export const EDITOR_LIVE_CHAT_UPDATE_EVENT = "manor:update-editor-live-chat";
@@ -42,6 +43,12 @@ export enum AiEditSessionCleanupStatus {
 }
 
 export const EDITOR_LIVE_STREAMING_PREVIEW_MAX_CHARS = 100_000;
+/**
+ * Above this the document stays out of the prompt: the model gets a map and
+ * reads sections. Measured on a targeted edit: inline costs more from about
+ * 35,000 characters, and 14% more at 50,000.
+ */
+export const EDITOR_LIVE_INLINE_DOCUMENT_MAX_CHARS = 50_000;
 
 /** End pointer/focus mutations before an AI preview snapshots editor state. */
 export function cancelActiveEditorInteractions(): void {
@@ -81,6 +88,8 @@ export type EditorLiveApplyMeta = {
   patch?: string;
   patchCount?: number;
   sourceLabel?: string;
+  /** Show the content without animating it: a large document cannot afford frames. */
+  instant?: boolean;
   signal?: AbortSignal;
 };
 
@@ -267,6 +276,11 @@ export type EditorLiveAdapter = Readonly<{
     meta: EditorLiveApplyMeta,
   ) => boolean | void | Promise<boolean | void>;
   rollback: () => void | Promise<void>;
+  /**
+   * Block hand edits while the model is reading: the server is patching this
+   * turn's snapshot, so a change made now would be overwritten by the preview.
+   */
+  setTurnLocked?: (locked: boolean) => void;
   isCommitting: () => boolean;
   waitForCommit: () => Promise<void>;
 }>;
@@ -280,6 +294,7 @@ export type EditorLiveAdapterConfig = {
   complete: EditorLiveAdapter["complete"];
   restore?: EditorLiveAdapter["restore"];
   rollback: EditorLiveAdapter["rollback"];
+  setTurnLocked?: EditorLiveAdapter["setTurnLocked"];
   commitCoordinator?: AiEditCommitCoordinator;
 };
 
@@ -354,6 +369,7 @@ export function createEditorLiveAdapter(
       await commitCoordinator.waitForCommit();
       await config.rollback();
     },
+    setTurnLocked: config.setTurnLocked,
     isCommitting: commitCoordinator.isCommitting,
     waitForCommit: commitCoordinator.waitForCommit,
   });
@@ -482,7 +498,21 @@ export type EditorLivePatchOperation =
   | {
       op: "prepend" | "append";
       text: string;
+    }
+  | {
+      op: "replace_range";
+      find_start: string;
+      find_end: string;
+      replace: string;
     };
+
+export type EditorLivePatchOptions = {
+  /**
+   * The server patches its own copy and tells the model what failed, so both
+   * sides must agree: an ambiguous find fails instead of taking the first match.
+   */
+  strict?: boolean;
+};
 
 export type EditorLivePatchResult = {
   content: string;
@@ -536,6 +566,20 @@ function parsePatchOperations(patchJson: string): EditorLivePatchOperation[] {
     ) {
       if (typeof operation.text !== "string") {
         throw new EditorLivePatchValidationError(index, `${operation.op} operation is missing text.`);
+      }
+      return operation as EditorLivePatchOperation;
+    }
+    if (operation.op === "replace_range") {
+      if (
+        typeof operation.find_start !== "string"
+        || !operation.find_start
+        || typeof operation.find_end !== "string"
+        || !operation.find_end
+      ) {
+        throw new EditorLivePatchValidationError(index, "Range operation is missing its exact start or end text.");
+      }
+      if (typeof operation.replace !== "string") {
+        throw new EditorLivePatchValidationError(index, "Replace operation is missing replacement text.");
       }
       return operation as EditorLivePatchOperation;
     }
@@ -685,6 +729,7 @@ function applyUniquePresentationJsonReplacement(
 export function applyEditorLivePatch(
   currentContent: string,
   patchJson: string,
+  options: EditorLivePatchOptions = {},
 ): EditorLivePatchResult {
   let operations: EditorLivePatchOperation[];
   try {
@@ -733,6 +778,25 @@ export function applyEditorLivePatch(
       continue;
     }
 
+    if (operation.op === "replace_range") {
+      const start = draft.indexOf(operation.find_start);
+      const end = start < 0
+        ? -1
+        : draft.indexOf(operation.find_end, start + operation.find_start.length);
+      if (
+        end < 0
+        || (options.strict && draft.indexOf(operation.find_start, start + 1) >= 0)
+      ) {
+        return {
+          content: currentContent,
+          applied: index,
+          failed: firstFailure(index, "Range text was not present once in the current document."),
+        };
+      }
+      draft = draft.slice(0, start) + operation.replace + draft.slice(end + operation.find_end.length);
+      continue;
+    }
+
     if (!("find" in operation) || typeof operation.find !== "string" || !operation.find) {
       return {
         content: currentContent,
@@ -742,8 +806,20 @@ export function applyEditorLivePatch(
     }
 
     const at = draft.indexOf(operation.find);
+    if (
+      options.strict
+      && at >= 0
+      && !("all" in operation && operation.all)
+      && draft.indexOf(operation.find, at + 1) >= 0
+    ) {
+      return {
+        content: currentContent,
+        applied: index,
+        failed: firstFailure(index, "Find text occurs more than once in the current document."),
+      };
+    }
     if (at < 0) {
-      const structuralReplacement = operation.op === "replace" && !operation.all
+      const structuralReplacement = operation.op === "replace" && !operation.all && !options.strict
         ? applyUniquePresentationJsonReplacement(draft, operation.find, operation.replace)
         : null;
       if (structuralReplacement != null) {
@@ -759,7 +835,7 @@ export function applyEditorLivePatch(
 
     if (operation.op === "delete") {
       draft = operation.all
-        ? draft.split(operation.find).join("")
+        ? draft.replaceAll(operation.find, "")
         : draft.slice(0, at) + draft.slice(at + operation.find.length);
       continue;
     }
@@ -773,7 +849,7 @@ export function applyEditorLivePatch(
         };
       }
       draft = operation.all
-        ? draft.split(operation.find).join(operation.replace)
+        ? draft.replaceAll(operation.find, () => operation.replace)
         : draft.slice(0, at) + operation.replace + draft.slice(at + operation.find.length);
       continue;
     }
@@ -1211,6 +1287,19 @@ function buildPartialPatchOperation(
   if (op === "append" || op === "prepend") {
     if (!("text" in stringFields)) return null;
     return JSON.stringify({ op, text: stringFields.text!.value });
+  }
+  if (op === "replace_range") {
+    if (
+      !stringFields.find_start?.complete
+      || !stringFields.find_end?.complete
+      || !("replace" in stringFields)
+    ) return null;
+    return JSON.stringify({
+      op,
+      find_start: stringFields.find_start.value,
+      find_end: stringFields.find_end.value,
+      replace: stringFields.replace!.value,
+    });
   }
   const find = stringFields.find?.complete ? stringFields.find.value : "";
   if (!find) return null;

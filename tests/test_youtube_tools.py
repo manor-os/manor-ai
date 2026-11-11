@@ -41,7 +41,6 @@ def test_youtube_tool_schemas_do_not_expose_paths_or_arbitrary_metric_urls() -> 
     assert set(schemas) == {
         "record_youtube_publication",
         "read_youtube_public_metrics",
-        "record_youtube_workspace_metrics",
     }
     assert set(schemas["record_youtube_publication"]["properties"]) == {
         "public_url",
@@ -52,7 +51,6 @@ def test_youtube_tool_schemas_do_not_expose_paths_or_arbitrary_metric_urls() -> 
         "source_kind",
     }
     assert schemas["read_youtube_public_metrics"]["properties"] == {}
-    assert schemas["record_youtube_workspace_metrics"]["properties"] == {}
 
 
 def test_verified_publication_count_includes_current_backfill_without_duplicates() -> None:

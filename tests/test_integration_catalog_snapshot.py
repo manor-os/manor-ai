@@ -39,6 +39,7 @@ async def test_full_catalog_repairs_existing_skills_and_snapshot_preserves_accou
     import packages.core.database as dbmod
     from packages.core.models.skill import Skill
     from packages.core.services.builtin_plugin_service import BUILTIN_PLUGINS
+    from packages.core.services.skill_service import reset_builtin_skill_seed_cache
 
     token = await _register(client, "snapshot_known_accounts")
     headers = {"Authorization": f"Bearer {token}"}
@@ -56,6 +57,8 @@ async def test_full_catalog_repairs_existing_skills_and_snapshot_preserves_accou
         original_prompt = skill.system_prompt
         skill.system_prompt = "stale packaged instructions"
         await db.commit()
+    # The repair runs once per process until a pass finds nothing to write.
+    reset_builtin_skill_seed_cache()
     for suffix in ("?snapshot=true", ""):
         response = await client.get(f"/api/v1/integrations/mcp-servers{suffix}", headers=headers)
         assert response.status_code == 200, response.text

@@ -213,7 +213,7 @@ async def test_file_tools_hide_private_doc_from_member(fs_enabled, tmp_path, cli
             db, entity_id, name="board-comp.md", fs_path="board-comp.md",
             file_type="md", source="upload", visibility="private", owner_id=owner_id,
         )
-        await create_document(
+        handbook = await create_document(
             db, entity_id, name="handbook.md", fs_path="handbook.md",
             file_type="md", source="upload", visibility="entity", owner_id=owner_id,
         )
@@ -319,6 +319,9 @@ async def test_file_tools_hide_private_doc_from_member(fs_enabled, tmp_path, cli
     # read_file the entity-visible doc as MEMBER: allowed (no over-block).
     r_shared = json.loads(await _read_file(entity_id, path="handbook.md", user_id=member_id))
     assert "team handbook" in r_shared.get("content", ""), r_shared
+    # A path read names its Document, so the caller can link it; a denied read names nothing.
+    assert r_shared["document_id"] == handbook.id
+    assert "document_id" not in r
 
     # grep as MEMBER must not surface private-doc content.
     g = json.loads(await _grep_files(

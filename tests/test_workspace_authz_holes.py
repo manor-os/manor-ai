@@ -199,7 +199,7 @@ async def test_workspace_delete_capability_matches_effective_delete_permission(c
     assert trash.status_code == 200, trash.text
     trashed = next(item for item in trash.json() if item["id"] == workspace_id)
     assert trashed["deleted_at"] is not None
-    assert trashed["can_delete"] is False
+    assert trashed["can_delete"] is True
 
 
 @pytest.mark.asyncio

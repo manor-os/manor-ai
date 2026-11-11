@@ -117,6 +117,8 @@ def get_plan_limit(plan_id: str | None, key: str) -> int | float | None:
     return get_plan(plan_id).get(key)
 
 
+
+
 # ── Async loader (called at startup + after admin mutations) ──────────
 
 async def ensure_plans_fresh(db, *, max_age_seconds: float = PLAN_CACHE_MAX_AGE_SECONDS) -> None:

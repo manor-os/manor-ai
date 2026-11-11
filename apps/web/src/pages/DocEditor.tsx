@@ -13,7 +13,7 @@ import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import { PrismAsync as CodeSyntaxHighlighter } from "react-syntax-highlighter";
-import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { vs, vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { api, ApiError } from "../lib/api";
 import { invalidateKnowledgeQueries } from "../lib/knowledgeInvalidation";
 import StatusBadge from "../components/ui/StatusBadge";
@@ -42,7 +42,7 @@ import {
 import SitePublishAction from "../components/SitePublishAction";
 import CodeProjectExplorer from "../components/code/CodeProjectExplorer";
 import {
-  IconArrowLeft,
+IconSparkles,   IconArrowLeft,
   IconArrowDown,
   IconArrowUp,
   IconArrowRight,
@@ -262,6 +262,7 @@ import {
 
 import { t } from "../lib/i18n";
 import { getPreferredTimeZone } from "../lib/format";
+import "./DocEditor.css";
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -449,12 +450,12 @@ const RICH_TEXT_FONTS = [
 ];
 
 const RICH_TEXT_BLOCK_OPTIONS = [
-  { value: "p", label: "Normal" },
-  { value: "h1", label: "Heading 1" },
-  { value: "h2", label: "Heading 2" },
-  { value: "h3", label: "Heading 3" },
-  { value: "blockquote", label: "Quote" },
-  { value: "pre", label: "Code block" },
+  { value: "p", label: t("ui.normal") },
+  { value: "h1", label: t("ui.heading_1") },
+  { value: "h2", label: t("ui.heading_2") },
+  { value: "h3", label: t("ui.heading_3") },
+  { value: "blockquote", label: t("ui.quote") },
+  { value: "pre", label: t("ui.code_block") },
 ];
 
 const RICH_TEXT_FONT_SIZES = [
@@ -496,26 +497,36 @@ function restorePlainTextSelection(textarea: HTMLTextAreaElement, selection: Pla
   textarea.setSelectionRange(selection.start, selection.end, selection.direction || "none");
 }
 
-const ideEditorTheme: Record<string, React.CSSProperties> = {
-  ...vscDarkPlus,
-  'pre[class*="language-"]': {
-    ...(vscDarkPlus['pre[class*="language-"]'] as React.CSSProperties),
-    margin: 0,
-    padding: "20px 24px 48px",
-    overflow: "visible",
-    background: "transparent",
-    fontSize: 13,
-    lineHeight: "1.65rem",
-  },
-  'code[class*="language-"]': {
-    ...(vscDarkPlus['code[class*="language-"]'] as React.CSSProperties),
-    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-    fontSize: 13,
-    lineHeight: "1.65rem",
-    textShadow: "none",
-    whiteSpace: "pre",
-  },
-};
+function buildIdeEditorTheme(base: Record<string, React.CSSProperties>): Record<string, React.CSSProperties> {
+  return {
+    ...base,
+    'pre[class*="language-"]': {
+      ...(base['pre[class*="language-"]'] as React.CSSProperties),
+      margin: 0,
+      padding: "20px 24px 48px",
+      overflow: "visible",
+      background: "transparent",
+      border: "none",
+      fontSize: 13,
+      lineHeight: "1.65rem",
+    },
+    'code[class*="language-"]': {
+      ...(base['code[class*="language-"]'] as React.CSSProperties),
+      fontFamily: "var(--font-mono)",
+      fontSize: 13,
+      lineHeight: "1.65rem",
+      textShadow: "none",
+      whiteSpace: "pre",
+    },
+  };
+}
+
+const lightIdeEditorTheme = buildIdeEditorTheme(vs);
+const darkIdeEditorTheme = buildIdeEditorTheme(vscDarkPlus);
+/** Code follows the page's light or dark theme like every other file. */
+const currentIdeEditorTheme = () => (
+  document.documentElement.getAttribute("data-theme") === "dark" ? darkIdeEditorTheme : lightIdeEditorTheme
+);
 
 const richTextSelectButtonStyle: React.CSSProperties = {
   height: 32,
@@ -523,7 +534,7 @@ const richTextSelectButtonStyle: React.CSSProperties = {
   borderRadius: 8,
   border: "1px solid var(--editor-control-border, #e2dfdc)",
   background: "var(--editor-control-bg, #ffffff)",
-  color: "var(--editor-control-text, #44403c)",
+  color: "var(--editor-control-text, #48484a)",
   padding: "0 28px 0 10px",
   fontSize: 12,
   fontWeight: 750,
@@ -858,7 +869,7 @@ const sheetToolbarButtonBase: React.CSSProperties = {
   border: "1px solid transparent",
   borderRadius: 8,
   background: "transparent",
-  color: "var(--editor-control-text, #57534e)",
+  color: "var(--editor-control-text, #6e6e73)",
   display: "inline-flex",
   alignItems: "center",
   justifyContent: "center",
@@ -874,10 +885,10 @@ const sheetToolbarButtonBase: React.CSSProperties = {
 const sheetToolbarSelectStyle: React.CSSProperties = {
   height: 30,
   minWidth: 0,
-  border: "1px solid var(--editor-control-border, rgba(28,25,23,0.06))",
+  border: "1px solid var(--editor-control-border, rgba(29, 29, 31,0.06))",
   borderRadius: 8,
   background: "var(--editor-control-bg, #ffffff)",
-  color: "var(--editor-control-text, #44403c)",
+  color: "var(--editor-control-text, #48484a)",
   padding: "0 28px 0 9px",
   fontSize: 12,
   fontWeight: 750,
@@ -939,7 +950,7 @@ function SheetToolbarButton({
     ? "var(--editor-active-text, #436b65)"
     : danger
       ? "var(--editor-danger-text, #a23e38)"
-      : "var(--editor-control-text, #44403c)";
+      : "var(--editor-control-text, #48484a)";
   return (
     <button
       type="button"
@@ -996,7 +1007,7 @@ function SheetColorControl({
           width: 14,
           height: 14,
           borderRadius: 4,
-          border: "1px solid rgba(28,25,23,0.18)",
+          border: "1px solid rgba(29, 29, 31,0.18)",
           background: value,
           boxShadow: "inset 0 0 0 1px rgba(255,255,255,0.55)",
         }}
@@ -1268,7 +1279,7 @@ function ChartPreview({ chart, data }: { chart: SheetChartConfig; data: any[][] 
 
   if (points.length === 0) {
     return (
-      <div style={{ height, display: "flex", alignItems: "center", justifyContent: "center", color: "#a8a29e", fontSize: 12 }}>
+      <div style={{ height, display: "flex", alignItems: "center", justifyContent: "center", color: "#aeaeb2", fontSize: 12 }}>
         {t("page.doc_editor.no_chart_data")}
       </div>
     );
@@ -1308,7 +1319,7 @@ function ChartPreview({ chart, data }: { chart: SheetChartConfig; data: any[][] 
         {points.slice(0, 4).map((p, i) => (
           <g key={p.label} transform={`translate(${16 + (i % 2) * 145}, ${150 + Math.floor(i / 2) * 16})`}>
             <rect width="8" height="8" rx="2" fill={SHEET_CHART_COLORS[i % SHEET_CHART_COLORS.length]} />
-            <text x="12" y="8" fontSize="10" fill="#78716c">{p.label}</text>
+            <text x="12" y="8" fontSize="10" fill="#8e8e93">{p.label}</text>
           </g>
         ))}
       </svg>
@@ -1321,9 +1332,9 @@ function ChartPreview({ chart, data }: { chart: SheetChartConfig; data: any[][] 
 
   return (
     <svg width="100%" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={chart.title}>
-      <line x1={pad.left} y1={pad.top} x2={pad.left} y2={pad.top + plotH} stroke="#d6d3d1" />
-      <line x1={pad.left} y1={pad.top + plotH} x2={pad.left + plotW} y2={pad.top + plotH} stroke="#d6d3d1" />
-      <text x={8} y={pad.top + 4} fontSize="10" fill="#a8a29e">{maxValue.toLocaleString()}</text>
+      <line x1={pad.left} y1={pad.top} x2={pad.left} y2={pad.top + plotH} stroke="#d1d1d6" />
+      <line x1={pad.left} y1={pad.top + plotH} x2={pad.left + plotW} y2={pad.top + plotH} stroke="#d1d1d6" />
+      <text x={8} y={pad.top + 4} fontSize="10" fill="#aeaeb2">{maxValue.toLocaleString()}</text>
       {chart.type === "line" ? (
         <>
           <path d={linePath} fill="none" stroke="#4869ac" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
@@ -1350,7 +1361,7 @@ function ChartPreview({ chart, data }: { chart: SheetChartConfig; data: any[][] 
         })
       )}
       {points.map((p, i) => i % Math.ceil(points.length / 5) === 0 && (
-        <text key={`${p.label}-label`} x={pad.left + xStep * i + xStep / 2} y={height - 12} textAnchor="middle" fontSize="10" fill="#78716c">
+        <text key={`${p.label}-label`} x={pad.left + xStep * i + xStep / 2} y={height - 12} textAnchor="middle" fontSize="10" fill="#8e8e93">
           {p.label.slice(0, 8)}
         </text>
       ))}
@@ -1490,7 +1501,7 @@ function SpreadsheetEditor({
   )));
   const valueColumnOptions = numericColumnOptions.length > 0 ? numericColumnOptions : columnOptions;
   const fontSelectOptions = [
-    { value: "", label: "Default font" },
+    { value: "", label: t("ui.default_font") },
     { value: "Inter, ui-sans-serif, system-ui, sans-serif", label: "Inter" },
     { value: "Arial, Helvetica, sans-serif", label: "Arial" },
     { value: "Georgia, serif", label: "Georgia" },
@@ -1636,7 +1647,7 @@ function SpreadsheetEditor({
     applyStyle({
       bold: true,
       fontSize: Math.max(13, activeStyle.fontSize || 13),
-      color: "#1c1917",
+      color: "#1d1d1f",
       fill: "#e8eff4",
       align: "center",
     });
@@ -1822,7 +1833,7 @@ function SpreadsheetEditor({
               borderRadius: 7,
               border: `1px solid ${active ? "var(--editor-active-border, #ccded9)" : "transparent"}`,
               background: active ? "var(--editor-active-bg, #ecfdf8)" : "transparent",
-              color: active ? "var(--editor-active-text, #436b65)" : "var(--text-muted, #57534e)",
+              color: active ? "var(--editor-active-text, #436b65)" : "var(--text-muted, #6e6e73)",
               fontSize: 12,
               fontWeight: active ? 800 : 650,
               whiteSpace: "nowrap" as const,
@@ -1894,16 +1905,16 @@ function SpreadsheetEditor({
           gap: 8,
           padding: "8px 12px",
           borderBottom: "1px solid var(--border-subtle, #dbe3ef)",
-          background: "var(--surface-muted, #fafaf9)",
+          background: "var(--surface-muted, #fafafa)",
           flexShrink: 0,
           flexWrap: "wrap",
         }}
       >
         <SheetToolbarGroup style={{ flex: "1 1 420px" }}>
-          <div style={{ minWidth: 72, height: 30, border: "1px solid var(--editor-control-border, #dbe3ef)", borderRadius: 8, background: "var(--editor-control-bg, #ffffff)", display: "flex", alignItems: "center", padding: "0 9px", fontSize: 12, fontWeight: 850, color: "var(--text-strong, #1c1917)" }}>
+          <div style={{ minWidth: 72, height: 30, border: "1px solid var(--editor-control-border, #dbe3ef)", borderRadius: 8, background: "var(--editor-control-bg, #ffffff)", display: "flex", alignItems: "center", padding: "0 9px", fontSize: 12, fontWeight: 850, color: "var(--text-strong, #1d1d1f)" }}>
             {selectedRangeLabel || "A1"}
           </div>
-          <div style={{ height: 30, width: 34, border: "1px solid var(--editor-control-border, #dbe3ef)", borderRadius: 8, background: "var(--editor-control-bg, #ffffff)", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faint, #78716c)", fontWeight: 900, fontSize: 12 }}>
+          <div style={{ height: 30, width: 34, border: "1px solid var(--editor-control-border, #dbe3ef)", borderRadius: 8, background: "var(--editor-control-bg, #ffffff)", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faint, #8e8e93)", fontWeight: 900, fontSize: 12 }}>
             fx
           </div>
           <input
@@ -1921,7 +1932,7 @@ function SpreadsheetEditor({
               event.preventDefault();
               pasteCells(selected.r, selected.c, pasted);
             }}
-            style={{ flex: 1, minWidth: 180, height: 30, border: "1px solid var(--editor-control-border, #dbe3ef)", borderRadius: 8, padding: "0 10px", fontSize: 13, color: "var(--text-strong, #1c1917)", background: "var(--editor-control-bg, #ffffff)" }}
+            style={{ flex: 1, minWidth: 180, height: 30, border: "1px solid var(--editor-control-border, #dbe3ef)", borderRadius: 8, padding: "0 10px", fontSize: 13, color: "var(--text-strong, #1d1d1f)", background: "var(--editor-control-bg, #ffffff)" }}
           />
         </SheetToolbarGroup>
         <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", marginLeft: "auto" }}>
@@ -1941,12 +1952,12 @@ function SpreadsheetEditor({
             value={activeStyle.fontSize || 13}
             onChange={(event) => applyStyle({ fontSize: Number(event.target.value) || 13 })}
             style={{ ...sheetToolbarSelectStyle, width: 58, padding: "0 7px" }}
-            title="Font size"
+            title={t("ui.font_size")}
           />
           <SheetToolbarButton
             onClick={() => applyStyle({ bold: !activeStyle.bold })}
             active={Boolean(activeStyle.bold)}
-            title="Bold"
+            title={t("ui.bold")}
             style={{ fontSize: 13, fontWeight: 950, padding: "0 10px" }}
           >
             B
@@ -1954,7 +1965,7 @@ function SpreadsheetEditor({
           <SheetToolbarButton
             onClick={() => applyStyle({ italic: !activeStyle.italic })}
             active={Boolean(activeStyle.italic)}
-            title="Italic"
+            title={t("ui.italic")}
             style={{ fontSize: 13, fontStyle: "italic", padding: "0 10px" }}
           >
             I
@@ -1962,14 +1973,14 @@ function SpreadsheetEditor({
           <SheetColorControl
             icon={<IconPalette size={14} />}
             label="A"
-            title="Text color"
-            value={activeStyle.color || "#1c1917"}
+            title={t("ui.text_color")}
+            value={activeStyle.color || "#1d1d1f"}
             onChange={(value) => applyStyle({ color: value })}
           />
           <SheetColorControl
             icon={<IconHighlighter size={14} />}
-            label="Fill"
-            title="Fill color"
+            label={t("ui.fill")}
+            title={t("ui.fill_color")}
             value={activeStyle.fill || "#ffffff"}
             onChange={(value) => applyStyle({ fill: value })}
           />
@@ -1986,8 +1997,8 @@ function SpreadsheetEditor({
               {align === "left" ? "L" : align === "center" ? "C" : "R"}
             </SheetToolbarButton>
           ))}
-          <SheetToolbarButton onClick={makeHeader} icon={<IconText size={14} />} title="Header">
-            Header
+          <SheetToolbarButton onClick={makeHeader} icon={<IconText size={14} />} title={t("ui.header")}>
+            {t("ui.header")}
           </SheetToolbarButton>
           <Dropdown
             align="right"
@@ -2005,20 +2016,20 @@ function SpreadsheetEditor({
           <SheetToolbarButton onClick={() => void copySelection()} icon={<IconCopy size={14} />} title={t("action.copy")}>
             {t("action.copy")}
           </SheetToolbarButton>
-          <SheetToolbarButton onClick={clearSelection} icon={<IconEraser size={14} />} title="Clear">
-            Clear
+          <SheetToolbarButton onClick={clearSelection} icon={<IconEraser size={14} />} title={t("ui.clear")}>
+            {t("ui.clear")}
           </SheetToolbarButton>
           <SheetToolbarButton onClick={addRow} icon={<IconPlus size={14} />} title={t("page.doc_editor.plus_row")}>
-            Row
+            {t("ui.row")}
           </SheetToolbarButton>
           <SheetToolbarButton onClick={addCol} icon={<IconPlus size={14} />} title={t("page.doc_editor.plus_column")}>
-            Col
+            {t("ui.col")}
           </SheetToolbarButton>
-          <SheetToolbarButton onClick={deleteRows} danger icon={<IconTrash size={14} />} title="Delete row">
-            Row
+          <SheetToolbarButton onClick={deleteRows} danger icon={<IconTrash size={14} />} title={t("ui.delete_row")}>
+            {t("ui.row")}
           </SheetToolbarButton>
-          <SheetToolbarButton onClick={deleteCols} danger icon={<IconTrash size={14} />} title="Delete col">
-            Col
+          <SheetToolbarButton onClick={deleteCols} danger icon={<IconTrash size={14} />} title={t("ui.delete_col")}>
+            {t("ui.col")}
           </SheetToolbarButton>
           <SheetToolbarButton
             onClick={() => setShowChartPanel((value) => !value)}
@@ -2026,7 +2037,7 @@ function SpreadsheetEditor({
             icon={<IconEye size={14} />}
             title={t("page.doc_editor.charts")}
           >
-            Charts {charts.length ? `(${charts.length})` : ""}
+            {t("ui.charts")} {charts.length ? `(${charts.length})` : ""}
           </SheetToolbarButton>
           </SheetToolbarGroup>
         </div>
@@ -2072,7 +2083,7 @@ function SpreadsheetEditor({
                       setSelected({ r: ri, c: maxCols - 1 });
                       setIsSelecting(true);
                     }}
-                    style={{ ...shTd, background: "#fafaf9", color: "#78716c", fontWeight: 700, textAlign: "center", width: 48, minWidth: 48, position: "sticky", left: 0, zIndex: 2, cursor: "cell" }}
+                    style={{ ...shTd, background: "#fafafa", color: "#8e8e93", fontWeight: 700, textAlign: "center", width: 48, minWidth: 48, position: "sticky", left: 0, zIndex: 2, cursor: "cell" }}
                   >
                     {ri + 1}
                   </td>
@@ -2101,7 +2112,7 @@ function SpreadsheetEditor({
                       : cellStyle.fill || "#ffffff";
                     const sharedTextStyle: React.CSSProperties = {
                       ...spreadsheetCellVisualStyle(cellStyle),
-                      color: displayValue === "#ERROR" ? "#c14a44" : cellStyle.color || "#1c1917",
+                      color: displayValue === "#ERROR" ? "#c14a44" : cellStyle.color || "#1d1d1f",
                       textAlign: cellStyle.align || "left",
                       border: "none",
                       borderTop: undefined, borderBottom: undefined, borderLeft: undefined, borderRight: undefined,
@@ -2181,18 +2192,18 @@ function SpreadsheetEditor({
         </div>
 
         {nativeCharts.length > 0 && (
-          <aside className="spreadsheet-editor-chart-pane spreadsheet-editor-chart-pane--native" style={{ width: "min(44vw, 520px)", minWidth: 360, maxWidth: "100%", borderLeft: "1px solid var(--border-subtle, rgba(28,25,23,0.06))", background: "var(--surface-muted, #fafaf9)", overflow: "auto", padding: 12, flexShrink: 0 }}>
+          <aside className="spreadsheet-editor-chart-pane spreadsheet-editor-chart-pane--native" style={{ width: "min(44vw, 520px)", minWidth: 360, maxWidth: "100%", borderLeft: "1px solid var(--border-subtle, rgba(29, 29, 31,0.06))", background: "var(--surface-muted, #fafafa)", overflow: "auto", padding: 12, flexShrink: 0 }}>
             <SpreadsheetChartPreview charts={nativeCharts} />
           </aside>
         )}
-        {showChartPanel && <aside className="spreadsheet-editor-chart-pane spreadsheet-editor-chart-pane--config" style={{ width: "min(100%, 360px)", maxWidth: "100%", borderLeft: "1px solid var(--border-subtle, rgba(28,25,23,0.06))", background: "var(--surface-muted, #fafaf9)", overflow: "auto", flexShrink: 0 }}>
-          <div style={{ padding: 14, borderBottom: "1px solid var(--border-subtle, rgba(28,25,23,0.06))", display: "flex", alignItems: "center", gap: 8 }}>
-            <strong style={{ fontSize: 13, color: "var(--text-strong, #1c1917)" }}>{t("page.doc_editor.charts")}</strong>
-            <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--text-faint, #a8a29e)" }}>
+        {showChartPanel && <aside className="spreadsheet-editor-chart-pane spreadsheet-editor-chart-pane--config" style={{ width: "min(100%, 360px)", maxWidth: "100%", borderLeft: "1px solid var(--border-subtle, rgba(29, 29, 31,0.06))", background: "var(--surface-muted, #fafafa)", overflow: "auto", flexShrink: 0 }}>
+          <div style={{ padding: 14, borderBottom: "1px solid var(--border-subtle, rgba(29, 29, 31,0.06))", display: "flex", alignItems: "center", gap: 8 }}>
+            <strong style={{ fontSize: 13, color: "var(--text-strong, #1d1d1f)" }}>{t("page.doc_editor.charts")}</strong>
+            <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--text-faint, #aeaeb2)" }}>
               {persistCharts ? t("page.doc_editor.saved_to_xlsx") : t("page.doc_editor.preview_only")}
             </span>
           </div>
-          <div style={{ padding: 12, display: "flex", gap: 8, flexWrap: "wrap", borderBottom: "1px solid var(--border-subtle, rgba(28,25,23,0.06))" }}>
+          <div style={{ padding: 12, display: "flex", gap: 8, flexWrap: "wrap", borderBottom: "1px solid var(--border-subtle, rgba(29, 29, 31,0.06))" }}>
             <Dropdown
               align="left"
               style={{ width: "100%" }}
@@ -2212,16 +2223,16 @@ function SpreadsheetEditor({
           </div>
           <div style={{ padding: 12, display: "flex", flexDirection: "column", gap: 12 }}>
             {charts.length === 0 ? (
-              <div style={{ padding: 20, textAlign: "center", color: "var(--text-faint, #a8a29e)", fontSize: 12 }}>
+              <div style={{ padding: 20, textAlign: "center", color: "var(--text-faint, #aeaeb2)", fontSize: 12 }}>
                 {t("page.doc_editor.no_charts_yet")}
               </div>
             ) : charts.map((chart) => (
-              <div key={chart.id} style={{ border: "1px solid var(--border-subtle, rgba(28,25,23,0.06))", borderRadius: 8, background: "var(--surface-panel, white)", overflow: "hidden" }}>
-                <div style={{ padding: "10px 12px", borderBottom: "1px solid #f5f5f4", display: "flex", gap: 8, alignItems: "center" }}>
+              <div key={chart.id} style={{ border: "1px solid var(--border-subtle, rgba(29, 29, 31,0.06))", borderRadius: 8, background: "var(--surface-panel, white)", overflow: "hidden" }}>
+                <div style={{ padding: "10px 12px", borderBottom: "1px solid #f5f5f7", display: "flex", gap: 8, alignItems: "center" }}>
                   <input
                     value={chart.title}
                     onChange={(e) => updateChart(chart.id, { title: e.target.value })}
-                    style={{ flex: 1, minWidth: 0, border: "none", outline: "none", fontSize: 13, fontWeight: 700, color: "#1c1917" }}
+                    style={{ flex: 1, minWidth: 0, border: "none", outline: "none", fontSize: 13, fontWeight: 700, color: "#1d1d1f" }}
                   />
                   <button onClick={() => deleteChart(chart.id)} className="btn-manor-ghost" style={{ fontSize: 11, padding: "3px 8px", color: "#c14a44" }}>
                     {t("action.delete")}
@@ -2282,7 +2293,7 @@ function SpreadsheetEditor({
           </div>
         </aside>}
       </div>
-      <div style={{ display: "flex", gap: 12, alignItems: "center", padding: "6px 12px", borderTop: "1px solid var(--border-subtle, #dbe3ef)", background: "var(--surface-muted, #fafaf9)", flexShrink: 0, fontSize: 12, color: "var(--text-faint, #78716c)" }}>
+      <div style={{ display: "flex", gap: 12, alignItems: "center", padding: "6px 12px", borderTop: "1px solid var(--border-subtle, #dbe3ef)", background: "var(--surface-muted, #fafafa)", flexShrink: 0, fontSize: 12, color: "var(--text-faint, #8e8e93)" }}>
         <span>{data.length} {t("page.doc_editor.rows")} · {actualMaxCols} {t("page.doc_editor.cols")}</span>
         <span>{selectedRangeLabel}</span>
       </div>
@@ -2291,19 +2302,19 @@ function SpreadsheetEditor({
 }
 
 const shTh: React.CSSProperties = {
-  padding: "6px 10px", fontSize: 11, fontWeight: 700, color: "var(--text-faint, #78716c)",
-  background: "var(--surface-muted, #fafaf9)", borderBottom: "2px solid var(--border-subtle, rgba(28,25,23,0.06))", borderRight: "1px solid var(--border-subtle, rgba(28,25,23,0.06))",
+  padding: "6px 10px", fontSize: 11, fontWeight: 700, color: "var(--text-faint, #8e8e93)",
+  background: "var(--surface-muted, #fafafa)", borderBottom: "2px solid var(--border-subtle, rgba(29, 29, 31,0.06))", borderRight: "1px solid var(--border-subtle, rgba(29, 29, 31,0.06))",
   textAlign: "center", position: "sticky", top: 0, whiteSpace: "nowrap",
 };
 const shTd: React.CSSProperties = {
-  borderBottom: "1px solid var(--border-subtle, #f5f5f4)", borderRight: "1px solid var(--border-subtle, #f5f5f4)",
+  borderBottom: "1px solid var(--border-subtle, #f5f5f7)", borderRight: "1px solid var(--border-subtle, #f5f5f7)",
 };
 const sheetFieldStyle: React.CSSProperties = {
-  display: "flex", flexDirection: "column", gap: 4, fontSize: 11, fontWeight: 700, color: "var(--text-faint, #78716c)",
+  display: "flex", flexDirection: "column", gap: 4, fontSize: 11, fontWeight: 700, color: "var(--text-faint, #8e8e93)",
 };
 const sheetControlStyle: React.CSSProperties = {
-  width: "100%", minWidth: 0, border: "1px solid var(--border-subtle, rgba(28,25,23,0.06))", borderRadius: 6, padding: "5px 7px",
-  fontSize: 12, color: "var(--text-strong, #1c1917)", background: "var(--surface-panel, white)",
+  width: "100%", minWidth: 0, border: "1px solid var(--border-subtle, rgba(29, 29, 31,0.06))", borderRadius: 6, padding: "5px 7px",
+  fontSize: 12, color: "var(--text-strong, #1d1d1f)", background: "var(--surface-panel, white)",
 };
 
 function colLetter(i: number): string {
@@ -2456,10 +2467,10 @@ function pptxXmlElement(xml: string, tag: string): string | null {
 
 // Default fallback scheme colors
 const DEFAULT_SCHEME: Record<string, string> = {
-  dk1: "#000000", dk2: "#292524", lt1: "#ffffff", lt2: "#fafaf9",
+  dk1: "#000000", dk2: "#2c2c2e", lt1: "#ffffff", lt2: "#fafafa",
   accent1: "#4472c4", accent2: "#ed7d31", accent3: "#a5a5a5",
   accent4: "#ffc000", accent5: "#5b9bd5", accent6: "#70ad47",
-  tx1: "#000000", tx2: "#57534e", bg1: "#ffffff", bg2: "#f5f5f4",
+  tx1: "#000000", tx2: "#6e6e73", bg1: "#ffffff", bg2: "#f5f5f7",
   hlink: "#0563c1", folHlink: "#954f72",
 };
 
@@ -2550,7 +2561,7 @@ function pptxParseColor(xml: string, phClrOverride?: string): string | null {
   if (m) {
     const base = m[1] === "phClr" && phClrOverride
       ? phClrOverride
-      : _activeTheme[m[1]] || DEFAULT_SCHEME[m[1]] || "#57534e";
+      : _activeTheme[m[1]] || DEFAULT_SCHEME[m[1]] || "#6e6e73";
     // Apply luminance transforms (tints/shades)
     const lumMod = xml.match(/<a:lumMod val="(\d+)"/);
     const lumOff = xml.match(/<a:lumOff val="(\d+)"/);
@@ -4025,7 +4036,7 @@ function PptxGraphicFramePreview({ shape }: { shape: PptxShape }) {
         position: "absolute",
         inset: 0,
         overflow: "hidden",
-        background: shape.graphicPreviewUrl ? "transparent" : "var(--color-surface-subtle, #f5f5f4)",
+        background: shape.graphicPreviewUrl ? "transparent" : "var(--color-surface-subtle, #f5f5f7)",
         pointerEvents: "none",
       }}
     >
@@ -4043,7 +4054,7 @@ function PptxGraphicFramePreview({ shape }: { shape: PptxShape }) {
           }}
         />
       ) : (
-        <span style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center", color: "var(--color-text-muted, #78716c)", fontSize: 12 }}>
+        <span style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center", color: "var(--color-text-muted, #8e8e93)", fontSize: 12 }}>
           {shape.graphicPreviewStatus === "loading"
             ? t("status.loading")
             : t("page.file_viewer.preview_not_available")}
@@ -4303,8 +4314,8 @@ function PptxParagraphContent({ paragraph }: { paragraph: PptxTextRun }) {
 
 function pptxTableCellVisualStyle(cell: PptxTableCell, rowIndex: number): React.CSSProperties {
   return {
-    background: cell.fill || (rowIndex === 0 ? "#f5f5f4" : "#ffffff"),
-    color: cell.color || "#292524",
+    background: cell.fill || (rowIndex === 0 ? "#f5f5f7" : "#ffffff"),
+    color: cell.color || "#2c2c2e",
     fontWeight: (cell.bold ?? rowIndex === 0) ? 700 : 400,
     fontStyle: cell.italic ? "italic" : "normal",
     fontFamily: cell.fontFamily || undefined,
@@ -4387,7 +4398,7 @@ function PptxReadOnlySlide({
                 controls
                 playsInline
                 preload="metadata"
-                aria-label="Presentation video"
+                aria-label={t("ui.presentation_video")}
                 style={{ opacity: shape.opacity }}
               />
             ) : shape.imgUrl && (
@@ -4884,7 +4895,7 @@ function PresentationEditor({
         shapes: [...s.shapes, {
           id: shapeId,
           x: 15, y: 50, w: 70, h: 15,
-          texts: [{ text, fontSize: 16, color: "#57534e" }],
+          texts: [{ text, fontSize: 16, color: "#6e6e73" }],
         }],
       };
     });
@@ -5093,7 +5104,7 @@ function PresentationEditor({
       roundRect: { x: 20, y: 30, w: 25, h: 20, fill: "#ed7d31", presetGeom: "roundRect", borderRadius: 8 },
       ellipse: { x: 25, y: 30, w: 20, h: 25, fill: "#a5a5a5", presetGeom: "ellipse" },
       triangle: { x: 25, y: 30, w: 20, h: 20, fill: "#ffc000", presetGeom: "triangle" },
-      line: { x: 15, y: 50, w: 70, h: 0.5, fill: "#57534e", presetGeom: "line", stroke: "#57534e", strokeWidth: 2 },
+      line: { x: 15, y: 50, w: 70, h: 0.5, fill: "#6e6e73", presetGeom: "line", stroke: "#6e6e73", strokeWidth: 2 },
     };
     const base = shapeMap[preset] || shapeMap.rect;
     const shapeId = genId();
@@ -5683,7 +5694,7 @@ function PresentationEditor({
     <div className="presentation-editor" style={{ flex: 1, display: "flex", overflow: "hidden", "--pptx-point-scale": 540 / (slides.find((slide) => slide.heightPoints)?.heightPoints || 540) } as React.CSSProperties}>
       {/* Slide thumbnails */}
       <div className="presentation-editor-sidebar" style={{
-        width: 180, flexShrink: 0, borderRight: "1px solid rgba(28,25,23,0.06)",
+        width: 180, flexShrink: 0, borderRight: "1px solid rgba(29, 29, 31,0.06)",
         background: "rgba(250,250,249,0.8)", overflow: "hidden",
         display: "flex", flexDirection: "column", minHeight: 0,
       }}>
@@ -5723,7 +5734,7 @@ function PresentationEditor({
                 }}
               >
                 <PptxReadOnlySlide slide={slide} thumbnail />
-                <div className="presentation-editor-thumb-label" style={{ fontSize: 10, textAlign: "center", color: "#78716c", padding: "4px 0" }}>
+                <div className="presentation-editor-thumb-label" style={{ fontSize: 10, textAlign: "center", color: "#8e8e93", padding: "4px 0" }}>
                   {idx + 1}
                 </div>
               </button>
@@ -5754,7 +5765,7 @@ function PresentationEditor({
         {/* Toolbar */}
         <div className="presentation-editor-toolbar" style={{
           display: "flex", alignItems: "center", gap: 8, padding: "8px 16px",
-          borderBottom: "1px solid rgba(28,25,23,0.06)", background: "rgba(255,255,255,0.5)",
+          borderBottom: "1px solid rgba(29, 29, 31,0.06)", background: "rgba(255,255,255,0.5)",
           flexShrink: 0, flexWrap: "nowrap", minHeight: 46,
         }}>
           {/* Undo / Redo */}
@@ -5764,7 +5775,7 @@ function PresentationEditor({
           <button onClick={redo} disabled={redoStack.length === 0} className="btn-manor-ghost" style={{ fontSize: 12, padding: "4px 8px", opacity: redoStack.length === 0 ? 0.3 : 1 }} title={t("page.doc_editor.redo_ctrl_plus_shift_plus_z")}>
             <IconRedo size={14} />
           </button>
-          <div className="presentation-editor-separator" style={{ width: 1, height: 20, background: "#e7e5e4" }} />
+          <div className="presentation-editor-separator" style={{ width: 1, height: 20, background: "#e5e5ea" }} />
           {/* Insert tools */}
           <button onClick={addTextBox} className="btn-manor-ghost" style={{ fontSize: 12, padding: "4px 12px" }}>
             {t("page.doc_editor.plus_text")}
@@ -5815,23 +5826,23 @@ function PresentationEditor({
                 <>
                   {!selectedShape.imgUrl && (
                     <>
-                      <span className="presentation-editor-field-label" style={{ fontSize: 11, color: "#a8a29e" }}>{t("page.doc_editor.fill")}</span>
+                      <span className="presentation-editor-field-label" style={{ fontSize: 11, color: "#aeaeb2" }}>{t("page.doc_editor.fill")}</span>
                       <input
                         type="color"
                         aria-label={t("page.doc_editor.fill")}
                         value={pptxColorInputValue(selectedShape.fill, "#ffffff")}
                         onChange={(event) => updateShapeFill(selectedShapeId, event.target.value)}
-                        style={{ width: 24, height: 24, border: "1px solid rgba(28,25,23,0.06)", borderRadius: 4, cursor: "pointer", padding: 0 }}
+                        style={{ width: 24, height: 24, border: "1px solid rgba(29, 29, 31,0.06)", borderRadius: 4, cursor: "pointer", padding: 0 }}
                       />
                     </>
                   )}
-                  <span className="presentation-editor-field-label" style={{ fontSize: 11, color: "#a8a29e" }}>{t("page.doc_editor.stroke")}</span>
+                  <span className="presentation-editor-field-label" style={{ fontSize: 11, color: "#aeaeb2" }}>{t("page.doc_editor.stroke")}</span>
                   <input
                     type="color"
                     aria-label={t("page.doc_editor.stroke")}
-                    value={pptxColorInputValue(selectedShape.stroke, "#1c1917")}
+                    value={pptxColorInputValue(selectedShape.stroke, "#1d1d1f")}
                     onChange={(event) => updateShapeProps(selectedShapeId, { stroke: event.target.value })}
-                    style={{ width: 24, height: 24, border: "1px solid rgba(28,25,23,0.06)", borderRadius: 4, cursor: "pointer", padding: 0 }}
+                    style={{ width: 24, height: 24, border: "1px solid rgba(29, 29, 31,0.06)", borderRadius: 4, cursor: "pointer", padding: 0 }}
                   />
                   <input
                     type="number"
@@ -5841,10 +5852,10 @@ function PresentationEditor({
                     value={selectedShape.strokeWidth ?? 0}
                     onChange={(event) => updateShapeProps(selectedShapeId, {
                       strokeWidth: Math.max(0, Number(event.target.value) || 0),
-                      stroke: selectedShape.stroke || "#1c1917",
+                      stroke: selectedShape.stroke || "#1d1d1f",
                     })}
                     title={t("page.doc_editor.stroke")}
-                    style={{ width: 48, fontSize: 12, padding: "2px 4px", border: "1px solid rgba(28,25,23,0.06)", borderRadius: 4 }}
+                    style={{ width: 48, fontSize: 12, padding: "2px 4px", border: "1px solid rgba(29, 29, 31,0.06)", borderRadius: 4 }}
                   />
                 </>
               )}
@@ -5852,7 +5863,7 @@ function PresentationEditor({
                 <select
                   value={selectedShape.imageFit || (selectedShape.imgCrop ? "cover" : "fill")}
                   onChange={(event) => void updateImageFit(selectedShapeId, event.target.value as "cover" | "contain" | "fill")}
-                  style={{ fontSize: 12, padding: "3px 8px", border: "1px solid rgba(28,25,23,0.06)", borderRadius: 6, background: "#fff" }}
+                  style={{ fontSize: 12, padding: "3px 8px", border: "1px solid rgba(29, 29, 31,0.06)", borderRadius: 6, background: "#fff" }}
                 >
                   <option value="fill">{t("page.doc_editor.stretch_image")}</option>
                   <option value="contain">{t("page.doc_editor.fit_image")}</option>
@@ -5868,13 +5879,13 @@ function PresentationEditor({
               </button>
               {selectedText && (
                 <>
-                  <div className="presentation-editor-separator" style={{ width: 1, height: 20, background: "#e7e5e4" }} />
+                  <div className="presentation-editor-separator" style={{ width: 1, height: 20, background: "#e5e5ea" }} />
                   <select
                     value={selectedText.fontFamily || "Aptos"}
                     aria-label={t("page.doc_editor.font")}
                     title={t("page.doc_editor.font")}
                     onChange={(event) => updateSelectedTextStyle({ fontFamily: event.target.value })}
-                    style={{ width: 108, fontSize: 12, padding: "3px 7px", border: "1px solid rgba(28,25,23,0.06)", borderRadius: 6, background: "#fff" }}
+                    style={{ width: 108, fontSize: 12, padding: "3px 7px", border: "1px solid rgba(29, 29, 31,0.06)", borderRadius: 6, background: "#fff" }}
                   >
                     {selectedText.fontFamily && !PRESENTATION_FONT_FAMILIES.includes(selectedText.fontFamily) && (
                       <option value={selectedText.fontFamily}>{selectedText.fontFamily}</option>
@@ -5889,7 +5900,7 @@ function PresentationEditor({
                     aria-label={t("page.doc_editor.size")}
                     title={t("page.doc_editor.size")}
                     onChange={(e) => updateSelectedTextStyle({ fontSize: parseInt(e.target.value, 10) || 16 })}
-                    style={{ width: 48, fontSize: 12, padding: "2px 4px", border: "1px solid rgba(28,25,23,0.06)", borderRadius: 4 }}
+                    style={{ width: 48, fontSize: 12, padding: "2px 4px", border: "1px solid rgba(29, 29, 31,0.06)", borderRadius: 4 }}
                   />
                   <button
                     onClick={() => updateSelectedTextStyle({ bold: !selectedText.bold })}
@@ -5922,23 +5933,23 @@ function PresentationEditor({
                     aria-label={t("page.doc_editor.color")}
                     title={t("page.doc_editor.color")}
                     onChange={(e) => updateSelectedTextStyle({ color: e.target.value })}
-                    style={{ width: 24, height: 24, border: "1px solid rgba(28,25,23,0.06)", borderRadius: 4, cursor: "pointer", padding: 0 }}
+                    style={{ width: 24, height: 24, border: "1px solid rgba(29, 29, 31,0.06)", borderRadius: 4, cursor: "pointer", padding: 0 }}
                   />
                   <select
                     value={selectedText.align || "left"}
                     onChange={(e) => updateSelectedTextStyle({ align: e.target.value })}
-                    style={{ fontSize: 12, padding: "3px 8px", border: "1px solid rgba(28,25,23,0.06)", borderRadius: 6, background: "#fff" }}
+                    style={{ fontSize: 12, padding: "3px 8px", border: "1px solid rgba(29, 29, 31,0.06)", borderRadius: 6, background: "#fff" }}
                   >
-                    <option value="left">Left</option>
-                    <option value="center">Center</option>
-                    <option value="right">Right</option>
+                    <option value="left">{t("ui.left")}</option>
+                    <option value="center">{t("ui.center")}</option>
+                    <option value="right">{t("ui.right")}</option>
                   </select>
                   <select
                     value={selectedText.lineSpacing || 1.2}
                     aria-label={t("page.doc_editor.line_spacing")}
                     title={t("page.doc_editor.line_spacing")}
                     onChange={(event) => updateSelectedTextStyle({ lineSpacing: Number(event.target.value) })}
-                    style={{ width: 64, fontSize: 12, padding: "3px 6px", border: "1px solid rgba(28,25,23,0.06)", borderRadius: 6, background: "#fff" }}
+                    style={{ width: 64, fontSize: 12, padding: "3px 6px", border: "1px solid rgba(29, 29, 31,0.06)", borderRadius: 6, background: "#fff" }}
                   >
                     {selectedText.lineSpacing && ![1, 1.15, 1.2, 1.5, 2].includes(selectedText.lineSpacing) && (
                       <option value={selectedText.lineSpacing}>{Number(selectedText.lineSpacing.toFixed(2))}</option>
@@ -5975,19 +5986,19 @@ function PresentationEditor({
               <button type="button" onClick={() => setCanvasZoom(1)} title={t("page.doc_editor.fit_slide")}>{Math.round(canvasZoom * 100)}%</button>
               <button type="button" onClick={() => setCanvasZoom((value) => Math.min(1.6, Number((value + 0.1).toFixed(1))))} disabled={canvasZoom >= 1.6} title={t("page.doc_editor.zoom_in")}>+</button>
             </div>
-            <span className="presentation-editor-field-label" style={{ fontSize: 11, color: "#a8a29e" }}>{t("page.doc_editor.bg")}</span>
+            <span className="presentation-editor-field-label" style={{ fontSize: 11, color: "#aeaeb2" }}>{t("page.doc_editor.bg")}</span>
             <input
               type="color"
               value={pptxColorInputValue(activeSlide.bg, "#ffffff")}
               onChange={(e) => updateSlideBg(e.target.value)}
-              style={{ width: 24, height: 24, border: "1px solid rgba(28,25,23,0.06)", borderRadius: 4, cursor: "pointer", padding: 0 }}
+              style={{ width: 24, height: 24, border: "1px solid rgba(29, 29, 31,0.06)", borderRadius: 4, cursor: "pointer", padding: 0 }}
             />
             {slides.length > 1 && (
               <button onClick={deleteSlide} className="btn-manor-ghost" style={{ fontSize: 12, padding: "4px 12px", color: "#c14a44" }}>
                 {t("page.doc_editor.delete_slide")}
               </button>
             )}
-            <span className="presentation-editor-page-count" style={{ fontSize: 11, color: "#a8a29e" }}>
+            <span className="presentation-editor-page-count" style={{ fontSize: 11, color: "#aeaeb2" }}>
               {activeIdx + 1}/{slides.length}
             </span>
           </div>
@@ -6000,7 +6011,7 @@ function PresentationEditor({
             className="presentation-editor-canvas-viewport"
             style={{
               flex: 1, display: "flex", alignItems: "center", justifyContent: "center",
-              padding: 24, background: "#e7e5e4", overflow: "auto", boxSizing: "border-box",
+              padding: 24, background: "var(--file-stage)", overflow: "auto", boxSizing: "border-box",
             }}
             onClick={() => { setSelectedShapeId(null); setEditingText(null); setEditingTableCell(null); }}
           >
@@ -6193,7 +6204,7 @@ function PresentationEditor({
                       controls
                       playsInline
                       preload="metadata"
-                      aria-label="Presentation video"
+                      aria-label={t("ui.presentation_video")}
                       onMouseDown={(event) => event.stopPropagation()}
                       style={{ opacity: shape.opacity }}
                     />
@@ -6328,7 +6339,7 @@ function PresentationEditor({
                     );
                   })}
                   {shape.type !== "graphic" && shape.texts.length === 0 && !shape.imgUrl && !shape.tableRows && isSelected && (
-                    <div style={{ color: "#a8a29e", fontSize: 12, textAlign: "center" }}>{t("page.doc_editor.empty_shape")}</div>
+                    <div style={{ color: "#aeaeb2", fontSize: 12, textAlign: "center" }}>{t("page.doc_editor.empty_shape")}</div>
                   )}
                   {isSelected && !shapeLocked && !editingText && renderResizeHandles(shape.id)}
                 </div>
@@ -6639,6 +6650,7 @@ export default function DocEditor() {
   const [liveDiff, setLiveDiff] = useState<string | null>(null);
   const [liveEditNotice, setLiveEditNotice] = useState<string | null>(null);
   const [liveEditPreview, setLiveEditPreview] = useState<EditorLivePreviewState | null>(null);
+  const [liveEditTurnLocked, setLiveEditTurnLocked] = useState(false);
   const [liveEditAccepting, setLiveEditAccepting] = useState(false);
   const [documentMediaInsertOpen, setDocumentMediaInsertOpen] = useState(false);
   const [, setPlainTextHistoryRevision] = useState(0);
@@ -8768,7 +8780,7 @@ export default function DocEditor() {
   }, [handleRichTextInput, restoreRichSelection, saveRichSelection]);
 
   const insertRichTextTable = useCallback((rows = 3, cols = 3) => {
-    const headerCells = Array.from({ length: cols }, () => "<th>Header</th>").join("");
+    const headerCells = Array.from({ length: cols }, () => `<th>${t("ui.header")}</th>`).join("");
     const bodyRows = Array.from({ length: Math.max(1, rows - 1) }, () => (
       `<tr>${Array.from({ length: cols }, () => "<td><br></td>").join("")}</tr>`
     )).join("");
@@ -8792,14 +8804,14 @@ export default function DocEditor() {
   const insertRichTextPageBreak = useCallback(() => {
     execCmd(
       "insertHTML",
-      '<div class="doc-editor-page-break" data-docx-page-break="true" contenteditable="false"><span>Page break</span></div><p><br></p>',
+      `<div class="doc-editor-page-break" data-docx-page-break="true" contenteditable="false"><span>${t("ui.page_break")}</span></div><p><br></p>`,
     );
   }, [execCmd]);
 
   const insertRichTextCallout = useCallback(() => {
     execCmd(
       "insertHTML",
-      '<blockquote class="doc-editor-callout"><strong>Note</strong><br><br></blockquote><p><br></p>',
+      `<blockquote class="doc-editor-callout"><strong>${t("ui.note")}</strong><br><br></blockquote><p><br></p>`,
     );
   }, [execCmd]);
 
@@ -10169,7 +10181,7 @@ export default function DocEditor() {
       return true;
     }
 
-    if (aiEditDisplayMode === AiEditDisplayMode.InstantPreview) {
+    if (aiEditDisplayMode === AiEditDisplayMode.InstantPreview || meta?.instant) {
       const instantPreview: EditorLivePreviewState = {
         ...initialPreview,
         current: nextText,
@@ -10306,7 +10318,7 @@ export default function DocEditor() {
     }
 
     const prefersReducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
-    if (aiEditDisplayMode !== AiEditDisplayMode.InstantPreview && !prefersReducedMotion) {
+    if (aiEditDisplayMode !== AiEditDisplayMode.InstantPreview && !prefersReducedMotion && !meta.instant) {
       const animationFormat: DelimitedTextFormat = isXlsx
         ? { delimiter: ",", lineEnding: "\n", finalLineEnding: false }
         : csvFormatRef.current;
@@ -10397,7 +10409,7 @@ export default function DocEditor() {
       return true;
     }
 
-    if (aiEditDisplayMode === AiEditDisplayMode.InstantPreview) {
+    if (aiEditDisplayMode === AiEditDisplayMode.InstantPreview || meta?.instant) {
       if (editor) editor.innerHTML = sanitizedText;
       contentRef.current = sanitizedText;
       setContent(sanitizedText);
@@ -11005,6 +11017,7 @@ export default function DocEditor() {
       complete: (next, meta) => completeEditorLiveContent(next, targetId, meta),
       restore: (_next, meta) => restoreEditorLiveTurnPreview(targetId, meta),
       rollback: discardLiveEditPreview,
+      setTurnLocked: setLiveEditTurnLocked,
       commitCoordinator: liveEditCommitCoordinator,
     });
     const baseDetail = {
@@ -11124,11 +11137,11 @@ export default function DocEditor() {
   const codeSourcePane = (
     <section
       className={`doc-editor-code-source${liveEditPreview?.mode === "code" ? " is-ai-editing" : ""}`}
-      aria-label="Code editor"
+      aria-label={t("ui.code_editor")}
       aria-busy={liveEditPreview?.mode === "code" && liveEditPreview.status === AiEditPreviewStatus.Animating}
     >
       <div className="doc-editor-code-titlebar doc-editor-code-tabs">
-        <div className="doc-editor-code-tablist" role="tablist" aria-label="Open code files">
+        <div className="doc-editor-code-tablist" role="tablist" aria-label={t("ui.open_code_files")}>
           {visibleCodeTabs.map((tab, index) => {
             const selected = tab.path === activeCodePath || (tab.isMain && !activeCodeTab);
             return (
@@ -11172,8 +11185,8 @@ export default function DocEditor() {
             <button
               type="button"
               className="doc-editor-code-diff-close"
-              aria-label="Close inline diff"
-              title="Close inline diff"
+              aria-label={t("ui.close_inline_diff")}
+              title={t("ui.close_inline_diff")}
               onClick={() => setLiveDiff(null)}
             >
               <IconClose size={13} />
@@ -11191,7 +11204,7 @@ export default function DocEditor() {
               type="button"
               onClick={() => void codeWorkspace.openFile({ path: activeCodeTab.path, name: activeCodeTab.name })}
             >
-              Retry
+              {t("ui.retry")}
             </button>
           </div>
         ) : liveDiff ? (
@@ -11229,12 +11242,12 @@ export default function DocEditor() {
               <div ref={codeHighlightRef} className="doc-editor-code-highlight" aria-hidden="true">
                 <CodeSyntaxHighlighter
                   language={codeLanguage}
-                  style={ideEditorTheme}
+                  style={currentIdeEditorTheme()}
                   wrapLongLines={false}
                   customStyle={{ minHeight: "100%", overflow: "visible" }}
                   codeTagProps={{
                     style: {
-                      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+                      fontFamily: "var(--font-mono)",
                       tabSize: 2,
                     },
                   }}
@@ -11258,7 +11271,7 @@ export default function DocEditor() {
                 className="manor-editor-codearea doc-editor-ide-textarea"
                 placeholder={t("page.doc_editor.start_coding")}
                 spellCheck={false}
-                readOnly={liveEditPreview?.mode === "code"}
+                readOnly={liveEditPreview?.mode === "code" || liveEditTurnLocked}
                 wrap="off"
               />
             </div>
@@ -11291,7 +11304,7 @@ export default function DocEditor() {
   const codePaneDefinitions: ResizablePaneDefinition[] = [
     ...(projectRootPath ? [{
       id: "files",
-      label: "Project files",
+      label: t("ui.project_files"),
       initialSize: 14,
       minSize: 160,
       maxSize: 340,
@@ -11315,7 +11328,7 @@ export default function DocEditor() {
     }] : []),
     {
       id: "source",
-      label: "Code editor",
+      label: t("ui.code_editor"),
       initialSize: projectRootPath ? 44 : 54,
       minSize: 360,
       className: "doc-editor-code-pane-shell",
@@ -11323,7 +11336,7 @@ export default function DocEditor() {
     },
     ...(codePreviewPane ? [{
       id: "preview",
-      label: "Preview",
+      label: t("ui.preview"),
       initialSize: 42,
       minSize: 320,
       className: "doc-editor-preview-pane",
@@ -11339,119 +11352,93 @@ export default function DocEditor() {
     <div className="manor-editor-shell">
       {/* Header bar */}
       <div className="manor-editor-header">
-        <button
-          onClick={() => void goBackFromEditor()}
-          className="btn-manor-ghost"
-          title={t("page.doc_editor.back_to_knowledge_base")}
-          style={{ width: 36, height: 36, padding: 0, display: "flex", alignItems: "center", justifyContent: "center" }}
-        >
-          <IconArrowLeft size={18} />
-        </button>
-
         <div className="manor-editor-header-main">
-          <PageHeaderTitle variant="editor" title={docName}>{docName}</PageHeaderTitle>
-          <StatusBadge type="gray">{modeLabel}</StatusBadge>
-        </div>
-
-        {visibleLiveEditNotice && <StatusBadge type="teal" dot>{visibleLiveEditNotice}</StatusBadge>}
-
-        {(displayedSaveStatus !== "saved" || savedFeedbackVisible) && (
-          <StatusBadge type={statusInfo.type} dot>{statusInfo.label}</StatusBadge>
-        )}
-
-        {!officeLoadError && (
-          <AiEditButton
-            onClick={openLiveEdit}
-            disabled={!doc || isLoadingContent}
-          />
-        )}
-
-        {!officeLoadError
-          && (["richtext", "markdown", "code"] as EditorMode[]).includes(mode)
-          && !(mode === "richtext" && isDocx)
-          && (
           <button
             type="button"
-            onClick={() => setDocumentMediaInsertOpen(true)}
-            className="btn-manor-ghost"
-            title={t("component.media_insert.title")}
-            aria-label={t("component.media_insert.title")}
-            style={{ width: 36, height: 36, padding: 0, display: "flex", alignItems: "center", justifyContent: "center" }}
+            className="page-header-back"
+            onClick={() => void goBackFromEditor()}
+            aria-label={t("page.file_viewer.go_back")}
+            title={t("page.file_viewer.go_back")}
           >
-            <IconImage size={18} />
+            <IconArrowLeft size={16} />
           </button>
-        )}
+          <PageHeaderTitle variant="editor" title={docName}>{docName}</PageHeaderTitle>
+        </div>
+        <div className="manor-editor-actions">
+          {visibleLiveEditNotice && <StatusBadge type="teal" dot>{visibleLiveEditNotice}</StatusBadge>}
 
-        {doc && (
+          {(displayedSaveStatus !== "saved" || savedFeedbackVisible) && (
+            <StatusBadge type={statusInfo.type} dot>{statusInfo.label}</StatusBadge>
+          )}
+
+          {canEditCurrentDoc && mode === "code" && isHtmlFile(docName) && (
+            <SitePublishAction doc={doc || null} beforePublish={saveCodeWorkspaceForPublish} />
+          )}
+
           <button
-            onMouseDown={preserveCommentSelection}
-            onClick={() => {
-              refreshCommentAnchor();
-              setShowComments((open) => {
-                const next = !open;
-                if (next) setShowVersions(false);
-                return next;
-              });
+            onClick={() => void handleManualSave()}
+            disabled={
+              saveMutation.isPending
+              || spreadsheetSaveMutation.isPending
+              || presentationSaveMutation.isPending
+              || activeCodeTab?.loading
+              || activeCodeTab?.readError
+              || displayedSaveStatus === "saving"
+              || Boolean(liveEditPreview)
+              || !canEditCurrentDoc
+              || Boolean(officeLoadError)
+            }
+            className="btn-manor"
+            style={{ fontSize: 12, padding: "6px 16px" }}
+          >
+            {t("action.save")}
+          </button>
+
+          <Dropdown
+            align="right"
+            trigger={(
+              /* The menu takes focus, so the comment anchor is read while the selection is still live. */
+              <button
+                type="button"
+                className="manor-editor-tool-button manor-editor-icon-button"
+                aria-label={t("nav.more")}
+                title={t("nav.more")}
+                onMouseDown={preserveCommentSelection}
+              >
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                  <circle cx="3.5" cy="8" r="1.3" /><circle cx="8" cy="8" r="1.3" /><circle cx="12.5" cy="8" r="1.3" />
+                </svg>
+              </button>
+            )}
+            items={[
+              ...(!officeLoadError ? [{ key: "ai", label: t("ui.ai_edit"), icon: <IconSparkles size={15} />, disabled: !doc || isLoadingContent }] : []),
+              ...(mode === "code" && isRenderableCodeFile(docName) ? [{ key: "preview", label: t("page.doc_editor.preview"), icon: <IconEye size={15} /> }] : []),
+              ...(!officeLoadError
+                && (["richtext", "markdown", "code"] as EditorMode[]).includes(mode)
+                && !(mode === "richtext" && isDocx)
+                ? [{ key: "media", label: t("component.media_insert.title"), icon: <IconImage size={15} /> }] : []),
+              ...(doc ? [{ key: "comments", label: t("page.tasks.comments"), icon: <IconComment size={15} /> }] : []),
+              { key: "versions", label: t("page.doc_editor.version_history"), icon: <IconClock size={15} /> },
+            ]}
+            onSelect={(key) => {
+              if (key === "ai") openLiveEdit();
+              if (key === "preview") setShowPreview((p) => !p);
+              if (key === "media") setDocumentMediaInsertOpen(true);
+              if (key === "comments") {
+                setShowComments((open) => {
+                  if (!open) setShowVersions(false);
+                  return !open;
+                });
+              }
+              if (key === "versions") {
+                setShowVersions((open) => {
+                  if (!open) setShowComments(false);
+                  return !open;
+                });
+              }
             }}
-            className={showComments ? "btn-manor-teal-light" : "btn-manor-ghost"}
-            title={t("page.tasks.comments")}
-            aria-label={t("page.tasks.comments")}
-            aria-pressed={showComments}
-            style={{ width: 36, height: 36, padding: 0, display: "flex", alignItems: "center", justifyContent: "center" }}
-          >
-            <IconComment size={18} />
-          </button>
-        )}
-
-        {(mode === "code" && isRenderableCodeFile(docName)) && (
-          <button
-            onClick={() => setShowPreview((p) => !p)}
-            className={showPreview ? "btn-manor-teal-light" : "btn-manor-ghost"}
-            style={{ fontSize: 12, fontWeight: 600, padding: "6px 14px" }}
-          >
-            {t("page.doc_editor.preview")}
-          </button>
-        )}
-
-        {canEditCurrentDoc && mode === "code" && isHtmlFile(docName) && (
-          <SitePublishAction doc={doc || null} beforePublish={saveCodeWorkspaceForPublish} />
-        )}
-
-        <button
-          onClick={() => void handleManualSave()}
-          disabled={
-            saveMutation.isPending
-            || spreadsheetSaveMutation.isPending
-            || presentationSaveMutation.isPending
-            || activeCodeTab?.loading
-            || activeCodeTab?.readError
-            || displayedSaveStatus === "saving"
-            || Boolean(liveEditPreview)
-            || !canEditCurrentDoc
-            || Boolean(officeLoadError)
-          }
-          className="btn-manor"
-          style={{ fontSize: 12, padding: "6px 16px" }}
-        >
-          {t("action.save")}
-        </button>
-
-        <button
-          onClick={() => {
-            setShowVersions((open) => {
-              const next = !open;
-              if (next) setShowComments(false);
-              return next;
-            });
-          }}
-          className={showVersions ? "btn-manor-teal-light" : "btn-manor-ghost"}
-          title={t("page.doc_editor.version_history")}
-          aria-label={t("page.doc_editor.version_history")}
-          aria-pressed={showVersions}
-          style={{ width: 36, height: 36, padding: 0, display: "flex", alignItems: "center", justifyContent: "center" }}
-        >
-          <IconClock size={18} />
-        </button>
+          />
+        </div>
       </div>
 
       {/* Toolbar (rich text + docx) */}
@@ -11490,9 +11477,9 @@ export default function DocEditor() {
             <ToolbarBtn label={t("page.doc_editor.b")} title={t("page.doc_editor.bold_ctrl_plus_b")} bold onClick={() => execCmd("bold")} />
             <ToolbarBtn label={t("page.doc_editor.i")} title={t("page.doc_editor.italic_ctrl_plus_i")} italic onClick={() => execCmd("italic")} />
             <ToolbarBtn label={t("page.doc_editor.u")} title={t("page.doc_editor.underline_ctrl_plus_u")} underline onClick={() => execCmd("underline")} />
-            <ToolbarBtn label="S" title="Strikethrough" onClick={() => execCmd("strikeThrough")} />
-            <ToolbarColor title="Text color" value="#1c1917" onChange={(value) => execCmd("foreColor", value)} icon={<IconText size={14} />} />
-            <ToolbarColor title="Highlight" value="#fef08a" onChange={(value) => execCmd("hiliteColor", value)} icon={<IconHighlighter size={14} />} />
+            <ToolbarBtn label="S" title={t("ui.strikethrough")} onClick={() => execCmd("strikeThrough")} />
+            <ToolbarColor title={t("ui.text_color")} value="#1d1d1f" onChange={(value) => execCmd("foreColor", value)} icon={<IconText size={14} />} />
+            <ToolbarColor title={t("ui.highlight")} value="#fef08a" onChange={(value) => execCmd("hiliteColor", value)} icon={<IconHighlighter size={14} />} />
           </ToolbarGroup>
           <ToolbarSep />
           <ToolbarGroup>
@@ -11505,24 +11492,24 @@ export default function DocEditor() {
                   onMouseDown={(event) => event.preventDefault()}
                 >
                   <IconList size={15} />
-                  Paragraph
+                  {t("ui.paragraph")}
                 </button>
               )}
               items={[
-                { key: "align-left", label: "Align left" },
-                { key: "align-center", label: "Align center" },
-                { key: "align-right", label: "Align right" },
-                { key: "align-justify", label: "Justify" },
-                { key: "bullet", label: "Bullet list" },
-                { key: "numbered", label: "Numbered list" },
-                { key: "indent", label: "Indent" },
-                { key: "outdent", label: "Outdent" },
-                { key: "line-1", label: "Line spacing 1.0" },
-                { key: "line-15", label: "Line spacing 1.5" },
-                { key: "line-2", label: "Line spacing 2.0" },
-                { key: "space-tight", label: "Tight paragraph spacing" },
-                { key: "space-normal", label: "Normal paragraph spacing" },
-                { key: "space-loose", label: "Loose paragraph spacing" },
+                { key: "align-left", label: t("ui.align_left") },
+                { key: "align-center", label: t("ui.align_center") },
+                { key: "align-right", label: t("ui.align_right") },
+                { key: "align-justify", label: t("ui.justify") },
+                { key: "bullet", label: t("ui.bullet_list") },
+                { key: "numbered", label: t("ui.numbered_list") },
+                { key: "indent", label: t("ui.indent") },
+                { key: "outdent", label: t("ui.outdent") },
+                { key: "line-1", label: t("ui.line_spacing_1_0") },
+                { key: "line-15", label: t("ui.line_spacing_1_5") },
+                { key: "line-2", label: t("ui.line_spacing_2_0") },
+                { key: "space-tight", label: t("ui.tight_paragraph_spacing") },
+                { key: "space-normal", label: t("ui.normal_paragraph_spacing") },
+                { key: "space-loose", label: t("ui.loose_paragraph_spacing") },
               ]}
               onSelect={handleRichTextLayoutAction}
             />
@@ -11535,12 +11522,12 @@ export default function DocEditor() {
                   onMouseDown={(event) => event.preventDefault()}
                 >
                   <IconLink size={15} />
-                  Link
+                  {t("ui.link")}
                 </button>
               )}
               items={[
-                { key: "add", label: "Add link" },
-                { key: "remove", label: "Remove link" },
+                { key: "add", label: t("ui.add_link") },
+                { key: "remove", label: t("ui.remove_link") },
               ]}
               onSelect={(key) => {
                 if (key === "add") applyRichTextLink();
@@ -11556,19 +11543,19 @@ export default function DocEditor() {
                   onMouseDown={(event) => event.preventDefault()}
                 >
                   <IconPlus size={15} />
-                  Insert
+                  {t("ui.insert")}
                 </button>
               )}
               items={[
                 { key: "table-2", label: "2 x 2 table" },
                 { key: "table-3", label: "3 x 3 table" },
-                { key: "table-custom", label: "Custom table" },
-                { key: "image", label: "Image" },
-                { key: "checklist", label: "Checklist" },
-                { key: "callout", label: "Callout" },
-                { key: "date", label: "Date" },
-                { key: "page-break", label: "Page break" },
-                { key: "divider", label: "Horizontal line" },
+                { key: "table-custom", label: t("ui.custom_table") },
+                { key: "image", label: t("ui.image") },
+                { key: "checklist", label: t("ui.checklist") },
+                { key: "callout", label: t("ui.callout") },
+                { key: "date", label: t("ui.date") },
+                { key: "page-break", label: t("ui.page_break") },
+                { key: "divider", label: t("ui.horizontal_line") },
               ]}
               onSelect={handleRichTextInsert}
             />
@@ -11580,20 +11567,20 @@ export default function DocEditor() {
                   className="manor-editor-tool-button richtext-toolbar-button"
                   onMouseDown={(event) => event.preventDefault()}
                 >
-                  Table
+                  {t("ui.table")}
                 </button>
               )}
               items={[
-                { key: "row-above", label: "Insert row above" },
-                { key: "row-below", label: "Insert row below" },
-                { key: "column-left", label: "Insert column left" },
-                { key: "column-right", label: "Insert column right" },
-                { key: "header-row", label: "Make first row header" },
-                { key: "merge-right", label: "Merge with cell right" },
-                { key: "split-cell", label: "Split cell" },
-                { key: "delete-row", label: "Delete row", danger: true },
-                { key: "delete-column", label: "Delete column", danger: true },
-                { key: "delete-table", label: "Delete table", danger: true },
+                { key: "row-above", label: t("ui.insert_row_above") },
+                { key: "row-below", label: t("ui.insert_row_below") },
+                { key: "column-left", label: t("ui.insert_column_left") },
+                { key: "column-right", label: t("ui.insert_column_right") },
+                { key: "header-row", label: t("ui.make_first_row_header") },
+                { key: "merge-right", label: t("ui.merge_with_cell_right") },
+                { key: "split-cell", label: t("ui.split_cell") },
+                { key: "delete-row", label: t("ui.delete_row"), danger: true },
+                { key: "delete-column", label: t("ui.delete_column"), danger: true },
+                { key: "delete-table", label: t("ui.delete_table"), danger: true },
               ]}
               onSelect={handleRichTextTableAction}
             />
@@ -11606,18 +11593,18 @@ export default function DocEditor() {
                   onMouseDown={(event) => event.preventDefault()}
                 >
                   <IconSearch size={15} />
-                  Tools
+                  {t("ui.tools")}
                 </button>
               )}
               items={[
-                { key: "find", label: "Find" },
-                { key: "replace", label: "Replace first match" },
-                { key: "select-all", label: "Select all" },
-                { key: "upper", label: "Uppercase selection" },
-                { key: "lower", label: "Lowercase selection" },
-                { key: "title", label: "Title case selection" },
-                { key: "clear-format", label: "Clear formatting" },
-                { key: "clear-document", label: "Clear document", danger: true },
+                { key: "find", label: t("ui.find") },
+                { key: "replace", label: t("ui.replace_first_match") },
+                { key: "select-all", label: t("ui.select_all") },
+                { key: "upper", label: t("ui.uppercase_selection") },
+                { key: "lower", label: t("ui.lowercase_selection") },
+                { key: "title", label: t("ui.title_case_selection") },
+                { key: "clear-format", label: t("ui.clear_formatting") },
+                { key: "clear-document", label: t("ui.clear_document"), danger: true },
               ]}
               onSelect={handleRichTextToolsAction}
             />
@@ -11628,16 +11615,16 @@ export default function DocEditor() {
       {mode === "markdown" && (
         <div className="manor-editor-toolbar markdown-editor-toolbar">
           <div className="markdown-toolbar-group">
-            <button type="button" className="manor-editor-tool-button manor-editor-icon-button" title="Bold (Cmd/Ctrl+B)" onClick={() => wrapMarkdownSelection("**", "**", "bold text")}>
+            <button type="button" className="manor-editor-tool-button manor-editor-icon-button" title={t("ui.bold_cmd_ctrl_b")} onClick={() => wrapMarkdownSelection("**", "**", "bold text")}>
               <strong>B</strong>
             </button>
-            <button type="button" className="manor-editor-tool-button manor-editor-icon-button" title="Italic (Cmd/Ctrl+I)" onClick={() => wrapMarkdownSelection("*", "*", "italic text")}>
+            <button type="button" className="manor-editor-tool-button manor-editor-icon-button" title={t("ui.italic_cmd_ctrl_i")} onClick={() => wrapMarkdownSelection("*", "*", "italic text")}>
               <em>I</em>
             </button>
-            <button type="button" className="manor-editor-tool-button manor-editor-icon-button" title="Inline code" onClick={() => wrapMarkdownSelection("`", "`", "code")}>
+            <button type="button" className="manor-editor-tool-button manor-editor-icon-button" title={t("ui.inline_code")} onClick={() => wrapMarkdownSelection("`", "`", "code")}>
               <IconCode size={15} />
             </button>
-            <button type="button" className="manor-editor-tool-button manor-editor-icon-button" title="Link (Cmd/Ctrl+K)" onClick={insertMarkdownLink}>
+            <button type="button" className="manor-editor-tool-button manor-editor-icon-button" title={t("ui.link_cmd_ctrl_k")} onClick={insertMarkdownLink}>
               <IconLink size={15} />
             </button>
           </div>
@@ -11649,38 +11636,38 @@ export default function DocEditor() {
           </div>
           <div className="manor-editor-toolbar-divider" />
           <div className="markdown-toolbar-group">
-            <button type="button" className="manor-editor-tool-button" title="Bullet list" onClick={() => prefixMarkdownLines("- ")}>
-              <IconList size={15} /> Bullet
+            <button type="button" className="manor-editor-tool-button" title={t("ui.bullet_list")} onClick={() => prefixMarkdownLines("- ")}>
+              <IconList size={15} /> {t("ui.bullet")}
             </button>
-            <button type="button" className="manor-editor-tool-button" title="Numbered list" onClick={() => prefixMarkdownLines("{n}. ")}>
+            <button type="button" className="manor-editor-tool-button" title={t("ui.numbered_list")} onClick={() => prefixMarkdownLines("{n}. ")}>
               1. List
             </button>
-            <button type="button" className="manor-editor-tool-button" title="Task list" onClick={() => prefixMarkdownLines("- [ ] ")}>
-              <IconCheck size={15} /> Task
+            <button type="button" className="manor-editor-tool-button" title={t("ui.task_list")} onClick={() => prefixMarkdownLines("- [ ] ")}>
+              <IconCheck size={15} /> {t("ui.task")}
             </button>
-            <button type="button" className="manor-editor-tool-button" title="Quote" onClick={() => prefixMarkdownLines("> ")}>
-              Quote
+            <button type="button" className="manor-editor-tool-button" title={t("ui.quote")} onClick={() => prefixMarkdownLines("> ")}>
+              {t("ui.quote")}
             </button>
           </div>
           <div className="manor-editor-toolbar-divider" />
           <div className="markdown-toolbar-group">
-            <button type="button" className="manor-editor-tool-button" title="Code block" onClick={() => insertMarkdownBlock("```ts\n\n```", "```ts\n".length)}>
-              <IconCode size={15} /> Block
+            <button type="button" className="manor-editor-tool-button" title={t("ui.code_block")} onClick={() => insertMarkdownBlock("```ts\n\n```", "```ts\n".length)}>
+              <IconCode size={15} /> {t("ui.block")}
             </button>
-            <button type="button" className="manor-editor-tool-button" title="Table" onClick={() => insertMarkdownBlock("| Name | Value |\n| --- | --- |\n| Item | 100 |")}>
-              Table
+            <button type="button" className="manor-editor-tool-button" title={t("ui.table")} onClick={() => insertMarkdownBlock("| Name | Value |\n| --- | --- |\n| Item | 100 |")}>
+              {t("ui.table")}
             </button>
-            <button type="button" className="manor-editor-tool-button" title="Image" onClick={insertMarkdownImage}>
-              Image
+            <button type="button" className="manor-editor-tool-button" title={t("ui.image")} onClick={insertMarkdownImage}>
+              {t("ui.image")}
             </button>
-            <button type="button" className="manor-editor-tool-button" title="Wiki link" onClick={insertMarkdownWikiLink}>
+            <button type="button" className="manor-editor-tool-button" title={t("ui.wiki_link")} onClick={insertMarkdownWikiLink}>
               [[Wiki]]
             </button>
-            <button type="button" className="manor-editor-tool-button" title="Divider" onClick={() => insertMarkdownBlock("---")}>
-              HR
+            <button type="button" className="manor-editor-tool-button" title={t("ui.divider")} onClick={() => insertMarkdownBlock("---")}>
+              {t("ui.hr")}
             </button>
           </div>
-          <div className="markdown-view-switch" aria-label="Markdown view mode">
+          <div className="markdown-view-switch" aria-label={t("ui.markdown_view_mode")}>
             {(["source", "split", "preview"] as MarkdownViewMode[]).map((viewMode) => (
               <button
                 key={viewMode}
@@ -11689,7 +11676,7 @@ export default function DocEditor() {
                 onClick={() => setMarkdownViewMode(viewMode)}
                 aria-pressed={markdownViewMode === viewMode}
               >
-                {viewMode === "source" ? "Edit" : viewMode === "split" ? "Split" : "Preview"}
+                {viewMode === "source" ? t("ui.edit") : viewMode === "split" ? t("ui.split") : t("ui.preview")}
               </button>
             ))}
           </div>
@@ -11723,15 +11710,15 @@ export default function DocEditor() {
                   onMouseDown={(event) => event.preventDefault()}
                 >
                   <IconPlus size={15} />
-                  Insert
+                  {t("ui.insert")}
                 </button>
               )}
               items={[
-                { key: "date", label: "Date" },
-                { key: "time", label: "Date and time" },
-                { key: "divider", label: "Divider" },
-                { key: "bullet", label: "Bullet lines" },
-                { key: "numbered", label: "Numbered lines" },
+                { key: "date", label: t("ui.date") },
+                { key: "time", label: t("ui.date_and_time") },
+                { key: "divider", label: t("ui.divider") },
+                { key: "bullet", label: t("ui.bullet_lines") },
+                { key: "numbered", label: t("ui.numbered_lines") },
               ]}
               onSelect={handlePlainTextInsertAction}
             />
@@ -11744,29 +11731,29 @@ export default function DocEditor() {
                   onMouseDown={(event) => event.preventDefault()}
                 >
                   <IconSearch size={15} />
-                  Tools
+                  {t("ui.tools")}
                 </button>
               )}
               items={[
-                { key: "find", label: "Find" },
-                { key: "replace", label: "Replace first match" },
-                { key: "select-all", label: "Select all" },
-                { key: "upper", label: "Uppercase selection" },
-                { key: "lower", label: "Lowercase selection" },
-                { key: "title", label: "Title case selection" },
-                { key: "sort", label: "Sort selected lines" },
-                { key: "dedupe", label: "Remove duplicate lines" },
-                { key: "trim", label: "Trim trailing spaces" },
-                { key: "clear-document", label: "Clear document", danger: true },
+                { key: "find", label: t("ui.find") },
+                { key: "replace", label: t("ui.replace_first_match") },
+                { key: "select-all", label: t("ui.select_all") },
+                { key: "upper", label: t("ui.uppercase_selection") },
+                { key: "lower", label: t("ui.lowercase_selection") },
+                { key: "title", label: t("ui.title_case_selection") },
+                { key: "sort", label: t("ui.sort_selected_lines") },
+                { key: "dedupe", label: t("ui.remove_duplicate_lines") },
+                { key: "trim", label: t("ui.trim_trailing_spaces") },
+                { key: "clear-document", label: t("ui.clear_document"), danger: true },
               ]}
               onSelect={handlePlainTextToolsAction}
             />
           </ToolbarGroup>
           <ToolbarSep />
           <ToolbarGroup>
-            <ToolbarBtn title="Find" onClick={findPlainText} icon={<IconSearch size={15} />} />
-            <ToolbarBtn title="Select all" onClick={selectAllPlainText} icon={<IconText size={15} />} />
-            <ToolbarBtn title="Copy selection" onClick={copyPlainTextSelection} icon={<IconCopy size={15} />} />
+            <ToolbarBtn title={t("ui.find")} onClick={findPlainText} icon={<IconSearch size={15} />} />
+            <ToolbarBtn title={t("ui.select_all")} onClick={selectAllPlainText} icon={<IconText size={15} />} />
+            <ToolbarBtn title={t("ui.copy_selection")} onClick={copyPlainTextSelection} icon={<IconCopy size={15} />} />
           </ToolbarGroup>
         </div>
       )}
@@ -11776,7 +11763,7 @@ export default function DocEditor() {
         {isLoadingContent ? (
           <div role="status" aria-live="polite" style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
             <LoadingSpinner size={28} />
-            <span>{t("status.loading")}</span>
+            <span className="sr-only">{t("status.loading")}</span>
           </div>
         ) : officeLoadError ? (
           <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -11859,7 +11846,7 @@ export default function DocEditor() {
                 <textarea
                   ref={textRef}
                   value={content}
-                  readOnly={liveEditPreview?.mode === "text"}
+                  readOnly={liveEditPreview?.mode === "text" || liveEditTurnLocked}
                   aria-busy={liveEditPreview?.mode === "text" && liveEditPreview.status === AiEditPreviewStatus.Animating}
                   onBeforeInput={(event) => {
                     plainTextSelectionRef.current = plainTextSelectionFrom(event.currentTarget);
@@ -11898,7 +11885,7 @@ export default function DocEditor() {
                   onKeyUp={refreshPlainTextSelection}
                   rows={Math.max(30, content.split("\n").length + 6)}
                   spellCheck
-                  placeholder="Start typing..."
+                  placeholder={t("ui.start_typing")}
                   className={`manor-editor-document-surface text-editor-page${liveEditPreview?.mode === "text" ? " is-ai-editing" : ""}`}
                 />
                 {renderCommentAnchorRail(lineCount)}
@@ -11910,7 +11897,7 @@ export default function DocEditor() {
           <div className="manor-editor-workspace richtext-editor-workspace">
             <div
               ref={editorRef}
-              contentEditable={canEditCurrentDoc && liveEditPreview?.mode !== "richtext"}
+              contentEditable={canEditCurrentDoc && liveEditPreview?.mode !== "richtext" && !liveEditTurnLocked}
               suppressContentEditableWarning
               role="textbox"
               aria-label={`${docName} content`}
@@ -11938,7 +11925,7 @@ export default function DocEditor() {
               }}
               onBlur={saveRichSelection}
               spellCheck
-              data-placeholder="Start typing..."
+              data-placeholder={t("ui.start_typing")}
               className={`manor-editor-document-surface richtext-editor-page ${isDocx && docxRender ? "manor-docx-native" : "docx-preview"}${liveEditPreview?.mode === "richtext" ? " is-ai-editing" : ""}`}
               style={isDocx && docxRender ? {
                 "--docx-page-width": `${docxRender.layout.pageWidthPx}px`,
@@ -11964,8 +11951,8 @@ export default function DocEditor() {
                     <button
                       type="button"
                       className="doc-editor-code-diff-close"
-                      aria-label="Close inline diff"
-                      title="Close inline diff"
+                      aria-label={t("ui.close_inline_diff")}
+                      title={t("ui.close_inline_diff")}
                       onClick={() => setLiveDiff(null)}
                     >
                       <svg width="13" height="13" viewBox="0 0 24 24" aria-hidden="true">
@@ -11991,7 +11978,7 @@ export default function DocEditor() {
                   <textarea
                     ref={markdownRef}
                     value={content}
-                    readOnly={liveEditPreview?.mode === "markdown"}
+                    readOnly={liveEditPreview?.mode === "markdown" || liveEditTurnLocked}
                     aria-busy={liveEditPreview?.mode === "markdown" && liveEditPreview.status === AiEditPreviewStatus.Animating}
                     onChange={(e) => handleContentChange(e.target.value)}
                     onKeyDown={(e) => handlePlainTextKeyDown(e, { markdown: true })}
@@ -12009,13 +11996,13 @@ export default function DocEditor() {
             {markdownViewMode !== "source" && (
               <div className="markdown-preview-pane">
                 <div className="markdown-pane-header">
-                  <span>Preview</span>
+                  <span>{t("ui.preview")}</span>
                   <span>{markdownStats.readingMinutes} min read · {markdownStats.headings} headings</span>
                 </div>
                 <div className="markdown-preview-body">
                   {markdownHeadings.length > 0 && (
                     <aside className="markdown-outline">
-                      <strong>Outline</strong>
+                      <strong>{t("ui.outline")}</strong>
                       {markdownHeadings.slice(0, 12).map((heading) => (
                         <button
                           key={`${heading.id}-${heading.line}`}
@@ -12108,7 +12095,7 @@ export default function DocEditor() {
                     ? "Preview loading"
                     : codePreviewFailedAssetCount > 0
                       ? `${codePreviewFailedAssetCount} preview asset${codePreviewFailedAssetCount === 1 ? "" : "s"} missing`
-                      : "Preview ready"}
+                      : t("ui.preview_ready")}
                 </span>
               )}
             </div>
@@ -12119,7 +12106,7 @@ export default function DocEditor() {
         {showComments && doc && (
           <div className="manor-editor-sidebar manor-editor-comments-panel" style={{ width: 320, overflowY: "auto" }}>
             <div className="manor-editor-sidebar-header" style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <h3 style={{ fontSize: 14, fontWeight: 700, color: "#44403c", margin: 0 }}>{t("page.tasks.comments")}</h3>
+              <h3 style={{ fontSize: 14, fontWeight: 700, color: "#48484a", margin: 0 }}>{t("page.tasks.comments")}</h3>
               <button
                 type="button"
                 onClick={() => setShowComments(false)}
@@ -12148,23 +12135,23 @@ export default function DocEditor() {
         {showVersions && (
           <div className="manor-editor-sidebar" style={{ width: 280, overflowY: "auto" }}>
             <div className="manor-editor-sidebar-header">
-              <h3 style={{ fontSize: 14, fontWeight: 700, color: "#44403c", margin: 0 }}>{t("page.doc_editor.version_history_2")}</h3>
+              <h3 style={{ fontSize: 14, fontWeight: 700, color: "#48484a", margin: 0 }}>{t("page.doc_editor.version_history_2")}</h3>
             </div>
             <div style={{ padding: 12, display: "flex", flexDirection: "column", gap: 6 }}>
               {!versions || versions.length === 0 ? (
-                <p style={{ fontSize: 12, color: "#a8a29e", textAlign: "center", padding: "24px 0" }}>{t("page.doc_editor.no_versions_yet")}</p>
+                <p style={{ fontSize: 12, color: "#aeaeb2", textAlign: "center", padding: "24px 0" }}>{t("page.doc_editor.no_versions_yet")}</p>
               ) : (
                 (versions as any[]).map((v: any) => (
                   <div key={v.id} className="glass-card-sm" style={{ padding: 12 }}>
                     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                      <span style={{ fontSize: 12, fontWeight: 700, color: "#44403c" }}>{t("page.doc_editor.v")}{v.version_number}</span>
-                      <span style={{ fontSize: 10, color: "#a8a29e" }}>
+                      <span style={{ fontSize: 12, fontWeight: 700, color: "#48484a" }}>{t("page.doc_editor.v")}{v.version_number}</span>
+                      <span style={{ fontSize: 10, color: "#aeaeb2" }}>
                         {v.created_at ? new Date(v.created_at).toLocaleString(undefined, { timeZone: getPreferredTimeZone() }) : ""}
                       </span>
                     </div>
-                    {v.change_summary && <p style={{ fontSize: 11, color: "#78716c", marginTop: 4, marginBottom: 0 }}>{v.change_summary}</p>}
-                    {v.created_by && <p style={{ fontSize: 10, color: "#a8a29e", marginTop: 2, marginBottom: 0 }}>{t("page.skills.by")} {v.created_by}</p>}
-                    {v.file_size != null && <p style={{ fontSize: 10, color: "#a8a29e", marginTop: 2, marginBottom: 0 }}>{formatBytes(v.file_size)}</p>}
+                    {v.change_summary && <p style={{ fontSize: 11, color: "#8e8e93", marginTop: 4, marginBottom: 0 }}>{v.change_summary}</p>}
+                    {v.created_by && <p style={{ fontSize: 10, color: "#aeaeb2", marginTop: 2, marginBottom: 0 }}>{t("page.skills.by")} {v.created_by}</p>}
+                    {v.file_size != null && <p style={{ fontSize: 10, color: "#aeaeb2", marginTop: 2, marginBottom: 0 }}>{formatBytes(v.file_size)}</p>}
                   </div>
                 ))
               )}
@@ -12262,20 +12249,20 @@ export default function DocEditor() {
           height: 20px;
           border-radius: 999px;
           border: 1px solid rgba(120, 113, 108, 0.55);
-          background: #fafaf9;
-          color: #57534e;
+          background: #fafafa;
+          color: #6e6e73;
           display: inline-flex;
           align-items: center;
           justify-content: center;
-          box-shadow: 0 4px 12px rgba(28, 25, 23, 0.12);
+          box-shadow: 0 4px 12px rgba(29, 29, 31, 0.12);
           pointer-events: auto;
           cursor: pointer;
         }
         .doc-comment-anchor-dot.is-active,
         .doc-comment-anchor-dot:hover {
-          background: #44403c;
+          background: #48484a;
           color: #fff;
-          border-color: #44403c;
+          border-color: #48484a;
         }
         .doc-editor-code-gutter-line {
           display: flex;
@@ -12290,7 +12277,7 @@ export default function DocEditor() {
           border-radius: 999px;
           border: 1px solid rgba(120, 113, 108, 0.55);
           background: rgba(250, 250, 249, 0.96);
-          color: #57534e;
+          color: #6e6e73;
           display: inline-flex;
           align-items: center;
           justify-content: center;
@@ -12299,9 +12286,9 @@ export default function DocEditor() {
         }
         .doc-editor-code-comment-marker.is-active,
         .doc-editor-code-comment-marker:hover {
-          background: #44403c;
+          background: #48484a;
           color: white;
-          border-color: #44403c;
+          border-color: #48484a;
         }
         .md-preview h1 { font-size: 1.75em; font-weight: 700; margin: 0.8em 0 0.4em; }
         .md-preview h2 { font-size: 1.4em; font-weight: 700; margin: 0.7em 0 0.35em; }
@@ -12309,13 +12296,13 @@ export default function DocEditor() {
         .md-preview p { margin: 0.5em 0; }
         .md-preview ul { list-style: disc; padding-left: 1.5em; margin: 0.5em 0; }
         .md-preview ol { list-style: decimal; padding-left: 1.5em; margin: 0.5em 0; }
-        .md-preview blockquote { border-left: 3px solid #d6d3d1; padding-left: 1em; color: #78716c; margin: 0.5em 0; }
-        .md-preview hr { border: none; border-top: 1px solid #e7e5e4; margin: 1em 0; }
+        .md-preview blockquote { border-left: 3px solid #d1d1d6; padding-left: 1em; color: #8e8e93; margin: 0.5em 0; }
+        .md-preview hr { border: none; border-top: 1px solid #e5e5ea; margin: 1em 0; }
         .md-code-block {
-          background: #1c1917;
-          border: 1px solid rgba(28, 25, 23, 0.08);
+          background: #1d1d1f;
+          border: 1px solid rgba(29, 29, 31, 0.08);
           border-radius: 10px;
-          color: #f5f5f4;
+          color: #f5f5f7;
           font-size: 0.85em;
           line-height: 1.65;
           margin: 0.5em 0;
@@ -12330,10 +12317,10 @@ export default function DocEditor() {
           white-space: pre;
         }
         .md-inline-code {
-          background: #f5f5f4;
-          border: 1px solid rgba(28, 25, 23, 0.06);
+          background: #f5f5f7;
+          border: 1px solid rgba(29, 29, 31, 0.06);
           border-radius: 4px;
-          color: #1c1917;
+          color: #1d1d1f;
           font-size: 0.9em;
           padding: 0.15em 0.4em;
         }
@@ -12360,7 +12347,7 @@ export default function DocEditor() {
         .md-wiki-link-missing {
           border-color: rgba(168, 162, 158, 0.34);
           background: rgba(250, 250, 249, 0.82);
-          color: #78716c;
+          color: #8e8e93;
           border-style: dashed;
         }
         .md-img { max-width: 100%; border-radius: 10px; margin: 0.5em 0; }
@@ -12382,26 +12369,26 @@ export default function DocEditor() {
           max-width: 100%;
         }
         .docx-preview table { border-collapse: collapse; width: 100%; margin: 12px 0; }
-        .docx-preview td, .docx-preview th { border: 1px solid #e7e5e4; padding: 8px 12px; font-size: 14px; }
-        .docx-preview th { background: #fafaf9; font-weight: 600; }
+        .docx-preview td, .docx-preview th { border: 1px solid #e5e5ea; padding: 8px 12px; font-size: 14px; }
+        .docx-preview th { background: #fafafa; font-weight: 600; }
         .docx-preview img { max-width: 100%; border-radius: 8px; margin: 8px 0; }
         .docx-preview p { margin: 0 0 12px; }
-        .docx-preview h1, .docx-preview h2, .docx-preview h3 { margin: 20px 0 10px; color: #1c1917; line-height: 1.25; }
+        .docx-preview h1, .docx-preview h2, .docx-preview h3 { margin: 20px 0 10px; color: #1d1d1f; line-height: 1.25; }
         .docx-preview h1 { font-size: 28px; }
         .docx-preview h2 { font-size: 22px; }
         .docx-preview h3 { font-size: 18px; }
         .docx-preview ul, .docx-preview ol { padding-left: 1.5em; margin: 8px 0 14px; }
         .richtext-editor-page:empty::before {
           content: attr(data-placeholder);
-          color: #a8a29e;
+          color: #aeaeb2;
           pointer-events: none;
         }
         .docx-preview blockquote {
           margin: 14px 0;
           padding: 10px 14px;
           border-left: 3px solid #ccded9;
-          color: #57534e;
-          background: #fafaf9;
+          color: #6e6e73;
+          background: #fafafa;
         }
         .docx-preview .doc-editor-callout {
           border-color: #4f7d75;
@@ -12420,13 +12407,13 @@ export default function DocEditor() {
           position: relative;
           height: 28px;
           margin: 28px 0;
-          border-top: 1px dashed #d6d3d1;
-          color: #a8a29e;
+          border-top: 1px dashed #d1d1d6;
+          color: #aeaeb2;
           font-size: 11px;
           font-weight: 800;
           letter-spacing: 0.08em;
           text-align: center;
-          text-transform: uppercase;
+          text-transform: none;
           user-select: none;
         }
         .docx-preview .doc-editor-page-break span {
@@ -12438,7 +12425,7 @@ export default function DocEditor() {
         }
         .docx-preview hr {
           border: 0;
-          border-top: 1px solid #e7e5e4;
+          border-top: 1px solid #e5e5ea;
           margin: 22px 0;
         }
         @media (max-width: 640px) {

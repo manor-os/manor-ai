@@ -1,5 +1,6 @@
 import { type CSSProperties, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { t } from "../../lib/i18n";
 
 const FOCUSABLE_SELECTOR = [
   "a[href]",
@@ -202,8 +203,6 @@ export default function Modal({
     padding: 24,
     overflowY: "auto",
     background: "var(--modal-overlay-bg)",
-    backdropFilter: "blur(5px)",
-    WebkitBackdropFilter: "blur(5px)",
     opacity: 1,
     pointerEvents: "auto",
   };
@@ -219,10 +218,7 @@ export default function Modal({
     flexDirection: "column",
     overflow: "hidden",
     background: "var(--modal-bg)",
-    backdropFilter: "blur(20px) saturate(1.08)",
-    WebkitBackdropFilter: "blur(20px) saturate(1.08)",
-    borderRadius: 24,
-    border: "1px solid var(--modal-border)",
+    borderRadius: "var(--modal-radius)",
     boxShadow: "var(--modal-shadow)",
   };
 
@@ -245,7 +241,7 @@ export default function Modal({
       >
         <div className="manor-dialog-header">
           <h2 className="manor-dialog-title" title={title}>{title}</h2>
-          <button type="button" className="manor-dialog-close" onClick={onClose} aria-label="Close" title="Close">
+          <button type="button" className="manor-dialog-close" onClick={onClose} aria-label={t("action.close")} title="Close">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5} strokeLinecap="round">
               <path d="M18 6L6 18M6 6l12 12" />
             </svg>

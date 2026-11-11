@@ -27,7 +27,6 @@ from packages.core.ai.runtime.capability_bindings import (
     expand_runtime_capability_binding,
     runtime_binding_owner_matches,
 )
-from packages.core.ai.runtime.capabilities import CORE_CAPABILITIES
 from packages.core.ai.runtime.tool_visibility import (
     WORKSPACE_LEDGER_VISUALIZATION_TOOL,
     runtime_expand_workspace_ledger_tools,
@@ -1084,67 +1083,6 @@ async def process_workspace_task_comment(
             logger.debug("Failed to persist workspace task comment error", exc_info=True)
 
 
-async def process_workspace_chat_message(
-    *,
-    conversation_id: str,
-    workspace_id: str,
-    entity_id: str,
-    user_id: str | None,
-    message: str,
-    message_id: str | None = None,
-) -> None:
-    """Turn a Workspace Chat user message into a Workspace Agent turn.
-
-    Workspace Chat stores the user's message synchronously so the UI is honest
-    even if the model path is slow. This async follow-up runs the same
-    agentic runtime used by task comments; tool policy and HITL still gate
-    side effects, so chat instructions can safely produce drafts, operation
-    proposals, tasks, rules, or Strategist review requests.
-    """
-    message = (message or "").strip()
-    if not message:
-        return
-
-    from packages.core.database import async_session
-    from packages.core.ai.runtime import runtime_run_chat_turn
-    from packages.core.workspace_chat import service as workspace_chat_service
-
-    try:
-        async with async_session() as db:
-            await runtime_run_chat_turn(
-                message,
-                conversation_id,
-                surface=ChatSurface.WORKSPACE_CHAT,
-                entity_id=entity_id,
-                user_id=user_id,
-                workspace_id=workspace_id,
-                db=db,
-                runtime_metadata={"origin_user_message_id": message_id} if message_id else None,
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Workspace Agent chat processing failed: workspace=%s message=%s error=%s",
-            workspace_id,
-            message_id,
-            exc,
-            exc_info=True,
-        )
-        try:
-            async with async_session() as db:
-                await workspace_chat_service.post_message(
-                    db,
-                    entity_id=entity_id,
-                    workspace_id=workspace_id,
-                    body=f"Workspace Agent could not process this message: {exc}",
-                    message_kind="agent_error",
-                    author_kind="agent",
-                    refs=([{"type": "message", "id": message_id}] if message_id else None),
-                )
-                await db.commit()
-        except Exception:
-            logger.debug("Failed to persist workspace chat processing error", exc_info=True)
-
-
 async def install_workspace_runtime_schedules(
     db: AsyncSession,
     workspace: Workspace,
@@ -1214,6 +1152,8 @@ async def sync_workspace_runtime_schedules(
     user_id: str | None = None,
 ) -> None:
     """Make scheduler rows match the workspace's runtime state."""
+    from packages.core.services.scheduler_service import release_workspace_held_jobs
+
     autonomy_state = workspace_autonomy_state(workspace)
     if autonomy_state is WorkspaceAutonomyState.PAUSED:
         # Keep automation definitions visible and restorable while making the
@@ -1226,6 +1166,8 @@ async def sync_workspace_runtime_schedules(
         await pause_workspace_autonomy_jobs(
             db, workspace.id, workspace.entity_id,
         )
+        # Independent Flows created before the pause still start now.
+        await release_workspace_held_jobs(db, workspace)
         return
     if autonomy_state is WorkspaceAutonomyState.RUNNING:
         await install_workspace_runtime_schedules(db, workspace, user_id=user_id)
@@ -1235,6 +1177,7 @@ async def sync_workspace_runtime_schedules(
             workspace.id,
             entity_id=workspace.entity_id,
         )
+    await release_workspace_held_jobs(db, workspace)
 
 
 async def _sync_workspace_goal_schedules(

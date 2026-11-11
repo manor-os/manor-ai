@@ -191,3 +191,46 @@ async def test_worker_parks_visible_question_and_resumes_same_chat(client, db_se
     assistant = await db_session.get(Message, event["message_id"])
     assert assistant.content == "I will use unit 4C."
     assert run.status == "completed" and len(calls) == 2
+
+
+async def test_parking_a_turn_never_cancels_its_open_approval(client, db_session, browser_runtime, monkeypatch):
+    """A turn that parks durably is finished, not stopped: the approval it is
+    waiting on stays open for the person to decide (it used to expire as
+    ``stream_stopped`` a moment after it was created)."""
+    from packages.core.ai.agentic_loop import AgenticResult
+    from packages.core.models.hitl_request import HitlRequest
+    from packages.core.services import chat_service
+    from packages.core.tasks.runtime_tasks import execute_runtime_run_once
+    from test_chat_stream_resume import _context_factory
+
+    headers = await _auth(client, "parked_approval")
+    event = await _start(client, headers)
+    run = await db_session.get(RuntimeRun, event["run_id"])
+    approval = HitlRequest(
+        entity_id=run.entity_id, workspace_id=None, action_key="workspace.agent.capabilities.modify",
+        risk_level="medium", origin_kind="tool_call", origin_conversation_id=run.conversation_id,
+        status="pending", hitl_type="authorize", reason="approval.mode",
+        dedup_key=f"parked-{run.id}", context={"requested_by": run.user_id},
+    )
+    db_session.add(approval)
+    await db_session.commit()
+    approval_id = approval.id
+
+    async def model_loop(**kwargs):
+        kwargs["on_tool_end"]("acquire_capabilities", json.dumps({
+            "__hitl__": True, "status": "approval_required",
+            "hitl": {"id": approval_id, "type": "approval", "prompt": "Add capabilities"},
+        }))
+        return AgenticResult(
+            content="", messages=[], usage={}, rounds=1, tool_calls_made=["acquire_capabilities"],
+            stop_reason="waiting_resource", control=_control(),
+        )
+
+    monkeypatch.setattr(chat_service, "resolve_runtime_chat_context", _context_factory(None))
+    monkeypatch.setattr(chat_service, "runtime_execute_chat_agent_loop", model_loop)
+    monkeypatch.setattr(chat_service, "record_chat_llm_usage", AsyncMock())
+    first = await execute_runtime_run_once(run_id=run.id, worker_id="initial")
+    assert first["waiting"] is True
+    db_session.expire_all()
+    request = await db_session.get(HitlRequest, approval_id)
+    assert request.status == "pending", request.resolved_reason

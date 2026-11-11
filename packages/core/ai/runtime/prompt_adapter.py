@@ -73,8 +73,9 @@ class ChatContext:
     prompt_source: str | None = None
     agent_files_loaded: dict[str, str] = field(default_factory=dict)
     runtime_context_sections: list[dict] = field(default_factory=list)
-    runtime_identity_sections: list[dict] = field(default_factory=list)
-    runtime_workspace_memory_sections: list[dict] = field(default_factory=list)
+    # A section renderer that produces several context sections (identity
+    # files, memory layers) leaves them here under its own name.
+    runtime_section_outputs: dict[str, list[dict]] = field(default_factory=dict)
     # Set when the turn's history comes from the conversation transcript; the
     # chat service appends this run's messages to it after the reply is saved.
     conversation_transcript: Any = None
@@ -156,8 +157,7 @@ class PromptBuilder:
         ctx.runtime_turn_context = ""
         ctx.runtime_turn_context_sections = []
         ctx.runtime_workspace_operation_skills = []
-        ctx.runtime_identity_sections = []
-        ctx.runtime_workspace_memory_sections = []
+        ctx.runtime_section_outputs = {}
         for name, fn, allowed_modes, turn_scoped in self._sections:
             if ctx.mode not in allowed_modes:
                 continue
@@ -166,12 +166,7 @@ class PromptBuilder:
                 if inspect.isawaitable(result):
                     result = await result
                 if result:
-                    if name == "agent_identity" and ctx.runtime_identity_sections:
-                        produced = list(ctx.runtime_identity_sections)
-                    elif name == "workspace_operating_memory" and ctx.runtime_workspace_memory_sections:
-                        produced = list(ctx.runtime_workspace_memory_sections)
-                    else:
-                        produced = [context_section(name, result)]
+                    produced = ctx.runtime_section_outputs.pop(name, None) or [context_section(name, result)]
                     sections.extend(produced)
                     if turn_scoped:
                         turn_section_ids.update(id(section) for section in produced)

@@ -108,6 +108,19 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
         tool_names=("request_input",),
         profiles=_ALL_RUNTIME_PROFILES,
     ),
+    "memory.write": BusinessCapability(
+        id="memory.write",
+        name="Remember",
+        description="Save what the person said to their memory, this Workspace's memory or the organization's.",
+        tool_names=("remember",),
+        profiles=(
+            RuntimeProfile.OWNER_COPILOT,
+            RuntimeProfile.AGENT_DELEGATE,
+            RuntimeProfile.WORKSPACE_OPERATOR,
+            RuntimeProfile.TASK_WORKER_FEEDBACK,
+            RuntimeProfile.VOICE_SAFE,
+        ),
+    ),
     "web.safe_search": BusinessCapability(
         id="web.safe_search",
         name="Safe web search",
@@ -315,7 +328,7 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
         id="file.read",
         name="File read",
         description="Inspect files and locate matching file paths.",
-        tool_names=("read_file", "list_files", "glob_files", "grep_files", "search_free_music"),
+        tool_names=("read_file", "list_files", "glob_files", "grep_files"),
         profiles=(
             RuntimeProfile.OWNER_COPILOT,
             RuntimeProfile.AGENT_DELEGATE,
@@ -329,7 +342,28 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
         id="file.write",
         name="File write",
         description="Create, edit, or generate workspace files.",
-        tool_names=("generate_file", "patch_file", "replace_file", "import_free_music"),
+        tool_names=("generate_file", "patch_file", "replace_file"),
+        profiles=(
+            RuntimeProfile.OWNER_COPILOT,
+            RuntimeProfile.AGENT_DELEGATE,
+            RuntimeProfile.WORKSPACE_OPERATOR,
+            RuntimeProfile.TASK_WORKER_FEEDBACK,
+            RuntimeProfile.WORKFLOW_STEP,
+            RuntimeProfile.BACKGROUND_WORKER,
+        ),
+        risk_level="write",
+        required_approval=True,
+    ),
+    # A bundle grants every tool it lists, so a tool that serves one kind of
+    # work gets its own capability instead of riding on a general one.
+    "media.music": BusinessCapability(
+        id="media.music",
+        name="Licensed music library",
+        description=(
+            "Search Manor's licensed free music catalog and import a track into "
+            "Knowledge for an audio or video project."
+        ),
+        tool_names=("search_free_music", "import_free_music"),
         profiles=(
             RuntimeProfile.OWNER_COPILOT,
             RuntimeProfile.AGENT_DELEGATE,
@@ -357,7 +391,10 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
         name="Automation management",
         description=(
             "Find eligible Agents and create, list/query, run, toggle, or cancel "
-            "background scheduled jobs. "
+            "Manor's background scheduled jobs (recurring Agent or Workflow runs). "
+            "To schedule a post, message, or meeting in a connected service, use "
+            "that service's own scheduling action when it has one; a scheduled job "
+            "is for work Manor itself must start at a time. "
             "Conversation-bound proactive updates are Agent Initiatives."
         ),
         tool_names=(
@@ -395,13 +432,14 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
     "workflow.run": BusinessCapability(
         id="workflow.run",
         name="Workflow execution",
-        description="Discover, start, inspect, cancel, or resume user-facing Workspace Flows.",
+        description="Discover, start, inspect, cancel, resume, or retry user-facing Workspace Flows.",
         tool_names=(
             "list_workspace_flows",
             "start_workspace_flow",
             "get_workflow_run",
             "cancel_workflow_run",
             "resume_workflow_run",
+            "retry_workflow_run",
         ),
         profiles=(
             RuntimeProfile.OWNER_COPILOT,
@@ -434,6 +472,7 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
             "get_workflow_run",
             "cancel_workflow_run",
             "resume_workflow_run",
+            "retry_workflow_run",
             "import_workflow",
         ),
         profiles=(
@@ -482,12 +521,14 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
         name="Workspace architect typed tools",
         description="Use typed draft-construction tools for workspace setup and repair.",
         tool_names=(
+            "ws_ask_user",
             "ws_commit_basics",
             "ws_propose_service",
             "ws_propose_goal",
             "ws_propose_agent_mapping",
             "ws_request_custom_agent",
             "ws_propose_channel",
+            "ws_flag_missing_integration",
             "ws_propose_rule",
             "ws_propose_automation",
             "ws_set_evaluation",
@@ -495,6 +536,7 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
             "ws_search_entity_agents",
             "ws_search_blueprints",
             "ws_suggest_blueprint",
+            "ws_apply_blueprint",
             "ws_get_draft",
             "ws_read_source",
             "ws_lint_draft",

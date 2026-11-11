@@ -50,12 +50,12 @@ function SpreadsheetChartSvg({ chart }: { chart: SpreadsheetChartModel }) {
           const path = piePath(240, 155, 112, angle, nextAngle);
           angle = nextAngle;
           return <path key={index} d={path} fill={colorForPoint(index)} stroke="#ffffff" strokeWidth="2" />;
-        }) : <circle cx="240" cy="155" r="112" fill="#f5f5f4" stroke="#d6d3d1" />}
+        }) : <circle cx="240" cy="155" r="112" fill="#f5f5f7" stroke="#d1d1d6" />}
         {chart.type === "doughnut" && <circle cx="240" cy="155" r="58" fill="var(--surface-panel, #ffffff)" />}
         {(series?.categories || []).slice(0, 8).map((label, index) => (
           <g key={`${label}:${index}`} transform={`translate(430 ${72 + index * 25})`}>
             <rect width="12" height="12" rx="2" fill={colorForPoint(index)} />
-            <text x="20" y="11" fontSize="12" fill="#57534e">{String(label).slice(0, 24)}</text>
+            <text x="20" y="11" fontSize="12" fill="#6e6e73">{String(label).slice(0, 24)}</text>
           </g>
         ))}
       </svg>
@@ -92,12 +92,12 @@ function SpreadsheetChartSvg({ chart }: { chart: SpreadsheetChartModel }) {
           const y = pad.top + plotHeight * ratio;
           return (
             <g key={ratio}>
-              <line x1={x} y1={pad.top} x2={x} y2={pad.top + plotHeight} stroke="#e7e5e4" strokeDasharray="4 4" />
-              <line x1={pad.left} y1={y} x2={pad.left + plotWidth} y2={y} stroke="#e7e5e4" strokeDasharray="4 4" />
-              <text x={x} y={height - 38} textAnchor="middle" fontSize="10" fill="#78716c">
+              <line x1={x} y1={pad.top} x2={x} y2={pad.top + plotHeight} stroke="#e5e5ea" strokeDasharray="4 4" />
+              <line x1={pad.left} y1={y} x2={pad.left + plotWidth} y2={y} stroke="#e5e5ea" strokeDasharray="4 4" />
+              <text x={x} y={height - 38} textAnchor="middle" fontSize="10" fill="#8e8e93">
                 {Math.round((minX + (maxX - minX) * ratio) * 100) / 100}
               </text>
-              <text x={pad.left - 8} y={y + 4} textAnchor="end" fontSize="10" fill="#a8a29e">
+              <text x={pad.left - 8} y={y + 4} textAnchor="end" fontSize="10" fill="#aeaeb2">
                 {Math.round((maxY - (maxY - minY) * ratio) * 100) / 100}
               </text>
             </g>
@@ -125,7 +125,7 @@ function SpreadsheetChartSvg({ chart }: { chart: SpreadsheetChartModel }) {
         {chart.series.map((series, index) => (
           <g key={`${series.name}:legend`} transform={`translate(${pad.left + index * 130} ${height - 15})`}>
             <rect width="11" height="11" rx="2" fill={colorForSeries(index)} />
-            <text x="17" y="10" fontSize="10" fill="#57534e">{series.name.slice(0, 17)}</text>
+            <text x="17" y="10" fontSize="10" fill="#6e6e73">{series.name.slice(0, 17)}</text>
           </g>
         ))}
       </svg>
@@ -160,8 +160,8 @@ function SpreadsheetChartSvg({ chart }: { chart: SpreadsheetChartModel }) {
           const value = maximum - (maximum - minimum) * ratio;
           return (
             <g key={ratio}>
-              <line x1={pad.left} y1={y} x2={pad.left + plotWidth} y2={y} stroke="#e7e5e4" strokeDasharray="4 4" />
-              <text x={pad.left - 8} y={y + 4} textAnchor="end" fontSize="10" fill="#a8a29e">
+              <line x1={pad.left} y1={y} x2={pad.left + plotWidth} y2={y} stroke="#e5e5ea" strokeDasharray="4 4" />
+              <text x={pad.left - 8} y={y + 4} textAnchor="end" fontSize="10" fill="#aeaeb2">
                 {Math.round(value * 100) / 100}
               </text>
             </g>
@@ -209,14 +209,14 @@ function SpreadsheetChartSvg({ chart }: { chart: SpreadsheetChartModel }) {
           );
         })}
         {categories.map((label, index) => index % Math.max(1, Math.ceil(categories.length / 8)) === 0 && (
-          <text key={`${label}:${index}`} x={pad.left + categoryWidth * index + categoryWidth / 2} y={height - 38} textAnchor="middle" fontSize="10" fill="#78716c">
+          <text key={`${label}:${index}`} x={pad.left + categoryWidth * index + categoryWidth / 2} y={height - 38} textAnchor="middle" fontSize="10" fill="#8e8e93">
             {String(label).slice(0, 12)}
           </text>
         ))}
         {chart.series.map((series, index) => (
           <g key={`${series.name}:legend`} transform={`translate(${pad.left + index * 130} ${height - 15})`}>
             <rect width="11" height="11" rx="2" fill={colorForSeries(index)} />
-            <text x="17" y="10" fontSize="10" fill="#57534e">{series.name.slice(0, 17)}</text>
+            <text x="17" y="10" fontSize="10" fill="#6e6e73">{series.name.slice(0, 17)}</text>
           </g>
         ))}
       </svg>
@@ -265,11 +265,11 @@ function SpreadsheetChartSvg({ chart }: { chart: SpreadsheetChartModel }) {
       <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={chart.title} style={{ display: "block", width: "100%", height: "auto" }}>
         {[0, 0.25, 0.5, 0.75, 1].map((ratio) => {
           const x = pad.left + plotWidth * ratio;
-          return <line key={ratio} x1={x} y1={pad.top} x2={x} y2={pad.top + plotHeight} stroke="#e7e5e4" strokeDasharray="4 4" />;
+          return <line key={ratio} x1={x} y1={pad.top} x2={x} y2={pad.top + plotHeight} stroke="#e5e5ea" strokeDasharray="4 4" />;
         })}
         {Array.from({ length: categoryCount }, (_unused, categoryIndex) => (
           <g key={categoryIndex}>
-            <text x={pad.left - 8} y={pad.top + categoryHeight * (categoryIndex + 0.5) + 4} textAnchor="end" fontSize="10" fill="#78716c">
+            <text x={pad.left - 8} y={pad.top + categoryHeight * (categoryIndex + 0.5) + 4} textAnchor="end" fontSize="10" fill="#8e8e93">
               {String(categories[categoryIndex] || String(categoryIndex + 1)).slice(0, 10)}
             </text>
             {chart.series.map((_series, seriesIndex) => {
@@ -282,11 +282,11 @@ function SpreadsheetChartSvg({ chart }: { chart: SpreadsheetChartModel }) {
             })}
           </g>
         ))}
-        <line x1={xFor(0)} y1={pad.top} x2={xFor(0)} y2={pad.top + plotHeight} stroke="#a8a29e" />
+        <line x1={xFor(0)} y1={pad.top} x2={xFor(0)} y2={pad.top + plotHeight} stroke="#aeaeb2" />
         {chart.series.map((series, index) => (
           <g key={`${series.name}:legend`} transform={`translate(${pad.left + index * 130} ${height - 15})`}>
             <rect width="11" height="11" rx="2" fill={colorForSeries(index)} />
-            <text x="17" y="10" fontSize="10" fill="#57534e">{series.name.slice(0, 17)}</text>
+            <text x="17" y="10" fontSize="10" fill="#6e6e73">{series.name.slice(0, 17)}</text>
           </g>
         ))}
       </svg>
@@ -300,12 +300,12 @@ function SpreadsheetChartSvg({ chart }: { chart: SpreadsheetChartModel }) {
         const value = maximum - span * ratio;
         return (
           <g key={ratio}>
-            <line x1={pad.left} y1={y} x2={pad.left + plotWidth} y2={y} stroke="#e7e5e4" strokeDasharray="4 4" />
-            <text x={pad.left - 8} y={y + 4} textAnchor="end" fontSize="10" fill="#a8a29e">{Math.round(value * 100) / 100}</text>
+            <line x1={pad.left} y1={y} x2={pad.left + plotWidth} y2={y} stroke="#e5e5ea" strokeDasharray="4 4" />
+            <text x={pad.left - 8} y={y + 4} textAnchor="end" fontSize="10" fill="#aeaeb2">{Math.round(value * 100) / 100}</text>
           </g>
         );
       })}
-      <line x1={pad.left} y1={zeroY} x2={pad.left + plotWidth} y2={zeroY} stroke="#a8a29e" />
+      <line x1={pad.left} y1={zeroY} x2={pad.left + plotWidth} y2={zeroY} stroke="#aeaeb2" />
       {lineSeries.map(({ series, seriesIndex }) => {
         const points = series.values.map((_value, index) => ({
           x: pad.left + categoryWidth * index + categoryWidth / 2,
@@ -346,14 +346,14 @@ function SpreadsheetChartSvg({ chart }: { chart: SpreadsheetChartModel }) {
         });
       })}
       {categories.map((label, index) => index % Math.max(1, Math.ceil(categories.length / 8)) === 0 && (
-        <text key={`${label}:${index}`} x={pad.left + categoryWidth * index + categoryWidth / 2} y={height - 38} textAnchor="middle" fontSize="10" fill="#78716c">
+        <text key={`${label}:${index}`} x={pad.left + categoryWidth * index + categoryWidth / 2} y={height - 38} textAnchor="middle" fontSize="10" fill="#8e8e93">
           {String(label).slice(0, 12)}
         </text>
       ))}
       {chart.series.map((series, index) => (
         <g key={`${series.name}:legend`} transform={`translate(${pad.left + index * 130} ${height - 15})`}>
           <rect width="11" height="11" rx="2" fill={colorForSeries(index)} />
-          <text x="17" y="10" fontSize="10" fill="#57534e">{series.name.slice(0, 17)}</text>
+          <text x="17" y="10" fontSize="10" fill="#6e6e73">{series.name.slice(0, 17)}</text>
         </g>
       ))}
     </svg>
@@ -365,8 +365,8 @@ export default function SpreadsheetChartPreview({ charts }: { charts: Spreadshee
   return (
     <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 520px), 1fr))", gap: 12 }}>
       {charts.map((chart) => (
-        <section key={chart.id} style={{ minWidth: 0, border: "1px solid var(--border-subtle, #e7e5e4)", borderRadius: 10, background: "var(--surface-panel, #ffffff)", padding: 12 }}>
-          <h3 style={{ margin: "0 0 8px", fontSize: 14, fontWeight: 800, color: "var(--text-strong, #1c1917)" }}>{chart.title}</h3>
+        <section key={chart.id} style={{ minWidth: 0, border: "1px solid var(--border-subtle, #e5e5ea)", borderRadius: 10, background: "var(--surface-panel, #ffffff)", padding: 12 }}>
+          <h3 style={{ margin: "0 0 8px", fontSize: 14, fontWeight: 800, color: "var(--text-strong, #1d1d1f)" }}>{chart.title}</h3>
           <SpreadsheetChartSvg chart={chart} />
         </section>
       ))}

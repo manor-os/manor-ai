@@ -20,6 +20,11 @@ from packages.core.ai.runtime.agent_files import (
 )
 from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
 
+# Memory is written with remember, which scopes it to a layer and keeps an audit
+# row; a whole-file overwrite here would bypass both.
+_MEMORY_FILES = frozenset({"MEMORY.md", "LEARNINGS.md"})
+WRITABLE_AGENT_FILE_NAMES = [name for name in RUNTIME_AGENT_FILE_NAMES if name not in _MEMORY_FILES]
+
 
 # ---------------------------------------------------------------------------
 # Schemas
@@ -62,7 +67,7 @@ WRITE_AGENT_FILE_SCHEMA = {
         "description": (
             "Write (create or update) an agent definition file. "
             "Use this to update identity, instructions, tool guidelines, rules, goals, "
-            "style, reusable skills, learnings, or stable memory. "
+            "style or reusable skills. Save facts, preferences and lessons with remember instead. "
             "Set level='user' to write a per-user override (different soul/instructions per user). "
             "Set level='entity' (default) for the shared entity-level file."
         ),
@@ -75,7 +80,7 @@ WRITE_AGENT_FILE_SCHEMA = {
                 },
                 "filename": {
                     "type": "string",
-                    "enum": RUNTIME_AGENT_FILE_NAMES,
+                    "enum": WRITABLE_AGENT_FILE_NAMES,
                     "description": "Which definition file to write.",
                 },
                 "content": {
@@ -170,6 +175,8 @@ def handle_write_agent_file(entity_id: str = "", **kwargs: Any) -> str:
         return json.dumps({"error": "filename is required"})
     if not content:
         return json.dumps({"error": "content is required"})
+    if filename in _MEMORY_FILES:
+        return json.dumps({"error": f"{filename} is not written here. Save facts, preferences and lessons with remember."})
 
     agent_id, user_id = _resolve_context(kwargs)
     aid = runtime_effective_agent_file_id(agent_id)

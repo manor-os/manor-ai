@@ -176,7 +176,11 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         response = await call_next(request)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("X-Frame-Options", "DENY")
+        # A response whose own CSP names frame-ancestors has decided who may
+        # frame it; a blanket DENY would contradict that choice (and win in
+        # browsers that only understand X-Frame-Options).
+        if "frame-ancestors" not in response.headers.get("Content-Security-Policy", "").lower():
+            response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
         response.headers.setdefault(
             "Permissions-Policy",
@@ -327,18 +331,13 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         from apps.api.middleware.rate_limit import (
             CHAT_RATE_LIMIT_ENABLED,
-            authenticated_chat_user_id,
-            is_chat_read_request,
+            authenticated_user_id,
         )
 
-        # Authenticated chat reads have their own bounded, per-user bucket;
-        # counting them again against one shared-IP global bucket blocks normal
-        # polling and everyone behind the same proxy.
-        if (
-            CHAT_RATE_LIMIT_ENABLED
-            and is_chat_read_request(request.method, request.url.path)
-            and authenticated_chat_user_id(request)
-        ):
+        # Signed-in requests are bounded by their own per-user buckets, shared
+        # across pods. Counting them again against a per-pod IP bucket throttles
+        # one user's open tabs and everyone behind the same office NAT.
+        if CHAT_RATE_LIMIT_ENABLED and authenticated_user_id(request):
             return await call_next(request)
 
         global _last_cleanup

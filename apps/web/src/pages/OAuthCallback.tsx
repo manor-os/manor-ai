@@ -163,10 +163,10 @@ export default function OAuthCallback() {
                 <path strokeLinecap="round" strokeLinejoin="round" d="M21.75 6.75v10.5a2.25 2.25 0 01-2.25 2.25h-15a2.25 2.25 0 01-2.25-2.25V6.75m19.5 0A2.25 2.25 0 0019.5 4.5h-15a2.25 2.25 0 00-2.25 2.25m19.5 0v.243a2.25 2.25 0 01-1.07 1.916l-7.5 4.615a2.25 2.25 0 01-2.36 0L3.32 8.91a2.25 2.25 0 01-1.07-1.916V6.75" />
               </svg>
             </div>
-            <h2 style={{ fontSize: 22, fontWeight: 900, color: "#292524", marginBottom: 8 }}>
+            <h2 style={{ fontSize: 22, fontWeight: 900, color: "var(--text-strong)", marginBottom: 8 }}>
               {t("page.oauth_callback.invitation_required")}
             </h2>
-            <p style={{ fontSize: 14, color: "#78716c", marginBottom: 24, lineHeight: 1.5 }}>
+            <p style={{ fontSize: 14, color: "var(--text-muted)", marginBottom: 24, lineHeight: 1.5 }}>
               {t("page.oauth_callback.we_re_currently_in_early_access_enter_your_invit")}
             </p>
 
@@ -177,14 +177,13 @@ export default function OAuthCallback() {
               placeholder={t("page.oauth_callback.enter_invitation_code")}
               autoFocus
               style={{
-                width: "100%", padding: "12px 16px", fontSize: 16, fontWeight: 600,
-                letterSpacing: "0.1em", textAlign: "center",
-                border: inviteError ? "2px solid #d65f59" : "2px solid #e7e5e4",
+                width: "100%", padding: "12px 16px", fontSize: 16, fontWeight: 600, textAlign: "center",
+                border: inviteError ? "2px solid #d65f59" : "2px solid #e5e5ea",
                 borderRadius: 16, outline: "none", background: "rgba(255,255,255,0.8)",
                 transition: "border-color 0.2s",
               }}
               onFocus={(e) => { if (!inviteError) e.target.style.borderColor = "#6d6fb2"; }}
-              onBlur={(e) => { if (!inviteError) e.target.style.borderColor = "#e7e5e4"; }}
+              onBlur={(e) => { if (!inviteError) e.target.style.borderColor = "#e5e5ea"; }}
             />
 
             {inviteError && (
@@ -197,7 +196,7 @@ export default function OAuthCallback() {
               style={{
                 width: "100%", marginTop: 16, padding: "12px 24px",
                 fontSize: 15, fontWeight: 700, color: "#fff",
-                background: !inviteCode.trim() ? "#d6d3d1" : "linear-gradient(135deg, #6d6fb2, #9079c2)",
+                background: !inviteCode.trim() ? "#d1d1d6" : "linear-gradient(135deg, #6d6fb2, #9079c2)",
                 border: "none", borderRadius: 16, cursor: !inviteCode.trim() ? "not-allowed" : "pointer",
                 transition: "all 0.2s",
               }}
@@ -209,7 +208,7 @@ export default function OAuthCallback() {
               to="/login"
               style={{
                 display: "inline-block", marginTop: 16,
-                fontSize: 13, color: "#a8a29e", textDecoration: "none",
+                fontSize: 13, color: "var(--text-faint)", textDecoration: "none",
               }}
             >
               {t("page.oauth_callback.back_to_login")}
@@ -226,8 +225,8 @@ export default function OAuthCallback() {
                 <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
               </svg>
             </div>
-            <h2 style={{ fontSize: 22, fontWeight: 900, color: "#292524", marginBottom: 8 }}>{t("page.oauth_callback.sign_in_failed")}</h2>
-            <p style={{ fontSize: 14, color: "#78716c", marginBottom: 28 }}>{error}</p>
+            <h2 style={{ fontSize: 22, fontWeight: 900, color: "var(--text-strong)", marginBottom: 8 }}>{t("page.oauth_callback.sign_in_failed")}</h2>
+            <p style={{ fontSize: 14, color: "var(--text-muted)", marginBottom: 28 }}>{error}</p>
             <Link
               to="/login"
               className="btn-manor-outline"
@@ -244,10 +243,10 @@ export default function OAuthCallback() {
             <div style={{ margin: "0 auto 24px", display: "flex", justifyContent: "center" }}>
               <LoadingSpinner size={40} />
             </div>
-            <p style={{ fontSize: 16, fontWeight: 600, color: "#292524", marginBottom: 4 }}>
+            <p style={{ fontSize: 16, fontWeight: 600, color: "var(--text-strong)", marginBottom: 4 }}>
               {t("page.oauth_callback.completing_sign_in")}
             </p>
-            <p style={{ fontSize: 14, color: "#78716c" }}>
+            <p style={{ fontSize: 14, color: "var(--text-muted)" }}>
               {t("page.oauth_callback.please_wait_while_we_verify_your_account")}
             </p>
           </>

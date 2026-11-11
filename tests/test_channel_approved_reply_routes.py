@@ -2352,7 +2352,7 @@ async def test_channel_approval_consumes_owner_quarantine_fallback(
     }]
 
 
-async def test_channel_retired_always_choice_cannot_save_a_rule(
+async def test_channel_always_choice_needs_standing_authority_before_any_io(
     monkeypatch,
 ) -> None:
     from packages.core.constants.pending_actions import PendingActionKind
@@ -2415,7 +2415,7 @@ async def test_channel_retired_always_choice_cannot_save_a_rule(
         return permission_key == "approve_external_publish"
 
     async def unexpected_claim(*_args, **_kwargs):
-        raise AssertionError("retired consent must be rejected before provider I/O")
+        raise AssertionError("standing consent without authority must stop before provider I/O")
 
     monkeypatch.setattr(callbacks, "async_session", SessionContext)
     monkeypatch.setattr(
@@ -2443,9 +2443,8 @@ async def test_channel_retired_always_choice_cannot_save_a_rule(
     )
 
     assert result["ok"] is False
-    assert result["error"] == "approval_command_retired"
-    assert "versioned approval settings" in result["message"]
-    assert permission_checks == ["approve_external_publish"]
+    assert result["error"] == "standing_grant_authority_required"
+    assert permission_checks == ["approve_external_publish", "manage_standing_grants"]
     assert msg.resolved_at is None
     assert msg.resolution is None
 

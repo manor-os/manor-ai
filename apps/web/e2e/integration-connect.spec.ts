@@ -3,6 +3,11 @@ import { test, expect, type Page, type Route } from "@playwright/test";
 const draft = "Read my email and summarize the attached notes";
 const attachment = "connection-notes.txt";
 
+async function openConnectors(page: Page) {
+  await page.getByRole("button", { name: "Add context or tools", exact: true }).click();
+  await page.getByRole("button", { name: "Connectors", exact: true }).click();
+}
+
 async function prepare(page: Page, outcome = "success", delay?: "start" | "sync") {
   // The Connectors menu belongs to professional mode; the product defaults to simple.
   await page.addInitScript(() => localStorage.setItem("manor-interface-mode", "professional"));
@@ -13,7 +18,7 @@ async function prepare(page: Page, outcome = "success", delay?: "start" | "sync"
   await page.locator('input[type="file"]').setInputFiles({
     name: attachment, mimeType: "text/plain", buffer: Buffer.from("Retain this file across connection setup"),
   });
-  await page.getByRole("button", { name: "Connectors", exact: true }).click();
+  await openConnectors(page);
   await page.getByRole("button", { name: "Gmail Read and send email Connect", exact: true }).click();
   return page.getByRole("dialog", { name: "Gmail", exact: true });
 }
@@ -34,7 +39,7 @@ async function holdResponses(page: Page, phase: "start" | "sync") {
 }
 
 async function reopenSetup(page: Page) {
-  await page.getByRole("button", { name: "Connectors", exact: true }).click();
+  await openConnectors(page);
   await page.getByRole("button", { name: "Gmail Read and send email Connect", exact: true }).click();
   return page.getByRole("dialog", { name: "Gmail", exact: true });
 }
@@ -46,7 +51,7 @@ for (const setup of ["checking", "unavailable"]) {
       await page.route("**/api/v1/**", route => route.fulfill({ json: [] }));
       await page.goto(`/e2e/fixtures/integration-connect.html?setup=${setup}${ready ? "&ready=1" : ""}`);
       await page.getByRole("textbox").fill(draft);
-      await page.getByRole("button", { name: "Connectors", exact: true }).click();
+      await openConnectors(page);
       const connector = page.getByRole("button", { name: /^Gmail Read and send email/ });
       if (ready) {
         await expect(connector).toBeEnabled();
@@ -84,10 +89,10 @@ for (const outcome of ["success", "cancel", "sync-error"]) {
     await expect(page.getByLabel("Request counts")).toContainText("Sync requests: 1");
     if (outcome === "success") {
       await expect(dialog).toHaveCount(0);
-      await page.getByRole("button", { name: "Connectors", exact: true }).click();
+      await openConnectors(page);
       await expect(page.getByRole("button", { name: "Gmail Read and send email Use", exact: true })).toBeVisible();
       await expect(page.getByLabel("Request counts")).toContainText("Catalog requests: 2");
-      await page.getByRole("button", { name: "Connectors", exact: true }).click();
+      await openConnectors(page);
     } else {
       await expect(dialog.getByRole("button", { name: "Connect", exact: true })).toBeEnabled();
       if (outcome === "sync-error") await expect(page.getByText("Fixture sync failed", { exact: true })).toBeVisible();
@@ -120,7 +125,7 @@ test("connection dialog fits mobile and traps keyboard focus", async ({ page }) 
   expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(390);
   await page.keyboard.press("Escape");
   await expectRetained(page);
-  await expect(page.getByRole("button", { name: "Connectors", exact: true })).toBeFocused();
+  await expect(page.getByRole("button", { name: "Add context or tools", exact: true })).toBeFocused();
 });
 
 for (const dismiss of ["button", "escape", "backdrop"]) {
@@ -138,7 +143,7 @@ for (const dismiss of ["button", "escape", "backdrop"]) {
     await page.clock.runFor(1200);
     await expect(page.getByLabel("Request counts")).toContainText("Sync requests: 0");
     await expectRetained(page);
-    await expect(page.getByRole("button", { name: "Connectors", exact: true })).toBeFocused();
+    await expect(page.getByRole("button", { name: "Add context or tools", exact: true })).toBeFocused();
     await reopenSetup(page);
     await expect(dialog.getByRole("button", { name: "Connect", exact: true })).toBeEnabled();
   });
@@ -199,7 +204,7 @@ for (const outcome of ["success", "sync-error"]) {
     await dialog.getByRole("button", { name: "Close", exact: true }).click();
     await expectRetained(page);
     if (outcome === "success") {
-      await page.getByRole("button", { name: "Connectors", exact: true }).click();
+      await openConnectors(page);
       await expect(page.getByRole("button", { name: "Gmail Read and send email Use", exact: true })).toBeVisible();
       await expect(page.getByLabel("Request counts")).toContainText("Catalog requests: 2");
     }

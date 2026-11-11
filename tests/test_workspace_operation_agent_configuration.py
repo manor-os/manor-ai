@@ -357,6 +357,49 @@ async def test_approved_additive_agent_operation_persists_its_requested_skill_an
 
 
 @pytest.mark.asyncio
+async def test_echoed_creation_design_does_not_redeploy_a_live_service(db_session):
+    """Staging 2026-11-01: a Workspace created from a draft kept the draft's
+    create_custom design in its operating model. The Rules page saves the whole
+    model back, so the first saved rule provisioned a second Agent, rewired the
+    service to it, and stranded the Task running on the first one."""
+    from sqlalchemy import func, select
+    from packages.core.models.workspace import Agent, AgentSubscription
+
+    seeded = await _seed_agent_operation(db_session)
+    workspace = seeded.workspace
+    workspace_id, entity_id = workspace.id, workspace.entity_id
+    before = {sub.service_key: sub.agent_id for sub in (await db_session.execute(select(AgentSubscription).where(
+        AgentSubscription.workspace_id == workspace_id, AgentSubscription.status == "active",
+    ))).scalars().all()}
+    agents_before = await db_session.scalar(select(func.count()).select_from(Agent).where(Agent.entity_id == entity_id))
+    # What finalize_setup left behind: the draft's design rows, not the deployment.
+    workspace.operating_model = {**workspace.operating_model, "agent_mappings": [
+        {"service_key": key, "strategy": "create_custom", "create_agent_draft": {
+            "agent_name": f"{key} writer", "system_prompt": f"Handle {key}.",
+        }} for key in before
+    ]}
+    await db_session.flush()
+
+    echoed = deepcopy(workspace.operating_model)
+    echoed["rules"] = [{"name": "Sign off", "description": "End every note with: Reviewed by DSA."}]
+    draft = await operations.create_operation_draft(db_session, workspace_id, entity_id,
+        user_id=seeded.requester.id,
+        initial_patches=[{"op": "operating_model.replace", "payload": {"operating_model": echoed}}])
+    assert draft.validation["valid"], draft.validation
+    result = await operations.apply_operation_draft(db_session, draft.id, entity_id, workspace_id,
+        user_id=seeded.requester.id, user_confirmation=True)
+
+    assert result["agent_mappings"]["custom_agents"] == 0
+    after = {sub.service_key: sub.agent_id for sub in (await db_session.execute(select(AgentSubscription).where(
+        AgentSubscription.workspace_id == workspace_id, AgentSubscription.status == "active",
+    ))).scalars().all()}
+    assert after == before
+    assert await db_session.scalar(
+        select(func.count()).select_from(Agent).where(Agent.entity_id == entity_id)
+    ) == agents_before
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("missing", [False, True])
 async def test_unavailable_requested_skill_leaves_agent_operation_unapplied(db_session, missing):
     from sqlalchemy import select

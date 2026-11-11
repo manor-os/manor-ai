@@ -62,6 +62,7 @@ async def chat_request(monkeypatch):
         "resolve_chat_approval_turn": (None, None, True, None),
         "add_message": SimpleNamespace(id="user-message-1"),
         "create_assistant_stream_placeholder": SimpleNamespace(id="assistant-message-1"),
+        "supersede_parked_approval_run": None,
         "_response_surface_submission_agent": SimpleNamespace(
             agent_id=None, agent_subscription_id=None,
         ),

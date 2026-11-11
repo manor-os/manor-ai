@@ -38,7 +38,9 @@ export type ApprovalCommandProjection = {
   rule_options: { id: string; action_key: string; rule: ApprovalRuleDraft; coverage: "exact_resource" | "all_targets_for_action" }[];
 };
 export type ApprovalSaveRuleCommand = {
-  request: { kind: "hitl"; id: string }; choice: "approve_and_save_rule";
+  /** ``approve_and_save_rule`` decides and saves atomically (Task approvals);
+   * ``save_rule`` only saves, and the card's own approve follows. */
+  request: { kind: "hitl"; id: string }; choice: "approve_and_save_rule" | "save_rule";
   expectedDigest: string; idempotencyKey: string; expectedPolicyVersion: string; optionId: string;
 };
 export type ApprovalCommandResult = {

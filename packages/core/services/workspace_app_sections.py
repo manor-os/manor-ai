@@ -6,6 +6,7 @@ to open: each block fetches its own data after the page renders.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 from packages.core.services.viewer_language import localize_run_names, localized, run_names_for
@@ -13,6 +14,8 @@ from packages.core.services.viewer_language import localize_run_names, localized
 _QUEUE_LIMIT = 20
 _FILES_PER_RUN = 6
 _MAX_STAGES = 24
+# A run in one of these has stopped; nothing more will change unless it is started again.
+_ENDED_RUN_STATUSES = frozenset({"completed", "failed", "cancelled"})
 # On a chat request sent from an App entry: the entry's key, so the App lists
 # the request and its reply under that entry as it lists a Flow's runs.
 WORKSPACE_APP_ACTION_META_KEY = "workspace_app_action"
@@ -78,13 +81,65 @@ async def _connection_items(db: Any, workspace: Any, *, user: Any) -> list[dict[
 
 
 async def _queue_items(db: Any, workspace: Any, *, user: Any) -> list[dict[str, Any]]:
-    """Pending decisions with a chat card; deciding stays on that card."""
+    """Pending decisions: with a chat card, deciding stays on it; a run with none opens at its page."""
     from packages.core.workspace_chat.attention import list_workspace_attention
 
     # Every open decision: a read receipt never hides one from the App.
     reminders = await list_workspace_attention(db, user=user, workspace_id=workspace.id, unread_only=False)
-    items = reminders["items"][:_QUEUE_LIMIT]
+    # A connect request is the connections block's row already; list it once.
+    items = [item for item in reminders["items"] if not item.get("connection_provider")][:_QUEUE_LIMIT]
     await _attach_review_glimpses(db, items)
+    return [*items, *await _runs_waiting_without_a_card(db, workspace)][:_QUEUE_LIMIT]
+
+
+def _waiting_run_summary(run: Any, action: dict[str, Any]) -> str:
+    """What the person is asked, named with its song when the run has one: "Made to Spark · Review the storyboard".
+
+    Without a song the step's own question ("Approve the plan?") says more than its name ("Review").
+    """
+    what = " ".join(str(action.get("review_title") or action.get("title") or "").split())
+    song = str((run.variables or {}).get("song_title") or "").strip() if isinstance(run.variables, dict) else ""
+    if song and what:
+        return f"{song} · {what}"[:240]
+    return " ".join(str(action.get("prompt") or what or song).split())[:240]
+
+
+async def _runs_waiting_without_a_card(db: Any, workspace: Any) -> list[dict[str, Any]]:
+    """Runs stopped on a person's decision that were started outside any chat (the API, MCP)."""
+    from sqlalchemy import select
+
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workflow_chat_projection import workflow_chat_context
+    from packages.core.services.workflow_run_control import run_resume_action
+
+    # A run whose chat holds its card is already listed; only the others load
+    # in full (their frozen step graph names the decision).
+    paused = (await db.execute(select(
+        WorkflowRun.id, WorkflowRun.trigger_data, WorkflowRun.trigger_source,
+    ).where(
+        WorkflowRun.entity_id == workspace.entity_id, WorkflowRun.workspace_id == workspace.id,
+        WorkflowRun.status == "paused",
+    ).order_by(WorkflowRun.started_at.desc()).limit(_QUEUE_LIMIT))).all()
+    run_ids = [
+        run_id for run_id, trigger_data, trigger_source in paused
+        if workflow_chat_context(SimpleNamespace(trigger_data=trigger_data, trigger_source=trigger_source)) is None
+    ]
+    if not run_ids:
+        return []
+    loaded = {run.id: run for run in (await db.execute(
+        select(WorkflowRun).where(WorkflowRun.id.in_(run_ids))
+    )).scalars().all()}
+    items = []
+    for run in (loaded[run_id] for run_id in run_ids if run_id in loaded):
+        action = run_resume_action(run)
+        if (action or {}).get("kind") not in {"workflow_approval", "workflow_input"}:
+            continue
+        items.append({
+            "key": f"workflow_run:{run.id}:{run.current_step_id}", "message_id": "", "source_id": run.id,
+            "kind": action["kind"], "summary": _waiting_run_summary(run, action),
+            "created_at": run.started_at, "connection_provider": None,
+            "workflow_run": {"workflow_id": run.workflow_id, "run_id": run.id},
+        })
     return items
 
 
@@ -102,6 +157,7 @@ async def _attach_review_glimpses(db: Any, items: list[dict[str, Any]]) -> None:
 
     from packages.core.models.task import Message
     from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workflow_review_files import REVIEW_FILE_KEYS
 
     await _attach_question_glimpses(db, items)
     ids = [item["message_id"] for item in items if item.get("kind") == "workflow_approval"]
@@ -129,7 +185,7 @@ async def _attach_review_glimpses(db: Any, items: list[dict[str, Any]]) -> None:
             item["has_changes_option"] = any(option.lower() in _REVISION_CHOICES - {"cancel", "reject"}
                                              for option in options)
         previews = []
-        for entry in [*(review.get("previews") or []), *(review.get("artifacts") or [])]:
+        for entry in [item for key in REVIEW_FILE_KEYS for item in (review.get(key) if isinstance(review.get(key), list) else [])]:
             if not isinstance(entry, dict) or not entry.get("document_id"):
                 continue
             name = str(entry.get("name") or entry.get("fs_path") or "").lower()
@@ -232,11 +288,14 @@ async def _metric_items(
         "freshness_status": stat_freshness_status(stat), "goal": goal_payload(goals_by_stat.get(stat.id)),
         "collector_type": stat.collector_type, "collector_config": stat.collector_config or {},
         "status": stat.status, "gaps": gaps(stat),
+        # What the number means and over which window: the Stat's own definition, shown as the tile's note.
+        "description": stat.description or None, "window": stat.window,
     } for stat in stats] + [{
         "ref": f"goal:{goal.goal_key}", "kind": "goal", "id": goal.id, "title": goal.title, "value_type": "number", "unit": None,
         "value": _number(goal.current_value), "updated_at": goal.current_value_updated_at,
         "freshness_status": "fresh" if goal.current_value is not None else "no_data", "goal": goal_payload(goal),
         "collector_type": None, "collector_config": {}, "status": goal.status, "gaps": [],
+        "description": goal.description or None, "window": None,
     } for goal in standalone]
     if refs is not None:
         position = {ref: index for index, ref in enumerate(refs)}
@@ -481,10 +540,16 @@ async def _flow_output_items(
 
     source = section["source"] or "workspace"
     limit = section["limit"] or 8
+    binding_id = source.removeprefix("workflow:") if source.startswith("workflow:") else None
+    # A Flow's runs include the ones started by hand without its binding (from chat,
+    # the Flow page or a builder tool), as the App entry's own history does.
+    workflow_id = (await db.execute(select(WorkflowBinding.workflow_id).where(
+        WorkflowBinding.id == binding_id, WorkflowBinding.entity_id == user.entity_id,
+    ))).scalar_one_or_none() if binding_id else None
     # Over-fetch so dropping hidden runs still fills the section.
     runs = await workflow_service.list_runs(
-        db, user.entity_id, workspace_id=workspace.id,
-        binding_id=source.removeprefix("workflow:") if source.startswith("workflow:") else None,
+        db, user.entity_id, workspace_id=workspace.id, binding_id=binding_id,
+        workflow_id=workflow_id, include_unbound=workflow_id is not None,
         limit=limit * 3, summary=True, top_level_only=True,
     )
     if not runs:
@@ -502,7 +567,15 @@ async def _flow_output_items(
         WorkflowBinding.entity_id == user.entity_id, WorkflowBinding.workspace_id == workspace.id,
         WorkflowBinding.config["workspace_blueprint_workflow_slug"].as_string() == REVIEW_WORKFLOW_SLUG,
     ))).scalars())
-    runs = [run for run in runs if run.workflow_id not in internal and run.binding_id not in assessments][:limit]
+    # A retried run is one result: runs come newest first, so its latest attempt stands for its earlier ones.
+    latest, families = [], set()
+    for run in runs:
+        family = run.lineage_root_run_id or run.id
+        if run.workflow_id in internal or run.binding_id in assessments or family in families:
+            continue
+        families.add(family)
+        latest.append(run)
+    runs = latest[:limit]
     if not runs:
         return []
     def summary(run: Any) -> dict[str, Any]:
@@ -587,4 +660,28 @@ async def _flow_output_items(
                 if isinstance(publication, dict)
             ][:_FILES_PER_RUN],
         })
-    return items
+    return _without_superseded_asks(items)
+
+
+def _without_superseded_asks(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop a finished run that only asked for something once its Flow ran again.
+
+    A run that ended asking for input (no topic picked, a brief too thin) is
+    answered by starting the Flow again; after that it is history, not
+    something the person still needs to do. ``items`` are newest first.
+    """
+    seen: set[str] = set()
+    kept = []
+    for item in items:
+        # The Flow, however it was started (its App entry or a direct run).
+        flow = item.get("workflow_id") or item.get("binding_id") or ""
+        # An ask's files are what it asked about (Knowledge to fill in), not
+        # something it made, so they go with it.
+        superseded = (
+            flow in seen and item["status"] in _ENDED_RUN_STATUSES
+            and item.get("business_outcome") in {"needs_input", "revision_required"}
+        )
+        if not superseded:
+            kept.append(item)
+        seen.add(flow)
+    return kept

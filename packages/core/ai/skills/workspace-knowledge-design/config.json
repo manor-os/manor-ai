@@ -1,0 +1,28 @@
+{
+  "id": "workspace-knowledge-design",
+  "name": "workspace-knowledge-design",
+  "display_name": "Workspace Knowledge design",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Design a Workspace's Knowledge nets so each starts with documents: the person's sources, or a starter document with an outline specific to the Workspace. Guides the Knowledge designer.",
+  "category": "workspace-design",
+  "output_format": "guidance",
+  "tags": [
+    "workspace-operations",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "search": {
+    "terms": [
+      "knowledge design",
+      "knowledge net",
+      "starter document",
+      "seed documents"
+    ],
+    "examples": [
+      "design the knowledge of a workspace",
+      "guidance for outlining starter knowledge documents",
+      "make sure each knowledge net starts with documents"
+    ]
+  }
+}

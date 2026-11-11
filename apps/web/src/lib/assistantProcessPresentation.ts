@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { nextTypewriterSlice, TYPEWRITER_TICK_MS } from "./chatTypewriter";
-import type { AssistantProcessBlock } from "./chatStream";
+import type { AssistantBlock, AssistantProcessBlock } from "./chatStream";
 
 export const LIVE_PROCESS_CLOCK_TICK_MS = 1000;
 export const LIVE_CLOCK_RESYNC_MS = 500;
@@ -64,6 +64,43 @@ export function processClockTiming(block: AssistantProcessBlock) {
     startedAtMs && ends.length ? Math.max(0, Math.max(...ends) - startedAtMs) : 0
   );
   return { startedAtMs, endedAtMs, serverDurationMs };
+}
+
+/** How long one finished process took (its own clock, else its steps). */
+function processDurationMs(block: AssistantProcessBlock): number {
+  const { startedAtMs, endedAtMs, serverDurationMs } = processClockTiming(block);
+  return startedAtMs && endedAtMs ? Math.max(0, endedAtMs - startedAtMs) : serverDurationMs;
+}
+
+/**
+ * One reply drawn across messages (the answer that continues past a decision
+ * card) has one process line, at the top: the first part's process takes the
+ * steps of every part and their summed time, and the parts below lose theirs.
+ * Returns the blocks for each part, in order.
+ */
+export function joinReplyProcesses(parts: (AssistantBlock[] | null | undefined)[]): (AssistantBlock[] | undefined)[] {
+  const blocks = parts.map((part) => (Array.isArray(part) ? part : []));
+  const processes = blocks.flatMap((part) =>
+    part.filter((block): block is AssistantProcessBlock => block.type === "process"));
+  if (processes.length < 2) return parts.map((part) => part ?? undefined);
+  const last = processes[processes.length - 1]!;
+  const joined: AssistantProcessBlock = {
+    ...processes[0]!,
+    steps: processes.flatMap((process) => process.steps || []),
+    duration_ms: processes.reduce((total, process) => total + processDurationMs(process), 0),
+    started_at_ms: undefined,
+    ended_at_ms: undefined,
+    lifecycle_status: last.lifecycle_status,
+    outcome_status: last.outcome_status,
+    status: last.status,
+  };
+  const firstWithProcess = blocks.findIndex((part) => part.some((block) => block.type === "process"));
+  return blocks.map((part, index) => {
+    if (index === firstWithProcess) {
+      return part.map((block) => (block.type === "process" ? joined : block));
+    }
+    return part.filter((block) => block.type !== "process");
+  });
 }
 
 export function isLiveAssistantProcess(

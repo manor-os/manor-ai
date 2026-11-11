@@ -354,8 +354,8 @@ async def test_editor_skill_then_sandbox_pass_the_execution_gate_for_an_internal
     exec_call = {"action": "exec", "params": {"sandbox_id": "sbx-1", "command": "python run.py"}}
     assert check_runtime_tool_policy(envelope=editor, tool_name="sandbox", arguments=exec_call).allowed
     assert await guard(editor, "sandbox", {"action": "create"}) is None
-    # The command passes the permission boundary and stops only for the
-    # missing persisted call identity (the approval-policy stage).
+    # The command passes the permission boundary. This calls the guard directly
+    # with no call identity, which every agent loop supplies, so it stops there.
     assert json.loads(await guard(editor, "sandbox", exec_call))["error"] == (
         "approval_operation_identity_missing"
     )

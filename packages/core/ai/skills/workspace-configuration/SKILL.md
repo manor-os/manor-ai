@@ -33,7 +33,7 @@ tool/MCP bindings use capability_binding.upsert with their actual transport.
 Inspect the actor's connections with manor(action="list_integrations",
 params={"ready_only":true}); use the returned provider/server_key. Read existing
 capability_bindings and integration_scope.disabled_providers from get_current.
-To add a connected provider, draft:
+To add a provider (connected or not yet), draft:
 {"op":"capability_binding.upsert","payload":{"binding":{"owner_scope":"workspace_agent","capability_type":"mcp","integration_key":"<provider>"}}}.
 Use owner_scope="service" plus owner_service_key only for a specific service.
 Include allowed_tools only when narrowing the server's actions; use exact
@@ -48,8 +48,12 @@ disabled_providers:string[] and replaces that list, so retain other exclusions.
 capability_binding.remove with an existing binding_key removes one explicit
 binding; it does not disable inherited provider access throughout the Workspace.
 Connection readiness is checked both while drafting and again on apply. A
-disconnected provider needs the actor to connect it in Integration settings;
-never ask for credentials in Chat or use another member's private account.
+provider the actor has not connected yet is not a blocker: validation warns
+integration_pending_connection, the draft applies with the binding and its
+rules kept, and the Workspace asks in its chat to connect it (connecting
+recommended); that work starts once connected. Never drop the binding or a
+rule because of it, never ask for credentials in Chat, and never use another
+member's private account.
 These Workspace edits preserve account credentials and shared Agent definitions.
 After approval, re-read the bindings and disabled providers. Do not test a
 connection by sending messages, publishing, spending money or starting work.

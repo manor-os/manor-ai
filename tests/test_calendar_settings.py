@@ -407,7 +407,22 @@ async def test_calendar_settings_update_and_booking_links(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_public_booking_pages_the_full_rolling_window_by_month(client: AsyncClient):
+async def test_public_booking_pages_the_full_rolling_window_by_month(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from apps.api.routers import calendar_settings as calendar_router
+
+    # A month page may end before day 360 when its last days are a weekend.
+    now = datetime(2026, 11, 4, 8, tzinfo=timezone.utc)
+
+    class BookingClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+
+    monkeypatch.setattr(calendar_router, "datetime", BookingClock)
+
     headers = await _auth(client, "calendar_long_booking_window")
     me = (await client.get("/api/v1/auth/me", headers=headers)).json()
     update = await client.put(
@@ -457,9 +472,9 @@ async def test_public_booking_pages_the_full_rolling_window_by_month(client: Asy
     assert max(
         datetime.fromisoformat(slot["starts_at"]).date()
         for slot in legacy_slots
-    ) >= datetime.now(timezone.utc).date() + timedelta(days=360)
+    ) >= now.date() + timedelta(days=360)
 
-    current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    current_month = now.strftime("%Y-%m")
     first_page = await client.get(
         "/api/v1/calendar-settings/public/booking-links/u/"
         f"{me['id']}/{create.json()['slug']}?month={current_month}&timezone=UTC"
@@ -470,11 +485,15 @@ async def test_public_booking_pages_the_full_rolling_window_by_month(client: Asy
         datetime.fromisoformat(slot["starts_at"]).strftime("%Y-%m") == current_month
         for slot in first_page_slots
     )
+    assert first_page_slots == [
+        slot for slot in legacy_slots
+        if datetime.fromisoformat(slot["starts_at"]).strftime("%Y-%m") == current_month
+    ]
     assert len(first_page_slots) <= 31 * 24 * 4
     assert first_page.json()["availability_range_start"]
     assert first_page.json()["availability_range_end"]
 
-    far_date = datetime.now(timezone.utc).date() + timedelta(days=360)
+    far_date = now.date() + timedelta(days=360)
     public = await client.get(
         "/api/v1/calendar-settings/public/booking-links/u/"
         f"{me['id']}/{create.json()['slug']}"
@@ -482,11 +501,18 @@ async def test_public_booking_pages_the_full_rolling_window_by_month(client: Asy
     )
 
     assert public.status_code == 200, public.text
+    far_slots = public.json()["available_slots"]
+    assert far_slots == [
+        slot for slot in legacy_slots
+        if datetime.fromisoformat(slot["starts_at"]).strftime("%Y-%m")
+        == far_date.strftime("%Y-%m")
+    ]
     slot_dates = [
         datetime.fromisoformat(slot["starts_at"]).date()
-        for slot in public.json()["available_slots"]
+        for slot in far_slots
     ]
-    assert max(slot_dates) >= datetime.now(timezone.utc).date() + timedelta(days=360)
+    assert max(slot_dates) == datetime(2027, 10, 29).date()
+    assert all(day.weekday() < 5 for day in slot_dates)
 
 
 def test_booking_validator_uses_the_existing_bookings_buffer():

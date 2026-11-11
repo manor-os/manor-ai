@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build && node build-tools/verify-build-version.mjs",
+    "build": "tsc -b && vite build && node build-tools/verify-build-version.mjs && node build-tools/precompress-assets.mjs",
     "build:nocheck": "vite build && node build-tools/verify-build-version.mjs",
     "test:e2e": "playwright test",
     "preview": "vite preview"
@@ -32,6 +32,7 @@
     "pako": "^3.0.1",
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^6.2.108",
+    "pigeon-maps": "0.22.1",
     "pptxgenjs": "^4.0.1",
     "pptxviewjs": "^1.1.9",
     "react": "^18.3.1",

@@ -10,9 +10,8 @@ import { canManageWorkspace } from "../lib/permissions";
 import BlueprintUpgradeDialog from "../components/blueprints/BlueprintUpgradeDialog";
 import BlueprintAgentSelection, { blueprintAgentSubscriptions } from "../components/blueprints/BlueprintAgentSelection";
 import PageHeader, { PageHeaderAddButton } from "../components/ui/PageHeader";
-import TabSwitcher from "../components/ui/TabSwitcher";
+import ContextMenu from "../components/ui/ContextMenu";
 import Dropdown from "../components/ui/Dropdown";
-import StatusBadge from "../components/ui/StatusBadge";
 import WorkspaceAppCard, {
   WORKSPACE_APP_CARD_MIN_WIDTH,
   workspaceAppCardGridStyle,
@@ -27,8 +26,6 @@ import Select from "../components/ui/Select";
 import Textarea from "../components/ui/Textarea";
 import Chip from "../components/ui/Chip";
 import { CardGridSkeleton, ListRowsSkeleton } from "../components/ui/Skeleton";
-import FilterPills from "../components/ui/FilterPills";
-import ItemCard from "../components/ui/ItemCard";
 import WorkspaceIconTile, { getWorkspacePresentation } from "../components/ui/WorkspaceIcon";
 import {
   IconAgent,
@@ -198,14 +195,14 @@ function WorkspaceCreatorSummary({ workspace }: { workspace: Workspace }) {
         )}
       </div>
       <div style={{ minWidth: 0 }}>
-        <div style={{ fontSize: 10, fontWeight: 800, textTransform: "uppercase", letterSpacing: "0.08em", color: "#a8a29e", marginBottom: 3 }}>
+        <div style={{ fontSize: 10, fontWeight: 800, color: "var(--text-muted)", marginBottom: 3 }}>
           {t("page.workspace_detail.field_created_by")}
         </div>
-        <div style={{ fontSize: 13, fontWeight: 760, color: "#292524", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        <div style={{ fontSize: 13, fontWeight: 760, color: "var(--text-strong)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {creatorName}
         </div>
         {creatorEmail && (
-          <div style={{ fontSize: 12, color: "#78716c", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          <div style={{ fontSize: 12, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             {creatorEmail}
           </div>
         )}
@@ -217,10 +214,10 @@ function WorkspaceCreatorSummary({ workspace }: { workspace: Workspace }) {
 function metadataStat(label: string, value: string) {
   return (
     <div style={{ minWidth: 0 }}>
-      <div style={{ fontSize: 10, fontWeight: 800, textTransform: "uppercase", letterSpacing: "0.08em", color: "#a8a29e", marginBottom: 4 }}>
+      <div style={{ fontSize: 10, fontWeight: 800, color: "var(--text-muted)", marginBottom: 4 }}>
         {label}
       </div>
-      <div style={{ fontSize: 12, fontWeight: 700, color: "#44403c", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+      <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-default)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
         {value}
       </div>
     </div>
@@ -253,7 +250,7 @@ function WorkspaceAccessRow({
   ).length;
   const canManage = canManageWorkspace(currentUser, staffRows || []);
 
-  const hairline = "1px solid rgba(28,25,23,0.06)";
+  const hairline = "0.5px solid rgba(29, 29, 31,0.06)";
   const detail = entityVisible
     ? t("page.workspaces.access_entity_visible_hint")
     : memberCount === 1
@@ -273,16 +270,16 @@ function WorkspaceAccessRow({
         borderBottom: hairline,
       }}
     >
-      <span style={{ color: "#a8a29e", display: "flex", flex: "none" }} aria-hidden="true">
+      <span style={{ color: "var(--text-muted)", display: "flex", flex: "none" }} aria-hidden="true">
         {entityVisible ? <IconBuilding size={17} /> : <IconLock size={17} />}
       </span>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: 13.5, fontWeight: 600, color: "#1c1917" }}>
+        <div style={{ fontSize: 13.5, fontWeight: 600, color: "var(--text-strong)" }}>
           {entityVisible
             ? t("page.workspaces.access_entity_visible")
             : t("page.workspaces.access_members_only")}
         </div>
-        <div style={{ fontSize: 11.5, color: "#a8a29e", marginTop: 2 }}>{detail}</div>
+        <div style={{ fontSize: 11.5, color: "var(--text-muted)", marginTop: 2 }}>{detail}</div>
       </div>
       {canManage && (
         <button
@@ -306,8 +303,10 @@ function WorkspaceAccessRow({
   );
 }
 
+// The sidebar has a place for each view, so a bare /workspaces is always the
+// Workspace list; the marketplace is only ever asked for by name.
 function parseWorkspaceView(value: string | null, includeMarketplace = true): WorkspaceView {
-  let fallbackView: WorkspaceView = "workspaces";
+  const fallbackView: WorkspaceView = "workspaces";
   const parsed = WORKSPACE_VIEW_KEYS.includes(value as WorkspaceView)
     ? (value as WorkspaceView)
     : fallbackView;
@@ -488,7 +487,7 @@ function ImportWorkspaceDialog({
       }
     >
       <div style={{ display: "grid", gap: 14 }}>
-        <p style={{ margin: 0, color: "#78716c", fontSize: 13, lineHeight: 1.55 }}>
+        <p style={{ margin: 0, color: "var(--text-muted)", fontSize: 13, lineHeight: 1.55 }}>
           {t("page.workspaces.import_workspace_desc")}
         </p>
         <label style={{
@@ -510,7 +509,7 @@ function ImportWorkspaceDialog({
             <IconUpload size={15} />
             {fileName || t("page.workspaces.choose_blueprint_json")}
           </span>
-          <span style={{ color: "#78716c", fontSize: 12 }}>
+          <span style={{ color: "var(--text-muted)", fontSize: 12 }}>
             {t("page.workspaces.choose_blueprint_json_hint")}
           </span>
         </label>
@@ -540,11 +539,11 @@ function ImportWorkspaceDialog({
         ))}
         {preflightQuery.data?.requirements.filter((requirement) => requirement.kind === "channel" && requirement.resource_options.length > 1).map((requirement) => (
           <label key={requirement.requirement_key} style={{ display: "grid", gap: 6 }}>
-            <span style={{ fontSize: 12, fontWeight: 700, color: "#57534e" }}>{requirement.label}</span>
+            <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-muted)" }}>{requirement.label}</span>
             <select
               value={requirement.requirement_key ? resolvedChannelConfigIds[requirement.requirement_key] || "" : ""}
               onChange={(event) => requirement.requirement_key && setChannelConfigIds((current) => ({ ...current, [requirement.requirement_key!]: event.target.value }))}
-              style={{ height: 38, borderRadius: 10, border: "1px solid #e7e5e4", padding: "0 10px", background: "#fff", color: "#292524" }}
+              style={{ height: 38, borderRadius: 10, border: "0.5px solid #e5e5ea", padding: "0 10px", background: "var(--surface-panel)", color: "var(--text-strong)" }}
             >
               <option value="">{t("page.workspace_detail.select_account")}</option>
               {requirement.resource_options.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
@@ -557,18 +556,18 @@ function ImportWorkspaceDialog({
           </div>
         )}
         <label style={{ display: "grid", gap: 6 }}>
-          <span style={{ fontSize: 12, fontWeight: 700, color: "#57534e" }}>{t("page.workspaces.import_mode")}</span>
+          <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-muted)" }}>{t("page.workspaces.import_mode")}</span>
           <select
             value={mode}
             onChange={(e) => setMode(e.target.value as "live" | "simulate")}
-            style={{ height: 38, borderRadius: 10, border: "1px solid #e7e5e4", padding: "0 10px", background: "#fff", color: "#292524" }}
+            style={{ height: 38, borderRadius: 10, border: "0.5px solid #e5e5ea", padding: "0 10px", background: "var(--surface-panel)", color: "var(--text-strong)" }}
           >
             <option value="live">{t("page.workspaces.import_mode_live")}</option>
             <option value="simulate">{t("page.workspaces.import_mode_simulate")}</option>
           </select>
         </label>
         <div style={{ display: "grid", gap: 6 }}>
-          <span style={{ fontSize: 12, fontWeight: 700, color: "#57534e" }}>{t("approval_settings.local_mode")}</span>
+          <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-muted)" }}>{t("approval_settings.local_mode")}</span>
           <Select
             value={preset}
             onChange={(value) => setPreset(value as GovernancePresetKey)}
@@ -577,7 +576,7 @@ function ImportWorkspaceDialog({
             disabled={!presets}
           />
         </div>
-        <label style={{ display: "flex", alignItems: "center", gap: 8, color: "#57534e", fontSize: 13 }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--text-muted)", fontSize: 13 }}>
           <input
             type="checkbox"
             checked={createMissingAgents}
@@ -588,6 +587,17 @@ function ImportWorkspaceDialog({
         {error && <div style={{ color: "#b91c1c", fontSize: 12, lineHeight: 1.5 }}>{error}</div>}
       </div>
     </Modal>
+  );
+}
+
+function ListFold({ label, open, onToggle }: { label: string; open: boolean; onToggle: (open: boolean) => void }) {
+  return (
+    <button type="button" className="workspace-list-fold-toggle" aria-expanded={open} onClick={() => onToggle(!open)}>
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} aria-hidden="true" style={{ transform: open ? "rotate(90deg)" : undefined, transition: "transform 0.15s" }}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+      </svg>
+      {label}
+    </button>
   );
 }
 
@@ -615,8 +625,8 @@ export default function Workspaces() {
   const [upgrading, setUpgrading] = useState<Workspace | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [confirmDraftDelete, setConfirmDraftDelete] = useState<string | null>(null);
+  const [showDrafts, setShowDrafts] = useState<boolean | null>(null);
   const [search, setSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState("all");
   let view = parseWorkspaceView(searchParams.get("view"), false);
 
   useEffect(() => {
@@ -632,7 +642,7 @@ export default function Workspaces() {
     queryFn: () => api.workspaces.list(),
   });
 
-  const { data: activeDrafts, isLoading: draftsLoading } = useQuery({
+  const { data: activeDrafts } = useQuery({
     queryKey: ["workspace-drafts", "active"],
     queryFn: async () => {
       const [a, r] = await Promise.all([
@@ -646,13 +656,15 @@ export default function Workspaces() {
     enabled: !collaborator,
   });
 
+  const [tileMenu, setTileMenu] = useState<{ ws: Workspace; x: number; y: number } | null>(null);
+  const longPressTimerRef = useRef<number | undefined>(undefined);
+  const longPressedRef = useRef(false);
+  const cancelLongPress = () => window.clearTimeout(longPressTimerRef.current);
   const allWs = workspaces || [];
   const deleteTarget = confirmDelete
     ? allWs.find((ws: Workspace) => ws.id === confirmDelete)
     : null;
   const canDeleteTarget = deleteTarget?.can_delete === true;
-  const activeCount = allWs.filter((ws: Workspace) => ws.status === "active").length;
-  const pausedCount = allWs.filter((ws: Workspace) => ws.status === "paused").length;
   const totalTasks = allWs.reduce((sum, ws: any) => sum + ((ws.stats?.tasks) || 0), 0);
   const activeTasks = allWs.reduce((sum, ws: any) => sum + ((ws.stats?.tasks_active) || 0), 0);
   const totalGoals = allWs.reduce((sum, ws: any) => sum + ((ws.stats?.goals) || 0), 0);
@@ -696,12 +708,63 @@ export default function Workspaces() {
 
   const restoreMutation = useMutation({
     mutationFn: (id: string) => api.workspaces.restore(id),
-    onSuccess: () => {
+    onSuccess: (restored) => {
       queryClient.invalidateQueries({ queryKey: ["workspaces"] });
       queryClient.invalidateQueries({ queryKey: ["workspaces-trash"] });
-      toast.success(t("page.workspaces.restored"));
+      const unmapped = restored.unmapped_agents ?? [];
+      if (unmapped.length) {
+        toast.warning(
+          t("page.workspaces.restored"),
+          t("page.workspaces.restored_unmapped_agents", {
+            names: unmapped.map((agent) => agent.agent_name || agent.service_key || agent.agent_id).join(", "),
+          }),
+        );
+      } else {
+        toast.success(t("page.workspaces.restored"));
+      }
     },
     onError: (err: Error) => toast.error(t("page.workspaces.restore_failed"), err.message),
+  });
+
+  const [trashSelection, setTrashSelection] = useState<string[]>([]);
+  const [confirmPurge, setConfirmPurge] = useState<string[] | null>(null);
+  const deletableTrashIds = (trashedWorkspaces ?? []).filter((ws) => ws.can_delete).map((ws) => ws.id);
+  const allDeletableTrashSelected = deletableTrashIds.length > 0 && deletableTrashIds.every((id) => trashSelection.includes(id));
+
+  function toggleTrashSelection(id: string) {
+    setTrashSelection((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  }
+
+  const purgeMutation = useMutation({
+    mutationFn: async (ids: string[]) => {
+      if (ids.length === 1) {
+        await api.workspaces.purgeTrashed(ids[0]);
+        return { purged: ids, failed: [] };
+      }
+      return api.workspaces.purgeTrashedMany(ids);
+    },
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+      queryClient.invalidateQueries({ queryKey: ["workspaces-trash"] });
+      setTrashSelection([]);
+      setConfirmPurge(null);
+      if (result.failed.length === 0) {
+        toast.success(
+          result.purged.length === 1
+            ? t("page.workspaces.deleted_now")
+            : t("page.workspaces.deleted_now_many").replace("{count}", String(result.purged.length)),
+        );
+      } else {
+        toast.error(
+          t("page.workspaces.delete_now_partial").replace("{count}", String(result.failed.length)),
+          result.failed[0].reason,
+        );
+      }
+    },
+    onError: (err: Error) => {
+      setConfirmPurge(null);
+      toast.error(err.message);
+    },
   });
 
   function daysUntilPurge(deletedAt?: string | null): number {
@@ -743,23 +806,9 @@ export default function Workspaces() {
   useEffect(() => {
     if (confirmDelete && !canDeleteTarget) setConfirmDelete(null);
   }, [canDeleteTarget, confirmDelete]);
-  function handleViewChange(next: string) {
-    let nextView = parseWorkspaceView(next, false);
-    let defaultView: WorkspaceView = "workspaces";
-    const params = new URLSearchParams(searchParams);
-    if (nextView === defaultView) {
-      params.delete("view");
-    } else {
-      params.set("view", nextView);
-    }
-    setSearchParams(params, { replace: true });
-  }
-
   const isSaving = updateMutation.isPending;
 
   const filtered = allWs.filter((ws: Workspace) => {
-    if (statusFilter === "active" && ws.status !== "active") return false;
-    if (statusFilter === "paused" && ws.status !== "paused") return false;
     if (!search) return true;
     const q = search.toLowerCase();
     return (
@@ -769,18 +818,9 @@ export default function Workspaces() {
     );
   });
 
-  const viewTabs = [
-    { key: "workspaces", label: t("page.workspaces.tab_workspaces") },
-  ];
-
   const isMarketplace =
     false;
 
-  const filterOptions = [
-    { key: "all", label: t("page.workspaces.filter_all"), count: isLoading ? undefined : allWs.length },
-    { key: "active", label: t("page.workspaces.filter_active"), count: isLoading ? undefined : activeCount },
-    { key: "paused", label: t("page.workspaces.filter_paused"), count: isLoading ? undefined : pausedCount },
-  ];
 
   return (
     <div className="workspaces-page relative z-10 flex h-full min-h-0 flex-col overflow-hidden">
@@ -789,34 +829,15 @@ export default function Workspaces() {
           t("page.workspaces.title")
         }
         subtitle={
-          t("page.workspaces.focused_operating_rooms_for_agents_knowledge_tasks_cha")}
-        tabs={(
-          <TabSwitcher
-            tabs={viewTabs}
-            value={view}
-            onChange={handleViewChange}
-          />
-        )}
-        toolbar={!isMarketplace ? (
+          undefined}
+        tabs={
+          undefined}
+        toolbar={!isMarketplace && (allWs.length > 6 || search) ? (
           <SmartToolbar
             searchValue={search}
             onSearchChange={setSearch}
             searchPlaceholder={t("page.workspaces.search_placeholder")}
             className="w-full sm:w-64"
-          />
-        ) : undefined}
-        actions={!isMarketplace && !collaborator ? (
-          <Dropdown
-            align="right"
-            trigger={<PageHeaderAddButton label={t("page.workspaces.add_workspace")} caret />}
-            items={[
-              { key: "create", label: t("page.workspaces.create_workspace"), icon: <IconPlus size={14} /> },
-              { key: "import", label: t("page.workspaces.import_workspace"), icon: <IconUpload size={14} /> },
-            ]}
-            onSelect={(key) => {
-              if (key === "create") openCreate();
-              if (key === "import") setShowImportModal(true);
-            }}
           />
         ) : undefined}
       />
@@ -856,7 +877,7 @@ export default function Workspaces() {
           {editing && (
             <div
               style={{
-                border: "1px solid rgba(28, 25, 23, 0.07)",
+                border: "0.5px solid rgba(29, 29, 31, 0.07)",
                 borderRadius: 16,
                 background: "linear-gradient(135deg, rgba(250,250,249,0.92), rgba(245,245,244,0.58))",
                 padding: 12,
@@ -865,7 +886,7 @@ export default function Workspaces() {
               }}
             >
               <WorkspaceCreatorSummary workspace={editing} />
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 12, paddingTop: 10, borderTop: "1px solid rgba(28, 25, 23, 0.06)" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 12, paddingTop: 10, borderTop: "0.5px solid rgba(29, 29, 31, 0.06)" }}>
                 {metadataStat(t("page.workspace_detail.field_created"), formatDate(editing.created_at))}
                 {metadataStat(t("page.workspace_detail.field_updated"), formatDate(editing.updated_at))}
               </div>
@@ -885,6 +906,7 @@ export default function Workspaces() {
       )}
       <ConfirmDialog open={canDeleteTarget} onClose={() => setConfirmDelete(null)} onConfirm={() => { if (deleteTarget?.can_delete) deleteMutation.mutate(deleteTarget.id); }} title={t("page.workspaces.delete_workspace")} message={t("page.workspaces.delete_workspace_msg").replace("{days}", String(graceDays))} confirmLabel={t("page.workspaces.move_to_trash")} danger />
       <ConfirmDialog open={!!confirmDraftDelete} onClose={() => setConfirmDraftDelete(null)} onConfirm={() => { if (confirmDraftDelete) deleteDraftMutation.mutate(confirmDraftDelete); }} title={t("page.workspaces.delete_draft")} message={t("page.workspaces.delete_draft_msg")} confirmLabel={t("action.delete")} danger />
+      <ConfirmDialog open={!!confirmPurge} onClose={() => setConfirmPurge(null)} onConfirm={() => { if (confirmPurge) purgeMutation.mutate(confirmPurge); }} title={t("page.workspaces.delete_now")} message={confirmPurge && confirmPurge.length > 1 ? t("page.workspaces.delete_now_many_msg").replace("{count}", String(confirmPurge.length)) : t("page.workspaces.delete_now_msg")} confirmLabel={t("page.workspaces.delete_now")} danger />
       <ImportWorkspaceDialog
         open={showImportModal}
         onClose={() => setShowImportModal(false)}
@@ -896,306 +918,115 @@ export default function Workspaces() {
 
       {/* Scrollable content */}
       <div style={{ flex: 1, overflowY: "auto", padding: "0 0 24px" }}>
-        <WorkspaceIntroPanel />
+        {!isLoading && allWs.length === 0 && <WorkspaceIntroPanel />}
 
-        {/* In-progress drafts */}
-        {draftsLoading ? (
-          <div style={{ marginBottom: 18 }}>
-            <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: "#a8a29e", marginBottom: 8, paddingLeft: 4 }}>
-              {t("page.workspaces.drafts")}
-            </div>
-            <ListRowsSkeleton rows={2} avatar={false} action />
-          </div>
-        ) : activeDrafts && activeDrafts.length > 0 && (
-          <div style={{ marginBottom: 18 }}>
-            <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: "#a8a29e", marginBottom: 8, paddingLeft: 4 }}>
-              {t("page.workspaces.drafts")}
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              {activeDrafts.slice(0, 5).map((d) => {
-                const name = (d.fields?.name as string) || t("page.workspaces.untitled_draft");
-                return (
-                  <ItemCard
-                    key={d.id}
-                    icon={
-                      <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
-                      </svg>
-                    }
-                    title={name}
-                    subtitle={d.status === "ready" ? t("page.workspaces.ready_to_create") : t("page.workspaces.drafting")}
-                    accent="teal"
-                    onClick={() => navigate(`/workspaces/new?draft=${d.id}`)}
-                    actions={
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <StatusBadge type={d.status === "ready" ? "success" : "info"} dot pulse={d.status === "active"}>
-                          {d.status === "ready" ? t("page.workspaces.ready") : t("page.workspaces.draft")}
-                        </StatusBadge>
-                        <button
-                          onClick={(e) => { e.stopPropagation(); setConfirmDraftDelete(d.id); }}
-                          style={{ width: 28, height: 28, borderRadius: 8, border: "none", background: "transparent", color: "#a8a29e", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
-                          onMouseEnter={(e) => { e.currentTarget.style.background = "#f8f0ef"; e.currentTarget.style.color = "#c14a44"; }}
-                          onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "#a8a29e"; }}
-                        >
-                          <IconTrash size={13} />
-                        </button>
-                      </div>
-                    }
-                  />
-                );
-              })}
-            </div>
-          </div>
-        )}
-
-        <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 14, flexWrap: "wrap", margin: "0 0 12px" }}>
-          <div>
-            <div style={{ fontSize: 11, fontWeight: 800, textTransform: "uppercase", letterSpacing: "0.08em", color: "#a8a29e", marginBottom: 3 }}>
-              {t("page.workspaces.current_workspaces")}
-            </div>
-            <div style={{ color: "#78716c", fontSize: 12 }}>
-              {t("page.workspaces.open_a_workspace_to_manage_its_tasks_knowledge_a")}
-            </div>
-          </div>
-          {hasWorkspaceActivity && (
-            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-              <Chip variant="teal" size="sm">{activeCount} {t("page.workspaces.active")}</Chip>
-              {totalTasks > 0 && <Chip variant="slate" size="sm">{activeTasks} / {totalTasks} {t("page.tasks.tasks")}</Chip>}
-              {totalAgents > 0 && <Chip variant="blue" size="sm">{totalAgents} {t("page.agent_dashboard.agents_plural")}</Chip>}
-              {totalGoals > 0 && <Chip variant="green" size="sm">{totalGoals} {t("page.workspaces.goals")}</Chip>}
-            </div>
-          )}
-        </div>
-
-        {/* Filter Pills */}
-        <div style={{ marginBottom: 16 }}>
-          <FilterPills options={filterOptions} value={statusFilter} onChange={setStatusFilter} />
-        </div>
-
-        {/* Workspace Cards Grid */}
-        <div style={workspaceAppCardGridStyle}>
-          {/* Workspace Cards */}
+        {/* One icon per Workspace, like apps on a home screen: the tile opens its
+            conversation, everything else lives in the ⋯ menu. */}
+        <div className="workspace-grid">
           {isLoading ? (
-            <div style={{ gridColumn: "1 / -1" }}>
-              <CardGridSkeleton count={6} minWidth={WORKSPACE_APP_CARD_MIN_WIDTH} />
-            </div>
+            Array.from({ length: 4 }, (_, index) => (
+              <div key={index} className="workspace-tile" aria-hidden="true">
+                <span className="workspace-tile-icon workspace-tile-icon--empty" />
+              </div>
+            ))
           ) : filtered.map((ws: Workspace) => {
-            const presentation = getWorkspacePresentation(ws);
-            const stats = (ws as any).stats || {};
-            const taskCount = Number(stats.tasks || 0);
-            const activeTaskCount = Number(stats.tasks_active || 0);
-            const agentCount = Number(stats.agents || 0);
-            const goalCount = Number(stats.goals || 0);
             const chatActionCount = workspaceChatActionCount(ws);
-            const chatButtonLabel = chatActionCount > 0
-              ? t("page.workspaces.review_workspace_chat")
-              : t("page.workspaces.open_workspace_chat");
             const isWorkspaceSimulation = Boolean(
               (ws.settings as Record<string, unknown> | undefined)?.sandbox === true ||
               ws.kind === "sandbox",
             );
-            const statusText = isWorkspaceSimulation
-              ? t("component.simulation_artifact_gallery.workspace_simulation")
-              : ws.status === "active"
-                ? t("page.agents.live")
+            const updateStatus = ws.blueprint_update?.status;
+            const hasUpdate = updateStatus === "update_available" || updateStatus === "reconfigure_required";
+            // Working on its own is the normal state; a caption only says the exception.
+            const caption = hasUpdate
+              ? (updateStatus === "reconfigure_required"
+                ? t("page.workspaces.blueprint_reconfigure_required")
+                : t("page.workspaces.blueprint_update_available"))
+              : isWorkspaceSimulation
+                ? t("component.simulation_artifact_gallery.workspace_simulation")
                 : ws.status === "paused"
-                  ? t("page.workspaces.filter_paused")
-                  : ws.status;
+                  ? t("page.workspaces.mode_manual")
+                  : ws.status !== "active"
+                    ? ws.status
+                    : "";
+            const openChat = () => navigate(`/chat?workspace=${encodeURIComponent(ws.id)}`);
             return (
-              <WorkspaceAppCard
+              <div
                 key={ws.id}
-                onClick={() => navigate(`/workspaces/${ws.id}`)}
+                role="link"
+                tabIndex={0}
+                className="workspace-tile"
+                title={ws.description || undefined}
+                onClick={() => {
+                  // The lift of a long press is not a tap.
+                  if (longPressedRef.current) longPressedRef.current = false;
+                  else openChat();
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") openChat();
+                  if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+                    e.preventDefault();
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    setTileMenu({ ws, x: rect.left + rect.width / 2, y: rect.bottom });
+                  }
+                }}
                 onContextMenu={(e) => {
                   e.preventDefault();
-                  openEdit(ws);
+                  setTileMenu({ ws, x: e.clientX, y: e.clientY });
                 }}
-                footer={
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        navigate(`/chat?workspace=${encodeURIComponent(ws.id)}`);
-                      }}
-                      aria-label={chatActionCount > 0
-                        ? `${chatButtonLabel}: ${chatActionCount}`
-                        : chatButtonLabel}
-                      title={chatActionCount > 0
-                        ? `${chatButtonLabel}: ${chatActionCount}`
-                        : chatButtonLabel}
-                      style={{
-                        minWidth: 0,
-                        flex: "1 1 auto",
-                        height: 30,
-                        borderRadius: 9,
-                        border: "1px solid rgba(28,25,23,0.06)",
-                        background: chatActionCount > 0 ? "#3f6f68" : "#4f7d75",
-                        color: "#fff",
-                        display: "inline-flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        gap: 7,
-                        padding: "0 10px",
-                        fontSize: 12,
-                        fontWeight: 800,
-                        cursor: "pointer",
-                        boxShadow: "0 8px 18px rgba(63,111,104,0.18)",
-                      }}
-                    >
-                      <IconChat size={13} />
-                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {chatButtonLabel}
-                      </span>
-                      {chatActionCount > 0 && (
-                        <span style={{
-                          minWidth: 18,
-                          height: 18,
-                          borderRadius: 9,
-                          padding: "0 5px",
-                          background: "#fff",
-                          color: "#3f6f68",
-                          display: "inline-flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                          fontSize: 11,
-                          fontWeight: 900,
-                          lineHeight: 1,
-                          flexShrink: 0,
-                        }}>
-                          {chatActionCount}
-                        </span>
-                      )}
-                    </button>
-                    <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
-                      <button
-                        onClick={(e) => { e.stopPropagation(); togglePauseMutation.mutate(ws); }}
-                        title={ws.status === "active" ? t("page.workspaces.pause") : t("page.workspaces.resume")}
-                        style={{ width: 28, height: 28, borderRadius: 8, border: "1px solid rgba(28,25,23,0.055)", background: "#ffffff", color: "#78716c", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", transition: "all 0.15s" }}
-                      >
-                        {ws.status === "active" ? (
-                          <svg width="12" height="12" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><rect x="6" y="4" width="4" height="16" rx="1" /><rect x="14" y="4" width="4" height="16" rx="1" /></svg>
-                        ) : (
-                          <svg width="12" height="12" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><path strokeLinecap="round" strokeLinejoin="round" d="M5.25 5.653c0-.856.917-1.398 1.667-.986l11.54 6.348a1.125 1.125 0 010 1.971l-11.54 6.347a1.125 1.125 0 01-1.667-.985V5.653z" /></svg>
-                        )}
-                      </button>
-                      <button
-                        onClick={(e) => { e.stopPropagation(); openEdit(ws); }}
-                        title={t("action.edit")}
-                        style={{ width: 28, height: 28, borderRadius: 8, border: "1px solid rgba(28,25,23,0.055)", background: "#ffffff", color: "#78716c", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", transition: "all 0.15s" }}
-                      >
-                        <IconEdit size={12} />
-                      </button>
-                      {ws.can_delete === true && (
-                        <button
-                          onClick={(e) => { e.stopPropagation(); setConfirmDelete(ws.id); }}
-                          title={t("action.delete")}
-                          style={{ width: 28, height: 28, borderRadius: 8, border: "1px solid rgba(28,25,23,0.055)", background: "#ffffff", color: "#78716c", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", transition: "all 0.15s" }}
-                        >
-                          <IconTrash size={12} />
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                }
+                onPointerDown={(e) => {
+                  if (e.pointerType !== "touch") return;
+                  const { clientX: x, clientY: y } = e;
+                  cancelLongPress();
+                  longPressTimerRef.current = window.setTimeout(() => {
+                    longPressedRef.current = true;
+                    setTileMenu({ ws, x, y });
+                  }, 500);
+                }}
+                onPointerUp={cancelLongPress}
+                onPointerMove={cancelLongPress}
+                onPointerCancel={cancelLongPress}
               >
-                <div>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 14 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
-                      <WorkspaceIconTile workspace={ws} size={40} iconSize={20} />
-                      <div style={{ minWidth: 0 }}>
-                        <div style={{ fontSize: 10, color: "#a8a29e", fontWeight: 850, textTransform: "uppercase", letterSpacing: "0.07em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                          {presentation.label}
-                        </div>
-                        <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                          <StatusBadge type="gray" dot={ws.status === "active"} pulse={false}>
-                            {statusText}
-                          </StatusBadge>
-                          {(ws.blueprint_update?.status === "update_available"
-                            || ws.blueprint_update?.status === "reconfigure_required") && (
-                            <button
-                              type="button"
-                              title={ws.blueprint_update.status === "reconfigure_required"
-                                ? t("page.workspaces.blueprint_reconfigure_title")
-                                : t("page.workspaces.blueprint_update_title")}
-                              onClick={(e) => { e.stopPropagation(); setUpgrading(ws); }}
-                              style={{
-                                display: "inline-flex", alignItems: "center", gap: 4,
-                                fontSize: 9.5, fontWeight: 850, letterSpacing: "0.04em",
-                                textTransform: "uppercase",
-                                color: ws.blueprint_update.status === "reconfigure_required" ? "#8a5d1f" : "#3f6f68",
-                                background: ws.blueprint_update.status === "reconfigure_required" ? "#fff5df" : "#eaf1ef",
-                                borderRadius: 999, padding: "2px 7px",
-                                whiteSpace: "nowrap", border: "none", cursor: "pointer",
-                              }}
-                            >
-                              {ws.blueprint_update.status === "reconfigure_required" ? (
-                                <IconInfo size={9} />
-                              ) : (
-                                <svg width="9" height="9" viewBox="0 0 24 24" fill="none"
-                                     stroke="currentColor" strokeWidth={3}>
-                                  <path strokeLinecap="round" strokeLinejoin="round"
-                                        d="M12 19V5M5 12l7-7 7 7" />
-                                </svg>
-                              )}
-                              {ws.blueprint_update.status === "reconfigure_required"
-                                ? t("page.workspaces.blueprint_reconfigure_required")
-                                : t("page.workspaces.blueprint_update_available")}
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-
-                  <h3 style={{
-                    fontSize: 16,
-                    fontWeight: 850,
-                    color: "#1c1917",
-                    margin: "0 0 6px",
-                    lineHeight: 1.25,
-                  }}>
-                    <button
-                      type="button"
-                      className="workspace-card-title-button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        navigate(`/workspaces/${ws.id}`);
-                      }}
-                    >
-                      {ws.name}
-                    </button>
-                  </h3>
-
-                  <p style={{
-                    fontSize: 12, color: "#78716c", lineHeight: 1.55, margin: "0 0 12px",
-                    display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" as const, overflow: "hidden",
-                    minHeight: 37,
-                  }}>
-                    {ws.description || t("page.workspaces.no_description")}
-                  </p>
-
-                  <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                    {ws.category && <Chip variant="slate" size="sm">{ws.category}</Chip>}
-                    {taskCount > 0 && (
-                      <Chip variant="slate" size="sm">{activeTaskCount} / {taskCount} {t("page.tasks.tasks")}</Chip>
-                    )}
-                    {agentCount > 0 && (
-                      <Chip variant="slate" size="sm">{agentCount} {t("page.agent_dashboard.agents_plural")}</Chip>
-                    )}
-                    {goalCount > 0 && (
-                      <Chip variant="slate" size="sm">{goalCount} {t("nav.goals").toLowerCase()}</Chip>
-                    )}
-                  </div>
-                </div>
-              </WorkspaceAppCard>
+                <span className="workspace-tile-icon">
+                  <WorkspaceIconTile workspace={ws} size={72} iconSize={34} style={{ borderRadius: 18 }} />
+                  {chatActionCount > 0 && (
+                    <span className="workspace-tile-badge" title={t("page.workspaces.review_workspace_chat")}>
+                      {chatActionCount}
+                    </span>
+                  )}
+                </span>
+                <span className="workspace-tile-name">{ws.name}</span>
+                {caption && <span className="workspace-tile-caption">{caption}</span>}
+              </div>
             );
           })}
+
+          {!isLoading && !collaborator && !search && (
+            <Dropdown
+              align="left"
+              trigger={(
+                <button type="button" className="workspace-tile workspace-tile--add" aria-label={t("page.workspaces.add_workspace")}>
+                  <span className="workspace-tile-icon workspace-tile-icon--add"><IconPlus size={24} /></span>
+                  <span className="workspace-tile-name">{t("page.workspaces.new_short")}</span>
+                </button>
+              )}
+              items={[
+                { key: "create", label: t("page.workspaces.create_workspace"), icon: <IconPlus size={14} /> },
+                { key: "import", label: t("page.workspaces.import_workspace"), icon: <IconUpload size={14} /> },
+              ]}
+              onSelect={(key) => {
+                if (key === "create") openCreate();
+                if (key === "import") setShowImportModal(true);
+              }}
+            />
+          )}
 
           {/* Empty search state */}
           {!isLoading && filtered.length === 0 && search && (
             <div style={{ gridColumn: "1 / -1" }}>
               <EmptyState
                 icon={
-                  <svg style={{ width: 32, height: 32, color: "#d6d3d1" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <svg style={{ width: 32, height: 32, color: "var(--text-faint)" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
                   </svg>
                 }
@@ -1206,64 +1037,160 @@ export default function Workspaces() {
           )}
         </div>
 
+        {tileMenu && (
+          <ContextMenu
+            x={tileMenu.x}
+            y={tileMenu.y}
+            onClose={() => setTileMenu(null)}
+            items={[
+              { label: t("page.apps.configure"), onClick: () => navigate(`/workspaces/${tileMenu.ws.id}`) },
+              ...(tileMenu.ws.blueprint_update?.status === "update_available" || tileMenu.ws.blueprint_update?.status === "reconfigure_required" ? [{
+                label: tileMenu.ws.blueprint_update?.status === "reconfigure_required"
+                  ? t("page.workspaces.blueprint_reconfigure_title")
+                  : t("page.workspaces.blueprint_update_title"),
+                onClick: () => setUpgrading(tileMenu.ws),
+              }] : []),
+              {
+                label: tileMenu.ws.status === "active" ? t("page.workspaces.pause") : t("page.workspaces.resume"),
+                onClick: () => togglePauseMutation.mutate(tileMenu.ws),
+              },
+              { label: t("action.edit"), onClick: () => openEdit(tileMenu.ws) },
+              ...(tileMenu.ws.can_delete === true ? [{ label: t("action.delete"), danger: true, onClick: () => setConfirmDelete(tileMenu.ws.id) }] : []),
+            ]}
+          />
+        )}
+
+        {/* In-progress drafts come after what already runs, folded unless there is nothing else to see. */}
+        {!collaborator && (activeDrafts?.length ?? 0) > 0 && (
+          <div className="workspace-list-fold">
+            <ListFold
+              label={`${t("page.workspaces.drafts")} (${activeDrafts!.length})`}
+              open={showDrafts ?? (!isLoading && allWs.length === 0)}
+              onToggle={(open) => setShowDrafts(open)}
+            />
+            {(showDrafts ?? (!isLoading && allWs.length === 0)) && (
+              <div className="workspace-list">
+                {activeDrafts!.map((d) => {
+                  const openDraft = () => navigate(`/workspaces/new?draft=${d.id}`);
+                  return (
+                    <div
+                      key={d.id}
+                      role="link"
+                      tabIndex={0}
+                      className="workspace-row"
+                      onClick={openDraft}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") openDraft();
+                      }}
+                    >
+                      <span className="workspace-row-glyph" aria-hidden="true"><IconDocument size={18} /></span>
+                      <div className="workspace-row-copy">
+                        <div className="workspace-row-name">
+                          <span>{(d.fields?.name as string) || t("page.workspaces.untitled_draft")}</span>
+                        </div>
+                        {d.status === "ready" && <div className="workspace-row-desc">{t("page.workspaces.ready_to_create")}</div>}
+                      </div>
+                      <button
+                        type="button"
+                        className="workspace-row-more"
+                        aria-label={t("action.delete")}
+                        title={t("action.delete")}
+                        onClick={(e) => { e.stopPropagation(); setConfirmDraftDelete(d.id); }}
+                      >
+                        <IconTrash size={14} />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Trash — soft-deleted workspaces in the grace window */}
-        {!collaborator && <div style={{ marginTop: 32, borderTop: "1px solid rgba(28,25,23,0.06)", paddingTop: 16 }}>
-            <button
-              onClick={() => setShowTrash((v) => !v)}
-              style={{
-                display: "flex", alignItems: "center", gap: 8,
-                background: "transparent", border: "none", cursor: "pointer",
-                fontSize: 11, fontWeight: 700, textTransform: "uppercase",
-                letterSpacing: "0.08em", color: "#a8a29e", padding: "4px 0",
-              }}
-            >
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5} style={{ transform: showTrash ? "rotate(90deg)" : "none", transition: "transform 0.15s" }}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
-              </svg>
-              {t("page.workspaces.trash")}{trashedWorkspaces ? ` (${trashedWorkspaces.length})` : ""}
-            </button>
+        {!collaborator && (
+          <div className="workspace-list-fold">
+            <ListFold
+              label={`${t("page.workspaces.trash")}${trashedWorkspaces ? ` (${trashedWorkspaces.length})` : ""}`}
+              open={showTrash}
+              onToggle={setShowTrash}
+            />
             {showTrash && (
               trashLoading ? (
-                <div style={{ marginTop: 12 }}>
-                  <ListRowsSkeleton rows={2} avatar={false} action />
-                </div>
+                <ListRowsSkeleton rows={2} avatar={false} action />
               ) : trashFailed ? (
-                <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 8, color: "#a23e38", fontSize: 12 }} role="alert">
+                <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--text-muted)", fontSize: 13 }}>
                   <span>{t("page.tasks.load_more_failed")}</span>
                   <Button size="sm" variant="outline" onClick={() => void refetchTrash()}>{t("page.tasks.retry_load_more")}</Button>
                 </div>
               ) : trashedWorkspaces?.length ? (
-                <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
-                  {trashedWorkspaces.map((ws) => {
-                  const days = daysUntilPurge(ws.deleted_at);
-                  return (
-                    <ItemCard
-                      key={ws.id}
-                      icon={<IconTrash size={14} />}
-                      title={ws.name}
-                      subtitle={t("page.workspaces.days_until_purge").replace("{days}", String(days))}
-                      accent="red"
-                      actions={
+                <>
+                  {deletableTrashIds.length > 0 && (
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 8 }}>
+                      <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "var(--text-muted)" }}>
+                        <input
+                          type="checkbox"
+                          checked={allDeletableTrashSelected}
+                          onChange={() => setTrashSelection(allDeletableTrashSelected ? [] : deletableTrashIds)}
+                        />
+                        {t("page.workspaces.select_all")}
+                      </label>
+                      {trashSelection.length > 0 && (
                         <Button
                           size="sm"
-                          variant="outline"
-                          onClick={(e: any) => { e.stopPropagation(); restoreMutation.mutate(ws.id); }}
+                          variant="danger"
+                          onClick={() => setConfirmPurge(trashSelection)}
+                          loading={purgeMutation.isPending}
+                        >
+                          {t("page.workspaces.delete_selected").replace("{count}", String(trashSelection.length))}
+                        </Button>
+                      )}
+                    </div>
+                  )}
+                  <div className="workspace-list">
+                    {trashedWorkspaces.map((ws) => (
+                      <div key={ws.id} className="workspace-row workspace-row--static">
+                        {ws.can_delete && (
+                          <input
+                            type="checkbox"
+                            aria-label={ws.name}
+                            checked={trashSelection.includes(ws.id)}
+                            onChange={() => toggleTrashSelection(ws.id)}
+                          />
+                        )}
+                        <span className="workspace-row-glyph" aria-hidden="true"><IconTrash size={16} /></span>
+                        <div className="workspace-row-copy">
+                          <div className="workspace-row-name"><span>{ws.name}</span></div>
+                          <div className="workspace-row-desc">{t("page.workspaces.days_until_purge").replace("{days}", String(daysUntilPurge(ws.deleted_at)))}</div>
+                        </div>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => restoreMutation.mutate(ws.id)}
                           loading={restoreMutation.isPending}
                         >
                           {t("page.workspaces.restore")}
                         </Button>
-                      }
-                    />
-                  );
-                  })}
-                </div>
+                        {ws.can_delete && (
+                          <Button
+                            size="sm"
+                            variant="danger"
+                            onClick={() => setConfirmPurge([ws.id])}
+                            loading={purgeMutation.isPending}
+                          >
+                            {t("page.workspaces.delete_now")}
+                          </Button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </>
               ) : (
-                <div style={{ marginTop: 12 }}>
-                  <EmptyState title={t("page.workspaces.trash")} description={t("page.knowledge.trash_is_empty")} />
-                </div>
+                <p className="workspace-list-fold-empty">{t("page.knowledge.trash_is_empty")}</p>
               )
             )}
-        </div>}
+          </div>
+        )}
       </div>
       </>
       )}

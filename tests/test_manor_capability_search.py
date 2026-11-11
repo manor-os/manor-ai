@@ -79,7 +79,7 @@ async def test_manor_search_finds_platform_capabilities_with_how_to_call_them(us
     assert "mcp__manor_mcp_calendar__create_booking_link" in result["loaded_tools"]
     assert "scope" in result  # outside a Workspace
 
-    inside = await _search(workspace_id="w1", query="let agents act without asking under 20 dollars")
+    inside = await _search(workspace_id="w1", query="set workspace risk ceilings and per-kind budgets")
     rule = inside["matches"][0]
     assert rule["id"] == "workspace_operation:governance_policy.update"
     assert rule["call"]["arguments"]["params"]["action"] == "operation"

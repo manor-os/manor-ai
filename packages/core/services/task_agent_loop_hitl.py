@@ -354,7 +354,7 @@ async def task_agent_loop_waiting_on_input(db: AsyncSession, task: Task) -> bool
 def input_answer_result(*, response_text: str, payload: dict[str, Any], answered_by: str) -> str:
     """Chat's request_input result for an answer; a declined result for a refusal."""
 
-    from packages.core.ai.runtime.human_input import human_input_answer_result
+    from packages.core.ai.runtime.human_input import human_input_answer_result, input_field_answer_text
 
     if str(payload.get("choice") or "").strip().lower() == "refuse":
         return json.dumps({
@@ -369,7 +369,7 @@ def input_answer_result(*, response_text: str, payload: dict[str, Any], answered
     answer = str(response_text or "").strip()
     if not answer and fields and len(fields) == 1:
         # A single-question form: its one value IS the answer (as plan steps).
-        answer = str(next(iter(fields.values())) or "").strip()
+        answer = input_field_answer_text(next(iter(fields.values())))
     return human_input_answer_result(
         answer=answer,
         fields=fields,

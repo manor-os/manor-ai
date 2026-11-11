@@ -256,6 +256,40 @@ def test_scheduled_workflow_requires_declared_portable_target():
         validate_payload(payload)
 
 
+@pytest.mark.parametrize(
+    ("job", "error"),
+    [
+        # Installed as an Agent Job, so it needs the Agent target even when unnamed.
+        ({"schedule_kind": "cron", "cron_expr": "0 9 * * 1", "execution_target": {"workflow_slug": "gone"}},
+         "portable Agent service_key target"),
+        # A cadence the installer does not read would install a Job with no clock.
+        ({"schedule": "0 9 * * 1", "execution_target": {"service_key": "social.x.poster"}}, "schedule_kind is required"),
+        ({"schedule_kind": "cron", "cron_expr": "0 25 * * *", "execution_target": {"service_key": "social.x.poster"}},
+         "cron_expr is invalid"),
+        ({"schedule_kind": "cron", "cron_expr": "0 9 * * 1", "timezone": "Beijing",
+          "execution_target": {"service_key": "social.x.poster"}}, "timezone is invalid"),
+    ],
+)
+def test_scheduled_job_needs_a_clock_and_the_target_it_installs_with(job, error):
+    payload = _v11_payload()
+    payload["recipe"]["scheduled_jobs"] = [{"job_id": "weekly-report", **job}]
+    with pytest.raises(PayloadError, match=error):
+        validate_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "clock",
+    [{"schedule_kind": "manual"}, {"job_type": "manual", "schedule_kind": None}, {"schedule_kind": "once"}],
+)
+def test_on_request_scheduled_job_needs_no_clock(clock):
+    payload = _v11_payload()
+    payload["recipe"]["scheduled_jobs"] = [{
+        "job_id": "setup", **clock,
+        "execution_type": "agent", "execution_target": {"service_key": "social.x.poster"},
+    }]
+    validate_payload(payload)
+
+
 def _startup_agent_job(job_id: str, *, job_type: str = "manual") -> dict:
     return {
         "job_id": job_id,

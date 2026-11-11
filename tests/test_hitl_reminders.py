@@ -287,3 +287,105 @@ async def test_a_task_card_without_people_follows_the_workspace_opt_out(db_sessi
                           payload={"question": "Retry?"})
 
     assert await hitl_reminders.reminder_recipients(db_session, request) == []
+
+
+@pytest.mark.asyncio
+async def test_an_unanswered_authorization_is_skipped_and_its_card_says_so(db_session):
+    """Only the one action waited: it expires, never runs, and its card records why.
+    A younger authorization and an unanswered question are left alone."""
+    from packages.core.models.task import Conversation, Message
+
+    entity_id, workspace_id = generate_ulid(), generate_ulid()
+    owner = await _user(db_session, entity_id, role="owner")
+    conversation = Conversation(id=generate_ulid(), entity_id=entity_id, user_id=owner.id,
+                                workspace_id=workspace_id, title="chat")
+    db_session.add_all([Workspace(id=workspace_id, entity_id=entity_id, name="W", status="active"), conversation])
+    await db_session.flush()
+    now = T0 + 200 * H
+
+    def request(*, created_at, hitl_type="authorize"):
+        return HitlRequest(id=generate_ulid(), entity_id=entity_id, workspace_id=workspace_id,
+                           action_key="workspace.automation.create", risk_level="medium", origin_kind="tool_call",
+                           origin_conversation_id=conversation.id, status="pending", hitl_type=hitl_type,
+                           dedup_key=f"expiry:{generate_ulid()}", payload={}, context={}, created_at=created_at)
+
+    stale, fresh, question = request(created_at=T0), request(created_at=now - H), request(created_at=T0, hitl_type="input")
+    db_session.add_all([stale, fresh, question])
+    await db_session.flush()
+    card = Message(conversation_id=conversation.id, role="assistant", content="Approve?",
+                   pending_action={"kind": "governance_approval", "approval_request_id": stale.id,
+                                   "options": ["approve", "reject"]})
+    reply_card = Message(conversation_id=conversation.id, role="system", content="Send?", created_at=T0,
+                         pending_action={"kind": "external_message_approval", "options": ["approve", "reject"]})
+    db_session.add_all([card, reply_card])
+    await db_session.flush()
+
+    await hitl_reminders.expire_unanswered_authorizations(db_session, now=now)
+
+    assert (stale.status, stale.resolved_reason) == ("expired", "unanswered")
+    assert fresh.status == "pending" and question.status == "pending"
+    for message in (card, reply_card):
+        assert message.resolution == {"choice": "expired", "reason": "unanswered"}
+
+
+
+@pytest.mark.asyncio
+async def test_a_lapsed_proposal_card_closes_its_proposal_too(db_session):
+    """Otherwise its Tasks stay proposed behind a card nobody can answer and
+    the Strategist keeps treating the cohort as undecided."""
+    from packages.core.models.proposal import ProposalRecord
+    from packages.core.models.task import Conversation, Message
+
+    entity_id, workspace_id = generate_ulid(), generate_ulid()
+    owner = await _user(db_session, entity_id, role="owner")
+    conversation = Conversation(id=generate_ulid(), entity_id=entity_id, user_id=owner.id,
+                                workspace_id=workspace_id, title="chat")
+    record = ProposalRecord(entity_id=entity_id, workspace_id=workspace_id, review_id="rv_lapsed",
+                            summary="Ship it", status="open")
+    task = Task(id=generate_ulid(), entity_id=entity_id, workspace_id=workspace_id, title="Ship it",
+                status="proposed", details={"strategist_review_id": "rv_lapsed"})
+    db_session.add_all([
+        Workspace(id=workspace_id, entity_id=entity_id, name="W", status="active"),
+        conversation, record, task,
+    ])
+    await db_session.flush()
+    request = HitlRequest(id=generate_ulid(), entity_id=entity_id, workspace_id=workspace_id,
+                          action_key="workspace.proposal.task", risk_level="low", origin_kind="operation",
+                          resource_kind="proposal", resource_id=record.id, status="pending",
+                          hitl_type="authorize", dedup_key=f"operation:proposal:{record.id}",
+                          payload={}, context={}, created_at=T0)
+    card = Message(conversation_id=conversation.id, role="assistant", content="Approve?",
+                   pending_action={"kind": "approve_proposals", "review_id": "rv_lapsed",
+                                   "task_ids": [task.id], "options": ["approve", "reject"]})
+    db_session.add_all([request, card])
+    await db_session.flush()
+
+    await hitl_reminders.expire_unanswered_authorizations(db_session, now=T0 + 200 * H)
+
+    await db_session.refresh(task)
+    assert request.status == "expired"
+    assert task.status == "cancelled"
+    assert task.details["rejection_reason_code"] == "EXPIRED"
+    assert card.resolution["choice"] == "expired"
+
+
+def test_what_a_person_reads_names_no_codes_or_record_ids():
+    """Staging 2026-11-04: "Review finished Word 01M6G400…; separate briefing 01M6G44T…"."""
+    from types import SimpleNamespace
+
+    from packages.core.attention.watchers.needs_input import _one_line, _workflow_label
+    from packages.core.services.hitl_reminders import summary
+
+    doc, other = "01M6G400TE4HC7SYSQ3N8DH2SM", "01M6G44TYT11C1WB2NTKHQAB50"
+    review = f"Review finished Word {doc}; separate briefing {other}. Approve it"
+    assert _one_line(review) == "Review finished Word; separate briefing. Approve it"
+    assert _workflow_label("client_article") == "Client article"
+    assert _workflow_label("Client article") == "Client article"
+
+    request = SimpleNamespace(payload={"question": review}, reason=None, action_key=None, resource_id=None)
+    assert summary(request) == "Review finished Word; separate briefing. Approve it"
+    bare = SimpleNamespace(payload={}, reason="approval.mode", action_key=None, resource_id=doc)
+    assert summary(bare) == "A decision"
+    named = SimpleNamespace(payload={}, reason=None, action_key=None, resource_id="Spring launch")
+    assert summary(named) == "A decision: Spring launch"
+

@@ -85,6 +85,11 @@ CELERY_BUILTIN_TASK_QUEUES: dict[str, CeleryQueue] = {
 # time?". A beat-driven task that fans out network calls (integrations.health_tick,
 # embeddings.sweep_pending) belongs on HEAVY even though beat fires it: beat lives
 # in the control-plane worker, but the task itself must not run there.
+# The converse holds too: a beat-driven sweep whose whole body is a bounded
+# database/Redis batch belongs on CONTROL, because on HEAVY it waits behind
+# Workflow runs and its backlog inflates the heavy queue-depth autoscaler.
+# Rolling deploys are safe in both directions: ``heavy`` stays consumed by the
+# heavy workers, so a tick queued under the old route is still run there.
 
 TASK_QUEUES: dict[str, CeleryQueue] = {
     # ── control plane: short, bounded, must run on schedule ──────────
@@ -99,6 +104,20 @@ TASK_QUEUES: dict[str, CeleryQueue] = {
     "workflow.terminal_effect_sweep": CeleryQueue.CONTROL,
     "workflow.recover_expired_claims": CeleryQueue.CONTROL,
     "workflow.redispatch_unclaimed_runs": CeleryQueue.CONTROL,
+    # Periodic housekeeping that only reads/writes the database or Redis in a
+    # fixed-size batch and makes no provider call. On HEAVY these queued behind
+    # 20-minute Workflow runs and each one counted toward the KEDA queue-depth
+    # trigger, so housekeeping alone could scale up a heavy pod. A periodic
+    # sweep that calls Stripe, a provider, a webhook, or walks the filesystem
+    # stays on HEAVY: its duration is the remote side's, not ours.
+    #
+    # Only publishes ``knowledge.analyze_media`` for at most SWEEP_BATCH (25)
+    # documents; the analysis itself still runs on HEAVY.
+    "knowledge.sweep_media_analysis": CeleryQueue.CONTROL,
+    # Copies the last few hour buckets of Redis counters into one table.
+    "metrics.http_flush": CeleryQueue.CONTROL,
+    # One indexed select and one DELETE of at most 500 clients per hour.
+    "maintenance.cleanup_oauth_dynamic_clients": CeleryQueue.CONTROL,
     "scheduler.project_scheduled_agent_result": CeleryQueue.CONTROL,
     "scheduler.recover_prepared_dispatch": CeleryQueue.CONTROL,
     "scheduler.settle_scheduled_agent_run": CeleryQueue.RECOVERY_V2,
@@ -109,7 +128,6 @@ TASK_QUEUES: dict[str, CeleryQueue] = {
     "agent_initiative.delivery_sweep": CeleryQueue.CONTROL,
     "oauth.refresh_tick": CeleryQueue.CONTROL,
     "notification.dispatch_due": CeleryQueue.CONTROL,
-    "monitor.heartbeat_check": CeleryQueue.CONTROL,
     "monitor.hitl_waiting_reminder": CeleryQueue.CONTROL,
     "monitor.sla_breach_check": CeleryQueue.CONTROL,
     "monitor.workspace_readiness_check": CeleryQueue.CONTROL,
@@ -128,6 +146,9 @@ TASK_QUEUES: dict[str, CeleryQueue] = {
     "runtime.resume_run": CeleryQueue.INTERACTIVE,
     "room_agent.execute": CeleryQueue.ROOM_AGENTS,
     "room_agent.recover_pending": CeleryQueue.CONTROL,
+    "workspace_draft.recover_turns": CeleryQueue.CONTROL,
+    # A recovered Architect turn: user-facing, minutes long, like a Chat turn.
+    "workspace_draft.resume_turn": CeleryQueue.INTERACTIVE,
 
     # ── heavy: unbounded duration, user-visible execution ────────────
     "packages.core.tasks.ai_tasks.run_agent_task": CeleryQueue.HEAVY,
@@ -143,15 +164,21 @@ TASK_QUEUES: dict[str, CeleryQueue] = {
     "packages.core.tasks.ai_tasks.process_document_embeddings": CeleryQueue.HEAVY,
     "packages.core.tasks.ai_tasks.send_agent_greetings": CeleryQueue.HEAVY,
     "memory.entity_chat_extraction_sweep": CeleryQueue.HEAVY,
+    # Model calls consolidating each entity's earlier memory, once.
+    "memory.migrate_layers": CeleryQueue.HEAVY,
     "learning.apply_candidate": CeleryQueue.HEAVY,
     "embeddings.batch_index": CeleryQueue.HEAVY,
     # One model call (+ ffmpeg for video/audio) per uploaded media file.
     "knowledge.analyze_media": CeleryQueue.HEAVY,
-    "knowledge.sweep_media_analysis": CeleryQueue.HEAVY,
     # A few model calls translating a Workspace's labels after an edit.
     "workspace.translate_text": CeleryQueue.HEAVY,
+    # Two searches and one small model call per person, at most daily.
+    "workspace.refresh_recommendations": CeleryQueue.HEAVY,
     "embeddings.sweep_pending": CeleryQueue.HEAVY,
     "media.cleanup_media_references": CeleryQueue.HEAVY,
+    # PIL or ffmpeg once per new media file version (signed display URLs).
+    "media.generate_display_variants": CeleryQueue.HEAVY,
+    "media.backfill_display_variants": CeleryQueue.HEAVY,
     "media.process_video_job": CeleryQueue.HEAVY,
     "media.recover_stale_jobs": CeleryQueue.HEAVY,
     "apify.reconcile_collections": CeleryQueue.HEAVY,
@@ -170,19 +197,17 @@ TASK_QUEUES: dict[str, CeleryQueue] = {
     "integrations.health_tick": CeleryQueue.HEAVY,
     "integrations.deliver_incident_notices": CeleryQueue.HEAVY,
     "workspace.digest_sweep": CeleryQueue.HEAVY,
-    "monitor.daily_health_briefing": CeleryQueue.HEAVY,
+    "workspace.attention_sweep": CeleryQueue.HEAVY,
     "calendar.reconcile_booking_metadata": CeleryQueue.HEAVY,
     "maintenance.cleanup_ai_edit_sessions": CeleryQueue.HEAVY,
     "maintenance.cleanup_chat_uploads": CeleryQueue.HEAVY,
     "maintenance.cleanup_document_upload_recovery": CeleryQueue.HEAVY,
-    "maintenance.cleanup_oauth_dynamic_clients": CeleryQueue.HEAVY,
     "maintenance.recover_runtime_file_commits": CeleryQueue.HEAVY,
     "maintenance.repair_missing_document_files": CeleryQueue.HEAVY,
     "maintenance.sync_openrouter_pricing": CeleryQueue.HEAVY,
     "ops.purge_soft_deleted_users": CeleryQueue.HEAVY,
     "ops.purge_soft_deleted_workspaces": CeleryQueue.HEAVY,
     "metrics.daily_rollup": CeleryQueue.HEAVY,
-    "metrics.http_flush": CeleryQueue.HEAVY,
     "metrics.workspace_health_refresh": CeleryQueue.HEAVY,
     "run_workflow": CeleryQueue.HEAVY,
     "resume_workflow": CeleryQueue.HEAVY,

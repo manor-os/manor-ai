@@ -132,7 +132,7 @@ function initiativeDestination(initiative: AgentInitiative): string {
 function DetailField({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div>
-      <dt className="text-[10px] font-semibold uppercase tracking-wide text-stone-400">{label}</dt>
+      <dt className="text-[10px] font-semibold text-stone-400">{label}</dt>
       <dd className="mt-1 break-words whitespace-pre-wrap text-sm leading-relaxed text-stone-700">{children}</dd>
     </div>
   );
@@ -502,7 +502,7 @@ export default function AgentInitiativePanel({ agentId }: { agentId: string }) {
       ) : (
         <>
           <div className="rounded-xl bg-stone-100/70 p-4">
-            <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-stone-500">
+            <label className="mb-1.5 block text-xs font-semibold text-stone-500">
               {t("page.agent_initiative.agent_instance")}
             </label>
             <Select

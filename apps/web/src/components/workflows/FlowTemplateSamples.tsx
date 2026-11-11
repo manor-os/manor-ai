@@ -366,7 +366,7 @@ export default function FlowTemplateSamples() {
     return (
       <div className="flow-template-state" role="status">
         <LoadingSpinner size={20} />
-        <span>{t("component.embedded_chat.flow_templates.loading")}</span>
+        <span className="sr-only">{t("component.embedded_chat.flow_templates.loading")}</span>
       </div>
     );
   }

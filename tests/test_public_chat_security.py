@@ -12,12 +12,14 @@ from packages.core.ai import runtime
 from packages.core.database import get_db
 from packages.core.models.user import User
 from packages.core.services import agent_subscription_service, channel_gateway, conversation_messages
+from packages.core.services.actor_authorization import ResolvedUserActor
 from packages.core.services.auth_service import create_access_token
 
 
 @pytest.fixture
 async def public_chat_case(monkeypatch):
     db = AsyncMock()
+    db.info = {}
     db.scalar.return_value = None  # No resident authorization row in this legacy channel fixture.
     user = User(
         id="customer", entity_id="customer-entity", role="external",
@@ -26,10 +28,19 @@ async def public_chat_case(monkeypatch):
         password_hash="unused",
     )
     db.execute.return_value = SimpleNamespace(scalar_one_or_none=lambda: user)
-    monkeypatch.setattr(deps, "resolve_current_user_actor", AsyncMock(return_value=SimpleNamespace(
+    actor = ResolvedUserActor(
+        user_id=user.id,
         entity_id=user.entity_id,
         display_role=user.role,
-    )))
+        role=None,
+        can_read_documents=False,
+        can_read_workspaces=False,
+        can_read_all_documents=False,
+        can_manage_all_documents=False,
+        can_read_all_workspaces=False,
+    )
+    monkeypatch.setattr(deps, "resolve_current_user_actor", AsyncMock(return_value=actor))
+    monkeypatch.setattr(deps, "resolve_authenticating_user_actor", AsyncMock(return_value=(user, actor)))
     cc = SimpleNamespace(
         id="channel", entity_id="business", workspace_id="workspace",
         name="Public chat", config={"login_required": False},

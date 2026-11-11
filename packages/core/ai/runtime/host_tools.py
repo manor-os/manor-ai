@@ -29,6 +29,12 @@ HOST_INJECTED_TOOLS: Mapping[str, frozenset[str]] = MappingProxyType({
         "request_input",
         "send_channel_attachment",
     }),
+    "workflow_agent_step": frozenset({
+        # Only on a retried step: its own stored recovery evidence, in full.
+        "read_step_recovery",
+        # Ends the step when only a person can provide what it is missing.
+        "stop_step_needs_person",
+    }),
 })
 ALL_HOST_INJECTED_TOOLS: frozenset[str] = frozenset().union(*HOST_INJECTED_TOOLS.values())
 
@@ -89,6 +95,18 @@ def _request_input_schema() -> dict[str, Any]:
     return runtime_request_input_tool_schema()
 
 
+def _step_recovery_schema() -> dict[str, Any]:
+    from packages.core.services.workflow_agent_recovery import STEP_RECOVERY_TOOL
+
+    return STEP_RECOVERY_TOOL
+
+
+def _step_needs_person_schema() -> dict[str, Any]:
+    from packages.core.services.workflow_step_needs_person import STEP_NEEDS_PERSON_TOOL
+
+    return STEP_NEEDS_PERSON_TOOL
+
+
 def _channel_attachment_schema() -> dict[str, Any]:
     from packages.core.ai.runtime.channel_tools import runtime_channel_attachment_tool_schema
 
@@ -103,6 +121,8 @@ _SCHEMAS: Mapping[str, Callable[[], dict[str, Any] | None]] = MappingProxyType({
     "request_input": _request_input_schema,
     "read_context_archive": _context_archive_schema,
     "send_channel_attachment": _channel_attachment_schema,
+    "read_step_recovery": _step_recovery_schema,
+    "stop_step_needs_person": _step_needs_person_schema,
 })
 
 

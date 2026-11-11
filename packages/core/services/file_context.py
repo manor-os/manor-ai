@@ -1114,7 +1114,7 @@ async def build_file_context(
                     entity_id=entity_id,
                     kind="whisper",
                     model=result.model,
-                    cost_usd=whisper_cost_usd(result.duration_seconds, result.model),
+                    cost_usd=whisper_cost_usd(result.duration_seconds, result.model, getattr(result, "usage", None)),
                     units=int(result.duration_seconds),
                     workspace_id=workspace_id,
                     user_id=user_id,

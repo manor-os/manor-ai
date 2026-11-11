@@ -19,13 +19,15 @@ from packages.core.models.task import Task
 from packages.core.models.user import Entity
 from packages.core.models.workspace import Workspace
 from packages.core.services.channel_credentials import lease_channel_config_credentials, use_channel_credential_session
+from packages.core.services.task_event_notifications import task_outcome_reaches_people_elsewhere
 
 logger = logging.getLogger(__name__)
 
+# Reminders are sent by hitl_reminders through each person's own notification
+# settings; no "task.hitl_reminder" event reaches these sinks.
 DEFAULT_EXTERNAL_EVENTS = [
     "task.failed",
     "task.hitl_requested",
-    "task.hitl_reminder",
 ]
 
 
@@ -138,6 +140,8 @@ async def deliver_task_external_notifications_in_session(
         return {"email": 0, "external_chat": 0}
 
     task = await _load_task(db, entity_id, payload)
+    if task_outcome_reaches_people_elsewhere(event_type, task):
+        return {"email": 0, "external_chat": 0}
     workspace = await _load_workspace(db, entity_id, task)
     policy = task_notification_policy_config(
         entity.settings if entity else None,

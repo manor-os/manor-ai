@@ -1,10 +1,10 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
   ReactFlow,
   Background,
   BackgroundVariant,
+  NodeResizeControl,
   Controls,
-  MiniMap,
   Handle,
   Position,
   useNodesState,
@@ -29,6 +29,8 @@ import MediaPreview from "./MediaPreview";
 import { resolveConnectorBrand } from "../../lib/workflowBrand";
 import IntegrationLogo from "../IntegrationLogo";
 import { IconClose } from "../icons";
+import AgentAvatar from "../ui/AgentAvatar";
+import { t } from "../../lib/i18n";
 import type { MediaRef } from "../../lib/workflowMedia";
 import {
   computeWorkflowCanvasLayout,
@@ -73,21 +75,24 @@ const NODE_H = 60;
 // Colour stays calm: a warm-stone neutral for working node types, teal only
 // for entry points, gold for notes. (Connectors still show their brand colour;
 // run state and typed sockets keep their own semantic hues.)
+// Every working node is monochrome; the icon and its words say what it
+// does. Only notes keep their gold, and connectors their brand logo.
 const CAT_COLOR = {
-  entry: "#0f766e", // teal  — triggers / entry points
-  ai: "#6f6861",    // neutral warm-stone ink
-  logic: "#6f6861",
-  data: "#6f6861",
-  io: "#6f6861",
-  media: "#6f6861",
+  entry: "#6e6e73",
+  ai: "#6e6e73",
+  logic: "#6e6e73",
+  data: "#6e6e73",
+  io: "#6e6e73",
+  media: "#6e6e73",
+  human: "#d99a35", // amber — a person looks first (the same amber as "waiting on you")
   note: "#c79a3a",  // gold  — sticky notes
-  term: "#9b938c",  // faint — terminal / unsupported markers
+  term: "#aeaeb2",  // faint — terminal / unsupported markers
 } as const;
 
 const NODE_CATEGORY: Record<string, keyof typeof CAT_COLOR> = {
   trigger: "entry", webhook: "entry",
   llm: "ai", agent: "ai", rag: "ai", classifier: "ai", extract: "ai",
-  condition: "logic", switch: "logic", loop: "logic", parallel: "logic", merge: "logic", wait: "logic", stage: "logic",
+  condition: "logic", switch: "logic", loop: "logic", parallel: "logic", merge: "logic", wait: "human", stage: "logic",
   transform: "data", split: "data", sort: "data", aggregate: "data", filter: "data",
   dedupe: "data", limit: "data", datetime: "data", extractfromfile: "data", code: "data",
   http: "io", connector: "io", respond: "io", notify: "io", subworkflow: "io", tool: "io",
@@ -108,13 +113,29 @@ const TYPE_LABEL: Record<string, string> = {
   unsupported: "UNSUPPORTED", note: "NOTE", stage: "STAGE", publication_receipt: "RECEIPT", workflow_effect_deadline: "DEADLINE",
 };
 
+// "workflow_project" / "EXTRACT FILE" -> "Workflow project" / "Extract file"
+function humanizeType(type: string) {
+  const words = type.replace(/[_-]+/g, " ").trim().toLowerCase();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+// Shown in the reader's language, never as an all-caps code.
+function typeLabel(type: string, fallback: string) {
+  const key = `component.workflow_canvas.type_${type}`;
+  const label = t(key);
+  return label === key ? humanizeType(fallback) : label;
+}
+
 // canonical node type -> accent colour (from its category) + short label
 export const TYPE_META: Record<string, { color: string; label: string }> = Object.fromEntries(
-  Object.entries(TYPE_LABEL).map(([t, label]) => [t, { color: CAT_COLOR[NODE_CATEGORY[t] || "data"], label }]),
+  Object.entries(TYPE_LABEL).map(([type, label]) => [type, { color: CAT_COLOR[NODE_CATEGORY[type] || "data"], label: typeLabel(type, label) }]),
 );
 
-function typeMeta(t: string) {
-  return TYPE_META[t] || { color: "#9b938c", label: t.toUpperCase() };
+type WorkflowAgent = { id: string; name: string; avatar_url?: string | null };
+const WorkflowAgentsContext = createContext<Record<string, WorkflowAgent>>({});
+
+function typeMeta(type: string) {
+  return TYPE_META[type] || { color: "var(--text-faint)", label: humanizeType(type) };
 }
 
 // one outline glyph per node category (n8n-style icon tile). Every canonical
@@ -195,7 +216,7 @@ export function NodeIcon({ type, size = 18 }: { type: string; size?: number }) {
   );
 }
 
-type NodeData = { type: string; label: string; branches: boolean; cases?: string[]; status?: string; preview?: MediaRef; issue?: "error" | "warning"; brand?: { color: string; provider: string }; agent?: { model?: string; tools?: string[]; memory?: boolean }; outType?: string; output?: string };
+type NodeData = { type: string; label: string; branches: boolean; cases?: string[]; status?: string; preview?: MediaRef; issue?: "error" | "warning"; brand?: { color: string; provider: string }; agentId?: string; outType?: string; output?: string };
 
 // ComfyUI-style typed sockets: the data type a node emits → a socket colour,
 // also used to tint the data wire. ``any`` stays neutral so ordinary flows are
@@ -230,7 +251,7 @@ const STATUS_COLOR: Record<string, string> = {
   failed: "#d65f59",
   paused: "#cf9b44",
   running: "#0f766e",
-  skipped: "#a8a29e",
+  skipped: "#aeaeb2",
 };
 
 const EDGE_FLOW = "#0f766e"; // teal — the run is moving across this edge right now
@@ -252,6 +273,7 @@ function edgeLook(srcStatus: string | undefined, tgtStatus: string | undefined, 
 const AddFromContext = createContext<((sourceId: string) => void) | null>(null);
 // lets a sticky note persist its edited text back to the steps array
 const NoteEditContext = createContext<((id: string, text: string) => void) | null>(null);
+const NoteResizeContext = createContext<((id: string, width: number, height: number) => void) | null>(null);
 // lets an edge delete itself (hover ✕) — so connections are removable without
 // knowing the select-then-Backspace gesture
 const EdgeDeleteContext = createContext<((edgeId: string) => void) | null>(null);
@@ -263,7 +285,7 @@ const NodeActionsContext = createContext<{ run?: (id: string) => void; remove?: 
 
 const TOOLBTN: React.CSSProperties = {
   width: 22, height: 22, borderRadius: 7, border: "none", cursor: "pointer", padding: 0,
-  background: "var(--surface-panel)", boxShadow: "0 1px 3px rgba(28,25,23,0.16), 0 0 0 1px rgba(28,25,23,0.06)",
+  background: "var(--surface-panel)", boxShadow: "0 1px 3px rgba(29, 29, 31,0.16), 0 0 0 1px rgba(29, 29, 31,0.06)",
   display: "inline-flex", alignItems: "center", justifyContent: "center",
 };
 
@@ -282,19 +304,19 @@ function NodeToolbar({ id, show }: { id: string; show: boolean }) {
       }}
     >
       {actions?.run && (
-        <button type="button" title="Test this node" style={{ ...TOOLBTN, color: "#0f766e" }}
+        <button type="button" title={t("ui.test_this_node")} style={{ ...TOOLBTN, color: "#0f766e" }}
           onClick={(e) => { e.stopPropagation(); actions.run?.(id); }}>
           <svg width={12} height={12} viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
         </button>
       )}
       {addFrom && (
-        <button type="button" title="Add a connected node" style={{ ...TOOLBTN, color: "var(--text-muted)" }}
+        <button type="button" title={t("ui.add_a_connected_node")} style={{ ...TOOLBTN, color: "var(--text-muted)" }}
           onClick={(e) => { e.stopPropagation(); addFrom(id); }}>
           <span aria-hidden style={{ fontSize: 15, lineHeight: 1, fontWeight: 600 }}>+</span>
         </button>
       )}
       {actions?.remove && (
-        <button type="button" title="Delete node" style={{ ...TOOLBTN, color: "#d65f59" }}
+        <button type="button" title={t("ui.delete_node")} style={{ ...TOOLBTN, color: "#d65f59" }}
           onClick={(e) => { e.stopPropagation(); actions.remove?.(id); }}>
           <svg width={12} height={12} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M3 6h18M8 6V4h8v2m-9 0v14a1 1 0 001 1h8a1 1 0 001-1V6" /></svg>
         </button>
@@ -429,7 +451,7 @@ function DeletableEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition,
               width: 11, height: 11, borderRadius: "50%",
               cursor: draft ? "grabbing" : "grab",
               background: "var(--surface-panel)",
-              boxShadow: "0 1px 3px rgba(28,25,23,0.18), 0 0 0 1.5px rgba(28,25,23,0.28)",
+              boxShadow: "0 1px 3px rgba(29, 29, 31,0.18), 0 0 0 1.5px rgba(29, 29, 31,0.28)",
               opacity: actionsVisible ? 1 : 0,
               pointerEvents: actionsVisible ? "all" : "none",
               transition: "opacity .12s",
@@ -449,15 +471,15 @@ function DeletableEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition,
           {onDelete && (
             <button
               className="nodrag"
-              title="Delete connection"
-              aria-label="Delete connection"
+              title={t("ui.delete_connection")}
+              aria-label={t("ui.delete_connection")}
               aria-hidden={!actionsVisible}
               tabIndex={actionsVisible ? 0 : -1}
               onClick={(e) => { e.stopPropagation(); onDelete(id); }}
               style={{
                 width: 17, height: 17, borderRadius: "50%", border: "none", cursor: "pointer",
                 background: selected ? "#d65f59" : "var(--surface-panel)", color: selected ? "#fff" : "#d65f59",
-                boxShadow: `0 1px 3px rgba(28,25,23,0.18), 0 0 0 1px rgba(28,25,23,0.10)`,
+                boxShadow: `0 1px 3px rgba(29, 29, 31,0.18), 0 0 0 1px rgba(29, 29, 31,0.10)`,
                 display: "inline-flex", alignItems: "center", justifyContent: "center",
                 lineHeight: 1, padding: 0, opacity: actionsVisible ? 1 : 0,
                 pointerEvents: actionsVisible ? "auto" : "none",
@@ -483,6 +505,7 @@ type NoteData = { text?: string; editable?: boolean };
  *  editable; read-only otherwise. */
 function NoteNode({ id, data }: NodeProps<Node<NoteData>>) {
   const onEdit = useContext(NoteEditContext);
+  const onResize = useContext(NoteResizeContext);
   const editable = !!onEdit && data.editable !== false;
   // Local text so typing stays smooth; persist to the steps array on blur
   // (avoids a save round-trip per keystroke).
@@ -491,13 +514,13 @@ function NoteNode({ id, data }: NodeProps<Node<NoteData>>) {
   return (
     <div
       style={{
-        minWidth: 180, minHeight: 96, maxWidth: 320, padding: "10px 12px",
+        boxSizing: "border-box", width: "100%", height: "100%", minWidth: 180, minHeight: 96, padding: "10px 12px",
         background: "#fbf3d6", borderRadius: 10, color: "#6b5618",
-        boxShadow: "0 1px 3px rgba(28,25,23,0.10), 0 6px 18px rgba(28,25,23,0.06)",
+        boxShadow: "0 1px 3px rgba(29, 29, 31,0.10), 0 6px 18px rgba(29, 29, 31,0.06)",
         display: "flex", flexDirection: "column", gap: 4,
       }}
     >
-      <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: 0.6, color: "#b08a2f", display: "flex", alignItems: "center", gap: 5 }}>
+      <span style={{ fontSize: 9, fontWeight: 700, color: "#b08a2f", display: "flex", alignItems: "center", gap: 5 }}>
         <NodeIcon type="note" size={11} /> NOTE
       </span>
       {editable ? (
@@ -506,9 +529,9 @@ function NoteNode({ id, data }: NodeProps<Node<NoteData>>) {
           value={text}
           onChange={(e) => setText(e.target.value)}
           onBlur={() => { if (text !== (data.text || "")) onEdit!(id, text); }}
-          placeholder="Write a note…"
+          placeholder={t("ui.write_a_note")}
           style={{
-            flex: 1, minHeight: 56, resize: "vertical", border: "none", outline: "none",
+            flex: 1, minHeight: 0, resize: "none", border: "none", outline: "none",
             background: "transparent", color: "#6b5618", fontSize: 12.5, lineHeight: 1.5,
             fontFamily: "var(--font-sans, inherit)", padding: 0,
           }}
@@ -517,6 +540,19 @@ function NoteNode({ id, data }: NodeProps<Node<NoteData>>) {
         <div style={{ fontSize: 12.5, lineHeight: 1.5, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
           {data.text || "—"}
         </div>
+      )}
+      {editable && onResize && (
+        <NodeResizeControl
+          className="workflow-note-resize"
+          position="bottom-right"
+          minWidth={180}
+          minHeight={96}
+          onResizeEnd={(_, { width, height }) => onResize(id, Math.round(width), Math.round(height))}
+        >
+          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" aria-hidden="true">
+            <path d="M9 3 3 9M9 6.5 6.5 9" />
+          </svg>
+        </NodeResizeControl>
       )}
     </div>
   );
@@ -624,8 +660,8 @@ function NodeSurface({
         style={{
           position: "absolute", inset: 0, width: "100%", height: "100%", overflow: "visible", pointerEvents: "none",
           filter: selected
-            ? "drop-shadow(0 0 5px rgba(15,118,110,0.24)) drop-shadow(0 4px 6px rgba(28,25,23,0.08))"
-            : "drop-shadow(0 1px 1px rgba(28,25,23,0.10)) drop-shadow(0 4px 6px rgba(28,25,23,0.05))",
+            ? "drop-shadow(0 0 5px rgba(15,118,110,0.24)) drop-shadow(0 4px 6px rgba(29, 29, 31,0.08))"
+            : "drop-shadow(0 1px 1px rgba(29, 29, 31,0.10)) drop-shadow(0 4px 6px rgba(29, 29, 31,0.05))",
         }}
       >
         {selected && (
@@ -652,8 +688,8 @@ function NodeSurface({
         borderRadius: NODE_RADIUS[variant],
         background: "var(--surface-panel)",
         boxShadow: selected
-          ? "0 0 0 6px rgba(15,118,110,0.13), 0 1px 2px rgba(28,25,23,0.12), 0 5px 12px rgba(28,25,23,0.06)"
-          : "0 1px 2px rgba(28,25,23,0.12), 0 5px 12px rgba(28,25,23,0.06)",
+          ? "0 0 0 6px rgba(15,118,110,0.13), 0 1px 2px rgba(29, 29, 31,0.12), 0 5px 12px rgba(29, 29, 31,0.06)"
+          : "0 1px 2px rgba(29, 29, 31,0.12), 0 5px 12px rgba(29, 29, 31,0.06)",
       }}
     />
   );
@@ -661,21 +697,6 @@ function NodeSurface({
 
 /** A folded agent sub-node, shown as a small pill on the agent card — echoes
  *  n8n's Chat Model / Memory / Tool ports (manor keeps them inline). */
-function AgentPort({ icon, label, color }: { icon: string; label: string; color: string }) {
-  return (
-    <span
-      title={label}
-      style={{
-        display: "inline-flex", alignItems: "center", gap: 4, maxWidth: 96,
-        padding: "2px 7px", borderRadius: 999, background: `${color}14`, color,
-      }}
-    >
-      <NodeIcon type={icon} size={10} />
-      <span style={{ fontSize: 9, fontWeight: 600, color: "var(--text-muted)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{label}</span>
-    </span>
-  );
-}
-
 /** A working node's icon: a ring of dots turning in the node's colour. */
 function RunningDots({ color }: { color: string }) {
   const dots = 8;
@@ -708,6 +729,7 @@ function RunningDots({ color }: { color: string }) {
 /** A single node card with typed input / output connection handles. */
 function WorkflowNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
   const m = typeMeta(data.type);
+  const assignedAgent = useContext(WorkflowAgentsContext)[data.agentId || ""];
   const statusColor = data.status ? STATUS_COLOR[data.status] : undefined;
   const variant = nodeVariant(data.type);
   const insets = NODE_INSETS[variant];
@@ -762,12 +784,15 @@ function WorkflowNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
         <div
           style={{
             width: 34, height: 34, borderRadius: 9, flexShrink: 0,
-            background: `${tileColor}1a`, color: tileColor,
+            background: data.brand ? "var(--surface-panel)" : "var(--surface-muted)", color: tileColor,
+            boxShadow: "inset 0 0 0 0.5px rgba(29, 29, 31, 0.08)",
             display: "flex", alignItems: "center", justifyContent: "center",
           }}
         >
           {data.status === "running" ? (
             <RunningDots color={tileColor} />
+          ) : assignedAgent ? (
+            <AgentAvatar name={assignedAgent.name} avatarUrl={assignedAgent.avatar_url} seed={assignedAgent.id} size={30} />
           ) : data.brand ? (
             <IntegrationLogo provider={data.brand.provider} size={19} />
           ) : (
@@ -775,19 +800,12 @@ function WorkflowNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
           )}
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 1, minWidth: 0 }}>
-          <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: 0.5, color: tileColor }}>{m.label}</span>
           <span style={{ fontSize: 13, fontWeight: 600, color: "var(--text-strong)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
             {data.label}
           </span>
+          <span style={{ fontSize: 11, fontWeight: 400, color: "var(--text-muted)" }}>{assignedAgent?.name || m.label}</span>
         </div>
       </div>
-      {data.agent && (data.agent.model || data.agent.memory || (data.agent.tools?.length ?? 0) > 0) && (
-        <div style={{ position: "relative", zIndex: 1, display: "flex", flexWrap: "wrap", gap: 4, padding: `0 ${padR}px 9px ${padL}px` }}>
-          {data.agent.model && <AgentPort icon="ai" label={data.agent.model} color={m.color} />}
-          {data.agent.memory && <AgentPort icon="wait" label="memory" color={m.color} />}
-          {(data.agent.tools?.length ?? 0) > 0 && <AgentPort icon="tool" label={`${data.agent.tools!.length} tool${data.agent.tools!.length === 1 ? "" : "s"}`} color={m.color} />}
-        </div>
-      )}
       {data.preview && (
         <div className="nodrag" style={{ position: "relative", zIndex: 1, padding: `0 ${padR}px 10px ${padL}px` }}>
           <MediaPreview refItem={data.preview} compact />
@@ -838,8 +856,8 @@ function WorkflowNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
         })
       ) : data.branches ? (
         <>
-          <Handle id="true" type="source" position={Position.Right} style={{ ...HANDLE_BASE, top: "38%", boxShadow: "0 0 0 2px #4f9c84" }} />
-          <Handle id="false" type="source" position={Position.Right} style={{ ...HANDLE_BASE, top: "72%", boxShadow: "0 0 0 2px #d65f59" }} />
+          <Handle id="true" type="source" position={Position.Right} style={{ ...HANDLE_BASE, top: "38%", boxShadow: `0 0 0 2px ${m.color}` }} />
+          <Handle id="false" type="source" position={Position.Right} style={{ ...HANDLE_BASE, top: "72%", boxShadow: `0 0 0 2px ${m.color}` }} />
         </>
       ) : (
         <Handle
@@ -886,6 +904,8 @@ function buildGraph(
         position: s.position || layout.get(s.id) || { x: 0, y: 0 },
         data: { text: s.config?.text ?? s.name ?? "" },
         zIndex: 0,
+        width: s.config?.width ?? 240,
+        height: s.config?.height ?? 120,
       };
     }
     const cases = switchCases(s);
@@ -895,10 +915,6 @@ function buildGraph(
           const b = resolveConnectorBrand(s.meta?.original_type || s.config?.tool || s.config?.n8n?.type);
           return b.color || b.icon ? { color: b.color, provider: b.key } : undefined;
         })()
-      : undefined;
-    // agent nodes surface their folded model / memory / tools as ports
-    const agent = s.type === "agent"
-      ? { model: s.config?.model, tools: s.config?.tools, memory: !!s.config?.memory }
       : undefined;
     return {
       id: s.id,
@@ -914,45 +930,46 @@ function buildGraph(
         issue: issueById?.[s.id],
         output: outputById?.[s.id],
         brand,
-        agent,
+        agentId: s.type === "agent" ? s.config?.agent_id : undefined,
         outType: nodeOutputType(s),
       },
     };
   });
 
-  const outTypeById = new Map(steps.map((s) => [s.id, nodeOutputType(s)]));
+  const positionById = new Map(nodes.map((node) => [node.id, node.position]));
   const edges: Edge[] = [];
   const add = (from: string, to: string, kind: string, baseColor: string, handle?: string, label?: string, route?: { points?: CanvasPoint[]; x?: number; y?: number }) => {
     if (!ids.has(to)) return;
     // data ("default"/next) wires take the source node's output-type colour
     // (ComfyUI-style); branch wires (true/false/case) keep their semantic hue.
-    const ot = outTypeById.get(from);
-    const color = kind === "default" && ot && ot !== "any" ? typeColor(ot) : baseColor;
+    const color = baseColor;
     const look = edgeLook(statusById?.[from], statusById?.[to], color);
+    const goesBack = (positionById.get(to)?.x ?? 0) <= (positionById.get(from)?.x ?? 0);
     edges.push({
       id: `${from}-${to}-${kind}`, source: from, target: to,
       sourceHandle: handle, label, type: "deletable", // orthogonal line + contextual delete
       animated: look.animated,
       data: { baseColor: color, kind, ...(route ? { route } : {}) },
-      style: { stroke: look.stroke, strokeWidth: look.strokeWidth },
-      labelStyle: { fontSize: 10, fill: color, fontWeight: 600 },
+      style: { stroke: look.stroke, strokeWidth: look.strokeWidth, ...(goesBack ? { strokeDasharray: "5 4" } : {}) },
+      labelStyle: { fontSize: 11, fill: "#8e8e93", fontWeight: 400 },
     });
   };
   steps.forEach((step) => workflowCanvasRoutes(step).forEach((route) => {
-    const color = route.kind === "true"
-      ? "#4f9c84"
+    // Lines are neutral; the words on them (Yes / No / a case) carry the
+    // meaning. Only an error path keeps its warning hue.
+    const color = route.kind === "error" ? "#b7791f" : "#c7c7cc";
+    const label = route.kind === "true"
+      ? t("component.workflow_canvas.branch_yes")
       : route.kind === "false"
-        ? "#d65f59"
-        : route.kind === "error"
-          ? "#b7791f"
-          : route.kind.startsWith("case") ? "#8b6fb0" : "#cfc9c1";
+        ? t("component.workflow_canvas.branch_no")
+        : route.label;
     add(
       step.id,
       route.target,
       route.kind,
       color,
       route.handle,
-      route.label?.slice(0, 14),
+      label?.slice(0, 14),
       step.meta?.routes?.[edgeRouteKey(route.kind, route.target)],
     );
   }));
@@ -1042,6 +1059,40 @@ function RemeasureUnplacedHandles() {
   return null;
 }
 
+/** Keeps the dots a steady distance apart on screen at any zoom, or they blur away when zoomed out. */
+function CanvasDots() {
+  const zoom = useStore((state) => state.transform[2]);
+  return <Background variant={BackgroundVariant.Dots} gap={22 / zoom} size={1.4 / zoom} color="var(--canvas-dot)" />;
+}
+
+const READABLE_ZOOM = 0.7;
+
+/** A flow too long to read when fitted opens at its start; the fit button still shows all of it. */
+function OpenLongFlowAtItsStart() {
+  const { getNodes, getNodesBounds, setViewport } = useReactFlow();
+  const width = useStore((state) => state.width);
+  const height = useStore((state) => state.height);
+  const initialized = useNodesInitialized();
+  const framedRef = useRef(false);
+  useEffect(() => {
+    if (framedRef.current || !initialized || !width || !height) return;
+    framedRef.current = true;
+    const bounds = getNodesBounds(getNodes());
+    if (Math.min(width / bounds.width, height / bounds.height) >= READABLE_ZOOM) return;
+    const frame = requestAnimationFrame(() => {
+      const scaledWidth = bounds.width * READABLE_ZOOM;
+      const scaledHeight = bounds.height * READABLE_ZOOM;
+      void setViewport({
+        x: scaledWidth <= width ? (width - scaledWidth) / 2 - bounds.x * READABLE_ZOOM : 56 - bounds.x * READABLE_ZOOM,
+        y: scaledHeight <= height ? (height - scaledHeight) / 2 - bounds.y * READABLE_ZOOM : 72 - bounds.y * READABLE_ZOOM,
+        zoom: READABLE_ZOOM,
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [getNodes, getNodesBounds, setViewport, width, height, initialized]);
+  return null;
+}
+
 function FitRunCanvasOnResize() {
   const { fitView } = useReactFlow();
   const width = useStore((state) => state.width);
@@ -1066,6 +1117,7 @@ export default function WorkflowCanvas({
   outputById,
   onRunNode,
   fitOnResize = false,
+  agents = {},
 }: {
   steps: CanvasStep[];
   onStepsChange?: (steps: CanvasStep[]) => void;
@@ -1077,6 +1129,7 @@ export default function WorkflowCanvas({
   outputById?: Record<string, string>;
   onRunNode?: (stepId: string) => void;
   fitOnResize?: boolean;
+  agents?: Record<string, WorkflowAgent>;
 }) {
   const editable = !!onStepsChange;
   const initial = useMemo(() => buildGraph(steps, statusById, previewById, issueById, outputById), [steps, statusById, previewById, issueById, outputById]);
@@ -1189,6 +1242,13 @@ export default function WorkflowCanvas({
     ));
   }, [steps, onStepsChange]);
 
+  const onResizeNote = useCallback((nid: string, width: number, height: number) => {
+    if (!onStepsChange) return;
+    onStepsChange(steps.map((s) => (
+      s.id === nid ? { ...s, config: { ...(s.config || {}), width, height } } : s
+    )));
+  }, [steps, onStepsChange]);
+
   // delete a single connection (the edge's ✕): drop it from the canvas and
   // remove the corresponding link from the source step.
   const onDeleteEdge = useCallback((edgeId: string) => {
@@ -1249,12 +1309,14 @@ export default function WorkflowCanvas({
   );
 
   return (
+    <WorkflowAgentsContext.Provider value={agents}>
     <NodeActionsContext.Provider value={nodeActions}>
     <EdgeDeleteContext.Provider value={editable ? onDeleteEdge : null}>
     <EdgeRouteContext.Provider value={editable ? onMoveEdgeRoute : null}>
     <NoteEditContext.Provider value={editable ? onEditNote : null}>
+    <NoteResizeContext.Provider value={editable ? onResizeNote : null}>
     <AddFromContext.Provider value={onAddFrom || null}>
-    <div style={{ width: "100%", height: "100%", borderRadius: 16, overflow: "hidden" }}>
+    <div style={{ width: "100%", height: "100%", overflow: "hidden" }}>
       <ReactFlow
         nodes={nodes}
         edges={edges}
@@ -1284,22 +1346,17 @@ export default function WorkflowCanvas({
         style={{ background: "var(--surface-app)" }}
       >
         <RemeasureUnplacedHandles />
-        {fitOnResize && <FitRunCanvasOnResize />}
-        <Background variant={BackgroundVariant.Dots} gap={22} size={1.4} color="rgba(28,25,23,0.12)" />
+        {fitOnResize ? <FitRunCanvasOnResize /> : <OpenLongFlowAtItsStart />}
+        <CanvasDots />
         <Controls showInteractive={false} />
-        <MiniMap
-          pannable
-          zoomable
-          nodeColor={(n) => (n.type === "note" ? CAT_COLOR.note : typeMeta((n.data as NodeData)?.type || "").color)}
-          maskColor="rgba(28,25,23,0.05)"
-          style={{ background: "var(--surface-panel)" }}
-        />
       </ReactFlow>
     </div>
     </AddFromContext.Provider>
+    </NoteResizeContext.Provider>
     </NoteEditContext.Provider>
     </EdgeRouteContext.Provider>
     </EdgeDeleteContext.Provider>
     </NodeActionsContext.Provider>
+    </WorkflowAgentsContext.Provider>
   );
 }

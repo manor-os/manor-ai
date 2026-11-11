@@ -203,7 +203,7 @@ async def test_workspace_chat_messages_resolve_author_user(client: AsyncClient, 
     monkeypatch.setattr(
         workspace_chat,
         "_schedule_workspace_chat_processing",
-        lambda **_kwargs: None,
+        AsyncMock(side_effect=lambda **_kwargs: None),
     )
 
     headers = await _register(client, "ws_group_chat_author")
@@ -254,7 +254,7 @@ async def test_workspace_team_chat_is_shared_without_starting_agent(
     monkeypatch.setattr(
         workspace_chat,
         "_schedule_workspace_chat_processing",
-        lambda **kwargs: scheduled.append(kwargs),
+        AsyncMock(side_effect=lambda **kwargs: scheduled.append(kwargs)),
     )
     monkeypatch.setattr(
         workspace_chat.chat_service,
@@ -798,7 +798,7 @@ async def test_workspace_chat_message_schedules_workspace_agent_processing(
     workspace = create.json()
     calls: list[dict] = []
 
-    def _fake_schedule(**kwargs):
+    async def _fake_schedule(**kwargs):
         calls.append(kwargs)
 
     monkeypatch.setattr(workspace_chat, "_schedule_workspace_chat_processing", _fake_schedule)
@@ -813,6 +813,7 @@ async def test_workspace_chat_message_schedules_workspace_agent_processing(
     message = posted.json()
     assert calls == [
         {
+            "db": ANY,
             "conversation_id": message["conversation_id"],
             "workspace_id": workspace["id"],
             "entity_id": workspace["entity_id"],
@@ -2602,12 +2603,14 @@ async def test_workspace_heartbeat_endpoint_advances_operation_revision(client: 
     create = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Heartbeat Revision"})
     ws_id = create.json()["id"]
 
+    # A draft made before the heartbeat endpoint sets the same setting another way.
     draft = await client.post(
         f"/api/v1/workspaces/{ws_id}/operation/drafts",
         headers=headers,
-        json={"source_event_id": "before_heartbeat", "patches": []},
+        json={"source_event_id": "before_heartbeat", "patches": [
+            {"op": "heartbeat_policy.update", "payload": {"enabled": True, "cadence": "hourly"}}]},
     )
-    assert draft.status_code == 200
+    assert draft.status_code == 200, draft.text
     assert draft.json()["base_revision"] == 0
 
     enabled = await client.post(
@@ -2627,7 +2630,8 @@ async def test_workspace_heartbeat_endpoint_advances_operation_revision(client: 
         headers=headers,
         json={"user_confirmation": True},
     )
-    assert stale_apply.status_code == 409
+    # Both changed the cadence to different values: refused, nothing applied.
+    assert stale_apply.status_code == 409, stale_apply.text
 
     await db_session.refresh(workspace)
     assert workspace.operation_revision == 1
@@ -4028,7 +4032,10 @@ async def test_workspace_operation_allows_mcp_binding_without_allowed_tools(clie
 
 
 @pytest.mark.asyncio
-async def test_workspace_operation_integration_must_still_exist_when_applied(client: AsyncClient):
+async def test_workspace_operation_integration_not_connected_waits_and_asks(client: AsyncClient):
+    """A live edit may bind an integration before it is connected: the change
+    applies with it pending and the Workspace asks once, in its chat, to
+    connect it. A connection removed after review does not undo that."""
     headers = await _register(client, "ws_op_connected_integration")
     created = await client.post(
         "/api/v1/workspaces", headers=headers, json={"name": "Connected Integration"},
@@ -4038,17 +4045,6 @@ async def test_workspace_operation_integration_must_still_exist_when_applied(cli
         "owner_scope": "workspace_agent", "capability_type": "mcp",
         "integration_key": "linkedin",
     }}}
-
-    missing = await client.post(
-        f"/api/v1/workspaces/{ws_id}/operation/drafts",
-        headers=headers, json={"patches": [patch]},
-    )
-    assert missing.status_code == 200
-    assert missing.json()["validation"]["valid"] is False
-    assert any(
-        error.get("code") == "integration_not_connected"
-        for error in missing.json()["validation"]["errors"]
-    )
 
     connection = await client.post(
         "/api/v1/integrations", headers=headers,
@@ -4061,16 +4057,50 @@ async def test_workspace_operation_integration_must_still_exist_when_applied(cli
     )
     assert ready.status_code == 200
     assert ready.json()["validation"]["valid"] is True
+    assert not any(
+        warning.get("code") == "integration_pending_connection"
+        for warning in ready.json()["validation"]["warnings"]
+    )
 
     disconnected = await client.delete(
         f"/api/v1/integrations/{connection.json()['id']}", headers=headers,
     )
     assert disconnected.status_code in {200, 204}
+    missing = await client.post(
+        f"/api/v1/workspaces/{ws_id}/operation/drafts/{ready.json()['id']}/validate",
+        headers=headers,
+    )
+    assert missing.status_code == 200
+    assert missing.json()["valid"] is True
+    assert [
+        warning["provider"] for warning in missing.json()["warnings"]
+        if warning.get("code") == "integration_pending_connection"
+    ] == ["linkedin"]
+
     applied = await client.post(
         f"/api/v1/workspaces/{ws_id}/operation/drafts/{ready.json()['id']}/apply",
         headers=headers, json={"user_confirmation": True},
     )
-    assert applied.status_code == 400
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["pending_connections"] == ["linkedin"]
+
+    state = (await client.get(
+        f"/api/v1/workspaces/{ws_id}/operation/current", headers=headers,
+    )).json()["state"]
+    assert any(
+        binding.get("integration_key") == "linkedin"
+        for binding in state["capability_bindings"]
+    )
+    messages = (await client.get(
+        f"/api/v1/workspaces/{ws_id}/chat/messages", headers=headers,
+    )).json()
+    cards = [
+        message["pending_action"] for message in messages
+        if (message.get("pending_action") or {}).get("provider_key") == "linkedin"
+    ]
+    assert len(cards) == 1
+    assert cards[0]["kind"] == "needs_login"
+    assert cards[0]["recommendation"]["option"] == "sign_in"
 
 
 @pytest.mark.asyncio
@@ -4108,7 +4138,8 @@ async def test_workspace_operation_rejects_unknown_runtime_capability(client: As
 
 
 @pytest.mark.asyncio
-async def test_workspace_operation_stale_revision_is_rejected(client: AsyncClient, db_session):
+async def test_workspace_operation_draft_rebases_onto_a_newer_revision(client: AsyncClient, db_session):
+    """A newer revision that changed nothing the draft touches does not void it (#1572): it applies on top."""
     from sqlalchemy import select
     from packages.core.models.workspace import Workspace
 
@@ -4119,7 +4150,7 @@ async def test_workspace_operation_stale_revision_is_rejected(client: AsyncClien
     draft = await client.post(
         f"/api/v1/workspaces/{ws_id}/operation/drafts",
         headers=headers,
-        json={"patches": [{"op": "heartbeat_policy.update", "payload": {"enabled": True, "cadence": "daily"}}]},
+        json={"patches": [{"op": "heartbeat_policy.update", "payload": {"enabled": True, "cadence": "hourly"}}]},
     )
     draft_id = draft.json()["id"]
 
@@ -4133,7 +4164,10 @@ async def test_workspace_operation_stale_revision_is_rejected(client: AsyncClien
         json={"user_confirmation": True},
     )
 
-    assert applied.status_code == 409
+    assert applied.status_code == 200, applied.text
+    await db_session.refresh(workspace)
+    assert workspace.operation_revision == 4
+    assert workspace.heartbeat_enabled is True
 
 
 @pytest.mark.asyncio
@@ -8632,7 +8666,7 @@ async def test_workspace_agent_context_resolves_duplicate_operation_hitl_cards(
     monkeypatch.setattr(
         workspace_chat_router,
         "_schedule_workspace_chat_processing",
-        lambda **_: None,
+        AsyncMock(side_effect=lambda **_: None),
     )
 
     plain_text = await client.post(
@@ -11527,7 +11561,7 @@ async def test_workspace_architect_lint_allows_no_goal_but_requires_materializab
 
 
 @pytest.mark.asyncio
-async def test_workspace_creation_rejects_mapped_agent_with_unconnected_integration(db_session):
+async def test_workspace_creation_keeps_mapped_agent_with_unconnected_integration_pending(db_session):
     from packages.core.ai.tools.workspace_arch_tools import _lint_draft
     from packages.core.models.base import generate_ulid
     from packages.core.models.mcp import AgentMCPBinding, MCPServer
@@ -11564,11 +11598,9 @@ async def test_workspace_creation_rejects_mapped_agent_with_unconnected_integrat
         db_session, draft_id=draft.id, entity_id=entity_id, user_id=user_id,
     ))
 
-    assert any(
-        issue["where"] == "agent_mappings.work.mcp_bindings"
-        and issue["severity"] == "P0"
-        for issue in lint["issues"]
-    )
+    [issue] = [item for item in lint["issues"] if item["where"] == "agent_mappings.work.mcp_bindings"]
+    assert issue["severity"] == "P2"
+    assert "linkedin" in issue["message"]
 
 
 @pytest.mark.asyncio
@@ -11778,14 +11810,30 @@ async def test_workspace_architect_channel_remove_cleans_runtime_references(db_s
     assert "emails" not in draft.fields["services"][0]["description"].lower()
     assert "follow-up message" in draft.fields["goals"][0]["description"].lower()
     assert [item["name"] for item in draft.fields["knowledge_attachments"]] == ["Leasing Playbook & Message Templates"]
-    rendered = json.dumps(draft.fields, ensure_ascii=False).lower()
-    assert "email.send" not in rendered
-    assert "via webchat or email" not in rendered
-    assert "re-engagement email" not in rendered
-    assert "initial email response" not in rendered
+    # The user's approvals hold exactly as written: removing (or not yet
+    # connecting) a channel must never weaken a rule about it.
+    assert draft.fields["rules"] == fields["rules"]
     visible_fields = copy.deepcopy(draft.fields)
     visible_fields.pop("_removed_channels", None)
-    assert "email" not in json.dumps(visible_fields, ensure_ascii=False).lower()
+    visible_fields.pop("rules", None)
+    rendered = json.dumps(visible_fields, ensure_ascii=False).lower()
+    assert "via webchat or email" not in rendered
+    assert "initial email response" not in rendered
+    assert "email" not in rendered
+
+    from packages.core.ai.tools.workspace_arch_tools import _propose_rule
+
+    proposed = json.loads(await _propose_rule(
+        db_session, entity_id=entity_id, user_id=user_id, draft_id=draft.id,
+        rule_key="confirm_email_send", description="Ask me before sending any email.",
+        rule_type="approval_required", action_patterns=["email.send"],
+    ))
+    assert proposed["ok"] is True
+    await db_session.flush()
+    await db_session.refresh(draft)
+    added = next(rule for rule in draft.fields["rules"] if rule["rule_key"] == "confirm_email_send")
+    assert added["action_patterns"] == ["email.send"]
+    assert added["description"] == "Ask me before sending any email."
 
 
 def test_workspace_draft_reconcile_applies_removed_channel_tombstones():
@@ -11839,7 +11887,7 @@ async def test_workspace_architect_replaces_same_signature_automation(db_session
         {
             "automation_key": "new_lead_draft_response",
             "description": "Old draft response automation.",
-            "trigger": "on_message_received",
+            "trigger": "weekdays 09:00",
             "service_key": "followup_drafting",
         },
         {
@@ -11868,8 +11916,8 @@ async def test_workspace_architect_replaces_same_signature_automation(db_session
             user_id=user_id,
             draft_id=draft.id,
             automation_key="new_inquiry_draft",
-            description="Updated webchat inquiry automation.",
-            trigger="on_message_received",
+            description="Updated inquiry follow-up automation.",
+            trigger="weekdays 09:00",
             service_key="followup_drafting",
         )
     )
@@ -11879,6 +11927,96 @@ async def test_workspace_architect_replaces_same_signature_automation(db_session
     await db_session.refresh(draft)
     keys = [item["automation_key"] for item in draft.fields["automations"]]
     assert keys == ["daily_pipeline_summary", "new_inquiry_draft"]
+
+
+@pytest.mark.asyncio
+async def test_workspace_architect_automation_records_an_exact_schedule(db_session):
+    import copy
+    import json
+
+    from packages.core.ai.tools.workspace_arch_tools import _lint_draft, _propose_automation
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.user import Entity, User
+    from packages.core.models.workspace_draft import WorkspaceDraft
+    from packages.core.services.workspace_setup_service import DEFAULT_FIELDS
+
+    entity_id = generate_ulid()
+    user_id = generate_ulid()
+    db_session.add(Entity(id=entity_id, name="Schedule account"))
+    await db_session.flush()
+    db_session.add(User(
+        id=user_id, entity_id=entity_id, email=f"{user_id}@example.test",
+        password_hash="test-only", role="owner", timezone="America/Los_Angeles",
+    ))
+    draft = WorkspaceDraft(
+        entity_id=entity_id, user_id=user_id, fields=copy.deepcopy(DEFAULT_FIELDS),
+        messages=[], missing=[], ready=False, status="active",
+    )
+    db_session.add(draft)
+    await db_session.flush()
+
+    async def propose(key: str, trigger: str, **extra):
+        return json.loads(await _propose_automation(
+            db_session, entity_id=entity_id, user_id=user_id, draft_id=draft.id,
+            automation_key=key, description=f"Automation {key} for the team.", trigger=trigger, **extra,
+        ))
+
+    # Words alone resolve on the user's own clock; a named place wins.
+    weekly = await propose("weekly_report", "每周一上午9点")
+    beijing = await propose("daily_report", "每天北京时间8点")
+    explicit = await propose("month_review", "monthly review", cron_expr="0 10 1 * *", timezone="Asia/Shanghai")
+    assert weekly["schedule"] == {"schedule_kind": "cron", "cron_expr": "0 9 * * 1", "timezone": "America/Los_Angeles"}
+    assert beijing["schedule"] == {"schedule_kind": "cron", "cron_expr": "0 8 * * *", "timezone": "Asia/Shanghai"}
+    assert explicit["schedule"]["cron_expr"] == "0 10 1 * *"
+
+    # Nothing is silently turned into a daily run.
+    event = await propose("reply_on_message", "on_message_received")
+    biweekly = await propose("biweekly_sync", "每两周一次")
+    bad_zone = await propose("zoned", "daily 08:00", timezone="Mars/Olympus")
+    assert (event["ok"], event["code"]) == (False, "event_trigger_unsupported")
+    assert (biweekly["ok"], biweekly["code"]) == (False, "invalid_automation_schedule")
+    assert (bad_zone["ok"], bad_zone["code"]) == (False, "invalid_automation_timezone")
+
+    # A native Job aimed at a workflow the draft lacks would fail the whole
+    # creation; it is refused here. Without a target it runs the service agent.
+    dangling = await propose("weekly_flow", "每周一上午9点", scheduled_job={"execution_target": {"workflow_slug": "missing_flow"}})
+    native = await propose("weekly_native", "每周一上午9点", service_key="reporting", scheduled_job={"schedule": "0 9 * * 1"})
+    assert (dangling["ok"], dangling["code"]) == (False, "invalid_scheduled_job")
+    assert native["ok"] is True, native
+
+    await db_session.flush()
+    await db_session.refresh(draft)
+    stored = {item["automation_key"]: item for item in draft.fields["automations"]}
+    assert set(stored) == {"weekly_report", "daily_report", "month_review", "weekly_native"}
+    (job,) = draft.fields["scheduled_jobs"]
+    assert {key: job[key] for key in ("job_id", "schedule_kind", "cron_expr", "timezone", "execution_type")} == {
+        "job_id": "weekly_native", "schedule_kind": "cron", "cron_expr": "0 9 * * 1",
+        "timezone": "America/Los_Angeles", "execution_type": "agent",
+    }
+    assert job["execution_target"] == {"service_key": "reporting"} and "schedule" not in job
+    assert job["name"] == "Weekly native"
+
+    # A draft carrying an older prose event automation cannot be created as-is.
+    fields = dict(draft.fields)
+    fields["automations"] = [*fields["automations"], {
+        "automation_key": "legacy_event", "description": "Reply to leads.", "trigger": "on_message_received",
+    }]
+    draft.fields = fields
+    await db_session.flush()
+    # A native Job that runs only on request passes the same shared validator.
+    fields["scheduled_jobs"] = [*fields.get("scheduled_jobs", []), {
+        "job_id": "manual_setup", "schedule_kind": "manual",
+        "execution_type": "agent", "execution_target": {"service_key": "reporting"},
+    }]
+    draft.fields = fields
+    await db_session.flush()
+    lint = json.loads(await _lint_draft(db_session, entity_id=entity_id, user_id=user_id, draft_id=draft.id))
+    assert not [issue for issue in lint["issues"] if issue["where"] == "resources"]
+    blocking = [
+        issue for issue in lint["issues"]
+        if issue["where"].startswith("automations.") and issue["severity"] == "P0"
+    ]
+    assert [(issue["severity"], issue["where"]) for issue in blocking] == [("P0", "automations.legacy_event")]
 
 
 @pytest.mark.asyncio
@@ -12170,7 +12308,8 @@ async def test_finalize_setup_materializes_draft_automations(db_session):
                     "automation_key": "weekly_digest",
                     "service_key": "ops",
                     "trigger": "Every Monday at 8am",
-                    "description": "Prepare a weekly workspace digest.",
+                    # Days in the description are not the schedule.
+                    "description": "Prepare a weekly workspace digest covering Monday–Sunday.",
                 }
             ],
         },
@@ -12192,7 +12331,9 @@ async def test_finalize_setup_materializes_draft_automations(db_session):
     assert job.workspace_id == workspace_id
     assert job.execution_type == "agent"
     assert job.cron_expr == "0 8 * * 1"
-    assert "Prepare a weekly workspace digest." in (job.payload_message or "")
+    assert "Prepare a weekly workspace digest" in (job.payload_message or "")
+    # No executable service, so the Workspace needs setup and holds the Job.
+    assert (job.enabled, job.workspace_hold) == (False, True)
 
 
 @pytest.mark.asyncio

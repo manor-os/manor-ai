@@ -62,6 +62,15 @@ class CreditUsageLog(Base):
         Index("ix_credit_usage_entity", "entity_id", "created_at"),
         Index("ix_credit_usage_agent", "entity_id", "agent_id"),
         Index("ix_credit_usage_workspace", "entity_id", "workspace_id", "created_at"),
+        Index("ix_credit_usage_operation", "operation_id"),
+        Index(
+            "ix_credit_usage_media_job", "media_job_id",
+            postgresql_where=text("media_job_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_credit_usage_task", "task_id",
+            postgresql_where=text("task_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
@@ -71,6 +80,18 @@ class CreditUsageLog(Base):
     conversation_id: Mapped[Optional[str]] = mapped_column(String(26))
     user_id: Mapped[Optional[str]] = mapped_column(String(26))
     operation_id: Mapped[Optional[str]] = mapped_column(String(100))
+    """The Workflow or External Agent run that made the call."""
+    media_job_id: Mapped[Optional[str]] = mapped_column(String(26))
+    """The media job (video) this row bills; reconciles with the job's generation id."""
+    task_id: Mapped[Optional[str]] = mapped_column(String(26))
+    """The Task whose execution made the call; ``None`` outside Task work."""
+    pricing_source: Mapped[Optional[str]] = mapped_column(String(50))
+    """``official_tokens``, ``estimated``, ``unpriced``, ``unknown`` or ``gateway_reported`` (media calls only).
+
+    ``official_tokens``: the provider's reported output tokens at the model's
+    token price. ``estimated``: the list price for the clip's duration.
+    ``gateway_reported`` is kept for rows written before tokens were billed.
+    """
 
     # Raw token counts
     input_tokens: Mapped[int] = mapped_column(BigInteger, server_default="0")

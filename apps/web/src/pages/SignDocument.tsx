@@ -12,6 +12,7 @@ import { t } from "../lib/i18n";
 import { normalizeSignatureFields, type DocumentSignatureField } from "../lib/signatureFields";
 import "../components/permissions/signature.css";
 import { getPreferredTimeZone } from "../lib/format";
+import { PageLoading } from "../components/ui/Skeleton";
 
 interface PublicSignatureRequest {
   id: string;
@@ -252,7 +253,7 @@ export default function SignDocument() {
     if (context) {
       context.lineCap = "round";
       context.lineJoin = "round";
-      context.strokeStyle = "#1c1917";
+      context.strokeStyle = "#1d1d1f";
       context.lineWidth = 5;
       const saved = activeFieldId ? fieldValues[activeFieldId] : undefined;
       if (typeof saved === "string" && saved.startsWith("data:image/png;base64,")) {
@@ -415,7 +416,7 @@ export default function SignDocument() {
 
       <div className="signature-customer-body mx-auto max-w-6xl px-4 pb-8 pt-3 sm:px-6 sm:pb-12 sm:pt-5">
         {state.kind === "loading" && (
-          <p role="status" className="py-20 text-center text-sm text-stone-500">{t("status.loading")}</p>
+          <PageLoading label={t("status.loading")} minHeight={96} />
         )}
         {state.kind === "verification" && (
           <section className="signature-verification mx-auto max-w-md py-10 sm:py-16">
@@ -521,7 +522,7 @@ export default function SignDocument() {
                 {pdfError ? (
                   <p role="alert" className="py-20 text-center text-sm text-red-700">{pdfError}</p>
                 ) : !pdfReady && (
-                  <p role="status" className="py-20 text-center text-sm text-stone-500">{t("status.loading")}</p>
+                  <PageLoading label={t("status.loading")} minHeight={96} />
                 )}
                 <div hidden={!pdfReady} className="signature-document-sheet relative mx-auto w-fit max-w-full overflow-hidden bg-white">
                   <canvas

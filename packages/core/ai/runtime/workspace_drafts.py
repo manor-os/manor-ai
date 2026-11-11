@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import asyncio
+import contextlib
 import json
 import logging
 from collections.abc import Mapping, Sequence
@@ -9,9 +10,11 @@ from typing import Any, Awaitable, Callable
 
 from packages.core.ai.runtime.control import RuntimeTurnAborted
 from packages.core.ai.runtime.surfaces import ChatSurface
+from packages.core.ai.runtime.tool_context import RUNTIME_TOOL_CONTEXT_KEYS
 from packages.core.ai.runtime.workspace_creation_authorization import (
     WorkspaceCreationAuthorizationStatus,
 )
+from packages.core.constants.workspace_drafts import STAFF_REQUEST_TEXT_FIELD
 
 
 logger = logging.getLogger(__name__)
@@ -19,6 +22,22 @@ logger = logging.getLogger(__name__)
 AGENT_BINDING_REPAIR_TOOLS = frozenset({
     "ws_search_capabilities", "ws_request_custom_agent", "ws_lint_draft",
 })
+# Tools that wait minutes on a model: a part designer, the capability matcher
+# or Skill discovery. In a ``DraftTurn`` they lock the draft only to read their
+# snapshot and again to save the result, through the ``draft_phase`` they are
+# given, so the model runs with no transaction. Every part designer's command
+# tool is one too (``draft_command_tools``).
+DRAFT_COMMAND_TOOLS = frozenset({
+    "ws_search_capabilities", "ws_request_custom_agent",
+    # Accepting a part may write Agents, which finds their missing Skills.
+    "ws_accept_parts",
+})
+
+
+def draft_command_tools() -> frozenset[str]:
+    from packages.core.services.workspace_part_designers import designer_command_tools
+
+    return DRAFT_COMMAND_TOOLS | designer_command_tools()
 
 
 # The authorization classifier starts with the turn; by the time the model
@@ -61,9 +80,21 @@ async def _workspace_draft_start_allowed(runtime_envelope: Any | None) -> bool:
     )
 
 
+def _draft_turn_question(draft: Any) -> dict[str, Any] | None:
+    """The question the architect asked in the turn just recorded, if any."""
+    messages = list(getattr(draft, "messages", None) or [])
+    last = messages[-1] if messages else None
+    if isinstance(last, dict) and last.get("role") == "assistant" and isinstance(last.get("question"), dict):
+        return last["question"]
+    return None
+
+
 def _draft_artifact_payload(draft: Any, reply: str) -> dict[str, Any]:
-    fields = dict(getattr(draft, "fields", None) or {})
-    return {
+    fields = {
+        key: value for key, value in dict(getattr(draft, "fields", None) or {}).items()
+        if key not in {"_pending_question", STAFF_REQUEST_TEXT_FIELD}
+    }
+    payload = {
         "artifact_kind": "workspace_draft",
         "draft_id": draft.id,
         "status": draft.status,
@@ -73,6 +104,16 @@ def _draft_artifact_payload(draft: Any, reply: str) -> dict[str, Any]:
         "assistant_reply": reply,
         "title": fields.get("name") or "Workspace draft",
     }
+    question = _draft_turn_question(draft)
+    if question is not None:
+        # The chat shows these answer buttons under the reply; a pick comes
+        # back as the user's next message for continue_workspace_draft.
+        payload["question"] = question
+        payload["question_guidance"] = (
+            "Ask the user this question in your reply, without other options; the "
+            "chat shows its answer buttons, recommended first."
+        )
+    return payload
 
 
 async def runtime_start_workspace_draft_action(
@@ -81,6 +122,7 @@ async def runtime_start_workspace_draft_action(
     user_id: str = "",
     initial_brief: str | None = None,
     runtime_envelope: Any | None = None,
+    active_user_message: str | None = None,
 ) -> str:
     """Start a workspace draft through the Runtime draft action boundary."""
 
@@ -113,6 +155,7 @@ async def runtime_start_workspace_draft_action(
                 entity_id=entity_id,
                 user_id=user_id,
                 initial_brief=(initial_brief or "").strip() or None,
+                staff_request_text=active_user_message or "",
             )
             await db.commit()
 
@@ -134,6 +177,7 @@ async def runtime_continue_workspace_draft_action(
     user_id: str,
     draft_id: str,
     message: str,
+    active_user_message: str | None = None,
 ) -> str:
     """Apply another ordinary-Chat turn to the caller's draft."""
     if not entity_id or not user_id:
@@ -154,6 +198,7 @@ async def runtime_continue_workspace_draft_action(
                 entity_id=entity_id,
                 user_id=user_id,
                 user_message=message.strip(),
+                staff_request_text=active_user_message or "",
             )
             await db.commit()
         return json.dumps(_draft_artifact_payload(draft, reply))
@@ -175,6 +220,7 @@ async def runtime_run_workspace_architect_turn(
     on_tool_end: Any | None = None,
     repair_service_keys: tuple[str, ...] | None = None,
     turn: Any | None = None,
+    mcp_client: bool = False,
 ) -> str:
     """Run one workspace architect turn through the Runtime draft boundary."""
 
@@ -192,6 +238,7 @@ async def runtime_run_workspace_architect_turn(
         on_tool_end=on_tool_end,
         **({"repair_service_keys": repair_service_keys} if repair_service_keys is not None else {}),
         **({"turn": turn} if turn is not None else {}),
+        **({"mcp_client": True} if mcp_client else {}),
     )
 
 
@@ -211,24 +258,60 @@ def runtime_workspace_architect_tool_executor(
     user_id: str | None,
     repair_service_keys: tuple[str, ...] | None = None,
     turn: Any | None = None,
+    stream_handler: Any | None = None,
 ) -> Callable[[str, dict[str, Any]], Awaitable[str]]:
     """Build the Runtime-owned executor for workspace architect draft tools.
 
     With a ``DraftTurn``, each tool call re-locks the draft, and its writes
     commit when it returns, so no transaction (row lock, connection or
     admission permit) stays open while the model works between tool calls.
+    A ``draft_command_tools`` call holds none while its sub-agent works either;
+    each of its phases tells ``stream_handler`` the turn is still going.
     """
 
     from packages.core.ai.tools.workspace_arch_tools import (
         HANDLERS,
         REQUEST_CUSTOM_AGENT_SCHEMA,
+        _tool_failed,
     )
     from packages.core.contracts.json_schema import SchemaContractValidatorFactory
 
     tool_lock = asyncio.Lock()
+    turn_lock = asyncio.Lock()
+    # Binding repair runs without a turn and keeps its one locked transaction.
+    phased_tools = draft_command_tools() if turn is not None and repair_service_keys is None else frozenset()
     agent_design_validator = SchemaContractValidatorFactory.build(
         REQUEST_CUSTOM_AGENT_SCHEMA["function"]["parameters"],
     )
+
+    async def rollback_quietly() -> None:
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001 - the original failure wins
+            logger.warning("architect tool rollback failed", exc_info=True)
+
+    @contextlib.asynccontextmanager
+    async def draft_phase():
+        # One short locked transaction; it aborts the turn like any tool's.
+        async with turn_lock, tool_lock:
+            try:
+                await turn.lock()
+                yield
+            except BaseException:
+                await rollback_quietly()
+                raise
+            try:
+                await turn.release()
+            except Exception as exc:
+                await rollback_quietly()
+                raise RuntimeTurnAborted(
+                    "Draft changes could not be saved; send the message again",
+                ) from exc
+        if stream_handler is not None:
+            try:
+                await stream_handler("tool_progress", {})
+            except Exception:  # noqa: BLE001 - telling the client never stops the work
+                logger.debug("architect tool progress not delivered", exc_info=True)
 
     async def executor(name: str, args: dict[str, Any]) -> str:
         if repair_service_keys is not None:
@@ -249,15 +332,22 @@ def runtime_workspace_architect_tool_executor(
         if name == "ws_request_custom_agent":
             public_args = {
                 key: value for key, value in next_args.items()
-                if key not in {
-                    "_runtime_run_id_from_context",
-                    "_runtime_tool_call_id_from_context",
-                    "_runtime_tool_attempt_from_context",
-                }
+                if key not in RUNTIME_TOOL_CONTEXT_KEYS
             }
             error = next(agent_design_validator.iter_errors(public_args), None)
             if error is not None:
                 return json.dumps({"ok": False, "error": f"invalid agent design: {error.message}"})
+        # Without a turn the caller's transaction spans the call, as before.
+        next_args.pop("draft_phase", None)
+        if name in phased_tools:
+            next_args["draft_phase"] = draft_phase
+            try:
+                return await handler(db, entity_id=entity_id, user_id=user_id or "", **next_args)
+            except RuntimeTurnAborted:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("architect tool %s crashed", name)
+                return _tool_failed(exc)
         async with tool_lock:
             try:
                 original_mapping = None
@@ -348,20 +438,15 @@ def runtime_workspace_architect_tool_executor(
                 raise
             except Exception as exc:  # noqa: BLE001
                 logger.exception("architect tool %s crashed", name)
-                return json.dumps({"ok": False, "error": f"tool crashed: {exc}"})
+                return _tool_failed(exc)
 
     if turn is None:
         return executor
 
-    turn_lock = asyncio.Lock()
-
-    async def rollback_quietly() -> None:
-        try:
-            await db.rollback()
-        except Exception:  # noqa: BLE001 - the original failure wins
-            logger.warning("architect tool rollback failed", exc_info=True)
-
     async def executor_in_turn(name: str, args: dict[str, Any]) -> str:
+        if name in phased_tools:
+            # It takes its own short draft_phase transactions.
+            return await executor(name, args)
         # agentic_loop runs tools in child tasks, possibly in parallel; they
         # share the turn's Session, so one tool transaction at a time.
         async with turn_lock:

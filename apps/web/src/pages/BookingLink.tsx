@@ -1,3 +1,4 @@
+import { displayReadInterval } from "../lib/readRefreshPolicy";
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
@@ -162,7 +163,7 @@ export default function BookingLink() {
     ),
     enabled: Boolean(slug && visibleMonth),
     staleTime: 0,
-    refetchInterval: confirmation ? false : AVAILABILITY_REFRESH_INTERVAL_MS,
+    refetchInterval: (query) => confirmation ? false : displayReadInterval(query.state, AVAILABILITY_REFRESH_INTERVAL_MS),
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: !confirmation,
   });

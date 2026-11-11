@@ -20,7 +20,6 @@ from html.parser import HTMLParser
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.config import get_settings
 from packages.core.models.site import Site
 from packages.core.services import site_publisher as sp
 
@@ -96,13 +95,6 @@ def page_address(rel_path: str) -> str:
     return "/" + rel
 
 
-def site_base_url(site: Site) -> str:
-    if site.custom_domain and site.domain_status == "active":
-        return f"https://{site.custom_domain}"
-    domain = (get_settings().MANOR_SITES_DOMAIN or "").strip().lower()
-    return f"https://{site.slug}.{domain}" if domain else ""
-
-
 @dataclass(frozen=True)
 class SitePage:
     address: str   # e.g. /pricing/
@@ -153,7 +145,7 @@ def site_pages(site: Site) -> tuple[SitePage, ...]:
     root = sp.site_serving_root(site.entity_id, site)
     if not os.path.isdir(root):
         return ()
-    return _snapshot_pages(os.path.realpath(root), int(site.revision), site_base_url(site))
+    return _snapshot_pages(os.path.realpath(root), int(site.revision), sp.site_public_url(site))
 
 
 @dataclass(frozen=True)
@@ -190,7 +182,7 @@ async def published_sites_for_webchat(
     for site in sites:
         pages = site_pages(site)
         if pages:
-            contents.append(PublishedSiteContent(name=site.name, url=site_base_url(site), pages=pages))
+            contents.append(PublishedSiteContent(name=site.name, url=sp.site_public_url(site), pages=pages))
     return contents
 
 

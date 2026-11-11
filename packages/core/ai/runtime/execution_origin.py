@@ -30,6 +30,13 @@ def runtime_origin_task_id(kwargs: dict[str, Any] | None, *, entity_id: str) -> 
     return runtime_envelope_task_id(context.runtime_envelope, entity_id=entity_id)
 
 
+def runtime_tool_is_chat_turn(kwargs: dict[str, Any], *, entity_id: str) -> bool:
+    """A team member's own Chat turn: not a background run, a Workflow or a public channel."""
+    context = runtime_tool_call_context_from_kwargs(kwargs, entity_id=entity_id)
+    profile = normalize_runtime_profile(getattr(context.runtime_envelope, "profile", None))
+    return profile in {RuntimeProfile.OWNER_COPILOT, RuntimeProfile.WORKSPACE_OPERATOR}
+
+
 async def runtime_tool_is_user_requested(
     db: Any,
     *,

@@ -431,11 +431,11 @@ async def extract_memories_from_conversation(
     db: AsyncSession, entity_id: str, conversation_id: str, *,
     agent_id: str | None = None, user_id: str | None = None,
 ):
-    """Return reviewable candidates through the shared chat admission service.
+    """Return the memory writes made through the shared chat admission service.
 
     The caller supplies the authenticated user, never an inferred owner. This
-    legacy API now has the same evidence and approval rules as scheduled Chat
-    and compact; explicit manual add_memory remains a direct operator edit.
+    legacy API has the same evidence and layer rules as scheduled Chat and
+    compact; explicit manual add_memory remains a direct operator edit.
     """
     from types import SimpleNamespace
     from packages.core.memory.compaction import MemoryScopeDenied, prepare_chat_memory

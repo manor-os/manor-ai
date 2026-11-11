@@ -84,10 +84,20 @@ class NotificationPolicy(_StrictContract):
         ),
     )
     recipient: Literal["owner"] = "owner"
+    # Only channels notification routing can deliver to (SUPPORTED_CHANNELS).
     channels: list[
-        Literal["inapp", "email", "telegram", "wechat", "slack", "discord", "whatsapp"]
-    ] = Field(default_factory=lambda: ["inapp"], min_length=1, max_length=7)
+        Literal["inapp", "email", "telegram", "wechat", "slack", "discord"]
+    ] = Field(default_factory=lambda: ["inapp"], min_length=1, max_length=6)
     content_mode: Literal["full", "summary_and_link"] = "summary_and_link"
+
+    @field_validator("channels", mode="before")
+    @classmethod
+    def drop_undeliverable_channels(cls, value):
+        # Earlier rows could name "whatsapp", which routing never delivered
+        # to (every attempt failed in the outbox). Keep them loadable.
+        if isinstance(value, list) and "whatsapp" in value:
+            value = [channel for channel in value if channel != "whatsapp"] or ["inapp"]
+        return value
 
     @field_validator("channels")
     @classmethod

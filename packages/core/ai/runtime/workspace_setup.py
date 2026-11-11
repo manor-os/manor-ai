@@ -513,6 +513,7 @@ def runtime_knowledge_starter_document_prompt(
     workspace_kind: str,
     primary_work: str,
     source_excerpt: str | None = None,
+    outline: list[str] | None = None,
 ) -> str:
     """Build the Runtime-owned prompt for starter knowledge base documents."""
 
@@ -535,6 +536,12 @@ def runtime_knowledge_starter_document_prompt(
             "mark gaps explicitly as 'to be confirmed'.\n"
             f"<source_excerpt>\n{excerpt}\n</source_excerpt>"
         )
+    sections = [str(section).strip() for section in outline or [] if str(section or "").strip()]
+    if sections:
+        prompt += (
+            "\n\nUse exactly these sections, in this order, as the document's headings:\n"
+            + "\n".join(f"- {section}" for section in sections)
+        )
     return prompt
 
 
@@ -546,6 +553,7 @@ def runtime_knowledge_starter_document_messages(
     workspace_kind: str,
     primary_work: str,
     source_excerpt: str | None = None,
+    outline: list[str] | None = None,
 ) -> list[dict[str, str]]:
     """Build Runtime one-shot messages for starter knowledge base documents."""
 
@@ -558,6 +566,7 @@ def runtime_knowledge_starter_document_messages(
             workspace_kind=workspace_kind,
             primary_work=primary_work,
             source_excerpt=source_excerpt,
+            outline=outline,
         ),
     }]
 
@@ -573,6 +582,7 @@ async def runtime_execute_knowledge_starter_document_completion(
     primary_work: str,
     user_id: str | None = None,
     source_excerpt: str | None = None,
+    outline: list[str] | None = None,
 ) -> RuntimeTextCompletionResult:
     """Execute starter knowledge document generation with Runtime-owned defaults."""
 
@@ -584,6 +594,7 @@ async def runtime_execute_knowledge_starter_document_completion(
             workspace_kind=workspace_kind,
             primary_work=primary_work,
             source_excerpt=source_excerpt,
+            outline=outline,
         ),
         entity_id=entity_id,
         source=RUNTIME_KNOWLEDGE_GEN_SOURCE,

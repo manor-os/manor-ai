@@ -19,6 +19,7 @@ import {
   workflowInputErrorPath,
   workflowSchemaPreset,
   workflowSchemaChoices,
+  workflowSchemaControl,
   workflowSchemaPictureChoices,
   workflowSchemaSuggestions,
   workflowSchemaChosen,
@@ -30,7 +31,10 @@ import {
   workflowSchemaCompactDocuments,
   workflowSchemaEntries,
   workflowSchemaFieldIds,
+  workflowSchemaFieldShown,
+  workflowSchemaHiddenResets,
   workflowSchemaOptionLabel,
+  workflowSchemaProjectSelect,
   workflowSchemaRecordSelect,
   workflowSchemaSelectValue,
   workflowSchemaType,
@@ -38,7 +42,7 @@ import {
   type WorkflowInputSchema,
 } from "./workflowSchema";
 import WorkflowKnowledgeFileField from "./WorkflowKnowledgeFileField";
-import WorkflowRecordSelect from "./WorkflowRecordSelect";
+import WorkflowRecordSelect, { WorkflowRecordChoices } from "./WorkflowRecordSelect";
 import { getPreferredTimeZone } from "../../lib/format";
 import WorkflowInputSuggestions from "./WorkflowInputSuggestions";
 
@@ -49,10 +53,22 @@ export {
   workflowSchemaDescribedBy,
   workflowSchemaEntries,
   workflowSchemaFieldIds,
+  workflowSchemaFieldShown,
   workflowSchemaType,
   type WorkflowInputSchema,
 } from "./workflowSchema";
 import SuggestionGallery from "./SuggestionGallery";
+import ConfiguredImage from "../ui/ConfiguredImage";
+import {
+  AddressField,
+  ColorField,
+  DateRangeField,
+  LineItemsField,
+  RatingField,
+  RichTextField,
+  SignatureField,
+  TagsField,
+} from "./WorkflowFormControlFields";
 
 export function workflowSchemaDraft(schema: WorkflowInputSchema, supplied: unknown): unknown {
   return workflowSchemaDraftPure(schema, supplied, getPreferredTimeZone());
@@ -93,6 +109,10 @@ export function parseWorkflowSchemaDraft(
     anyOfRequired: (fields) => t("component.workspace_chat.workflow_input_any_of_required", {
       fields: fields.join(t("component.workspace_chat.workflow_input_list_separator")),
     }),
+    invalidEmail: t("component.workspace_chat.workflow_input_invalid_email"),
+    invalidPhone: t("component.workspace_chat.workflow_input_invalid_phone"),
+    invalidColor: t("component.workspace_chat.workflow_input_invalid_color"),
+    dateRangeOrder: t("component.workspace_chat.workflow_input_range_order"),
   });
 }
 
@@ -129,6 +149,16 @@ interface WorkflowProjectCandidate {
   created_at: string;
 }
 
+/** How a project's stage reads under its name in a picker. */
+function projectStageLabel(stage: string): string {
+  // Other project types name their own stage, e.g. "Awaiting acceptance".
+  return stage === "youtube_saved"
+    ? t("component.workspace_chat.workflow_project_published")
+    : stage === "video_ready"
+      ? t("component.workspace_chat.workflow_project_ready")
+      : humanizeKey(stage);
+}
+
 function WorkflowProjectSelect({
   id,
   schema,
@@ -138,6 +168,8 @@ function WorkflowProjectSelect({
   required,
   describedBy,
   invalid,
+  multiple = false,
+  label,
   onChange,
 }: {
   id: string;
@@ -148,10 +180,14 @@ function WorkflowProjectSelect({
   required: boolean;
   describedBy?: string;
   invalid: boolean;
+  /** Several records of the type, kept as a line list of project ids. */
+  multiple?: boolean;
+  label?: string;
   onChange: (value: string) => void;
 }) {
   const ui = schema["x-ui"] || {};
   const projectType = String(ui.project_type || "").trim();
+  // No allowed_stages offers the type's records in every stage.
   const stages = ui.allowed_stages || [];
   const [candidates, setCandidates] = useState<WorkflowProjectCandidate[]>([]);
   const [loading, setLoading] = useState(Boolean(workspaceId));
@@ -159,7 +195,7 @@ function WorkflowProjectSelect({
 
   useEffect(() => {
     let active = true;
-    if (!workspaceId || !projectType || stages.length === 0) {
+    if (!workspaceId || !projectType) {
       setCandidates([]);
       setLoading(false);
       return () => { active = false; };
@@ -171,6 +207,8 @@ function WorkflowProjectSelect({
       workspace_id: workspaceId,
       project_type: projectType,
       stages,
+      // Several picks come from the whole list, not only the latest records.
+      ...(multiple ? { limit: 500 } : {}),
     }).then((items) => {
       if (active) setCandidates(items);
     }).catch(() => {
@@ -182,10 +220,23 @@ function WorkflowProjectSelect({
       if (active) setLoading(false);
     });
     return () => { active = false; };
-  }, [workspaceId, projectType, stages.join("\u0000")]);
+  }, [workspaceId, projectType, stages.join("\u0000"), multiple]);
 
   if (!workspaceId) {
-    return (
+    // Without a Workspace there is nothing to list; ids are typed, one per line for several.
+    return multiple ? (
+      <textarea
+        id={id}
+        value={String(value ?? "")}
+        onChange={(event) => onChange(event.target.value)}
+        rows={4}
+        disabled={disabled}
+        required={required}
+        aria-required={required}
+        aria-invalid={invalid}
+        aria-describedby={describedBy}
+      />
+    ) : (
       <input
         id={id}
         type="text"
@@ -200,42 +251,54 @@ function WorkflowProjectSelect({
     );
   }
 
-  const selected = String(value ?? "");
-  const selectedIsMissing = Boolean(selected && !candidates.some((item) => item.id === selected));
-  const groups = stages.map((stage) => ({
-    stage,
-    candidates: candidates.filter((candidate) => candidate.current_stage === stage),
-  })).filter((group) => group.candidates.length > 0);
+  // Listed stage by stage in the declared order; without stages, newest first.
+  const ordered = stages.length
+    ? stages.flatMap((stage) => candidates.filter((candidate) => candidate.current_stage === stage))
+    : candidates;
+  const options = ordered.map((candidate) => ({
+    value: candidate.id,
+    label: `${candidate.title}${candidate.youtube_video_id ? ` · ${candidate.youtube_video_id}` : ""} · ${new Date(candidate.created_at).toLocaleDateString(undefined, { timeZone: getPreferredTimeZone() })}`,
+    description: projectStageLabel(candidate.current_stage),
+  }));
+  const ariaLabel = label || schema.title || humanizeKey(projectType);
+  // A prefilled id stays visible even after its record left the list.
+  const missing = [...workflowSchemaChosen(multiple ? value : String(value ?? ""))]
+    .filter((option) => !candidates.some((item) => item.id === option))
+    .map((option) => ({ value: option, label: option, description: undefined }));
   return (
     <>
-      <Select
-        id={id}
-        role="combobox"
-        value={selected}
-        onChange={onChange}
-        disabled={disabled || loading || failed}
-        ariaRequired={required}
-        ariaInvalid={invalid || failed}
-        ariaDescribedBy={describedBy}
-        ariaLabel={schema.title || humanizeKey(projectType)}
-        placeholder={loading
-          ? t("component.workspace_chat.workflow_project_loading")
-          : t("component.chat_action_card.select")}
-        filterable
-        options={[
-          ...(selectedIsMissing ? [{ value: selected, label: selected }] : []),
-          ...groups.flatMap((group) => group.candidates.map((candidate) => ({
-            value: candidate.id,
-            label: `${candidate.title}${candidate.youtube_video_id ? ` · ${candidate.youtube_video_id}` : ""} · ${new Date(candidate.created_at).toLocaleDateString(undefined, { timeZone: getPreferredTimeZone() })}`,
-            // Other project types name their own stage, e.g. "Awaiting acceptance".
-            description: group.stage === "youtube_saved"
-              ? t("component.workspace_chat.workflow_project_published")
-              : group.stage === "video_ready"
-                ? t("component.workspace_chat.workflow_project_ready")
-                : humanizeKey(group.stage),
-          }))),
-        ]}
-      />
+      {multiple ? (
+        loading
+          ? <small id={id}>{t("component.workspace_chat.workflow_project_loading")}</small>
+          : <WorkflowRecordChoices
+            id={id}
+            options={[...options, ...missing]}
+            value={value}
+            disabled={disabled || failed}
+            required={required}
+            describedBy={describedBy}
+            invalid={invalid || failed}
+            label={ariaLabel}
+            onChange={onChange}
+          />
+      ) : (
+        <Select
+          id={id}
+          role="combobox"
+          value={String(value ?? "")}
+          onChange={onChange}
+          disabled={disabled || loading || failed}
+          ariaRequired={required}
+          ariaInvalid={invalid || failed}
+          ariaDescribedBy={describedBy}
+          ariaLabel={ariaLabel}
+          placeholder={loading
+            ? t("component.workspace_chat.workflow_project_loading")
+            : t("component.chat_action_card.select")}
+          filterable
+          options={[...missing, ...options]}
+        />
+      )}
       {failed && (
         <small role="alert">{t("component.workspace_chat.workflow_project_load_failed")}</small>
       )}
@@ -274,15 +337,23 @@ function WorkflowSchemaFieldTree({
   workflowId,
   path = [],
   idNamespace,
-  onChange,
+  onChange: onFieldChange,
   onFileBusyChange,
 }: WorkflowSchemaFieldTreeProps) {
   const required = new Set(schema.required || []);
   const compactDocuments = workflowSchemaCompactDocuments(schema);
+  const level = path.length ? workflowValueAtPath(value, path) : value;
+  // An answer on this level that hides other inputs (x-ui.visible_when) puts them back to their defaults.
+  const onChange = (changedPath: string[], nextValue: unknown) => {
+    onFieldChange(changedPath, nextValue);
+    if (changedPath.length !== path.length + 1) return;
+    const resets = workflowSchemaHiddenResets(schema, changedPath[path.length], nextValue, getPreferredTimeZone());
+    for (const [field, reset] of Object.entries(resets)) onFieldChange([...path, field], reset);
+  };
   return (
     <div className="workflow-starter-input-schema-fields">
       {workflowSchemaEntries(schema).map(([key, child]) => {
-        if (child["x-ui"]?.hidden) return null;
+        if (child["x-ui"]?.hidden || !workflowSchemaFieldShown(child, level)) return null;
         const childPath = [...path, key];
         const schemaType = workflowSchemaType(child);
         const fieldIds = workflowSchemaFieldIds(idNamespace, rootKey, childPath);
@@ -295,8 +366,9 @@ function WorkflowSchemaFieldTree({
           Boolean(child.description),
           Boolean(error),
         );
-        // An object with its own control (a part of a track) is one field, not a group of fields.
-        if (schemaType === "object" && child["x-ui"]?.control !== "audio_clip") {
+        const formControl = workflowSchemaControl(child);
+        // An object with its own control (a part of a track, a date range) is one field, not a group of fields.
+        if (formControl === "group") {
           const nested = (
             <WorkflowSchemaFieldTree
               rootKey={rootKey}
@@ -402,6 +474,7 @@ function WorkflowSchemaFieldTree({
                 onBusyChange={(busy) => onFileBusyChange(fieldIds.fieldId, busy)}
                 compact={compactDocuments}
                 accept={ui.accept}
+                capture={ui.capture}
                 onChange={(nextValue) => onChange(childPath, nextValue)}
               />
               {error && <small id={fieldIds.errorId} role="alert">
@@ -409,6 +482,63 @@ function WorkflowSchemaFieldTree({
                   ? t("component.workflow_wait_document.required")
                   : error}
               </small>}
+            </div>
+          );
+        }
+        // Controls that are one answer drawn their own way: each is a labelled group.
+        const ownControl = formControl === "signature" || formControl === "date_range" || formControl === "tags"
+          || formControl === "line_items" || formControl === "rating" || formControl === "color"
+          || formControl === "rich_text" || formControl === "address";
+        if (ownControl) {
+          const fieldLabel = `${label}${isRequired ? " *" : ""}`;
+          const childErrors = Object.entries(errors).filter(([path, message]) => message
+            && path.startsWith(`${workflowInputErrorPath(rootKey, childPath)}.`));
+          // A range's own dates report under it: show the first.
+          const shownError = formControl === "signature" && error && isRequired && (!Array.isArray(childValue) || childValue.length === 0)
+            ? t("component.workspace_chat.workflow_input_required")
+            : error || (formControl === "date_range" ? childErrors[0]?.[1] : "");
+          const controlProps = {
+            id: fieldIds.fieldId, label: fieldLabel, disabled, required: isRequired,
+            invalid: Boolean(shownError), describedBy,
+          };
+          return (
+            <div
+              key={key}
+              className={`workflow-starter-input-field${formControl === "signature" || formControl === "line_items" || formControl === "rich_text"
+                ? " workflow-starter-input-field--files" : ""}`}
+              role="group"
+              aria-labelledby={`${fieldIds.fieldId}-label`}
+            >
+              <span id={`${fieldIds.fieldId}-label`}>{fieldLabel}</span>
+              {child.description && <small id={fieldIds.helpId} className="workflow-starter-input-help">{child.description}</small>}
+              {formControl === "signature" ? (
+                <SignatureField {...controlProps} value={childValue} workspaceId={workspaceId} workflowRunInput
+                  onBusyChange={(busy) => onFileBusyChange(fieldIds.fieldId, busy)}
+                  onChange={(nextValue) => onChange(childPath, nextValue)} />
+              ) : formControl === "date_range" ? (
+                <DateRangeField {...controlProps} value={childValue}
+                  mode={child.properties?.start?.format === "date-time" ? "datetime" : "date"}
+                  onChange={(nextValue) => onChange(childPath, nextValue)} />
+              ) : formControl === "tags" ? (
+                <TagsField {...controlProps} value={childValue} placeholder={ui.placeholder}
+                  onChange={(nextValue) => onChange(childPath, nextValue)} />
+              ) : formControl === "line_items" ? (
+                <LineItemsField {...controlProps} schema={child} value={childValue} errors={errors}
+                  errorPath={workflowInputErrorPath(rootKey, childPath)}
+                  onChange={(nextValue) => onChange(childPath, nextValue)} />
+              ) : formControl === "rating" ? (
+                <RatingField {...controlProps} schema={child} value={childValue}
+                  onChange={(nextValue) => onChange(childPath, nextValue)} />
+              ) : formControl === "color" ? (
+                <ColorField {...controlProps} value={childValue} onChange={(nextValue) => onChange(childPath, nextValue)} />
+              ) : formControl === "rich_text" ? (
+                <RichTextField {...controlProps} value={childValue} rows={ui.rows} placeholder={ui.placeholder}
+                  onChange={(nextValue) => onChange(childPath, nextValue)} />
+              ) : (
+                <AddressField {...controlProps} value={childValue} placeholder={ui.placeholder}
+                  onChange={(nextValue) => onChange(childPath, nextValue)} />
+              )}
+              {shownError && <small id={fieldIds.errorId} role="alert">{shownError}</small>}
             </div>
           );
         }
@@ -432,7 +562,7 @@ function WorkflowSchemaFieldTree({
               disabled={disabled}
               onClick={() => pick(choice.value)}
             >
-              <img src={choice.image} alt="" loading="lazy" decoding="async" />
+              <ConfiguredImage src={choice.image} alt="" loading="lazy" decoding="async" />
               <strong>{choice.label}</strong>
               {choice.detail && <span>{choice.detail}</span>}
             </button>
@@ -471,6 +601,8 @@ function WorkflowSchemaFieldTree({
         if ((ui.control === "segmented" || ui.control === "aspect") && child.enum?.length) {
           // A short fixed list reads as one row of buttons; ratios also draw their frame.
           const chosen = workflowSchemaSelectValue(child, childValue);
+          // What the picked option means (e.g. what the AI decides), read under the buttons.
+          const chosenDetail = child["x-enum-descriptions"]?.[child.enum.findIndex((option) => String(option) === chosen)];
           return (
             <div key={key} className="workflow-starter-input-field">
               <span id={`${fieldIds.fieldId}-label`}>{label}{isRequired ? " *" : ""}</span>
@@ -509,6 +641,7 @@ function WorkflowSchemaFieldTree({
                   );
                 })}
               </div>
+              {chosenDetail && <small className="workflow-starter-input-help">{chosenDetail}</small>}
               {error && <small id={fieldIds.errorId} role="alert">{error}</small>}
             </div>
           );
@@ -537,6 +670,36 @@ function WorkflowSchemaFieldTree({
                 ? <textarea {...fieldProps} rows={ui.rows || 3} onChange={(event) => onChange(childPath, event.target.value)} />
                 : <input {...fieldProps} type="text" onChange={(event) => onChange(childPath, event.target.value)} />}
               <SuggestionGallery suggestions={suggestions} value={text} label={label} disabled={disabled} onPick={pick} />
+              {error && <small id={fieldIds.errorId} role="alert">{error}</small>}
+            </div>
+          );
+        }
+        if (workflowSchemaProjectSelect(child)?.multiple) {
+          // Several Workspace records: a group of chips, not a label around one control.
+          return (
+            <div
+              key={key}
+              className="workflow-starter-input-field workflow-starter-input-field--choices"
+              role="group"
+              aria-labelledby={`${fieldIds.fieldId}-label`}
+              aria-describedby={describedBy}
+              aria-invalid={Boolean(error)}
+            >
+              <span id={`${fieldIds.fieldId}-label`}>{label}{isRequired ? " *" : ""}</span>
+              {child.description && <small id={fieldIds.helpId} className="workflow-starter-input-help">{child.description}</small>}
+              <WorkflowProjectSelect
+                id={fieldIds.fieldId}
+                schema={child}
+                value={childValue}
+                workspaceId={workspaceId}
+                disabled={disabled}
+                required={isRequired}
+                describedBy={describedBy}
+                invalid={Boolean(error)}
+                multiple
+                label={`${label}${isRequired ? " *" : ""}`}
+                onChange={(nextValue) => onChange(childPath, nextValue)}
+              />
               {error && <small id={fieldIds.errorId} role="alert">{error}</small>}
             </div>
           );
@@ -615,6 +778,8 @@ function WorkflowSchemaFieldTree({
               <input
                 id={fieldIds.fieldId}
                 type="checkbox"
+                // Yes / no reads as a switch on every form.
+                role="switch"
                 checked={Boolean(childValue)}
                 onChange={(event) => onChange(childPath, event.target.checked)}
                 disabled={disabled}
@@ -757,8 +922,9 @@ function WorkflowSchemaFieldTree({
               <input
                 id={fieldIds.fieldId}
                 // type="url" makes the browser reject www.example.com; we add https:// instead.
-                type={child.format === "date" ? "date" : "text"}
-                inputMode={child.format === "uri" ? "url" : undefined}
+                type={child.format === "date" ? "date" : formControl === "email" ? "email" : formControl === "phone" ? "tel" : "text"}
+                inputMode={child.format === "uri" ? "url" : formControl === "email" ? "email" : formControl === "phone" ? "tel" : undefined}
+                autoComplete={formControl === "email" ? "email" : formControl === "phone" ? "tel" : undefined}
                 {...(child.format === "date" ? {} : presetBlankHandlers(child.default))}
                 value={String(childValue ?? "")}
                 placeholder={ui.placeholder}

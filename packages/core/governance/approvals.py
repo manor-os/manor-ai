@@ -962,6 +962,37 @@ async def _find_open_request(
     return (await db.execute(stmt)).scalar_one_or_none()
 
 
+#: ``context`` key holding the shape of an authorization question: whether
+#: "always" is offered and which answer is recommended (see always_allow).
+AUTHORIZATION_DECISION_CONTEXT_KEY = "decision"
+
+
+async def _authorization_decision(db, *, subject, origin, context: dict) -> Optional[dict]:
+    """Shape the question at mint time; a failure leaves the plain card.
+
+    "Always" is offered where a saved allow rule is what lets the same action
+    through next time: a tool call the policy gate raised. A provider's own
+    confirmation is not governed by those rules.
+    """
+    from packages.core.governance.always_allow import authorization_decision
+
+    facts = context.get("approval_facts") if isinstance(context.get("approval_facts"), dict) else {}
+    standing = (
+        origin.kind == ApprovalOriginKind.TOOL_CALL.value
+        and context.get("kind") != "provider"
+    )
+    try:
+        async with db.begin_nested():
+            return await authorization_decision(
+                db, entity_id=subject.entity_id, workspace_id=subject.workspace_id,
+                action_key=subject.action_key, impact=facts.get("impact"),
+                category=facts.get("category"), standing=standing,
+            )
+    except Exception:  # noqa: BLE001 - the question still goes out with its defaults
+        logger.warning("approval: could not shape the authorization question", exc_info=True)
+        return None
+
+
 async def _create_pending_request(
     db,
     *,
@@ -988,6 +1019,10 @@ async def _create_pending_request(
     context.pop(_APPROVAL_RESOURCE_IDS_CONTEXT_KEY, None)
     if subject.resource_ids:
         context[_APPROVAL_RESOURCE_IDS_CONTEXT_KEY] = list(subject.resource_ids)
+    if hitl_type == HitlType.AUTHORIZE.value and subject.action_key:
+        decision = await _authorization_decision(db, subject=subject, origin=origin, context=context)
+        if decision is not None:
+            context[AUTHORIZATION_DECISION_CONTEXT_KEY] = decision
     req = HitlRequest(
         entity_id=subject.entity_id,
         workspace_id=subject.workspace_id,
@@ -1029,7 +1064,51 @@ async def _create_pending_request(
     from packages.core.ledger import event_types as ledger_et
 
     await ledger_adapters.record_approval_event(db, req, ledger_et.APPROVAL_REQUESTED)
+    await _supersede_earlier_turn_requests(db, req)
     return req
+
+
+def _runtime_turn(request: HitlRequest) -> str:
+    """The run (one Chat turn) that minted a tool-call request: ``runtime:<run>:call:<call>``."""
+    operation_id = str((request.context or {}).get("operation_id") or "")
+    return operation_id.split(":call:", 1)[0] if operation_id.startswith("runtime:") else ""
+
+
+async def _supersede_earlier_turn_requests(db, request: HitlRequest) -> None:
+    """A Chat Agent asking again for the same action closes its earlier turn's card.
+
+    The user moved on from that turn; its card shows content the Agent has
+    since replaced, and approving it would run the stale version beside the
+    new one. Cards raised within one turn (several files, say) all stay.
+    """
+    turn = _runtime_turn(request)
+    if (
+        not turn or request.origin_kind != ApprovalOriginKind.TOOL_CALL.value
+        or not request.origin_conversation_id or request.origin_task_id
+    ):
+        return
+    tool = (request.context or {}).get("tool")
+    rows = (await db.execute(select(HitlRequest).where(
+        HitlRequest.entity_id == request.entity_id,
+        HitlRequest.origin_conversation_id == request.origin_conversation_id,
+        HitlRequest.origin_kind == ApprovalOriginKind.TOOL_CALL.value,
+        HitlRequest.origin_task_id.is_(None),
+        HitlRequest.status == ApprovalStatus.PENDING.value,
+        HitlRequest.action_key == request.action_key,
+        HitlRequest.id != request.id,
+    ))).scalars().all()
+    stale = [
+        row.id for row in rows
+        if (row.context or {}).get("tool") == tool and _runtime_turn(row) not in {"", turn}
+    ]
+    if not stale:
+        return
+    from packages.core.ai.runtime.approval_service import cancel_pending_runtime_approvals
+
+    await cancel_pending_runtime_approvals(
+        db, conversation_id=request.origin_conversation_id, entity_id=request.entity_id,
+        user_id=None, hitl_ids=stale, reason="superseded",
+    )
 
 
 async def grant_approval(

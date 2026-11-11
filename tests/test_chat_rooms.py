@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -3671,3 +3671,58 @@ async def test_group_agent_context_restarts_for_a_new_audience_and_ends_with_the
     closed = await client.delete(f"/api/v1/chat/rooms/{room_id}", headers=owner_headers)
     assert closed.status_code == 204, closed.text
     assert await _room_transcript_rows(db_session, room_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_room_list_reads_rooms_together_and_shows_each_room_as_its_page_does(
+    client: AsyncClient, db_session,
+):
+    owner_headers, _ = await _register(client, "room_list_owner")
+    guests = [(await _register(client, f"room_list_guest_{index}"))[1] for index in range(3)]
+
+    async def create(guest: dict) -> str:
+        created = await client.post("/api/v1/chat/rooms", headers=owner_headers, json={
+            "kind": "group", "title": f"Room {guest['email']}", "owner_scope": "entity",
+            "recipient_email": guest["email"],
+        })
+        assert created.status_code == 201, created.text
+        db_session.add(ChatRoomMember(
+            id=generate_ulid(), room_id=created.json()["id"], user_id=guest["id"],
+            role="member", status="active", visible_from=datetime.now(timezone.utc),
+        ))
+        await db_session.commit()
+        return created.json()["id"]
+
+    async def listed() -> tuple[list[dict], int]:
+        statements: list[str] = []
+
+        def record(_conn, _cursor, statement, *_args):
+            statements.append(statement)
+
+        from packages.core import database
+
+        engine = database.engine.sync_engine
+        event.listen(engine, "before_cursor_execute", record)
+        try:
+            response = await client.get("/api/v1/chat/rooms", headers=owner_headers)
+        finally:
+            event.remove(engine, "before_cursor_execute", record)
+        assert response.status_code == 200, response.text
+        return response.json(), len(statements)
+
+    first = await create(guests[0])
+    _, one_room_statements = await listed()
+    room_ids = [first, *[await create(guest) for guest in guests[1:]]]
+    posted = await client.post(f"/api/v1/chat/rooms/{room_ids[1]}/messages", headers=owner_headers,
+                               json={"content": "Latest"})
+    assert posted.status_code == 201, posted.text
+
+    rooms, three_room_statements = await listed()
+
+    assert three_room_statements == one_room_statements > 0
+    assert sorted(room["id"] for room in rooms) == sorted(room_ids)
+    for room in rooms:
+        page = (await client.get(f"/api/v1/chat/rooms/{room['id']}", headers=owner_headers)).json()
+        assert {key: room[key] for key in page} == page
+        assert len(room["members"]) == 2 and room["agents"]
+        assert (room["last_message_at"] is not None) == (room["id"] == room_ids[1])

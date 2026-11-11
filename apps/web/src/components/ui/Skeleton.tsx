@@ -95,15 +95,14 @@ export function PageLoading({
 }) {
   return (
     <div
-      className="flex h-full items-center justify-center"
+      className="page-loading flex h-full items-center justify-center"
       style={{ minHeight }}
+      role="status"
       aria-busy="true"
       aria-live="polite"
     >
-      <div style={{ display: "flex", alignItems: "center", gap: 12, color: "var(--text-muted)" }}>
-        <LoadingSpinner size={20} />
-        {label && <span style={{ fontSize: 14, fontWeight: 650 }}>{label}</span>}
-      </div>
+      <LoadingSpinner size={20} />
+      {label && <span className="sr-only">{label}</span>}
     </div>
   );
 }

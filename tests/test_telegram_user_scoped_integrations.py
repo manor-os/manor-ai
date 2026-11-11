@@ -11,6 +11,7 @@ from packages.core.credentials import Requester, get_credential_service
 from packages.core.models.base import generate_ulid
 from packages.core.models.channel import ChannelConfig
 from packages.core.models.document import Integration
+from packages.core.tasks.channel_tasks import dispatch_inbound_task
 from tests.test_document_permissions import _auth
 
 
@@ -182,7 +183,6 @@ async def test_legacy_telegram_webhook_without_secret_remains_available_after_up
     db_session,
     monkeypatch,
 ):
-    from apps.api.routers.channels import telegram as telegram_router
     from packages.core.services.channels.telegram_adapter import TelegramAdapter
 
     headers = await _auth(client, "telegram_legacy_webhook_owner")
@@ -207,12 +207,8 @@ async def test_legacy_telegram_webhook_without_secret_remains_available_after_up
             "msg_id": "legacy-message",
         }
 
-    async def fake_handle_inbound_message(*_args, **_kwargs):
-        return None
-
     monkeypatch.setattr(TelegramAdapter, "handle_update", fake_handle_update)
-    monkeypatch.setattr(telegram_router, "handle_inbound_message", fake_handle_inbound_message)
-    monkeypatch.setattr(telegram_router.dispatch_inbound_task, "delay", lambda **_kwargs: None)
+    monkeypatch.setattr(dispatch_inbound_task, "delay", lambda **_kwargs: None)
     token_hash = hashlib.sha256(b"332211:legacy-token").hexdigest()
 
     response = await client.post(
@@ -222,6 +218,45 @@ async def test_legacy_telegram_webhook_without_secret_remains_available_after_up
 
     assert response.status_code == 200, response.text
     assert response.json() == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_telegram_update_is_dispatched_once_with_its_receipt(client, db_session, monkeypatch):
+    """A webhook retry of the same update must not run the agent twice, and an
+    update whose dispatch could not be queued must stay deliverable."""
+    from packages.core.models.channel import MessageLog
+
+    headers = await _auth(client, "telegram_receipt_owner")
+    user = await _me(client, headers)
+    channel_config = ChannelConfig(
+        entity_id=user["entity_id"], channel_type="telegram", provider="telegram_bot",
+        credentials={"bot_token": "778899:receipt-token"}, status="active",
+    )
+    db_session.add(channel_config)
+    await db_session.commit()
+    token_hash = hashlib.sha256(b"778899:receipt-token").hexdigest()
+    url = f"/api/v1/channels/telegram/webhook/{token_hash}?config_id={channel_config.id}"
+    update = {"update_id": 9001, "message": {
+        "message_id": 5, "from": {"id": 42, "first_name": "Ana"}, "chat": {"id": 42}, "text": "hi",
+    }}
+
+    def broken_queue(**_kwargs):
+        raise RuntimeError("broker down")
+
+    monkeypatch.setattr(dispatch_inbound_task, "delay", broken_queue)
+    assert (await client.post(url, json=update)).status_code == 503
+
+    dispatched: list[dict] = []
+    monkeypatch.setattr(dispatch_inbound_task, "delay", lambda **kwargs: dispatched.append(kwargs))
+    assert (await client.post(url, json=update)).json() == {"ok": True}
+    assert (await client.post(url, json=update)).json() == {"ok": True}
+
+    receipts = (await db_session.execute(select(MessageLog).where(
+        MessageLog.channel_config_id == channel_config.id, MessageLog.direction == "inbound",
+    ))).scalars().all()
+    assert [row.external_id for row in receipts] == ["update:9001"]
+    assert len(dispatched) == 1 and dispatched[0]["inbound_message_log_id"] == receipts[0].id
+    assert dispatched[0]["content"] == "hi"
 
 
 @pytest.mark.asyncio

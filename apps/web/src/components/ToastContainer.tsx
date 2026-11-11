@@ -7,14 +7,14 @@ const ICON_COLORS: Record<ToastItem["type"], string> = {
   success: "#436b65",
   warning: "#cf9b44",
   error: "#d65f59",
-  info: "#5f84bd",
+  info: "#6e6e73",
 };
 
 const ICON_BG: Record<ToastItem["type"], string> = {
   success: "#f2f6f5",
   warning: "#faf7ef",
   error: "#f8f0ef",
-  info: "#f4f7fa",
+  info: "#f5f5f7",
 };
 
 function ToastIcon({ type }: { type: ToastItem["type"] }) {
@@ -79,11 +79,11 @@ function ToastCard({ toast }: { toast: ToastItem }) {
   return (
     <div
       style={{
-        background: "rgba(255,255,255,0.95)",
+        background: "var(--surface-panel)",
         backdropFilter: "blur(20px)",
         WebkitBackdropFilter: "blur(20px)",
         borderRadius: 16,
-        border: "1px solid rgba(255,255,255,0.5)",
+        border: "1px solid var(--border-subtle)",
         boxShadow: "0 8px 16px -4px rgba(0,0,0,0.1), 0 4px 6px -2px rgba(0,0,0,0.04)",
         padding: toast.actionLabel ? "10px 32px 12px 12px" : "10px 32px 10px 12px",
         width: "min(calc(100vw - 24px), 320px)",
@@ -98,14 +98,19 @@ function ToastCard({ toast }: { toast: ToastItem }) {
         fontFamily: '"Inter", system-ui, sans-serif',
       }}
     >
-      <ToastIcon type={toast.type} />
+      {/* Information needs no icon: only outcomes and problems carry one. */}
+      {toast.type !== "info" && <ToastIcon type={toast.type} />}
 
-      <div style={{ flex: 1, minWidth: 0, paddingTop: 1 }}>
+      <div
+        style={toast.actionLabel && !toast.message
+          ? { flex: 1, minWidth: 0, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }
+          : { flex: 1, minWidth: 0, paddingTop: 1 }}
+      >
         <div
           style={{
             fontSize: 13,
-            fontWeight: 700,
-            color: "#292524",
+            fontWeight: 500,
+            color: "var(--text-strong)",
             lineHeight: 1.35,
             marginBottom: toast.message ? 2 : 0,
           }}
@@ -116,7 +121,7 @@ function ToastCard({ toast }: { toast: ToastItem }) {
           <div
             style={{
               fontSize: 12,
-              color: "#78716c",
+              color: "var(--text-muted)",
               lineHeight: 1.4,
               margin: 0,
             }}
@@ -129,14 +134,15 @@ function ToastCard({ toast }: { toast: ToastItem }) {
             type="button"
             onClick={handleAction}
             style={{
-              marginTop: 10,
+              flex: "none",
+              marginTop: toast.message ? 10 : 0,
               padding: "6px 10px",
-              borderRadius: 10,
-              border: "1px solid rgba(95,132,189,0.18)",
-              background: "#f3f6fa",
-              color: "#3f57a0",
-              fontSize: 12,
-              fontWeight: 700,
+              borderRadius: 8,
+              border: 0,
+              background: "var(--surface-muted)",
+              color: "var(--text-strong)",
+              fontSize: 13,
+              fontWeight: 500,
               cursor: "pointer",
             }}
           >
@@ -154,24 +160,24 @@ function ToastCard({ toast }: { toast: ToastItem }) {
           width: 20,
           height: 20,
           borderRadius: "50%",
-          background: "#f5f5f4",
+          background: "var(--surface-muted)",
           border: "none",
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
           cursor: "pointer",
-          color: "#a8a29e",
+          color: "var(--text-muted)",
           fontSize: 12,
           transition: "all 0.2s",
           padding: 0,
         }}
         onMouseEnter={(e) => {
-          e.currentTarget.style.background = "#e7e5e4";
-          e.currentTarget.style.color = "#57534e";
+          e.currentTarget.style.background = "var(--surface-sunken)";
+          e.currentTarget.style.color = "var(--text-strong)";
         }}
         onMouseLeave={(e) => {
-          e.currentTarget.style.background = "#f5f5f4";
-          e.currentTarget.style.color = "#a8a29e";
+          e.currentTarget.style.background = "var(--surface-muted)";
+          e.currentTarget.style.color = "var(--text-muted)";
         }}
       >
         <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={3}>

@@ -55,13 +55,16 @@ def test_app_mapping_covers_all_target_types_and_presentation():
                            "launch_workflows": [{"workflow": "workflow:old-flow", "project_steps": ["create"]}]},
         },
         "components": [{"key": "delivery_results", "type": "data_view", "context": {"kind": "project", "source": "deliveries"},
-                        "blocks": [{"key": "progress", "type": "progress", "source": "deliveries"}]}],
+                        "blocks": [{"key": "progress", "type": "progress", "source": "deliveries",
+                                    "item_action": {"action": "workflow:old-flow", "input": "delivery_id", "label": "Redo"}}]}],
     }
     portable = remap_app_view(
         source, workflows={"old-flow": "collect"}, agents={"old-agent": "writer"}, automations={"old-job": "daily"},
         workflow_definitions={"old-definition": "collect"},
     )
     assert portable["hero"] == "workflow:collect"
+    # An item's own action names the same entry as the tile does.
+    assert portable["components"][0]["blocks"][0]["item_action"]["action"] == "workflow:collect"
     assert portable["data_sources"]["deliveries"]["label_fields"] == [["title"]]
     assert portable["targets"]["action:draft"] == "agent:writer"
     assert portable["targets"]["service:review"] == "agent:default"
@@ -146,7 +149,7 @@ async def test_export_install_reexport_preserves_app_and_builtin_with_new_ids(db
         steps=[
             {"id": "start", "name": "start", "type": "trigger", "config": {"trigger_type": "manual"}, "next": ["create"]},
             {"id": "create", "name": "Create delivery", "type": "workflow_project", "next": ["end"], "config": {
-                "operation": "create", "project_type": "client_delivery", "project_key": "delivery", "schema_version": 1,
+                "operation": "create", "project_type": "client_delivery", "schema_version": 1,
                 "state_schema": {"type": "object", "properties": {
                     "deliverable": {"type": "string"}, "title": {"type": "string"}, "due_at": {"type": "string"},
                     "publication": {"type": "object"},
@@ -342,6 +345,48 @@ async def test_export_install_reexport_preserves_app_and_builtin_with_new_ids(db
     bad["recipe"]["operating_model"]["app_view"]["hero"] = "workflow:source-row-id"
     with pytest.raises(PayloadError, match="not included"):
         validate_payload(bad)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("choice", ["keep_yours", "use_blueprint"])
+async def test_a_page_with_an_uploaded_cover_upgrades_and_reverts(db_session, choice):
+    """An upload made after install is a local edit of the page, like any other: reviewed, and never lost silently."""
+    from packages.core.blueprints.configuration_upgrade import (
+        apply_configuration,
+        capture_configuration,
+        plan_configuration,
+        revert_configuration,
+    )
+
+    db = db_session
+    released = normalize_app_view_config({"title": "Radar", "cover_image_url": "/blueprints/covers/radar.webp"})
+    workspace = Workspace(id=generate_ulid(), entity_id=generate_ulid(), name="Radar",
+                          operating_model={"app_view": released})
+    db.add(workspace)
+    await db.flush()
+    await initialize_workspace_approval(db, workspace)
+    payload = {"recipe": {"operating_model": {"app_view": released}}}
+    baseline = await capture_configuration(db, workspace=workspace, payload=payload)
+
+    upload = "/api/v1/files/upload.png"
+    edited = {**released, "cover_image_url": upload}
+    workspace.operating_model = {"app_view": edited}
+    await db.flush()
+    next_release = {"recipe": {"operating_model": {"app_view": {**released, "title": "New radar"}}}}
+
+    plan = await plan_configuration(db, workspace=workspace, payload=next_release, baseline=baseline)
+    key = "workspace_configuration:operating_model/app_view"
+    item = next(row for row in plan["items"] if row["key"] == key)
+    assert item["action"] == "keep_yours"
+    assert item["current_content"]["value"]["cover_image_url"] == upload
+
+    changes = await apply_configuration(db, workspace=workspace, payload=next_release, plan=plan, choices={key: choice})
+    page = workspace.operating_model["app_view"]
+    assert (page["title"], page["cover_image_url"]) == (
+        ("Radar", upload) if choice == "keep_yours" else ("New radar", "/blueprints/covers/radar.webp"))
+
+    await revert_configuration(db, workspace=workspace, restore=changes["restore"])
+    assert workspace.operating_model["app_view"] == edited
 
 
 @pytest.mark.asyncio

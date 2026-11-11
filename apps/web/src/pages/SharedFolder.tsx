@@ -130,25 +130,25 @@ export default function SharedFolder() {
       style={{
         minHeight: "100vh",
         padding: "32px 16px",
-        background: "linear-gradient(180deg, #fafaf9 0%, #ffffff 100%)",
+        background: "var(--surface-panel)",
       }}
     >
       <div
         style={{
           maxWidth: 720,
           margin: "0 auto",
-          background: "#ffffff",
+          background: "var(--surface-panel)",
           borderRadius: 12,
-          boxShadow: "0 1px 3px rgba(28,25,23,0.06)",
+          boxShadow: "0 1px 3px rgba(29, 29, 31,0.06)",
           padding: 24,
         }}
       >
-        <h1 style={{ fontSize: 14, fontWeight: 700, color: "#78716c", margin: "0 0 4px", letterSpacing: 0.5 }}>
+        <h1 style={{ fontSize: 14, fontWeight: 700, color: "var(--text-muted)", margin: "0 0 4px", }}>
           {t("page.shared_folder.brand_header")}
         </h1>
 
         {state.kind === "loading" && (
-          <p style={{ fontSize: 14, color: "#a8a29e", padding: "32px 0", textAlign: "center" }}>
+          <p style={{ fontSize: 14, color: "var(--text-muted)", padding: "32px 0", textAlign: "center" }}>
             {t("page.shared_folder.loading")}
           </p>
         )}
@@ -165,10 +165,10 @@ export default function SharedFolder() {
 
         {state.kind === "error" && (
           <div style={{ padding: "32px 0", textAlign: "center" }}>
-            <p style={{ fontSize: 18, fontWeight: 600, color: "#292524", margin: "0 0 4px" }}>
-              {state.status === 404 ? "🔒" : "⏰"} {state.message}
+            <p style={{ fontSize: 18, fontWeight: 600, color: "var(--text-strong)", margin: "0 0 4px" }}>
+              {state.message}
             </p>
-            <p style={{ fontSize: 12, color: "#a8a29e", margin: "12px 0 0" }}>
+            <p style={{ fontSize: 12, color: "var(--text-muted)", margin: "12px 0 0" }}>
               {t("page.shared_folder.contact_owner")}
             </p>
           </div>
@@ -181,16 +181,16 @@ export default function SharedFolder() {
                 {t("page.file_viewer.go_back")}
               </Button>
             )}
-            <h2 style={{ fontSize: 22, fontWeight: 700, color: "#1c1917", margin: "8px 0 4px" }}>
+            <h2 style={{ fontSize: 22, fontWeight: 700, color: "var(--text-strong)", margin: "8px 0 4px" }}>
               {state.data.name}
             </h2>
             <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 18 }}>
               <ClassificationBadge level={state.data.classification} size="sm" />
-              <span style={{ fontSize: 12, color: "#a8a29e" }}>
+              <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
                 {t("page.shared_folder.permission_prefix")} {state.data.capabilities.join(" / ")}
               </span>
               {state.data.expires_at && (
-                <span style={{ fontSize: 12, color: "#a8a29e" }}>
+                <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
                   · {t("page.shared_folder.expires_on", { date: new Date(state.data.expires_at).toLocaleDateString(undefined, { timeZone: getPreferredTimeZone() }) })}
                 </span>
               )}
@@ -219,7 +219,7 @@ export default function SharedFolder() {
                 {t("page.shared_folder.files_section", { count: state.data.documents.length })}
               </h3>
               {state.data.documents.length === 0 ? (
-                <p style={{ fontSize: 13, color: "#a8a29e", margin: 0 }}>
+                <p style={{ fontSize: 13, color: "var(--text-muted)", margin: 0 }}>
                   {t("page.shared_folder.empty_files")}
                 </p>
               ) : (
@@ -231,7 +231,7 @@ export default function SharedFolder() {
                         {d.name}
                       </Button>
                       <ClassificationBadge level={d.classification} size="sm" />
-                      <span style={{ fontSize: 11, color: "#a8a29e", marginLeft: "auto" }}>
+                      <span style={{ fontSize: 11, color: "var(--text-muted)", marginLeft: "auto" }}>
                         {formatSize(d.file_size)}
                       </span>
                     </li>
@@ -244,9 +244,9 @@ export default function SharedFolder() {
               style={{
                 marginTop: 20,
                 paddingTop: 12,
-                borderTop: "1px solid rgba(28,25,23,0.06)",
+                borderTop: "0.5px solid rgba(29, 29, 31,0.06)",
                 fontSize: 11,
-                color: "#a8a29e",
+                color: "var(--text-faint)",
               }}
             >
               {t("page.shared_folder.footer_notice")}
@@ -281,9 +281,7 @@ export default function SharedFolder() {
 const SECTION_LABEL_STYLE: React.CSSProperties = {
   fontSize: 11,
   fontWeight: 700,
-  color: "#78716c",
-  textTransform: "uppercase",
-  letterSpacing: 0.4,
+  color: "var(--text-muted)",
   margin: "0 0 8px",
 };
 

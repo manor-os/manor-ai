@@ -137,6 +137,64 @@ async def test_rows_no_run_wrote_are_appended_once_and_current_turn_is_left_to_i
     assert first == again == [{"role": "assistant", "content": "Your weekly report is ready."}]
 
 
+async def _run(db, scope, request, reply, *, user_id, reply_id, compacted=False):
+    initial = await load_or_import_transcript(db, scope, legacy_history=legacy([])[0], exclude_message_ids=set())
+    # A compacted run hands back a working view that no longer starts with its initial history.
+    kept = [{"role": "user", "content": "[Earlier conversation compacted]"}] if compacted else initial
+    await append_run_transcript(
+        db, scope, run_id=None, initial_messages=initial,
+        final_messages=[*kept, {"role": "user", "content": request}, CALL, OUTPUT, {"role": "assistant", "content": reply}],
+        user_message_id=user_id, assistant_message_id=reply_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_turn_reads_back_only_to_the_snapshot_before_the_latest(db_session):
+    async def turn_reads(old_turns):
+        conv = await conversation(db_session)
+        scope = scope_for(conv)
+        await load_or_import_transcript(db_session, scope, legacy_history=legacy([])[0], exclude_message_ids=set())
+        for i in range(old_turns):
+            await _run(db_session, scope, f"old {i}", "ok", user_id=f"old-user-{i}", reply_id=f"old-reply-{i}")
+        for c in range(2):
+            await _run(db_session, scope, f"long {c}", "ok", user_id=f"cmp-user-{c}", reply_id=f"cmp-reply-{c}", compacted=True)
+        await _run(db_session, scope, "new", "ok", user_id="new-user", reply_id="new-reply")
+        seen = {}
+
+        async def rows_since(started_at, represented):
+            seen.update(started_at=started_at, represented=represented)
+            return []
+        await load_or_import_transcript(db_session, scope, legacy_history=legacy([])[0], exclude_message_ids=set(),
+                                        external_rows=rows_since)
+        first_compaction = next(i for i in await items(db_session, conv) if i.kind == "compaction")
+        assert seen["started_at"] == first_compaction.created_at
+        return seen["represented"]
+
+    few, many = await turn_reads(1), await turn_reads(8)
+    assert few == many == {"cmp-user-0", "cmp-reply-0", "cmp-user-1", "cmp-reply-1", "new-user", "new-reply"}
+
+
+@pytest.mark.asyncio
+async def test_rows_that_arrive_while_a_run_compacts_are_still_synced(db_session):
+    conv = await conversation(db_session)
+    scope = scope_for(conv)
+    await load_or_import_transcript(db_session, scope, legacy_history=legacy([])[0], exclude_message_ids=set())
+    await _run(db_session, scope, "long 0", "ok", user_id=None, reply_id=None, compacted=True)
+    initial = await load_or_import_transcript(db_session, scope, legacy_history=legacy([])[0], exclude_message_ids=set())
+    # Posted after this run loaded its history and before its compaction is written.
+    notice = Message(id=generate_ulid(), conversation_id=conv.id, role="assistant", content="Your weekly report is ready.")
+    db_session.add(notice)
+    await db_session.commit()
+    await append_run_transcript(
+        db_session, scope, run_id=None, initial_messages=initial,
+        final_messages=[{"role": "user", "content": "[Earlier conversation compacted]"}, {"role": "assistant", "content": "ok"}],
+        user_message_id=None, assistant_message_id=None,
+    )
+    history = await load_or_import_transcript(db_session, scope, legacy_history=legacy([])[0], exclude_message_ids=set())
+    assert history[-1] == {"role": "assistant", "content": "Your weekly report is ready."}
+    assert await load_or_import_transcript(db_session, scope, legacy_history=legacy([])[0], exclude_message_ids=set()) == history
+
+
 @pytest.mark.asyncio
 async def test_each_running_principal_has_its_own_stream(db_session):
     conv = await conversation(db_session)

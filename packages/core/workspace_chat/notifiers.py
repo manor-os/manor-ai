@@ -311,29 +311,6 @@ def formatted_task_subject(title: Optional[str], task_id: str) -> str:
 
 # ── Goal lifecycle ────────────────────────────────────────────────────
 
-async def notify_goal_measured(
-    *,
-    entity_id: str,
-    workspace_id: Optional[str],
-    goal_id: str,
-    metric_key: str,
-    value: Decimal,
-    pace: Optional[str],
-) -> None:
-    """Quiet tick — only posted on non-trivial pace context. Frequent
-    routine measurements (e.g. hourly) would spam the chat."""
-    if not workspace_id:
-        return
-    if pace not in {"at_risk", "behind", "ahead"}:
-        return
-    await _safe_post(
-        entity_id=entity_id, workspace_id=workspace_id,
-        body=f"📊 {metric_key}: {value:g} ({pace})",
-        message_kind="goal_alert", author_kind="agent",
-        refs=[{"type": "goal", "id": goal_id}],
-    )
-
-
 async def notify_goal_pace_changed(
     *,
     entity_id: str,

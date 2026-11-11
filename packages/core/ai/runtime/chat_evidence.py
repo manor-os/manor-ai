@@ -582,6 +582,8 @@ class ChatStopGate(RuntimeToolEvidence):
         requires_execution: bool = False, discovery_gate: bool = False,
         task_reader: Any = None, current_turn_task_reader: Any = None,
         file_resolver: Any = None, entity_id: str | None = None,
+        stranded_task_reader: Any = None,
+        lone_task_reader: Any = None,
     ):
         super().__init__()
         self.workspace_scope = workspace_scope
@@ -594,6 +596,8 @@ class ChatStopGate(RuntimeToolEvidence):
         self.discovery_gate = discovery_gate
         self._task_reader = task_reader
         self._current_turn_task_reader = current_turn_task_reader
+        self._stranded_task_reader = stranded_task_reader
+        self._lone_task_reader = lone_task_reader
         self.gate_attempts: dict[str, int] = {}
         self.gate_limitations: list[str] = []
         self.instructions = _PLAIN_TEXT_REPLY_INSTRUCTIONS + (
@@ -750,6 +754,40 @@ class ChatStopGate(RuntimeToolEvidence):
                 )
             open_limitations.append(limitation)
         self.gate_limitations = open_limitations
+        if stranded := await self._stranded_tasks():
+            return FinalResponseDecision(
+                FinalResponseAction.CONTINUE_EXECUTION,
+                diagnostic=tool_error_payload(
+                    tool_name="final_response", code="tasks_stranded",
+                    message=(
+                        "These Tasks this turn created will never start: "
+                        + "; ".join(f"{item['title']} ({item['id']})" for item in stranded[:8])
+                        + ". Link each to the stages it follows with the Workspace "
+                        "update_task_runtime action (depends_on_task_ids = the earlier task ids); "
+                        "it then starts when they complete. If it follows nothing, start it with "
+                        "start_task. Then reply."
+                    ),
+                    details={"response_action": FinalResponseAction.CONTINUE_EXECUTION.value,
+                             "task_ids": [item["id"] for item in stranded[:8]]},
+                ),
+            )
+        if lone := await self._once("tasks_requested_one_created", self._lone_task_reader):
+            return FinalResponseDecision(
+                FinalResponseAction.CONTINUE_EXECUTION,
+                diagnostic=tool_error_payload(
+                    tool_name="final_response", code="tasks_requested_one_created",
+                    message=(
+                        f"The user asked for Tasks and this turn created one: {lone[0]['title']} "
+                        f"({lone[0]['id']}). Nothing creates later stages for you: Chat does not run "
+                        "again when a Task completes. If the plan has further stages, create each now "
+                        "with create_task (owner_service_key, depends_on_task_ids naming the earlier "
+                        "task ids, start=true); each starts when its predecessors complete. If this "
+                        "one Task is the whole request, reply."
+                    ),
+                    details={"response_action": FinalResponseAction.CONTINUE_EXECUTION.value,
+                             "task_ids": [lone[0]["id"]]},
+                ),
+            )
         if self._file_resolver is not None:
             links = await rewrite_reply_file_links(text, self._file_resolver)
             if links.unresolved and not self.gate_attempts.get("file_link_unopenable"):
@@ -803,6 +841,22 @@ class ChatStopGate(RuntimeToolEvidence):
             message += " Files saved in this turn: " + "; ".join(available[:10])
         return message
 
+    async def _stranded_tasks(self) -> list[dict[str, str]]:
+        """Once per turn: stages this turn created that nothing will start."""
+        return await self._once("tasks_stranded", self._stranded_task_reader)
+
+    async def _once(self, code: str, reader: Any) -> list[dict[str, str]]:
+        """A Task reader's findings, acted on at most once per turn."""
+        if self.workspace_scope is None or reader is None or self.gate_attempts.get(code):
+            return []
+        try:
+            found = await reader(self.workspace_scope)
+        except Exception:
+            return []  # a lookup failure is not evidence
+        if found:
+            self.gate_attempts[code] = 1
+        return found
+
     async def _current_turn_task_section(self) -> tuple[str, tuple[dict, ...]]:
         from packages.core.ai.runtime.workspace_response import render_verified_task_status
 
@@ -834,7 +888,8 @@ def _chat_stop_gate(ctx, plan) -> ChatStopGate:
     from packages.core.ai.runtime.turn_policy import TurnResearchStrategy
     from packages.core.i18n import get_locale
     from packages.core.services.workspace_execution_evidence import (
-        ExecutionEvidenceScope, read_current_turn_task_references, read_workspace_task_evidence,
+        ExecutionEvidenceScope, read_current_turn_task_references, read_lone_requested_task,
+        read_stranded_turn_tasks, read_workspace_task_evidence,
     )
 
     envelope = getattr(ctx, "runtime_envelope", None)
@@ -859,6 +914,8 @@ def _chat_stop_gate(ctx, plan) -> ChatStopGate:
         ),
         task_reader=read_workspace_task_evidence,
         current_turn_task_reader=read_current_turn_task_references,
+        stranded_task_reader=read_stranded_turn_tasks,
+        lone_task_reader=read_lone_requested_task,
     )
 
 

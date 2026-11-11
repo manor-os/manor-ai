@@ -190,6 +190,10 @@ async def _safe_runtime_completion(
             workspace_id=getattr(workspace, "id", None),
             user_id=user_id,
         )
+        # A failed call comes back empty; say why rather than "no proposal content".
+        failure_cause = (getattr(completion, "usage", None) or {}).get("error")
+        if failure_cause and not completion.content:
+            raise RuntimeError(f"Model call failed: {failure_cause}")
         return completion.content
     except (CreditExhaustedError, CreditCheckUnavailableError, CreditReservationError, BudgetExceeded):
         raise

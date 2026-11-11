@@ -801,6 +801,27 @@ async def test_catalog_function_cannot_hide_nested_write_or_lock(managed_db, ope
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("read, unsafe", [
+    (select(Probe.value).where(Probe.id == 1), select(Probe.value).where(Probe.id == 1).with_for_update()),
+    (select(func.pg_catalog.lower(literal("a"))), select(func.lower(literal("a")))),
+    (select(func.pg_catalog.lower(literal("a"))), select(func.pg_catalog.upper(literal("a")))),
+])
+async def test_a_known_read_shape_never_answers_for_a_locking_variant(managed_db, read, unsafe):
+    """Statements are classified once per shape; a lock, an unknown function or
+    different raw SQL is another shape."""
+    _, factory = managed_db
+    async with factory() as db:
+        db.add(Probe(id=1))
+        await db.commit()
+        for _ in range(2):
+            await db.execute(read)
+            assert await release_read_transaction(db)
+            await db.execute(unsafe)
+            assert not await release_read_transaction(db)
+            await db.rollback()
+
+
+@pytest.mark.asyncio
 async def test_pending_and_flushed_writes_core_sql_and_locks_not_auto_committed(managed_db):
     engine, factory = managed_db
     async with factory() as db:
@@ -1541,8 +1562,8 @@ async def test_workspace_draft_turn_runs_model_rounds_without_holding_admission(
 ):
     """The staging draft turn: several model rounds, each preceded by the real
     credit preflight, with tools between them that run in agentic_loop child
-    tasks. One tool (like ws_search_capabilities) commits and re-locks the
-    draft. With one chat permit, no round may wait on the turn's own draft
+    tasks. One tool (like ws_search_capabilities) locks the draft in two short
+    draft_phase transactions. With one chat permit, no round may wait on the turn's own draft
     transaction, and the turn must persist its fields, messages and status."""
     from decimal import Decimal
     import json
@@ -1574,17 +1595,16 @@ async def test_workspace_draft_turn_runs_model_rounds_without_holding_admission(
         )).id
         await db.commit()
 
-    async def capability_matcher_like(db, *, entity_id, user_id, draft_id, **_):
-        # ws_search_capabilities: release the draft during provider work,
-        # then re-lock it in the same Session (inside the tool's child task).
-        await db.commit()
-        draft = (await db.execute(
-            select(WorkspaceDraft).where(WorkspaceDraft.id == draft_id).with_for_update()
-            .execution_options(populate_existing=True)
-        )).scalar_one()
-        draft.fields = {**draft.fields, "capability_plan": "matched"}
-        flag_modified(draft, "fields")
-        await db.flush()
+    async def capability_matcher_like(db, *, entity_id, user_id, draft_id, draft_phase, **_):
+        # ws_search_capabilities: read the draft, hold nothing during provider
+        # work, then re-lock it in the same Session (inside the tool's child task).
+        async with draft_phase():
+            await db.get(WorkspaceDraft, draft_id)
+        assert runtime.snapshot()["active_transactions"] == 0
+        async with draft_phase():
+            draft = await db.get(WorkspaceDraft, draft_id)
+            draft.fields = {**draft.fields, "capability_plan": "matched"}
+            flag_modified(draft, "fields")
         return json.dumps({"ok": True})
 
     monkeypatch.setitem(workspace_arch_tools.HANDLERS, "ws_search_capabilities", capability_matcher_like)
@@ -1639,6 +1659,233 @@ async def test_workspace_draft_turn_runs_model_rounds_without_holding_admission(
         assert draft.fields["capability_plan"] == "matched"
         assert [m["role"] for m in draft.messages] == ["assistant"]
         assert not any(key.startswith("_architect_turn") for key in draft.fields)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("meanwhile", ["person_edits", "another_turn_takes_over"])
+async def test_the_app_designer_runs_while_the_draft_stays_free(db_session, tight_engine, monkeypatch, meanwhile):
+    """ws_design_app_view runs its sub-agent for minutes. Meanwhile the draft
+    row, the turn's connection and the chat permit must be free, so the
+    person's edits land; a turn that lost its claim keeps no candidate."""
+    import copy
+    import json
+    import time
+    from pathlib import Path
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from packages.core.ai import agentic_loop
+    from packages.core.ai.runtime.control import RuntimeTurnAborted
+    from packages.core.blueprints.builtin_app_views import BUILTIN_APP_VIEWS
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.workspace_draft import WorkspaceDraft
+    from packages.core.services import workspace_app_designer, workspace_architect
+    from packages.core.services import workspace_draft_service as drafts
+
+    recipe = Path(__file__).resolve().parents[1] / "packages/core/blueprints/configs/creative/creative-presentation-v1.json"
+    entity_id, user_id = generate_ulid(), generate_ulid()
+    factory = tight_engine()
+    runtime = factory.kw["bind"].sync_engine._manor_database_runtime
+    async with factory() as db:
+        draft = await drafts.create_draft_shell(db, entity_id=entity_id, user_id=user_id, initial_brief="Decks")
+        draft.fields = {**draft.fields, "workflows": json.loads(recipe.read_text())["recipe"]["workflows"]}
+        draft_id = draft.id
+        await db.commit()
+
+    async def designer(context, **_):
+        assert runtime.snapshot()["active_transactions"] == 0
+
+        async def meanwhile_on_the_draft():
+            async with factory() as db:
+                row = (await db.execute(
+                    select(WorkspaceDraft).where(WorkspaceDraft.id == draft_id).with_for_update(nowait=True)
+                )).scalar_one()
+                fields = dict(row.fields)
+                if meanwhile == "person_edits":
+                    fields["primary_work"] = "Edited while the App was designed"
+                else:
+                    fields[drafts.TURN_CLAIM_FIELD] = {"id": "another-turn", "expires_at": time.time() + 300}
+                row.fields = fields
+                flag_modified(row, "fields")
+                await db.commit()
+
+        # Another request: not a nested Session of the turn.
+        await asyncio.create_task(meanwhile_on_the_draft(), context=contextvars.Context())
+        config, errors, _ = context.check(copy.deepcopy(BUILTIN_APP_VIEWS["creative-presentation-v1"]))
+        assert not errors
+        return workspace_app_designer.AppDesignResult(
+            app_view=config, recipes=["one flow, several kinds"], warnings=[], notes="Designed.", attempts=1,
+        )
+
+    async def loop(*, tool_executor, **_):
+        async def not_cancelled():
+            return False
+
+        result = await agentic_loop._await_cancellable(
+            tool_executor("ws_design_app_view", {"brief": "Make decks of different kinds."}), not_cancelled,
+        )
+        assert json.loads(result)["ok"], result
+        return SimpleNamespace(content="The App is designed.", usage={}, rounds=2, tool_calls_made=[{}])
+
+    monkeypatch.setattr(workspace_app_designer, "run_app_designer", designer)
+    monkeypatch.setattr(workspace_architect, "runtime_execute_workspace_architect_loop", loop)
+    monkeypatch.setattr(database, "async_session", factory)
+
+    async def turn():
+        async with factory() as db:
+            reply, _ = await drafts.process_draft_message(
+                db, draft_id=draft_id, entity_id=entity_id, user_id=user_id, user_message="Design the App",
+            )
+            await db.commit()
+            return reply
+
+    if meanwhile == "person_edits":
+        assert await asyncio.create_task(turn()) == "The App is designed."
+    else:
+        with pytest.raises(RuntimeTurnAborted, match="took over"):
+            await asyncio.create_task(turn())
+    assert runtime.snapshot()["wait_timeouts"] == 0
+    async with factory() as db:
+        fields = (await db.get(WorkspaceDraft, draft_id)).fields
+    if meanwhile == "person_edits":
+        assert fields["primary_work"] == "Edited while the App was designed"
+        assert fields["_candidates"]["app"]["recipes"] == ["one flow, several kinds"]
+        assert drafts.TURN_CLAIM_FIELD not in fields
+    else:
+        assert "_candidates" not in fields
+        assert fields[drafts.TURN_CLAIM_FIELD]["id"] == "another-turn"
+
+
+async def _draft_turn_with_slow_model(tight_engine, monkeypatch, *, meanwhile, calls, patch_slow):
+    """Run one Architect turn making ``calls``. ``patch_slow(while_slow)`` makes
+    one slow model call await ``while_slow``, which edits the draft from another
+    request. Returns the tool results and the draft's final fields."""
+    import json
+    import time
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from packages.core.ai import agentic_loop
+    from packages.core.ai.runtime.control import RuntimeTurnAborted
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.workspace_draft import WorkspaceDraft
+    from packages.core.services import workspace_architect
+    from packages.core.services import workspace_draft_service as drafts
+    from packages.core.services.agent_capability_catalog import (
+        AgentCapabilityCandidate, AgentCapabilityCatalog, AgentCapabilityCatalogFactory, AgentCapabilityKind,
+    )
+
+    entity_id, user_id = generate_ulid(), generate_ulid()
+    factory = tight_engine()
+    runtime = factory.kw["bind"].sync_engine._manor_database_runtime
+    async with factory() as db:
+        draft = await drafts.create_draft_shell(db, entity_id=entity_id, user_id=user_id, initial_brief="Research")
+        draft.fields = {**draft.fields, "services": [
+            {"service_key": "research", "name": "Research", "description": "Find and verify sources."},
+        ]}
+        draft_id = draft.id
+        await db.commit()
+
+    held_while_slow = []
+
+    async def while_slow():
+        held_while_slow.append(runtime.snapshot()["active_transactions"])
+
+        async def meanwhile_on_the_draft():
+            async with factory() as db:
+                row = (await db.execute(
+                    select(WorkspaceDraft).where(WorkspaceDraft.id == draft_id).with_for_update(nowait=True)
+                )).scalar_one()
+                fields = dict(row.fields)
+                if meanwhile == "person_edits":
+                    fields["name"] = "Edited while the model worked"
+                else:
+                    fields[drafts.TURN_CLAIM_FIELD] = {"id": "another-turn", "expires_at": time.time() + 300}
+                row.fields = fields
+                flag_modified(row, "fields")
+                await db.commit()
+
+        # Another request: not a nested Session of the turn.
+        await asyncio.create_task(meanwhile_on_the_draft(), context=contextvars.Context())
+
+    async def catalog(*_, **__):
+        return AgentCapabilityCatalog(candidates=(
+            AgentCapabilityCandidate("tool:invoke_skill", AgentCapabilityKind.TOOL, "invoke_skill", "Skills"),
+            AgentCapabilityCandidate("tool:web_search", AgentCapabilityKind.TOOL, "web_search", "Search"),
+            AgentCapabilityCandidate("skill:research", AgentCapabilityKind.SKILL, "research", "Research",
+                                     metadata={"declared_tools": ["web_search"]}),
+        ))
+
+    results = []
+
+    async def loop(*, tool_executor, **_):
+        async def not_cancelled():
+            return False
+
+        for name, args in calls:
+            results.append(json.loads(await agentic_loop._await_cancellable(
+                tool_executor(name, args), not_cancelled,
+            )))
+        return SimpleNamespace(content="Done.", usage={}, rounds=len(calls) + 1, tool_calls_made=[{}] * len(calls))
+
+    patch_slow(while_slow)
+    monkeypatch.setattr(AgentCapabilityCatalogFactory, "create", catalog)
+    monkeypatch.setattr(workspace_architect, "runtime_execute_workspace_architect_loop", loop)
+    monkeypatch.setattr(database, "async_session", factory)
+
+    async def turn():
+        async with factory() as db:
+            await drafts.process_draft_message(
+                db, draft_id=draft_id, entity_id=entity_id, user_id=user_id, user_message="Design the Agent",
+            )
+            await db.commit()
+
+    aborted = None
+    try:
+        await asyncio.create_task(turn())
+    except RuntimeTurnAborted as exc:
+        aborted = exc
+    assert held_while_slow == [0], results
+    assert runtime.snapshot()["wait_timeouts"] == 0
+    async with factory() as db:
+        fields = (await db.get(WorkspaceDraft, draft_id)).fields
+    if meanwhile == "person_edits":
+        assert aborted is None, aborted
+        assert fields["name"] == "Edited while the model worked"
+        assert drafts.TURN_CLAIM_FIELD not in fields
+    else:
+        assert "took over" in str(aborted)
+        assert fields[drafts.TURN_CLAIM_FIELD]["id"] == "another-turn"
+    return results, fields
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("meanwhile", ["person_edits", "another_turn_takes_over"])
+async def test_the_capability_matcher_runs_while_the_draft_stays_free(tight_engine, monkeypatch, meanwhile):
+    """ws_search_capabilities waits on the semantic matcher. Meanwhile the draft
+    row, the turn's connection and the chat permit must be free, so the
+    person's edits land; a turn that lost its claim saves no plan."""
+    from packages.core.ai.tools.workspace_arch_tools import _AGENT_CAPABILITY_PLANS_FIELD
+    from packages.core.services import agent_generator
+
+    def patch_slow(while_slow):
+        async def match(*, capability_catalog, **_):
+            await while_slow()
+            return capability_catalog.resolve(["tool:web_search"])
+
+        monkeypatch.setattr(agent_generator, "match_agent_capabilities", match)
+
+    results, fields = await _draft_turn_with_slow_model(
+        tight_engine, monkeypatch, meanwhile=meanwhile, patch_slow=patch_slow,
+        calls=[("ws_search_capabilities", {"service_key": "research"})],
+    )
+    if meanwhile == "person_edits":
+        assert results[0]["ok"], results
+        assert [plan["capability_ids"] for plan in fields[_AGENT_CAPABILITY_PLANS_FIELD]] == [["tool:web_search"]]
+    else:
+        assert not fields.get(_AGENT_CAPABILITY_PLANS_FIELD)
+
+
 
 
 @pytest.mark.asyncio

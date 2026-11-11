@@ -29,7 +29,7 @@ export default function PanelHeader({
         alignItems: "center",
         justifyContent: "space-between",
         padding: "14px 16px",
-        borderBottom: "1px solid var(--modal-border, #f5f5f4)",
+        borderBottom: "1px solid var(--modal-border, #f5f5f7)",
         flexShrink: 0,
       }}
     >
@@ -41,7 +41,7 @@ export default function PanelHeader({
             style={{
               fontSize: 13,
               fontWeight: 700,
-              color: "var(--text-strong, #292524)",
+              color: "var(--text-strong, #2c2c2e)",
               lineHeight: 1.3,
             }}
           >

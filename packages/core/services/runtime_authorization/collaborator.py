@@ -189,7 +189,6 @@ COLLABORATOR_RUNTIME_SUBJECTS: tuple[CollaboratorSubjectGroup, ...] = (
             ("tool.read_finance_ledger.read", None),
             ("tool.read_recruiting_ledger.read", None),
             ("tool.read_relationship_ledger.read", None),
-            ("tool.read_stickman_topic_ledger.read", None),
             ("tool.query_ledger.read", None),
             ("tool.visualize_workspace_ledgers.read", None),
         ),
@@ -622,7 +621,7 @@ _WORKFLOW_WRITE_TOOLS = frozenset({"ai_edit_workflow", "update_workflow", "delet
 
 
 # Workflow-run tools whose ``run_id`` must be a run in the run Workspace.
-_WORKFLOW_RUN_TOOLS = frozenset({"get_workflow_run", "cancel_workflow_run", "resume_workflow_run"})
+_WORKFLOW_RUN_TOOLS = frozenset({"get_workflow_run", "cancel_workflow_run", "resume_workflow_run", "retry_workflow_run"})
 
 
 async def _workflow_outside(db, *, entity_id: str, workspace_id: str, tool_name: str, arguments) -> bool:

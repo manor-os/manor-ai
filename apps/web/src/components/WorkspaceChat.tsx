@@ -1,4 +1,5 @@
 import ApprovalModeTrigger from "./approvals/ApprovalModeTrigger";
+import { publishedSitesFromAttachments } from "../lib/publishedSites";
 /**
  * WorkspaceChat — interactive group chat for workspace operations.
  *
@@ -7,6 +8,9 @@ import ApprovalModeTrigger from "./approvals/ApprovalModeTrigger";
  * @mention: type "@" to open agent picker dropdown, routes message to that agent.
  * Also displays workspace events: proposals, agent updates, step events, goal alerts.
  */
+import { ALWAYS_ALLOW_CHOICE, FOCUS_COMPOSER_EVENT, type FocusComposerDetail } from "../lib/recommendedOptions";
+import MessageQuestionOptions from "./ui/MessageQuestionOptions";
+import PendingBatchQuestion, { collectPendingBatches, type BatchGroup } from "./ui/PendingBatchQuestion";
 import { Fragment, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type CSSProperties } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { skillListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
@@ -22,12 +26,14 @@ import {
 } from "../lib/api";
 import { invalidateAgentInitiativeQueries } from "../lib/agentInitiativeInvalidation";
 import { invalidateKnowledgeQueries } from "../lib/knowledgeInvalidation";
+import { displayReadInterval, setupReadInterval } from "../lib/readRefreshPolicy";
+import { WORKSPACE_CHAT_PAGE_SIZE, workspaceChatMessagesQuery } from "../lib/workspaceChatMessages";
+import { isPageVisible, usePageVisible } from "../lib/usePageVisible";
 import { uploadPendingInputFiles } from "../lib/pendingInputUploads";
 import type { WorkflowDocumentRef } from "../lib/workflowRunInputs";
 import {
   createKeyedTrailingScheduler,
   workspaceRealtimeRefreshPlan,
-  workspaceSetupRefetchInterval,
   WORKFLOW_RUN_EVENT_COALESCE_MS,
 } from "../lib/workspaceLiveRefresh";
 import {
@@ -58,16 +64,20 @@ import {
   type OutputArtifact,
 } from "./EmbeddedChat";
 import {
-  ChatMessageReferenceStrip,
   chatMessageReferencesFromAttachments,
   parseUserMessageDisplay,
 } from "./ChatMessageDisplay";
-import WorkflowResultCard from "./WorkflowResultCard";
-import SimulationArtifactGallery from "./SimulationArtifactGallery";
+import AssistantReplyResults from "./chat/AssistantReplyResults";
+import { PreviewsStartFolded } from "./ChatFilePreview";
+import { workspaceResultStartsFolded } from "../lib/resultFiles";
 import {
-  WorkspaceSimulationRuntimeBar,
+  WorkspaceSimulationChip,
+  WorkspaceSimulationComposerNotice,
+  WorkspaceSimulationCompletion,
+  WorkspaceSimulationStatus,
   useWorkspaceSimulationRuntime,
 } from "./WorkspaceSimulationRuntime";
+import PromoteWorkspaceModal from "./blueprints/PromoteWorkspaceModal";
 import AssistantMessageBlocks, {
   assistantPendingActionKindForMessage,
 } from "./AssistantMessageBlocks";
@@ -95,7 +105,7 @@ import { agentAvatarSeed } from "./ui/AgentAvatar";
 import UserAvatar from "./ui/UserAvatar";
 import WorkspaceIconTile from "./ui/WorkspaceIcon";
 import WorkspaceConnectionNotice from "./workspaces/WorkspaceConnectionNotice";
-import WorkspaceAppView from "./workspaces/WorkspaceAppView";
+import WorkspaceAppView, { workspaceAppHasContent } from "./workspaces/WorkspaceAppView";
 import FeatureDiscoveryHint, { FeatureDiscoveryBadge } from "./ui/FeatureDiscoveryHint";
 import useFeatureDiscovery from "./useFeatureDiscovery";
 import { FEATURE_DISCOVERIES } from "../lib/featureDiscovery";
@@ -103,9 +113,9 @@ import BlueprintGuideDialog, { workspaceUsageGuide } from "./blueprints/Blueprin
 import WorkspaceStatsQuickAccess from "./workspaces/WorkspaceStatsQuickAccess";
 import WorkspaceLedgerConfigurationDialog from "./workspaces/WorkspaceLedgerConfigurationDialog";
 import ChatActionCard, { ApprovalSummary } from "./ui/ChatActionCard";
+import { CardReplyContext } from "./ui/cardReplyContext";
 import { isErrorHitlCard } from "../lib/approvalCopy";
 import { PendingActionKind } from "../lib/pendingActionKinds";
-import InlineTips from "./ui/InlineTips";
 import ToolCallList from "./ui/ToolCallList";
 import LoadingSpinner from "./ui/LoadingSpinner";
 import Button from "./ui/Button";
@@ -135,11 +145,17 @@ import {
   getChatModeInputPlaceholder,
   type ChatModePayload,
 } from "./ChatModeBriefPanel";
-import WorkspaceWorkflowRunHost, {
-  buildWorkspaceWorkflowRunGroups,
-  workflowRunIdForMessage,
-  workflowHostOwnedMessageIds,
-} from "./workflows/WorkspaceWorkflowRunHost";
+import { workflowRunIdForMessage } from "./workflows/WorkspaceWorkflowRunHost";
+import { workflowRunPath } from "../lib/workflowRoutes";
+import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
+import { preserveReturnToInHistory } from "../lib/chatRouteReferences";
+import {
+  applyWorkflowProgress,
+  foldWorkflowRunRows,
+  hasOwnBubble,
+  WORKFLOW_WAIT_ACTION_KINDS,
+  type WorkflowRunRow,
+} from "../lib/workspaceWorkflowRunRows";
 import {
   workflowRunStatusPresentation,
   type WorkflowRunAction,
@@ -153,12 +169,11 @@ import {
   IconEdit,
   IconFlow,
   IconHelp,
-  IconPanelRight,
-  IconPanelRightClose,
   IconPause,
   IconPlay,
   IconPlus,
   IconRefresh,
+  IconReply,
   IconTrash,
   IconUsers,
   IconWarning,
@@ -168,7 +183,6 @@ import {
   formatByokProviderErrorMessage,
   formatFilePermissionErrorMessage,
   isRedundantApprovalResolutionReceipt,
-  hitlActionTranscriptText,
   nextTypewriterSlice,
   pendingHITLIds,
   parseToolCalls,
@@ -180,6 +194,8 @@ import {
   type SubAgentEvent,
   type ToolCall,
 } from "../lib/chatStream";
+import type { AssistantBlock } from "../lib/chatStream";
+import { joinReplyProcesses } from "../lib/assistantProcessPresentation";
 import { hasNewerNonGreetingMessage } from "../lib/agentGreetingPlayback";
 import {
   collectResponseSurfaceSubmissionFailureMessageIds,
@@ -195,7 +211,7 @@ import {
   recoverRuntimeChatSession,
   useChatStreamStore,
 } from "../stores/chatStream";
-import { answerRuntimeHumanInput } from "../stores/chatStream";
+import { answerRuntimeHumanInput, decideRuntimeApproval, parkedApprovalDecision, parkedOnApproval } from "../stores/chatStream";
 import { RuntimeHumanInputCard } from "./ui/RuntimeHumanInputCard";
 import {
   formatUserFacingStructuredText,
@@ -205,7 +221,7 @@ import { relativeTime } from "../lib/format";
 import { hasActiveWorkspaceChatStream } from "../lib/workspaceChatStream";
 import Chip from "./ui/Chip";
 import StatusBadge from "./ui/StatusBadge";
-import type { WorkspaceMessageKind } from "../lib/workspaceMessageKinds";
+import { repeatsWorkspaceLifecycle, type WorkspaceMessageKind } from "../lib/workspaceMessageKinds";
 import {
   proposalApprovalView,
   proposalApprovedRowIds,
@@ -425,7 +441,7 @@ function systemSenderName(msg: WsMessage) {
 }
 
 const WORKSPACE_CHAT_DRAFT_PREFIX = "manor_workspace_chat_draft:";
-const WORKSPACE_CHAT_PAGE_SIZE = 75;
+const WORKSPACE_CHAT_LOAD_OLDER_WITHIN_PX = 400;
 const STRATEGIST_ACTIVITY_RECONCILE_MS = 3_000;
 const STRATEGIST_ACTIVITY_RECONCILE_TIMEOUT_MS = 10_000;
 const STRATEGIST_ACTIVITY_RECONCILE_MAX_DELAY_MS = 30_000;
@@ -1389,15 +1405,25 @@ export default function WorkspaceChat({
 }: WorkspaceChatProps) {
   const isSimple = useDisplayPreferences((s) => s.interfaceMode === "simple");
   const isTaskSession = Boolean(taskSession);
+  const visible = usePageVisible();
   const queryClient = useQueryClient();
   const catalogScope = useCatalogScope();
   const workflowRunInvalidationScheduler = useMemo(
     () => createKeyedTrailingScheduler(
       WORKFLOW_RUN_EVENT_COALESCE_MS,
-      (runId) => queryClient.invalidateQueries({
-        queryKey: ["workflow-run", runId],
-        exact: true,
-      }),
+      async (runId) => {
+        const refetchType = isPageVisible() ? "active" : "none";
+        await Promise.all([
+          queryClient.invalidateQueries({
+            queryKey: ["workflow-run", runId],
+            exact: true,
+            refetchType,
+          }, { cancelRefetch: false }),
+          queryClient.invalidateQueries({
+            queryKey: ["workflow-run-history-control", runId], exact: true, refetchType,
+          }, { cancelRefetch: false }),
+        ]);
+      },
     ),
     [queryClient],
   );
@@ -1433,6 +1459,10 @@ export default function WorkspaceChat({
   const navigate = useNavigate();
   const location = useLocation();
   const attentionTargetKey = new URLSearchParams(location.search).get("attention") || "";
+  // A link to one App entry (?app_action=<key>, e.g. from the mobile App) opens the App on it.
+  const appActionTarget = new URLSearchParams(location.search).get("app_action") || "";
+  // A page change's review card links here (?app_preview=<draft id>) to show the candidate page.
+  const appPreviewDraftId = new URLSearchParams(location.search).get("app_preview") || "";
   const locatedAttentionNavigationRef = useRef("");
   const attentionTargetMessageId = attentionTargetKey && location.hash.startsWith("#workspace-chat-message-")
     ? location.hash.slice("#workspace-chat-message-".length) : "";
@@ -1458,21 +1488,31 @@ export default function WorkspaceChat({
   } | null>(null);
   const [outputOpen, setOutputOpen] = useState(false);
   const configuredAppDisplay = workspace?.operating_model?.app_view?.open_as;
-  const [appDisplayMode, setAppDisplayMode] = useState(
-    () => initialAppDisplay ?? readWorkspaceAppDisplay(workspaceId, configuredAppDisplay),
+  const [savedAppDisplay, setAppDisplayMode] = useState(
+    () => initialAppDisplay ?? (appActionTarget ? "app" : readWorkspaceAppDisplay(workspaceId, configuredAppDisplay)),
   );
   // The Workspace record can arrive after the first render; its App's opening view applies until the viewer picks one.
   useEffect(() => {
-    if (initialAppDisplay || attentionTargetKey || hasChosenWorkspaceAppDisplay(workspaceId)) return;
+    if (initialAppDisplay || attentionTargetKey || appActionTarget || hasChosenWorkspaceAppDisplay(workspaceId)) return;
     const configured = asAppDisplay(configuredAppDisplay);
     if (configured) setAppDisplayMode(configured);
-  }, [attentionTargetKey, configuredAppDisplay, initialAppDisplay, workspaceId]);
+  }, [appActionTarget, attentionTargetKey, configuredAppDisplay, initialAppDisplay, workspaceId]);
   useEffect(() => {
     if (attentionTargetKey) setAppDisplayMode("chat");
   }, [attentionTargetKey]);
-  const appOpen = !threadRef && !isTaskSession && appDisplayMode !== "chat";
-  // The App beside the chat shows runs itself (Needs you, the run when opened).
-  const appPanelShown = appOpen && !outputOpen;
+  useEffect(() => {
+    if (appActionTarget) setAppDisplayMode((mode) => (mode === "chat" ? "app" : mode));
+  }, [appActionTarget]);
+  // The candidate page sits beside the chat that holds its review card.
+  useEffect(() => {
+    if (appPreviewDraftId) setAppDisplayMode((mode) => (mode === "chat" ? "split" : mode));
+  }, [appPreviewDraftId]);
+  const exitAppPreview = useCallback(() => {
+    const nextParams = new URLSearchParams(location.search);
+    nextParams.delete("app_preview");
+    navigate({ pathname: location.pathname, search: nextParams.toString(), hash: location.hash }, { replace: true });
+  }, [location.hash, location.pathname, location.search, navigate]);
+  const appPaneWanted = !threadRef && !isTaskSession && savedAppDisplay !== "chat";
   const changeAppDisplay = useCallback((mode: WorkspaceAppDisplayMode) => {
     setAppDisplayMode(mode);
     try {
@@ -1501,7 +1541,7 @@ export default function WorkspaceChat({
   const selectedArtifactReturnTo = `${location.pathname}${location.search}${
     selectedArtifactAnchor ? `#${selectedArtifactAnchor}` : location.hash || ""
   }`;
-  let promoteSimulationToLive: (() => void) | undefined;
+  const promoteSimulationToLive = () => setPromoteSimulationOpen(true);
   const currentUser = useAuthStore((s) => s.user);
   const [appUsed, setAppUsed] = useState(false);
   const appDiscovery = useFeatureDiscovery({
@@ -1533,18 +1573,11 @@ export default function WorkspaceChat({
   } = useQuery({
     queryKey: ["workspace-setup-status", workspaceId],
     queryFn: ({ signal }) => api.workspaces.setupStatus(workspaceId, signal),
-    enabled: shouldWatchBlueprintSetup,
+    enabled: visible && shouldWatchBlueprintSetup,
     staleTime: 10_000,
     refetchInterval: (query) => {
       const current = query.state.data;
-      return workspaceSetupRefetchInterval({
-        enabled: shouldWatchBlueprintSetup,
-        ready: current?.ready,
-        hasSetupJob: current?.incomplete_checks.some(
-          (check) => Boolean(check.setup_job_id),
-        ),
-        automaticSetupState: current?.automatic_setup_state,
-      });
+      return displayReadInterval(query.state, setupReadInterval(current));
     },
     refetchIntervalInBackground: false,
   });
@@ -1586,6 +1619,19 @@ export default function WorkspaceChat({
   >(new Map());
   const agentGreetingPlaybackStartedRef = useRef(false);
   const composerEditorRef = useRef<HTMLDivElement>(null);
+  // "Something else…" on a question card: answer in the composer, as a reply to that card.
+  const [cardReply, setCardReply] = useState<FocusComposerDetail | null>(null);
+  const cardReplyRef = useRef(cardReply);
+  cardReplyRef.current = cardReply;
+  useEffect(() => {
+    const replyInComposer = (event: Event) => {
+      const detail = (event as CustomEvent<FocusComposerDetail>).detail;
+      setCardReply(detail?.messageId ? detail : null);
+      composerEditorRef.current?.focus();
+    };
+    window.addEventListener(FOCUS_COMPOSER_EVENT, replyInComposer);
+    return () => window.removeEventListener(FOCUS_COMPOSER_EVENT, replyInComposer);
+  }, []);
   const draftScope = threadRef
     ? `${workspaceId}:${threadRef.kind}:${threadRef.id}`
     : workspaceId;
@@ -1624,7 +1670,7 @@ export default function WorkspaceChat({
       : undefined;
   const [runtimeInputBusy, setRuntimeInputBusy] = useState(false);
   const submitRuntimeHumanInput = useCallback(
-    async (answer: string, fields?: Record<string, string>, choice?: string) => {
+    async (answer: string, fields?: Record<string, unknown>, choice?: string) => {
       const sessionKey = currentSession?.key;
       if (!sessionKey) return;
       setRuntimeInputBusy(true);
@@ -1640,10 +1686,15 @@ export default function WorkspaceChat({
   const stopStream = useChatStreamStore((s) => s.stopStream);
   const setSessionMessages = useChatStreamStore((s) => s.setSessionMessages);
   const streamingRef = useRef(false);
+  // A run parked on an approval waits for a decision, not for this chat: the
+  // composer stays usable and a new message moves the conversation on.
+  const waitingOnApproval = parkedOnApproval(currentSession);
+  const waitingOnApprovalRef = useRef(false);
 
   useEffect(() => {
     streamingRef.current = streaming;
-  }, [streaming]);
+    waitingOnApprovalRef.current = waitingOnApproval;
+  }, [streaming, waitingOnApproval]);
 
   useLayoutEffect(() => {
     const stage = workspaceChatHistoryStageRef.current;
@@ -1706,27 +1757,13 @@ export default function WorkspaceChat({
 
   // Fetch the latest workspace chat page; older pages are loaded on demand.
   const workspaceMessagesQuery = useQuery({
-    queryKey: [
-      "workspace-chat",
-      workspaceId,
-      threadRef?.kind || "main",
-      threadRef?.id || "",
-    ],
-    queryFn: ({ signal }) =>
-      api.workspaces.chat.listMessagesPage(
-        workspaceId,
-        {
-          limit: WORKSPACE_CHAT_PAGE_SIZE,
-          thread_ref_kind: threadRef?.kind,
-          thread_ref_id: threadRef?.id,
-        },
-        signal,
-      ),
-    refetchInterval: (query) => !streaming && hasActiveWorkspaceChatStream(
+    ...workspaceChatMessagesQuery(workspaceId, threadRef),
+    enabled: visible,
+    refetchInterval: (query) => displayReadInterval(query.state, !streaming && hasActiveWorkspaceChatStream(
       query.state.data?.items || [],
       query.state.data?.conversation_id,
       query.state.data?.has_active_runtime_run,
-    ) ? 10_000 : false,
+    ) ? 10_000 : false),
   });
 
   const { data: workspaceMessagesPage, isLoading: workspaceMessagesLoading } = workspaceMessagesQuery;
@@ -1738,14 +1775,45 @@ export default function WorkspaceChat({
   const appViewQuery = useQuery({
     queryKey: ["workspace-app-view", workspaceId, "runtime"],
     queryFn: ({ signal }) => api.workspaces.appView(workspaceId, { includeCatalog: false, signal }),
-    enabled: Boolean(workspaceId && appOpen && !outputOpen && !threadRef && !isTaskSession),
-    refetchInterval: appOpen && !outputOpen ? 30_000 : false,
+    // Chat alone still reads it, after its messages, to know whether there is an App to offer.
+    enabled: visible && Boolean(workspaceId && !appPreviewDraftId && !threadRef && !isTaskSession && ((appPaneWanted && !outputOpen) || !workspaceMessagesQuery.isPending)),
+    refetchInterval: (query) => appPaneWanted && !outputOpen ? displayReadInterval(query.state, 300_000) : false,
+    retry: false,
+    refetchOnWindowFocus: "always",
     refetchIntervalInBackground: false,
   });
+  const appPreviewQuery = useQuery({
+    queryKey: ["workspace-app-view", workspaceId, "draft", appPreviewDraftId],
+    queryFn: ({ signal }) => api.workspaces.appView(workspaceId, { includeCatalog: false, draftId: appPreviewDraftId, signal }),
+    enabled: visible && Boolean(workspaceId && appPreviewDraftId && appPaneWanted && !outputOpen && !threadRef && !isTaskSession),
+    retry: false,
+    // Noticing soon that its review card was answered returns the pane to the saved page.
+    refetchInterval: (query) => displayReadInterval(query.state, 15_000),
+    refetchOnWindowFocus: "always",
+    refetchIntervalInBackground: false,
+  });
+  const shownAppViewQuery = appPreviewDraftId ? appPreviewQuery : appViewQuery;
+  // A draft that was approved or discarded has no page to preview: show the saved one.
+  const refetchAppView = appViewQuery.refetch;
+  useEffect(() => {
+    if (visible && appPreviewDraftId && appPreviewQuery.isError) {
+      exitAppPreview();
+      void refetchAppView({ cancelRefetch: false });
+    }
+  }, [visible, appPreviewDraftId, appPreviewQuery.isError, exitAppPreview, refetchAppView]);
+  // The saved choice stays, so the viewer's view comes back once the App has content.
+  const appViewEmpty = shownAppViewQuery.data ? !workspaceAppHasContent(shownAppViewQuery.data) : null;
+  // A pane that might have nothing on it waits for the answer: opening and then
+  // closing it would shift the chat under the reader. Anyone who picked this view,
+  // or a Workspace whose App sets how it opens, knows there is an App to show.
+  const appExpected = Boolean(appPreviewDraftId || initialAppDisplay || appActionTarget || asAppDisplay(configuredAppDisplay) || hasChosenWorkspaceAppDisplay(workspaceId));
+  const appOpen = appPaneWanted && (appViewEmpty === false || (appViewEmpty === null && (appExpected || shownAppViewQuery.isError)));
+  const appDisplayMode = appPaneWanted && !appOpen ? "chat" : savedAppDisplay;
+  const appSwitchVisible = appViewEmpty === false || appOpen || shownAppViewQuery.isError;
   // Start secondary reads after the visible Chat/App requests settle. Errors
   // also release this gate so a failed panel cannot block the remaining UI.
   const supportingQueriesEnabled = !workspaceMessagesQuery.isPending
-    && (!appOpen || outputOpen || threadRef || isTaskSession || !appViewQuery.isPending);
+    && (!appPaneWanted || outputOpen || threadRef || isTaskSession || !shownAppViewQuery.isPending);
   const { data: fetchedMappings, isLoading: fetchedMappingsLoading } = useQuery({
     queryKey: ["workspace-agents", workspaceId],
     queryFn: () => api.workspaces.agents.list(workspaceId),
@@ -2001,7 +2069,7 @@ export default function WorkspaceChat({
             ))}
           </>
         ),
-        body: <p style={{ margin: 0, color: "#44403c" }}>{full.description}</p>,
+        body: <p style={{ margin: 0, color: "var(--text-default)" }}>{full.description}</p>,
         primaryAction: readOnlyTemplate
           ? undefined
           : {
@@ -2038,7 +2106,7 @@ export default function WorkspaceChat({
         ),
         title: agent.name,
         body: (
-          <p style={{ margin: 0, color: "#a8a29e" }}>
+          <p style={{ margin: 0, color: "var(--text-muted)" }}>
             {t("component.workspace_chat.failed_to_load_agent_details")}
           </p>
         ),
@@ -2179,6 +2247,24 @@ export default function WorkspaceChat({
     workspaceHistoryState.nextCursor,
     workspaceId,
   ]);
+
+  // Scrolling up near the top reads the next older page. The button stays for
+  // when the history is too short to scroll.
+  const loadOlderOnScrollRef = useRef(handleLoadOlderMessages);
+  loadOlderOnScrollRef.current = handleLoadOlderMessages;
+  useEffect(() => {
+    // Listened to from the document: the chat body comes and goes with the App view.
+    let lastTop = 0;
+    const onScroll = (event: Event) => {
+      const body = chatBodyRef.current;
+      if (!body || event.target !== body) return;
+      const top = body.scrollTop;
+      if (top < lastTop && top < WORKSPACE_CHAT_LOAD_OLDER_WITHIN_PX) void loadOlderOnScrollRef.current();
+      lastTop = top;
+    };
+    document.addEventListener("scroll", onScroll, { capture: true, passive: true });
+    return () => document.removeEventListener("scroll", onScroll, { capture: true });
+  }, [chatBodyRef]);
 
   // The page identifies this Workspace/thread's conversation. Pinned action
   // cards can belong to other threads and must never redirect new messages.
@@ -2642,12 +2728,26 @@ export default function WorkspaceChat({
               meta: { workflow_run_id: data.workflow_run_id },
             },
           );
+          // A run's row moves on each step's announcement without reading the
+          // chat again; an ending or a question on the row itself is read again.
+          const progressed = loadedMessage && data.message_kind === "workflow_activity" && data.workflow_progress
+            ? (data.has_pending_action ? null : applyWorkflowProgress(loadedMessage, data.workflow_progress))
+            : undefined;
+          if (progressed) {
+            const updatedAt = new Date().toISOString();
+            setWsMessages((current) =>
+              current.map((message) =>
+                message.id === progressed.id ? { ...progressed, updated_at: updatedAt } : message,
+              ),
+            );
+          }
           const refreshPlan = workspaceRealtimeRefreshPlan({
             messageKind: typeof data.message_kind === "string"
               ? data.message_kind
               : null,
             isKnownMessage: Boolean(loadedMessage),
             workflowRunId: changedRunId,
+            progressApplied: progressed === undefined ? undefined : Boolean(progressed),
           });
           if (refreshPlan.invalidateChat) {
             void queryClient.invalidateQueries({
@@ -3131,14 +3231,8 @@ export default function WorkspaceChat({
     setAgentGreetingPlayback(null);
   }, [agentGreetingPlayback]);
 
-  const workflowRunGroups = useMemo(
-    () => buildWorkspaceWorkflowRunGroups(sorted),
-    [sorted],
-  );
-  const hostOwnedWorkflowMessageIds = useMemo(
-    () => workflowHostOwnedMessageIds(workflowRunGroups),
-    [workflowRunGroups],
-  );
+  // Each Workflow run is one event row; its waits stay bubbles on their messages.
+  const workflowRunFold = useMemo(() => foldWorkflowRunRows(sorted), [sorted]);
   const responseSurfaceSubmissionReceipts = useMemo(
     () => collectResponseSurfaceSubmissionReceipts([...sorted, ...localMsgs]),
     [localMsgs, sorted],
@@ -3152,8 +3246,7 @@ export default function WorkspaceChat({
   );
   const visibleSortedMessages = useMemo(
     () => sorted.filter((msg) => (
-      (!hostOwnedWorkflowMessageIds.has(msg.id) || msg.id === attentionTargetMessageId)
-      && !isResponseSurfaceSubmissionMessage(msg, responseSurfaceSubmissionReceipts)
+      !isResponseSurfaceSubmissionMessage(msg, responseSurfaceSubmissionReceipts)
       && !responseSurfaceSubmissionFailureMessageIds.has(msg.id)
     ))
       .filter((msg) =>
@@ -3166,8 +3259,6 @@ export default function WorkspaceChat({
         }),
       ),
     [
-      attentionTargetMessageId,
-      hostOwnedWorkflowMessageIds,
       responseSurfaceSubmissionFailureMessageIds,
       responseSurfaceSubmissionReceipts,
       sorted,
@@ -3203,35 +3294,39 @@ export default function WorkspaceChat({
   const presentedVisibleSortedMessages = useMemo(
     () => visibleSortedMessages
       .filter((message) => !hiddenAgentGreetingIds.has(message.id))
-      .map((message) =>
-        message.id === activeAgentGreetingId
+      .map((message) => {
+        // A run's wait is asked by the agent on that step.
+        const speaker = workflowRunFold.speakerByMessageId.get(message.id);
+        const presented = speaker ? { ...message, author_subscription_id: speaker } : message;
+        return message.id === activeAgentGreetingId
           ? {
-              ...message,
+              ...presented,
               body: activeAgentGreetingCharacters
                 .slice(0, agentGreetingPlayback?.visibleCharacters || 0)
                 .join(""),
             }
-          : message,
-      ),
+          : presented;
+      }),
     [
       activeAgentGreetingCharacters,
       activeAgentGreetingId,
       agentGreetingPlayback?.visibleCharacters,
       hiddenAgentGreetingIds,
       visibleSortedMessages,
+      workflowRunFold,
     ],
   );
 
   const pendingActions = useMemo(
-    () => sorted.filter((msg) =>
-      isOpenPendingAction(msg) && !hostOwnedWorkflowMessageIds.has(msg.id)
-    ),
-    [hostOwnedWorkflowMessageIds, sorted],
+    () => sorted.filter(isOpenPendingAction),
+    [sorted],
   );
 
   // Resolve pending action
   const resolvingActionIdsRef = useRef(new Set<string>());
   const [actionResetTokens, setActionResetTokens] = useState<Record<string, number>>({});
+  /** Why the last answer to a card was not accepted, shown quietly on it. */
+  const [actionErrors, setActionErrors] = useState<Record<string, string>>({});
   const resolveMutation = useMutation({
     mutationFn: async ({
       msgId,
@@ -3267,6 +3362,7 @@ export default function WorkspaceChat({
       );
     },
     onSuccess: (resolved, { msgId }) => {
+      setActionErrors(({ [msgId]: _cleared, ...rest }) => rest);
       // Close the card locally on the server's own response. The refetch below
       // cannot be relied on for this: a card pinned from outside the page
       // window drops out of the pinned set the instant it is answered, so the
@@ -3326,6 +3422,8 @@ export default function WorkspaceChat({
         ...previous,
         [msgId]: (previous[msgId] || 0) + 1,
       }));
+      // The answer did not go through: the card keeps its options and says why.
+      setActionErrors((previous) => ({ ...previous, [msgId]: error.message || t("lib.api.request_failed") }));
       // The shared API client reports other failures, but leaves 403s to the
       // caller so permission failures on background reads do not create noise.
       if (error instanceof ApiError && error.status === 403) {
@@ -3353,21 +3451,6 @@ export default function WorkspaceChat({
     },
     [resolveMutation],
   );
-  const handleWorkflowResolve = useCallback(
-    async (
-      msgId: string,
-      choice: string,
-      note?: string,
-      payload?: Record<string, unknown>,
-      files?: File[],
-    ) => {
-      if (resolvingActionIdsRef.current.has(msgId)) return;
-      resolvingActionIdsRef.current.add(msgId);
-      // The floating card needs the actual request lifetime, including errors.
-      await resolveMutation.mutateAsync({ msgId, choice, note, payload, files });
-    },
-    [resolveMutation],
-  );
   /* ── Tool-call HITL (metadata channel) ──
    *
    * These cards normally have no `pending_action` row, so `/messages/{id}/resolve`
@@ -3382,24 +3465,22 @@ export default function WorkspaceChat({
    * a new one. The server persists `resolved` back into the message metadata
    * and saves a readable transcript line in place of the raw JSON.
    */
+  const refreshWorkspaceChat = useCallback(() => {
+    void queryClient.invalidateQueries({ queryKey: ["workspace-chat", workspaceId] });
+  }, [queryClient, workspaceId]);
   const handleHitlAction = useCallback(
     async (hitlId: string, action: string) => {
       if (!hitlId || streamingRef.current) return;
       resumeAutoFollow();
       const now = new Date().toISOString();
+      // The card itself collapses to "You chose …"; no separate receipt bubble.
       const initialMessages: WorkspaceLocalMsg[] = [
-        {
-          id: `local-user-${Date.now()}`,
-          role: "user",
-          content: hitlActionTranscriptText(action),
-          timestamp: now,
-        },
         {
           id: `local-bot-${Date.now()}`,
           role: "assistant",
           content: "",
           agentName: MANOR_AGENT_NAME,
-          agentColor: "#1c1917",
+          agentColor: "#1d1d1f",
           timestamp: now,
         },
       ];
@@ -3580,7 +3661,11 @@ export default function WorkspaceChat({
       } = {},
     ) => {
       if (streamingRef.current || remoteRunInFlight) {
-        return false;
+        if (!waitingOnApprovalRef.current) return false;
+        // Supersede the parked run: its approval closes and its card settles.
+        await stopStream(streamSessionKey);
+        streamingRef.current = false;
+        waitingOnApprovalRef.current = false;
       }
       const isResponseSurfaceSubmission = Boolean(sendOptions.responseSurfaceSubmission);
 
@@ -3651,7 +3736,7 @@ export default function WorkspaceChat({
         ? taskSession?.hostName || MANOR_AGENT_NAME
         : targetAgent?.name || MANOR_AGENT_NAME;
       const targetColor = targetName === MANOR_AGENT_NAME
-        ? "#1c1917"
+        ? "#1d1d1f"
         : agentColor(targetName);
 
       if (!isResponseSurfaceSubmission) {
@@ -3661,6 +3746,8 @@ export default function WorkspaceChat({
 
       const workflowMessage = workflow ? workflowInvokeMessage(workflow) : "";
       const clientMessageId = crypto.randomUUID();
+      const replyToMessageId = starterBindingId ? undefined : cardReplyRef.current?.messageId;
+      setCardReply(null);
       // Keep content as user text; the shared renderer owns attachment/Skill
       // chips from structured fields, independent of the current UI language.
       const displayContent = [
@@ -3698,6 +3785,7 @@ export default function WorkspaceChat({
           meta: {
             client_message_id: clientMessageId,
             author_user_id: currentUser?.id,
+            ...(replyToMessageId ? { reply_to_message_id: replyToMessageId } : {}),
             ...(starterBindingId ? {
                 workflow_binding_id: starterBindingId,
                 workflow_route_source: "explicit",
@@ -3756,6 +3844,7 @@ export default function WorkspaceChat({
                 workspaceContext: true,
                 agentId: targetAgent?.id,
                 workspaceAppAction: sendOptions.appAction,
+                replyToMessageId,
                 localWorkerId: sendContext?.localWorkerId,
                 threadRef,
                 files: localFiles.length > 0 ? localFiles : undefined,
@@ -3831,6 +3920,7 @@ export default function WorkspaceChat({
       queryClient,
       setInputDraft,
       startStream,
+      stopStream,
       streamSessionKey,
       requestChatMode,
       chatModePayload,
@@ -3992,6 +4082,32 @@ export default function WorkspaceChat({
     [wsMessages],
   );
 
+  // Same-kind open authorizations are one question in the timeline, asked
+  // where the first of them is. "Review each" brings back the single cards.
+  const [reviewEachBatches, setReviewEachBatches] = useState<Set<string>>(() => new Set());
+  const pendingBatches = useMemo(
+    () => collectPendingBatches(timelinePersistedMessages).filter((group) => !reviewEachBatches.has(group.key)),
+    [timelinePersistedMessages, reviewEachBatches],
+  );
+  const repliedCardIds = useMemo(() => new Set(
+    wsMessages.map((message) => message.meta?.reply_to_message_id).filter(Boolean) as string[],
+  ), [wsMessages]);
+  const batchedCardIds = useMemo(
+    () => new Set(pendingBatches.flatMap((group) => group.items.map((item) => item.id))),
+    [pendingBatches],
+  );
+  const batchLeadByMessage = useMemo(
+    () => new Map(pendingBatches.map((group) => [group.items[0].msgId, group])),
+    [pendingBatches],
+  );
+  const decideBatch = useCallback(async (group: BatchGroup, decision: "approve" | "reject") => {
+    for (const item of group.items) {
+      if (item.kind === "action") handleResolve(item.msgId, decision);
+      // Tool-call approvals resume their run one at a time.
+      else await handleHitlAction(item.id, decision);
+    }
+  }, [handleResolve, handleHitlAction]);
+
   const timelineItems = useMemo(() => {
     const persistedItems = timelinePersistedMessages.map((msg, index) => {
       const time = messageTimestampMs(msg.created_at);
@@ -4040,10 +4156,30 @@ export default function WorkspaceChat({
   // status messages are absorbed. This is the core de-noising step.
   const renderTimeline = useMemo(() => {
     type RunItem = { kind: "activity-run"; key: string; msgs: WsMessage[] };
-    type Folded = (typeof timelineItems)[number] | RunItem;
+    /** One Workflow run, anchored at its first message and shown as of now. */
+    type WorkflowRunItem = { kind: "workflow-run"; key: string; msg: WsMessage; row: WorkflowRunRow };
+    type Folded = (typeof timelineItems)[number] | RunItem | WorkflowRunItem;
     const out: Folded[] = [];
     const runByPlan = new Map<string, RunItem>();
+    const shownWorkflowRuns = new Set<string>();
     for (const it of timelineItems) {
+      const previous = out[out.length - 1];
+      if (it.kind === "persisted" && previous?.kind === "persisted" && repeatsWorkspaceLifecycle(previous.msg, it.msg)) {
+        out[out.length - 1] = it;
+        continue;
+      }
+      const workflowRunKey = it.kind === "persisted"
+        ? workflowRunFold.rowKeyByMessageId.get(it.msg.id)
+        : undefined;
+      const workflowRun = workflowRunKey ? workflowRunFold.rows.get(workflowRunKey) : undefined;
+      if (it.kind === "persisted" && workflowRun) {
+        if (!shownWorkflowRuns.has(workflowRun.key)) {
+          shownWorkflowRuns.add(workflowRun.key);
+          out.push({ kind: "workflow-run", key: `workflow-run-${workflowRun.key}`, msg: it.msg, row: workflowRun });
+        }
+        // A status update that asks something keeps its question as a bubble.
+        if (!hasOwnBubble(it.msg)) continue;
+      }
       if (it.kind === "persisted" && isActivityMessage(it.msg)) {
         const pid = planRefId(it.msg);
         if (pid) {
@@ -4064,20 +4200,28 @@ export default function WorkspaceChat({
       }
       out.push(it);
     }
+    // While a run waits on an approval its card reads under the run's own
+    // "Waiting for approval" line, never above it.
+    const parkedRunId = waitingOnApproval ? currentSession?.runtimeRunId : undefined;
+    if (parkedRunId) {
+      const isParkedCard = (item: Folded) => item.kind === "persisted"
+        && (item.msg.hitl_requests || []).some((hitl) => hitl?.runtime_run_id === parkedRunId);
+      return [...out.filter((item) => !isParkedCard(item)), ...out.filter(isParkedCard)];
+    }
     return out;
-  }, [timelineItems]);
+  }, [timelineItems, workflowRunFold, waitingOnApproval, currentSession?.runtimeRunId]);
 
   // A date divider opens each calendar day; consecutive bubbles of one speaker
-  // share one avatar and name for the rest of that day. After a pause, a merged
-  // bubble still shows its own time.
+  // share one avatar and name for the rest of that day; every bubble keeps its
+  // own time underneath.
   const timelineDecorations = useMemo(() => {
     let previousDay = "";
     let previousSpeaker = "";
     let previousTime = Number.NaN;
-    return renderTimeline.map((item) => {
+    const decorations = renderTimeline.map((item) => {
       const timestamp = item.kind === "activity-run"
         ? item.msgs[0]?.created_at
-        : item.kind === "persisted"
+        : item.kind === "persisted" || item.kind === "workflow-run"
           ? item.msg.created_at
           : item.msg.timestamp;
       const day = chatDayKey(timestamp);
@@ -4090,24 +4234,59 @@ export default function WorkspaceChat({
         : item.kind === "persisted" && !isActivityMessage(item.msg)
           ? persistedSpeakerKey(item.msg, subToAgent)
           : "";
-      const time = messageTimestampMs(timestamp || "");
       const continuation = Boolean(speaker && !divider && speaker === previousSpeaker);
+      const time = messageTimestampMs(timestamp || "");
       const continuationTime = continuation && (
-        !Number.isFinite(time) ||
-        !Number.isFinite(previousTime) ||
+        !Number.isFinite(time) || !Number.isFinite(previousTime) ||
         time - previousTime >= BUBBLE_CONTINUATION_TIME_GAP_MS
       );
       previousSpeaker = speaker;
       previousTime = speaker ? time : Number.NaN;
-      return { divider, continuation, continuationTime };
+      return { divider, continuation, continuationTime, speaker, joinedAbove: false, joinedBelow: false };
     });
+    // A reply that continues past a decision card (the answer after "You
+    // chose …", or the card of a run waiting under its status line) is the
+    // same reply: one bubble, one name and one time, never a second message.
+    const hasDecisionCard = (item: (typeof renderTimeline)[number]) => item.kind !== "activity-run" && Boolean(
+      (item.msg.hitl_requests || []).length
+      || (item.kind === "persisted" && (item.msg.pending_action?.kind || (item.msg.resolved_at && item.msg.resolution))),
+    );
+    const isParkedCard = (item: (typeof renderTimeline)[number]) => item.kind === "persisted"
+      && (item.msg.hitl_requests || []).some((hitl) => Boolean(hitl?.runtime_run_id));
+    for (let index = 1; index < decorations.length; index += 1) {
+      const item = renderTimeline[index];
+      const previous = renderTimeline[index - 1];
+      if (!decorations[index].continuation || !decorations[index].speaker.startsWith("agent:")) continue;
+      if (!hasDecisionCard(previous) && !isParkedCard(item)) continue;
+      decorations[index].joinedAbove = true;
+      decorations[index - 1].joinedBelow = true;
+      decorations[index].continuationTime = false;
+    }
+    return decorations;
   }, [currentUser?.id, renderTimeline, subToAgent]);
+
+  // A joined reply has one process line, at the top: the first saved part
+  // takes every part's steps and time (a still-streaming part keeps its own
+  // live line until it settles).
+  const joinedReplyBlocks = useMemo(() => {
+    const byKey = new Map<string, AssistantBlock[] | undefined>();
+    for (let start = 0; start < renderTimeline.length; start += 1) {
+      if (!timelineDecorations[start]?.joinedBelow || timelineDecorations[start]?.joinedAbove) continue;
+      let end = start;
+      while (timelineDecorations[end]?.joinedBelow && end + 1 < renderTimeline.length) end += 1;
+      const chain = renderTimeline.slice(start, end + 1);
+      if (chain.some((item) => item.kind !== "persisted")) continue;
+      const joined = joinReplyProcesses(chain.map((item) => (item.kind === "persisted" ? item.msg.assistant_blocks : null)));
+      chain.forEach((item, index) => byKey.set(item.key, joined[index]));
+    }
+    return byKey;
+  }, [renderTimeline, timelineDecorations]);
 
   const activeOutputArtifact = useMemo(() => {
     if (!selectedArtifact || !selectedArtifactAnchor) return selectedArtifact;
     const selectedKey = artifactDedupKey(selectedArtifact);
     for (const item of renderTimeline) {
-      if (item.kind === "activity-run") continue;
+      if (item.kind === "activity-run" || item.kind === "workflow-run") continue;
       const itemAnchor =
         item.kind === "local"
           ? `workspace-chat-message-${item.msg.id || item.key}`
@@ -4172,6 +4351,18 @@ export default function WorkspaceChat({
   const chatScrollRailMarkers = useMemo<ChatScrollRailMarker[]>(
     () => {
       const sources = renderTimeline.map<ChatScrollRailTurnSource>((item, index) => {
+        if (item.kind === "workflow-run") {
+          const line = workflowRunRowText(item.row);
+          return {
+            id: item.key,
+            sourceIndex: index,
+            role: "action",
+            tone: "action",
+            title: line,
+            excerpt: "",
+            text: line,
+          };
+        }
         if (item.kind === "activity-run") {
           const first = item.msgs[0];
           const body = first ? formatUserFacingStructuredText(first.body) : "";
@@ -4475,6 +4666,9 @@ export default function WorkspaceChat({
               >
                 {workspaceName || t("component.workspace_chat.workspace_chat")}
               </h2>
+              {showSimulationRuntime && <WorkspaceSimulationChip />}
+              {/* Just you is the normal state; the count only says something once there are others. */}
+              {workspaceParticipantCount > 1 && (
               <AnchoredPopover
                 align="left"
                 width={320}
@@ -4562,8 +4756,10 @@ export default function WorkspaceChat({
                   )}
                 </div>
               </AnchoredPopover>
+              )}
             </div>
-            {streaming ? (
+            {showSimulationRuntime && <WorkspaceSimulationStatus runtime={simulationRuntime} />}
+            {streaming && !waitingOnApproval ? (
               <div
                 style={{
                   display: "flex",
@@ -4574,20 +4770,8 @@ export default function WorkspaceChat({
               >
                 <AgentActivityOrb activity={activeWorkspaceActivity} />
               </div>
-            ) : !isSimple && (
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  marginTop: 2,
-                }}
-              >
-                <span className="workspace-chat-subtitle">
-                  {t("component.workspace_chat.talking_with_host", {
-                    agent: mentionAgent?.name || MANOR_AGENT_NAME,
-                  })}</span>
-              </div>
-            )}
+            ) : null}
+            {/* Who you are talking to lives in the composer placeholder. */}
           </div>
         </div>
         <div className="workspace-chat-header-actions">
@@ -4675,7 +4859,7 @@ export default function WorkspaceChat({
                         {workspaceAutonomyGoalsQuery.isLoading ? (
                           <div className="workspace-chat-autonomy-state" aria-live="polite">
                             <LoadingSpinner size={18} />
-                            <span>{t("page.workspace_detail.loading_goals")}</span>
+                            <span className="sr-only">{t("page.workspace_detail.loading_goals")}</span>
                           </div>
                         ) : workspaceAutonomyGoalsQuery.isError ? (
                           <div className="workspace-chat-autonomy-state workspace-chat-autonomy-state--error" role="alert">
@@ -4779,7 +4963,7 @@ export default function WorkspaceChat({
           )}
           {!threadRef && (
             <>
-              {appDiscovery.badgeVisible && (
+              {appSwitchVisible && appDiscovery.badgeVisible && (
                 <FeatureDiscoveryBadge
                   label={t("component.feature_discovery.new")}
                   onClick={appDiscovery.reveal}
@@ -4787,29 +4971,33 @@ export default function WorkspaceChat({
                   controls="workspace-app-feature-discovery"
                 />
               )}
-              <Button
-                variant="ghost"
-                size="sm"
-                className="workspace-app-pane-toggle"
-                onClick={() => {
-                  setAppUsed(true);
-                  setOutputOpen(false);
-                  changeAppDisplay(!appOpen || outputOpen ? "split" : "chat");
-                }}
-                ariaLabel={t(appOpen && !outputOpen ? "component.workspace_app_view.hide_app" : "component.workspace_app_view.open_app")}
-                ariaPressed={appOpen && !outputOpen}
-                title={t(appOpen && !outputOpen ? "component.workspace_app_view.hide_app" : "component.workspace_app_view.open_app")}
-                style={{ width: 30, padding: 0, display: "inline-flex", alignItems: "center", justifyContent: "center" }}
-              >
-                {appOpen && !outputOpen ? <IconPanelRightClose size={17} /> : <IconPanelRight size={17} />}
-              </Button>
+              {appSwitchVisible && <div className="workspace-app-display-switch" role="group" aria-label={t("component.workspace_app_view.page_tab")}>
+                {(["chat", "split", "app"] as const).map((mode) => {
+                  const active = (appOpen && !outputOpen ? appDisplayMode : "chat") === mode;
+                  return (
+                    <button
+                      key={mode}
+                      type="button"
+                      className={active ? "is-active" : ""}
+                      aria-pressed={active}
+                      onClick={() => {
+                        if (mode !== "chat") setAppUsed(true);
+                        setOutputOpen(false);
+                        changeAppDisplay(mode);
+                      }}
+                    >
+                      {t(`component.workspace_app_view.display_${mode}`)}
+                    </button>
+                  );
+                })}
+              </div>}
             </>
           )}
         </div>
       </div>
       )}
 
-      {!isTaskSession && !threadRef && appDiscovery.open && (
+      {!isTaskSession && !threadRef && appSwitchVisible && appDiscovery.open && (
         <FeatureDiscoveryHint
           id="workspace-app-feature-discovery"
           title={t("component.feature_discovery.workspace_app_title")}
@@ -4878,13 +5066,14 @@ export default function WorkspaceChat({
         </div>
       ))}
 
-      {!isTaskSession && (
-        <WorkspaceSimulationRuntimeBar
-          runtime={simulationRuntime}
-          onPromoteToLive={canToggleWorkspace ? promoteSimulationToLive : undefined}
+      {showSimulationRuntime && canToggleWorkspace && (
+        <PromoteWorkspaceModal
+          open={promoteSimulationOpen}
+          onClose={() => setPromoteSimulationOpen(false)}
+          workspaceId={workspaceId}
+          workspaceName={workspaceName || workspace?.name}
         />
       )}
-
 
       {/* ── Messages and floating run status ── */}
       <div
@@ -4919,6 +5108,30 @@ export default function WorkspaceChat({
               height: "100%",
             }}
           >
+            {!isTaskSession ? (
+              <div className="chat-empty-welcome workspace-chat-welcome">
+                {workspace && <WorkspaceIconTile workspace={workspace} size={56} iconSize={26} style={{ borderRadius: 16 }} />}
+                <h1 className="chat-empty-welcome-title">{workspace?.description?.split(/(?<=[.!?。！？])\s*/)[0] || workspaceName || workspace?.name}</h1>
+                <p className="workspace-chat-empty-copy">
+                  {t(isSimple ? "component.chat_input_footer.simple_placeholder" : "component.workspace_chat.empty_copy")}
+                </p>
+                {!isSimple && workflowInvokeOptions.length > 0 && (
+                  <div className="manor-welcome-chips">
+                    {workflowInvokeOptions.slice(0, 4).map((workflow) => (
+                      <button
+                        key={workflow.bindingId}
+                        type="button"
+                        className="manor-welcome-chip"
+                        title={workflow.description || undefined}
+                        onClick={() => setAppWorkflowSeed({ key: crypto.randomUUID(), workflow })}
+                      >
+                        {workflow.title}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ) : (
             <div style={{ textAlign: "center" }}>
               <div
                 style={{
@@ -4935,24 +5148,19 @@ export default function WorkspaceChat({
                 <IconChatBubble size={32} style={{ color: "#4f7d75" }} />
               </div>
               <p className="workspace-chat-empty-title">
-                {t(isTaskSession
-                  ? taskSession?.hostAvailable === false
-                    ? "page.task_detail.session_host_unavailable"
-                    : "page.task_detail.session_ready_title"
-                  : "component.workspace_chat.workspace_group_chat")}
+                {t(taskSession?.hostAvailable === false
+                  ? "page.task_detail.session_host_unavailable"
+                  : "page.task_detail.session_ready_title")}
               </p>
               <p className="workspace-chat-empty-copy">
-                {isTaskSession
-                  ? taskSession?.hostAvailable === false
-                    ? t("page.task_detail.session_host_unavailable_copy")
-                    : t("page.task_detail.session_ready_copy", {
-                        agent: taskSession?.hostName || MANOR_AGENT_NAME,
-                      })
-                  : isSimple
-                    ? t("component.chat_input_footer.simple_placeholder")
-                    : `${t("component.workspace_chat.talk_to")}${MANOR_AGENT_NAME} ${t("component.workspace_chat.or_mention_a_specific_agent")}`}
+                {taskSession?.hostAvailable === false
+                  ? t("page.task_detail.session_host_unavailable_copy")
+                  : t("page.task_detail.session_ready_copy", {
+                      agent: taskSession?.hostName || MANOR_AGENT_NAME,
+                    })}
               </p>
             </div>
+            )}
           </div>
         )}
 
@@ -4971,11 +5179,14 @@ export default function WorkspaceChat({
         )}
 
         {renderTimeline.map((item, itemIndex) => {
-          const { divider, continuation, continuationTime } = timelineDecorations[itemIndex] || {
+          const { divider, continuation, continuationTime, joinedAbove, joinedBelow } = timelineDecorations[itemIndex] || {
             divider: "",
             continuation: false,
             continuationTime: false,
+            joinedAbove: false,
+            joinedBelow: false,
           };
+          const joinClass = `${joinedAbove ? "chat-message-row--joined-above" : ""} ${joinedBelow ? "chat-message-row--joined-below" : ""}`;
           const rendered = (() => {
           if (item.kind === "activity-run") {
             return (
@@ -4983,6 +5194,18 @@ export default function WorkspaceChat({
                 key={item.key}
                 markerId={item.key}
                 msgs={item.msgs}
+              />
+            );
+          }
+          if (item.kind === "workflow-run") {
+            return (
+              <WsWorkflowRunLine
+                key={item.key}
+                markerId={item.key}
+                anchorId={item.msg.id}
+                anchorOwnsBubble={hasOwnBubble(item.msg)}
+                row={item.row}
+                workspaceId={workspaceId}
               />
             );
           }
@@ -5036,18 +5259,26 @@ export default function WorkspaceChat({
                 markerId={item.key}
                 workspaceId={workspaceId}
                 highlighted={pendingActionHighlight.highlightedMessageId === item.msg.id}
-                msg={item.msg}
+                msg={joinedReplyBlocks.has(item.key)
+                  ? { ...item.msg, assistant_blocks: joinedReplyBlocks.get(item.key) }
+                  : item.msg}
                 attentionKeys={workspaceMessagesPage?.unseen_action_keys?.[item.msg.id]}
-                workflowHistoryContext={hostOwnedWorkflowMessageIds.has(item.msg.id)}
                 subToAgent={subToAgent}
                 currentUserName={currentUserName}
                 currentUserAvatar={currentUserAvatar}
                 currentUserId={currentUser?.id || null}
                 onResolve={handleResolve}
                 onHitlAction={handleHitlAction}
+                onHitlSettled={refreshWorkspaceChat}
                 streaming={workspaceMessageOwnsStream(item.msg, localMsgs, streaming)}
                 presentingAgentGreeting={item.msg.id === activeAgentGreetingId}
                 actionResetToken={actionResetTokens[item.msg.id] || 0}
+                actionError={actionErrors[item.msg.id]}
+                batchedCardIds={batchedCardIds}
+                repliedCardIds={repliedCardIds}
+                batchLead={batchLeadByMessage.get(item.msg.id)}
+                onBatchDecision={(group, decision) => { void decideBatch(group, decision); }}
+                onBatchReviewEach={(group) => setReviewEachBatches((previous) => new Set([...previous, group.key]))}
                 onFeedback={handleTaskCompletionFeedback}
                 messageFeedbackValue={
                   messageFeedback[completionFeedbackKey || item.msg.id] || null
@@ -5057,6 +5288,7 @@ export default function WorkspaceChat({
                 suppressedTaskReferenceId={isTaskSession ? threadRef?.id : undefined}
                 onResponseSurfaceSubmit={handleResponseSurfaceSubmit}
                 responseSurfaceSubmissionReceipts={responseSurfaceSubmissionReceipts}
+                onAnswerQuestion={(answer) => { void handleSend(answer, []); }}
                 onConfigureLedgers={
                   !isSimple && canToggleWorkspace && !threadRef
                     ? openLedgerConfiguration
@@ -5064,6 +5296,8 @@ export default function WorkspaceChat({
                 }
                 continuation={continuation}
                 continuationTime={continuationTime}
+                joinClass={joinClass}
+                joinedBelow={joinedBelow}
               />
             );
           }
@@ -5125,7 +5359,7 @@ export default function WorkspaceChat({
           const visibleMessageFileReferences = messageDisplay.references;
           // A reply always has its bubble: speaker, text, then its process.
           const showMessageBubble = msg.role !== "user" || Boolean(
-            renderedBubbleContent || visibleMessageFileReferences.length > 0,
+            renderedBubbleContent || visibleMessageFileReferences.length > 0 || messageDisplay.sites.length > 0,
           );
           const messageArtifacts =
             msg.role === "assistant"
@@ -5153,11 +5387,12 @@ export default function WorkspaceChat({
           const showLocalMessageActions = Boolean(
             actionCopyText.trim() || canRateLocalMessage,
           );
-          const showLocalMessageMeta = Boolean(
+          const showLocalMessageMeta = !joinedBelow && Boolean(
             !isStreamingAssistant ||
               renderedBubbleContent ||
               localTools.length > 0 ||
               visibleMessageFileReferences.length > 0 ||
+              messageDisplay.sites.length > 0 ||
               messageArtifacts.length > 0,
           );
           const messageAnchorId = `workspace-chat-message-${msg.id || item.key}`;
@@ -5167,7 +5402,7 @@ export default function WorkspaceChat({
               key={item.key}
               id={messageAnchorId}
               data-chat-scroll-marker-id={item.key}
-              className={`chat-message-row chat-message-shell ${msg.role === "user" ? "chat-message-row--user" : ""} ${continuation ? "chat-message-row--continuation" : ""}`}
+              className={`chat-message-row chat-message-shell ${msg.role === "user" ? "chat-message-row--user" : ""} ${continuation ? "chat-message-row--continuation" : ""} ${joinClass}`}
             >
               {continuation ? (
                 <span className="chat-avatar-spacer" aria-hidden="true" />
@@ -5244,6 +5479,8 @@ export default function WorkspaceChat({
                       stepsSummary
                     />
                   )}
+                  {/* The question reads under the turn's status line, where
+                      the reply continues once it is answered. */}
                   {isStreamingAssistant && runtimeHumanInput && (
                     <RuntimeHumanInputCard
                       input={runtimeHumanInput}
@@ -5288,11 +5525,12 @@ export default function WorkspaceChat({
                       className="agent-activity-orb--message"
                     />
                   ) : null}
-                  <ChatMessageReferenceStrip
+                  <AssistantReplyResults
                     references={visibleMessageFileReferences}
+                    sites={messageDisplay.sites}
                     align={msg.role === "user" ? "right" : "left"}
-                    inlineFileCards
                     returnTo={messageReturnTo}
+                    toolCalls={localTools}
                   />
                   {msg.role === "assistant" && (
                     <ArtifactSummaryCards
@@ -5357,6 +5595,13 @@ export default function WorkspaceChat({
             </Fragment>
           );
         })}
+
+        {showSimulationRuntime && (
+          <WorkspaceSimulationCompletion
+            runtime={simulationRuntime}
+            onPromote={canToggleWorkspace ? promoteSimulationToLive : undefined}
+          />
+        )}
 
         {isSimple && shouldWatchBlueprintSetup && (blueprintSetupLoading || blueprintSetupError) && (
           <div className="workspace-chat-setup-status" role={blueprintSetupError ? "alert" : "status"}>
@@ -5464,34 +5709,12 @@ export default function WorkspaceChat({
               </div>
             )}
 
-            {/* Persistent feature tip — visible even in active chats so users keep
-                discovering what the workspace can do. */}
-            {!isSimple && <div className="chat-tip-bar">
-              <InlineTips
-                surface="workspace_chat"
-                context={{ hasAgents: agentList.length > 0 }}
-                placement="composer"
-              />
-            </div>}
-
-            {/* With the App open beside it the pinned run card would repeat what the
-                App shows; opening a run from the App switches to chat, which shows it. */}
-            {!appPanelShown && <WorkspaceWorkflowRunHost
-              workspaceId={workspaceId}
-              groups={workflowRunGroups}
-              attentionKeys={workspaceMessagesPage?.unseen_action_keys}
-              onResolveMessage={handleWorkflowResolve}
-              resolveLoading={resolveMutation.isPending}
-              resolveError={resolveMutation.error}
-              resolveMessageId={resolveMutation.variables?.msgId || null}
-              onRunChange={resolveMutation.reset}
-            />}
           </div>
         )}
       </div>
 
       {/* ── Footer / Input (shared composer with attach + voice + #) ── */}
-      <ChatInputFooter
+      {showSimulationRuntime ? <WorkspaceSimulationComposerNotice /> : <ChatInputFooter
         attachments="documents"
         voiceScope={{ workspaceId, conversationId: voiceScopeConversationId, threadRefKind: threadRef?.kind, threadRefId: threadRef?.id }}
         onVoiceConversation={(id) => {
@@ -5501,7 +5724,7 @@ export default function WorkspaceChat({
         value={input}
         onChange={handleInputChange}
         enterToSend
-        streaming={streaming}
+        streaming={streaming && !waitingOnApproval}
         showStopButton={!runtimeHumanInput}
         disabled={composerDisabled || remoteRunInFlight || taskSession?.hostAvailable === false}
         onSend={(text, attachments, manualSkills, context) => {
@@ -5512,7 +5735,21 @@ export default function WorkspaceChat({
         }}
         onStop={handleStopRequest}
         topSlot={
-          !isSimple && !isTaskSession && timelineItems.length > 0 ? (
+          cardReply ? (
+            <div className="composer-card-reply">
+              <IconReply size={14} aria-hidden="true" />
+              <span>{t("component.workspace_chat.replying_to_card", {
+                title: cardReply.title || t("component.workspace_chat.this_card"),
+              })}</span>
+              <button
+                type="button"
+                aria-label={t("component.workspace_chat.cancel_card_reply")}
+                onClick={() => setCardReply(null)}
+              >
+                <IconClose size={14} aria-hidden="true" />
+              </button>
+            </div>
+          ) : !isSimple && !isTaskSession && timelineItems.length > 0 ? (
               <ChatModeTemplateGallery
                 mode={chatMode}
                 disabled={streaming || composerDisabled}
@@ -5573,8 +5810,8 @@ export default function WorkspaceChat({
                 ? t("component.chat_input_footer.message_mentioned_agent_placeholder", { agent: mentionAgent.name })
                 : requestChatMode
                   ? getChatModeInputPlaceholder(chatMode, chatModePayload)
-                  : t("component.chat_input_footer.message_agent_placeholder", {
-                      agent: MANOR_AGENT_NAME,
+                  : t("component.workspace_chat.say_something_to", {
+                      name: workspaceName || workspace?.name || MANOR_AGENT_NAME,
                     })
         }
         mentions={isTaskSession ? [] : mentionOptions}
@@ -5587,7 +5824,7 @@ export default function WorkspaceChat({
         seedAttachmentsKey={composerSeed?.key}
         seedWorkflow={appWorkflowSeed?.workflow}
         seedWorkflowKey={appWorkflowSeed?.key}
-      />
+      />}
     </div>
   );
 
@@ -5600,6 +5837,22 @@ export default function WorkspaceChat({
     changeAppDisplay("chat");
     window.requestAnimationFrame(() => composerEditorRef.current?.focus());
   };
+  // An App entry's request gets the chat's latest reply; its result step draws it as the chat does:
+  // the live session while it streams, then the saved message the chat shows once it is done.
+  const latestAssistant = [...localMsgs].reverse().find((message) => message.role === "assistant");
+  const latestSaved = [...sorted].reverse().find((message) => message.author_kind === "agent");
+  const appLiveReply = streaming && latestAssistant ? { message: latestAssistant, streaming: true }
+    : latestSaved ? {
+      streaming: false,
+      message: {
+        id: latestSaved.id, role: "assistant" as const, content: String(latestSaved.body || ""),
+        tool_calls: parseToolCalls(latestSaved.tool_calls) || [],
+        assistant_blocks: latestSaved.assistant_blocks as ChatMessage["assistant_blocks"],
+        sub_agent_events: delegatedAgentRunsFromMeta(latestSaved.meta),
+        hitl_requests: (latestSaved.hitl_requests || undefined) as ChatMessage["hitl_requests"],
+      },
+    } : null;
+
   const launchAppAction = async (action: WorkspaceAppAction, request: string, documents: WorkflowDocumentRef[] = []) => {
     const prompt = [action.prompt || action.title, request].filter(Boolean).join("\n\n");
     // The form already put these files in Knowledge; the Agent reads them as attached documents.
@@ -5637,7 +5890,7 @@ export default function WorkspaceChat({
           {
             id: "chat",
             label: workspaceName || t("component.workspace_chat.workspace_chat"),
-            initialSize: 2,
+            initialSize: outputOpen ? 2 : 1,
             minSize: outputOpen ? 420 : showAppView ? 340 : undefined,
             collapsed: appPaneAvailable && appDisplayMode === "app",
             className: "embedded-chat-pane workspace-chat-pane",
@@ -5672,23 +5925,36 @@ export default function WorkspaceChat({
                   className: "embedded-chat-pane workspace-chat-app-pane",
                   children: (
                     <WorkspaceAppView
-                      view={appViewQuery.data}
-                      loading={appViewQuery.isLoading}
-                      error={appViewQuery.isError}
+                      key={appPreviewDraftId || "saved"}
+                      // Chat alone reads the view only to offer the switch; its sections wait until it is opened.
+                      view={appOpen || appUsed ? shownAppViewQuery.data : undefined}
+                      contextTitle={workspaceName || workspace?.name}
+                      loading={shownAppViewQuery.isLoading}
+                      error={shownAppViewQuery.isError}
                       busy={streaming || remoteRunInFlight}
-                      canStart={Boolean(appViewQuery.data?.can_start) && !composerDisabled}
-                      onRetry={() => { void appViewQuery.refetch(); }}
+                      canStart={Boolean(shownAppViewQuery.data?.can_start) && !composerDisabled}
+                      readOnlyNote={showSimulationRuntime ? t("component.workspace_simulation.app_after_promote") : undefined}
+                      onRetry={() => { void shownAppViewQuery.refetch(); }}
+                      draftPreview={appPreviewDraftId ? { draftId: appPreviewDraftId, onExit: exitAppPreview } : undefined}
                       onUse={() => setAppUsed(true)}
                       onAction={launchAppAction}
+                      liveReply={appLiveReply}
                       canUseWorkflowChat={(action) => !isSimple && workflowInvokeOptions.some((item) => item.bindingId === action.binding_id)}
                       onOpenWorkflow={prepareAppWorkflowChat}
                       onEdit={() => {
                         setAppUsed(true);
-                        setInputDraft(t("component.workspace_app_view.edit_prompt"));
                         changeAppDisplay("chat");
-                        window.requestAnimationFrame(() => composerEditorRef.current?.focus());
+                        // A guided start: the agent first asks who the page is for, then designs it.
+                        const prompt = t("component.workspace_app_view.edit_prompt");
+                        if (composerDisabled || streaming || remoteRunInFlight) {
+                          setInputDraft(prompt);
+                          window.requestAnimationFrame(() => composerEditorRef.current?.focus());
+                          return;
+                        }
+                        void handleSend(prompt, []);
                       }}
                       onClose={() => changeAppDisplay("chat")}
+                      onSplit={() => changeAppDisplay("split")}
                     />
                   ),
                 },
@@ -5753,7 +6019,6 @@ export function WsMessageRow({
   workspaceId,
   highlighted = false,
   attentionKeys,
-  workflowHistoryContext = false,
   msg,
   subToAgent,
   currentUserName,
@@ -5761,9 +6026,16 @@ export function WsMessageRow({
   currentUserId,
   onResolve,
   onHitlAction,
+  onHitlSettled,
   streaming,
   presentingAgentGreeting,
   actionResetToken,
+  actionError,
+  batchedCardIds,
+  repliedCardIds,
+  batchLead,
+  onBatchDecision,
+  onBatchReviewEach,
   onFeedback,
   messageFeedbackValue,
   onMessageFeedback,
@@ -5772,15 +6044,18 @@ export function WsMessageRow({
   onResponseSurfaceSubmit,
   responseSurfaceSubmissionReceipts = [],
   onConfigureLedgers,
+  onAnswerQuestion,
   continuation = false,
   continuationTime = false,
+  joinClass = "",
+  joinedBelow = false,
 }: {
+  /** Send an answer to a message's question as the person's reply. */
+  onAnswerQuestion?: (answer: string) => void;
   markerId?: string;
   workspaceId: string;
   highlighted?: boolean;
   attentionKeys?: Record<string, string>;
-  /** A located workflow message shows its original body; the run host owns controls. */
-  workflowHistoryContext?: boolean;
   msg: WsMessage;
   subToAgent: Map<string, AgentInfo>;
   currentUserName: string;
@@ -5796,9 +6071,20 @@ export function WsMessageRow({
   /** Answer a tool-call HITL card — a different path from `onResolve`; see
    *  `handleHitlAction`. */
   onHitlAction?: (hitlId: string, action: string) => void;
+  /** A parked run's approval was decided on its own endpoint; refresh. */
+  onHitlSettled?: () => void;
   streaming?: boolean;
   presentingAgentGreeting?: boolean;
   actionResetToken?: number;
+  /** Why the last answer to this card was not accepted. */
+  actionError?: string;
+  /** Cards answered together in a same-kind batch question; not shown alone. */
+  batchedCardIds?: Set<string>;
+  repliedCardIds?: Set<string>;
+  /** The batch question this message asks, when it holds the first card of one. */
+  batchLead?: BatchGroup;
+  onBatchDecision?: (group: BatchGroup, decision: "approve" | "reject") => void;
+  onBatchReviewEach?: (group: BatchGroup) => void;
   onFeedback: (
     msgId: string,
     feedbackKey: string,
@@ -5823,6 +6109,10 @@ export function WsMessageRow({
   continuation?: boolean;
   /** A merged bubble after a pause keeps its own time. */
   continuationTime?: boolean;
+  /** One reply drawn across rows (see timelineDecorations). */
+  joinClass?: string;
+  /** The reply continues in the row below, which carries its time. */
+  joinedBelow?: boolean;
 }) {
   const location = useLocation();
   const isSimple = useDisplayPreferences((s) => s.interfaceMode === "simple");
@@ -5844,23 +6134,33 @@ export function WsMessageRow({
       ? externalCustomerName(msg)
     : agent?.name ||
       (msg.author_kind === "system" ? systemSenderName(msg) : MANOR_AGENT_NAME);
-  const color = isExternalCustomer ? "#436b65" : agent ? agentColor(agent.name) : "#1c1917";
+  const color = isExternalCustomer ? "#436b65" : agent ? agentColor(agent.name) : "#1d1d1f";
   const collapseBody = shouldCollapseWorkspaceMessage(msg, isUser);
   const taskId = messageRefId(msg, "task");
   const linkedTaskRefs = taskRefs(msg);
   const delegatedRuns = delegatedAgentRunsFromMeta(msg.meta);
   const visibleTools = parseToolCalls(msg.tool_calls) || [];
   const fileReferences = chatMessageReferencesFromAttachments(msg.attachments);
-  const messageAttachments = fileReferences.map((reference) => ({
-    name: reference.name,
-    document_id: reference.document_id,
-    type: reference.kind,
-    fileType: reference.fileType,
-    mimeType: reference.mimeType,
-    previewUrl: reference.previewUrl || reference.url,
-    openUrl: reference.openUrl,
-    fsPath: reference.fsPath,
-  }));
+  const messageAttachments: NonNullable<ChatMessage["attachments"]> = [
+    ...fileReferences.map((reference) => ({
+      name: reference.name,
+      document_id: reference.document_id,
+      type: reference.kind,
+      fileType: reference.fileType,
+      mimeType: reference.mimeType,
+      previewUrl: reference.previewUrl || reference.url,
+      openUrl: reference.openUrl,
+      fsPath: reference.fsPath,
+    })),
+    // Published websites stay site attachments so the reply shows their card.
+    ...publishedSitesFromAttachments(msg.attachments).map((site) => ({
+      name: site.name,
+      type: "site",
+      url: site.url,
+      site_id: site.siteId,
+      revision: site.revision,
+    })),
+  ];
   const localCodingNotice = !isUser ? maybeLocalCodingRunNoticeForTools(visibleTools) : null;
   const bodyContent = String(localCodingNotice || msg.body || "");
   const baseWorkspaceChatMessage: ChatMessage = {
@@ -5962,27 +6262,41 @@ export function WsMessageRow({
       linkedTaskRefs.some((ref) => ref.status === "proposed"),
   );
   const displayPendingAction = workflowStarterAction(msg);
+  const cardReplyIdentity = useMemo(() => ({
+    messageId: msg.id,
+    title: displayPendingAction?.kind === PendingActionKind.WORKSPACE_OPERATION_REVIEW
+      ? t("component.chat_action_card.workspace_changes_title")
+      : String(displayPendingAction?.title || "").trim() || undefined,
+  }), [msg.id, displayPendingAction]);
   const pendingAttentionKey = attentionKeys?.[String(msg.pending_action?.approval_request_id || msg.pending_action?.approval_token || msg.id)];
   const inputQuestion = displayPendingAction?.kind === PendingActionKind.HUMAN_INPUT
     ? String(displayPendingAction.payload?.question || displayPendingAction.prompt || "").trim()
     : "";
   // The body is the text-only rendering (notifications, email) of the card:
-  // a lead line naming the asker, the question, and its options. The card
-  // shows all of it — the task chip names the task — open or answered.
-  const inputBody = renderedBodyContent.trim()
-    .replace(/^🙋\s*[^:\n]+? needs a human input:\s*/i, "")
-    .replace(/^(?:Question from the agent working on|Asked by [^\n]+?, an agent working on) “[^\n]*”:\s*/i, "")
-    .replace(/\n+Options: [^\n]*$/, "");
-  // An answered card restates its question unless it carries its own title.
-  const answeredCardShowsQuestion = Boolean(
-    displayPendingAction?.payload?.question &&
-    !["title", "review_title", "action_summary", "context_summary", "description"]
-      .some((key) => String(displayPendingAction?.[key] || "").trim()),
+  // a lead line naming the asker, the question, its options, who should answer
+  // and by when. The card shows the question, open or answered, so in chat the
+  // card is the message. Decided by the structured card, never by matching the
+  // body's wording, which every sender writes differently.
+  const redundantInputBody = Boolean(inputQuestion);
+  // An answered Workflow wait restates its prompt in the bubble; the body says
+  // the same words, so it is not shown twice. An answered review is named by its
+  // card, and its prompt only said how to decide, so that goes too.
+  const answeredWorkflowPrompt = msg.resolved_at
+    && WORKFLOW_WAIT_ACTION_KINDS.has(String(displayPendingAction?.kind || ""))
+    && (displayPendingAction?.review != null
+      || !["title", "review_title", "action_summary", "context_summary", "description"]
+        .some((key) => String(displayPendingAction?.[key] || "").trim()))
+    ? String(displayPendingAction?.prompt || "").trim()
+    : "";
+  const redundantWorkflowPromptBody = Boolean(
+    answeredWorkflowPrompt
+    && renderedBodyContent.trim().replace(/\s+/g, " ") === answeredWorkflowPrompt.replace(/\s+/g, " "),
   );
-  const redundantInputBody = Boolean(
-    inputQuestion &&
-    (!msg.resolved_at || answeredCardShowsQuestion) &&
-    inputBody.replace(/\s+/g, " ") === inputQuestion.replace(/\s+/g, " "),
+  // The bubble already says the action's prompt; its card does not repeat it.
+  const actionPrompt = String(displayPendingAction?.prompt || "").trim().replace(/\s+/g, " ");
+  const actionPromptShown = Boolean(
+    actionPrompt && !redundantWorkflowPromptBody
+    && renderedBodyContent.trim().replace(/\s+/g, " ") === actionPrompt,
   );
   const structuredProposalPayload = structuredProposal(msg);
   const resolvedByName =
@@ -6045,6 +6359,9 @@ export function WsMessageRow({
     msg.pending_action?.kind === PendingActionKind.WORKSPACE_OPERATION_REVIEW
       ? String(msg.pending_action.approval_token || msg.pending_action.draft_id || "")
       : "";
+  // A Workflow wait is likewise written twice; its `pending_action` is the
+  // one bubble with options.
+  const workflowWait = WORKFLOW_WAIT_ACTION_KINDS.has(String(msg.pending_action?.kind || ""));
   const hitlCards = (
     Array.isArray(msg.hitl_requests) ? msg.hitl_requests : []
   ).filter(
@@ -6052,15 +6369,18 @@ export function WsMessageRow({
       hitl &&
       typeof hitl === "object" &&
       hitl.id &&
-      !(pendingReviewToken && String(hitl.id) === pendingReviewToken),
+      !workflowWait &&
+      !(pendingReviewToken && String(hitl.id) === pendingReviewToken) &&
+      !batchedCardIds?.has(String(hitl.id)),
   );
   // A Workflow review is answered on its message; its metadata copy is not updated.
   const hitlResolved = (hitl: { resolved?: unknown; action?: unknown }) => Boolean(hitl.resolved)
     || (hitl.action === "workflow.review" && Boolean(msg.resolved_at));
-  // The review card carries the instructions; the body would repeat them.
+  // A review kept in the run's history is read from there into the bubble.
   const showsWorkflowReviewCard = !msg.resolved_at
     && msg.pending_action?.kind === PendingActionKind.WORKFLOW_APPROVAL
-    && hitlCards.some((hitl) => hitl.action === "workflow.review" && !hitl.resolved);
+    && msg.pending_action.review == null
+    && msg.pending_action.review_location === "workflow_history";
   const showFallbackProcess = !retryableAssistant && !hasAssistantBlocks && visibleTools.length > 0;
   // Bubble layer 1: speaker · time. Your own bubbles need neither; a
   // continuation of the same speaker does not repeat them.
@@ -6069,10 +6389,9 @@ export function WsMessageRow({
   return (
     <div
       id={`workspace-chat-message-${msg.id}`}
-      data-workspace-attention-key={workflowHistoryContext ? pendingAttentionKey : undefined}
       data-chat-scroll-marker-id={markerId || msg.id}
       tabIndex={-1}
-      className={`chat-message-row chat-message-shell ${isCurrentUser ? "chat-message-row--user" : ""} ${continuation ? "chat-message-row--continuation" : ""} ${highlighted ? "workspace-chat-message--highlighted" : ""}`}
+      className={`chat-message-row chat-message-shell ${isCurrentUser ? "chat-message-row--user" : ""} ${continuation ? "chat-message-row--continuation" : ""} ${joinClass} ${highlighted ? "workspace-chat-message--highlighted" : ""}`}
     >
       {continuation ? (
         <span className="chat-avatar-spacer" aria-hidden="true" />
@@ -6089,12 +6408,8 @@ export function WsMessageRow({
           type="user"
           size={32}
         />
-      ) : msg.author_kind === "system" ? (
-        isGovernanceApprovalMessage(msg) ? (
-          <UserAvatar type="governance" name={senderName} size={32} />
-        ) : (
-          <ManorAvatar size={32} />
-        )
+      ) : msg.author_kind === "system" && isGovernanceApprovalMessage(msg) ? (
+        <UserAvatar type="governance" name={senderName} size={32} />
       ) : agent ? (
         <UserAvatar
           name={agent.name}
@@ -6153,6 +6468,7 @@ export function WsMessageRow({
               stepsSummary
             />
           )}
+          <PreviewsStartFolded.Provider value={!isUser && workspaceResultStartsFolded(msg)}>
           {hasAssistantBlocks && (
             <AssistantMessageBlocks
               blocks={msg.assistant_blocks}
@@ -6173,14 +6489,11 @@ export function WsMessageRow({
             />
           )}
 
-          {!hasAssistantBlocks && msg.message_kind === "workflow_activity" && (
-            <WorkflowActivityContent msg={msg} subToAgent={subToAgent} />
-          )}
-
           {!hasAssistantBlocks &&
             msg.message_kind !== "workflow_activity" &&
             renderedBodyContent &&
             !redundantInputBody &&
+            !redundantWorkflowPromptBody &&
             !showsWorkflowReviewCard &&
             // An open approval renders a clean action card below; suppress the
             // raw governance body so internal keys/payloads never leak. Proposal
@@ -6188,7 +6501,7 @@ export function WsMessageRow({
             // typed payload and gives the operator the rationale before approval.
             // The input card owns its question; keep distinct body context.
             !(
-              !workflowHistoryContext && msg.pending_action?.kind &&
+              msg.pending_action?.kind &&
               msg.pending_action.kind !== PendingActionKind.HUMAN_INPUT &&
               !(
                 msg.message_kind === "proposal" &&
@@ -6204,42 +6517,57 @@ export function WsMessageRow({
                   action={displayPendingAction}
                   resolution={msg.resolution}
                   resolvedByName={resolvedByName}
-                  selectedRowIds={proposalRowsRenderedInline ? proposalSelectedRowIds : undefined}
-                  onToggleRow={proposalRowsRenderedInline ? toggleProposalRow : undefined}
+                  // A card decided as whole combinations has no per-row picks.
+                  selectedRowIds={proposalRowsRenderedInline && !displayPendingAction?.option_details ? proposalSelectedRowIds : undefined}
+                  onToggleRow={proposalRowsRenderedInline && !displayPendingAction?.option_details ? toggleProposalRow : undefined}
                   selectionDisabled={proposalSelectionLocked}
                 />
               </div>
             ) : (
+              <>
+              {isUser && typeof msg.meta?.reply_to_message_id === "string" && (
+                <button
+                  type="button"
+                  className="chat-card-reply-quote"
+                  onClick={() => document
+                    .querySelector(`[data-card-message-id="${msg.meta?.reply_to_message_id}"]`)
+                    ?.scrollIntoView({ behavior: "smooth", block: "center" })}
+                >
+                  <IconReply size={13} aria-hidden="true" />
+                  {t("component.workspace_chat.reply_to_card_quote")}
+                </button>
+              )}
               <ExpandableWorkspaceMarkdown
                 content={isUser ? renderedBodyContent : formatUserFacingStructuredText(renderedBodyContent)}
                 isUser={isCurrentUser}
                 collapsible={collapseBody}
                 streaming={presentingAgentGreeting}
               />
+              </>
             )
+          )}
+
+          {/* A question answered by replying ("which workflow?"): its options
+              send the answer as the person's message, the best match first. */}
+          {!isUser && msg.meta?.question?.answer_as === "message" && onAnswerQuestion && (
+            <MessageQuestionOptions question={msg.meta.question} onAnswer={onAnswerQuestion} disabled={Boolean(streaming)} />
           )}
 
           {presentingAgentGreeting && (
             <span className="chat-streaming-cursor" aria-hidden="true" />
           )}
 
-          <ChatMessageReferenceStrip
+          {/* The result is this bubble's text and files; one quiet link opens its run. */}
+          <AssistantReplyResults
             references={visibleFileReferences}
+            sites={messageDisplay.sites}
             align={isCurrentUser ? "right" : "left"}
-            inlineFileCards
             returnTo={messageReturnTo}
+            toolCalls={isUser ? undefined : visibleTools}
+            workflowResult={isUser ? undefined : msg.meta?.workflow_result}
+            simulationArtifacts={!isUser && Array.isArray(msg.meta?.simulation_artifacts) ? msg.meta.simulation_artifacts : undefined}
           />
-
-          {!isUser && msg.meta?.workflow_result && (
-            <WorkflowResultCard
-              result={msg.meta.workflow_result}
-              returnTo={`${location.pathname}${location.search}#workspace-chat-message-${msg.id}`}
-            />
-          )}
-
-          {!isUser && Array.isArray(msg.meta?.simulation_artifacts) && (
-            <SimulationArtifactGallery artifacts={msg.meta.simulation_artifacts} />
-          )}
+          </PreviewsStartFolded.Provider>
 
           {!isUser && (
             <ArtifactSummaryCards
@@ -6259,6 +6587,14 @@ export function WsMessageRow({
               just below) is already inline; a second, floating affordance for
               one card type would contradict the surface's own idiom and put
               two different Approve buttons on screen at once. */}
+          {batchLead && onBatchDecision && onBatchReviewEach && (
+            <PendingBatchQuestion
+              group={batchLead}
+              disabled={Boolean(streaming)}
+              onDecideAll={(decision) => onBatchDecision(batchLead, decision)}
+              onReviewEach={() => onBatchReviewEach(batchLead)}
+            />
+          )}
           {hitlCards.length > 0 && (
             <div className="chat-hitl-cards">
               {hitlCards.map((hitl) => (
@@ -6267,18 +6603,6 @@ export function WsMessageRow({
                   data-workspace-attention-key={attentionKeys?.[String(hitl.id)]}
                   className={`chat-hitl-card ${hitl.type === "approval" ? "chat-hitl-card--approval" : ""}`}
                 >
-                  {hitl.action === "workflow.review"
-                    && msg.pending_action?.kind === PendingActionKind.WORKFLOW_APPROVAL
-                    && !hitl.resolved && !msg.resolved_at ? (
-                    // The deliverables and a change request that keeps its note.
-                    <WorkflowReviewChatCard
-                      workspaceId={workspaceId}
-                      action={msg.pending_action as WorkflowRunAction}
-                      currentUserName={currentUserName}
-                      disabled={Boolean(streaming)}
-                      onResolve={(choice, note, payload) => onResolve(msg.id, choice, note, payload)}
-                    />
-                  ) : <>
                   {hitl.type === "approval" ? (
                     <ApprovalSummary
                       prompt={hitl.prompt}
@@ -6303,6 +6627,14 @@ export function WsMessageRow({
                       kind:
                         hitl.type === "approval" ? "approve" : "human_input",
                       options: hitl.options || ["approve", "reject"],
+                      // The question's recommended answer and the words of
+                      // its options ("Always …"); "Always" needs the request.
+                      recommendation: hitl.recommendation,
+                      option_details: hitl.option_details,
+                      allow_other: hitl.allow_other,
+                      ...((hitl.options || []).includes(ALWAYS_ALLOW_CHOICE)
+                        ? { approval_request_id: String(hitl.id) }
+                        : {}),
                     }}
                     resolved={hitlResolved(hitl)}
                     resolution={
@@ -6313,10 +6645,15 @@ export function WsMessageRow({
                     currentUserName={currentUserName}
                     disabled={Boolean(streaming) || hitlResolved(hitl)}
                     onResolve={(choice) =>
-                      onHitlAction?.(String(hitl.id), choice)
+                      hitl.runtime_run_id
+                        ? decideRuntimeApproval(
+                            String(hitl.runtime_run_id),
+                            String(hitl.id),
+                            parkedApprovalDecision(choice),
+                          ).finally(() => onHitlSettled?.())
+                        : onHitlAction?.(String(hitl.id), choice)
                     }
                   />
-                  </>}
                 </div>
               ))}
             </div>
@@ -6325,13 +6662,25 @@ export function WsMessageRow({
           {/* Persisted actions use their own endpoint; only their own
               submission locks them. A paused workspace stops the autonomous
               loop, not the operator: cards stay answerable while paused. */}
-          {!workflowHistoryContext && !inlineProposalDecision &&
+          {!inlineProposalDecision && !batchedCardIds?.has(msg.id) &&
             ((msg.pending_action && msg.pending_action.kind) ||
               (msg.resolved_at && msg.resolution)) && (
-              <div data-workspace-attention-key={pendingAttentionKey}>
-                <ChatActionCard
+              <div data-workspace-attention-key={pendingAttentionKey} data-card-message-id={msg.id}>
+                <CardReplyContext.Provider value={cardReplyIdentity}>
+                {showsWorkflowReviewCard ? (
+                  // The deliverables and a change request that keeps its note.
+                  <WorkflowReviewChatCard
+                    workspaceId={workspaceId}
+                    action={msg.pending_action as WorkflowRunAction}
+                    currentUserName={currentUserName}
+                    promptShown={actionPromptShown}
+                    disabled={Boolean(streaming)}
+                    onResolve={(choice, note, payload) => onResolve(msg.id, choice, note, payload)}
+                  />
+                ) : <ChatActionCard
                   workspaceId={workspaceId}
                   action={displayPendingAction || { kind: "unknown" }}
+                  promptShown={actionPromptShown}
                   hasTaskReference={Boolean(
                     displayPendingAction?.task_id && visibleTaskRefs.slice(0, 5).some(
                       ({ ref }) => ref.id === String(displayPendingAction.task_id).trim(),
@@ -6344,6 +6693,7 @@ export function WsMessageRow({
                   resolvedByName={resolvedByName}
                   currentUserName={currentUserName}
                   resetToken={actionResetToken}
+                  error={actionError}
                   proposalSelectedRowIds={
                     proposalRowsRenderedInline ? proposalSelectedRowIds : undefined
                   }
@@ -6355,7 +6705,11 @@ export function WsMessageRow({
                     if (proposalRowsRenderedInline) setProposalSelectionLocked(true);
                     onResolve(msg.id, choice, note, payload, files)
                   }}
-                />
+                />}
+                </CardReplyContext.Provider>
+                {!msg.resolved_at && repliedCardIds?.has(msg.id) && (
+                  <p className="chat-card-replied">{t("component.workspace_chat.card_replied")}</p>
+                )}
               </div>
             )}
 
@@ -6397,7 +6751,7 @@ export function WsMessageRow({
             </div>
           )}
         </div>
-        {(isCurrentUser || showMessageActions) && (
+        {!joinedBelow && (isCurrentUser || showMessageActions) && (
         <div
           className={`chat-message-meta-row ${
             isCurrentUser ? "chat-message-meta-row--user" : ""
@@ -6438,102 +6792,6 @@ export function WsMessageRow({
         </div>
         )}
       </div>
-    </div>
-  );
-}
-
-function WorkflowActivityContent({
-  msg,
-  subToAgent,
-}: {
-  msg: WsMessage;
-  subToAgent: Map<string, AgentInfo>;
-}) {
-  const isSimple = useDisplayPreferences((s) => s.interfaceMode === "simple");
-  const meta = msg.meta || {};
-  const steps = Array.isArray(meta.workflow_steps)
-    ? meta.workflow_steps.filter((step: unknown) => step && typeof step === "object")
-    : [];
-  const status = String(meta.workflow_status || "queued").toLowerCase();
-  const businessOutcome = String(meta.workflow_business_outcome || "in_progress").toLowerCase();
-  const statusPresentation = workflowRunStatusPresentation({ status: status as WorkflowRunStatus, businessOutcome });
-  const attemptNumber = Math.max(1, Number(meta.workflow_attempt_number || 1));
-  const currentStepId = String(meta.workflow_current_step_id || "");
-  const currentStep = steps.find(
-    (step: Record<string, unknown>) => String(step.id || "") === currentStepId,
-  ) as Record<string, unknown> | undefined;
-  const currentSubscriptionId = String(meta.workflow_current_subscription_id || "");
-  const currentAgent = currentSubscriptionId
-    ? subToAgent.get(currentSubscriptionId) || null
-    : null;
-  const completedCount = steps.filter(
-    (step: Record<string, unknown>) => String(step.status || "") === "completed",
-  ).length;
-
-  return (
-    <div className="workspace-workflow-activity" data-status={statusPresentation.iconStatus}>
-      <div className="workspace-workflow-activity-header">
-        <span className="workspace-workflow-activity-icon" aria-hidden="true">
-          <IconFlow size={15} />
-        </span>
-        <strong>{String(meta.workflow_title || t("component.workspace_chat.workflow"))}</strong>
-        <span className="workspace-workflow-activity-status">
-          <span aria-hidden="true" />
-          {t(statusPresentation.stateKey)}
-        </span>
-      </div>
-
-      <div className="workspace-workflow-activity-outcome">
-        <span>
-          {t("component.workspace_chat.workflow_outcome", {
-            outcome: formatUserFacingText(businessOutcome),
-          })}
-        </span>
-        {!isSimple && <span className="mono">
-          {t("component.workspace_chat.workflow_attempt", { count: attemptNumber })}
-        </span>}
-      </div>
-
-      {!isSimple && (currentStep || currentAgent) && (
-        <div className="workspace-workflow-activity-current">
-          <AgentMiniAvatar agent={currentAgent} size={18} />
-          <span>
-            {currentAgent?.name || MANOR_AGENT_NAME}
-            {currentStep?.name ? ` · ${formatUserFacingText(String(currentStep.name))}` : ""}
-          </span>
-        </div>
-      )}
-
-      {!isSimple && steps.length > 0 && (
-        <div
-          className="workspace-workflow-activity-steps"
-          aria-label={t("component.workspace_chat.activity_steps", { count: steps.length })}
-        >
-          {steps.map((step: Record<string, unknown>) => {
-            const stepStatus = String(step.status || "queued").toLowerCase();
-            return (
-              <span
-                key={String(step.id || step.name)}
-                className="workspace-workflow-activity-step"
-                data-status={stepStatus}
-                title={`${formatUserFacingText(String(step.name || step.id))}: ${formatUserFacingText(stepStatus)}`}
-              >
-                <span aria-hidden="true" />
-                {formatUserFacingText(String(step.name || step.id))}
-              </span>
-            );
-          })}
-          <span className="workspace-workflow-activity-count mono">
-            {completedCount}/{steps.length}
-          </span>
-        </div>
-      )}
-
-      {meta.workflow_error && (
-        <div className="workspace-workflow-activity-error">
-          {formatUserFacingText(String(meta.workflow_error))}
-        </div>
-      )}
     </div>
   );
 }
@@ -6648,6 +6906,87 @@ function WsActivityRun({
         )}
         <span className="ws-activity-line-time mono">
           {formatChatTime(last.created_at)}
+        </span>
+      </span>
+    </div>
+  );
+}
+
+const WORKFLOW_RUN_ROW_TONE: Record<WorkflowRunRow["state"], EventTone> = {
+  running: "running",
+  waiting: "attention",
+  paused: "attention",
+  completed: "done",
+  failed: "attention",
+  cancelled: "neutral",
+};
+
+/** "Weekly report · step 3/6", "Weekly report · Completed · recovered after 1 retry". */
+function workflowRunRowText(row: WorkflowRunRow): string {
+  const title = formatUserFacingText(row.title || t("component.workspace_chat.workflow"));
+  if (row.state === "running" && row.totalSteps > 0) {
+    return t("component.workspace_chat.workflow_step_progress", {
+      title,
+      current: row.currentStep,
+      total: row.totalSteps,
+    });
+  }
+  const label = row.state === "waiting"
+    ? t("component.workspace_chat.workflow_waiting_on_you")
+    : t(`component.workflow_run.status.${row.state}`);
+  const recovered = row.state === "completed" && row.retries > 0
+    ? ` · ${t(`component.workspace_chat.workflow_recovered_after_retries_${row.retries === 1 ? "one" : "other"}`, { count: row.retries })}`
+    : "";
+  return `${title} · ${label}${recovered}`;
+}
+
+/** One Workflow run: an event row with no buttons, updated in place. What it
+ *  needs from someone is a bubble with options on the wait's own message; the
+ *  run page ("View") holds pause, stop, retry and the full step history. */
+function WsWorkflowRunLine({
+  markerId,
+  anchorId,
+  anchorOwnsBubble,
+  row,
+  workspaceId,
+}: {
+  markerId: string;
+  anchorId: string;
+  anchorOwnsBubble: boolean;
+  row: WorkflowRunRow;
+  workspaceId: string;
+}) {
+  const location = useLocation();
+  const flows = usePreviewFeatureAccess("flows");
+  const text = workflowRunRowText(row);
+  const tone = WORKFLOW_RUN_ROW_TONE[row.state];
+  const href = flows.enabled && row.state !== "completed"
+    ? workflowRunPath(row.workflowId, row.runId, workspaceId)
+    : "";
+  const returnTo = `${location.pathname}${location.search}#workspace-chat-message-${anchorId}`;
+  return (
+    <div
+      // The anchor's own bubble, when it asks something, keeps the message id.
+      id={anchorOwnsBubble ? undefined : `workspace-chat-message-${anchorId}`}
+      className="ws-activity-line-row ws-workflow-run-row"
+      data-chat-scroll-marker-id={markerId}
+      data-run-state={row.state}
+    >
+      <span className="ws-activity-line" data-tone={tone}>
+        <EventRowGlyph tone={tone} />
+        <span className="ws-activity-line-text" title={text}>{text}</span>
+        {href && (
+          <Link
+            className="ws-activity-line-link"
+            to={href}
+            state={{ returnTo, chatReturnTo: returnTo }}
+            onClick={() => preserveReturnToInHistory(returnTo)}
+          >
+            {t("component.workspace_chat.workflow_view_run")}
+          </Link>
+        )}
+        <span className="ws-activity-line-time mono">
+          {formatChatTime(row.updatedAt)}
         </span>
       </span>
     </div>
@@ -7261,7 +7600,7 @@ function ExpandableWorkspaceMarkdown({
 }) {
   return (
     <CollapsibleSentMessage text={content} enabled={collapsible && !streaming} tone={isUser ? "user" : "assistant"}>
-      <ChatMarkdown content={content} isUser={isUser} streaming={streaming} />
+      <ChatMarkdown content={content} isUser={isUser} streaming={streaming} showFilesInPlace={!isUser} />
     </CollapsibleSentMessage>
   );
 }

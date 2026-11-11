@@ -39,7 +39,7 @@ export async function readPeaks(url: string, bytes?: Blob, bars = BARS): Promise
   }
 }
 
-export default function AudioWaveform({ src, data, label, seek, onError, autoPlay = false }: {
+export default function AudioWaveform({ src, data, label, seek, onError, onTime, autoPlay = false }: {
   src: string;
   /** The track's bytes when ``src`` is a blob: URL made from them, to read its waveform. */
   data?: Blob;
@@ -49,6 +49,8 @@ export default function AudioWaveform({ src, data, label, seek, onError, autoPla
   /** Go to this second and play (a section picked elsewhere); ``n`` makes a repeat pick count. */
   seek?: { at: number; n: number } | null;
   onError?: () => void;
+  /** Where the track is as it plays or is moved (a transcript follows it). */
+  onTime?: (seconds: number) => void;
 }) {
   const audio = useRef<HTMLAudioElement>(null);
   const [peaks, setPeaks] = useState<number[]>([]);
@@ -131,7 +133,7 @@ export default function AudioWaveform({ src, data, label, seek, onError, autoPla
   return <div className="audio-waveform">
     <audio ref={audio} src={src} preload="metadata" aria-label={label}
       onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)}
-      onTimeUpdate={(event) => setTime(event.currentTarget.currentTime)}
+      onTimeUpdate={(event) => { setTime(event.currentTarget.currentTime); onTime?.(event.currentTarget.currentTime); }}
       onLoadedMetadata={(event) => {
         setDuration(event.currentTarget.duration || 0);
         if (autoPlay) void event.currentTarget.play().catch(() => undefined);
@@ -156,6 +158,6 @@ export default function AudioWaveform({ src, data, label, seek, onError, autoPla
       {bars.map((peak, index) => <i key={index} data-played={index / bars.length < played || undefined}
         style={{ height: `${Math.round(peak * 100)}%` }} />)}
     </div>
-    <span className="audio-waveform__time mono">{clock(time)} / {clock(duration)}</span>
+    <span className="audio-waveform__time">{clock(time)}<span className="audio-waveform__total"> / {clock(duration)}</span></span>
   </div>;
 }

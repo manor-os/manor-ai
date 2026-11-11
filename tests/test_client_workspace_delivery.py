@@ -34,9 +34,9 @@ async def register(client, db, name, *, verified=True):
     return {"Authorization": f"Bearer {response.json()['access_token']}"}, user
 
 
-async def prepared(client, db, *, phase="trial"):
-    provider_headers, provider = await register(client, db, "provider")
-    recipient_headers, recipient = await register(client, db, "recipient")
+async def prepared(client, db, *, phase="trial", suffix=""):
+    provider_headers, provider = await register(client, db, f"provider{suffix}")
+    recipient_headers, recipient = await register(client, db, f"recipient{suffix}")
     c = await client.post("/api/v1/clients", headers=provider_headers, json={"name": "Customer"})
     assert c.status_code == 201, c.text
     cid = c.json()["id"]

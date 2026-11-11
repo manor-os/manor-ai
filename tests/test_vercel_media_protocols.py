@@ -1,4 +1,5 @@
 import base64
+import io
 import json
 from types import SimpleNamespace
 
@@ -204,17 +205,27 @@ async def test_catalog_models_with_vercel_aliases_prefer_the_gateway(
 
 
 @pytest.mark.asyncio
-async def test_managed_image_generation_uses_vercel_v4_protocol(monkeypatch):
+@pytest.mark.parametrize(
+    "model_id,output_format,animated",
+    [
+        ("openai/gpt-image-2", "png", False),
+        ("openai/gpt-image-2.6-sunburst", "png", False),
+        ("openai/gpt-image-2.6-sunburst", "gif", True),
+        ("openai/gpt-image-2.6-sunburst", "gif", False),
+    ],
+)
+async def test_managed_image_generation_uses_vercel_v4_protocol(monkeypatch, model_id, output_format, animated):
     from packages.core.ai.tools import extended_tools
     from packages.core.services import vercel_ai_gateway
 
     monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
 
     async def credentials(*_args, **_kwargs):
-        return "", "", False
+        # The managed OpenRouter default must not prevent Vercel GIF routing.
+        return "sk-or-test", "https://openrouter.ai/api/v1", False
 
     async def model(*_args, **_kwargs):
-        return "openai/gpt-image-2"
+        return model_id
 
     async def route(*_args, **kwargs):
         assert kwargs.get("provider_chain") == ("vercel", "openai", "openrouter")
@@ -227,18 +238,26 @@ async def test_managed_image_generation_uses_vercel_v4_protocol(monkeypatch):
         )
 
     captured = {}
+    encoded = io.BytesIO()
+    frames = [Image.new("RGB", (32, 32), color) for color in ("red", "blue")]
+    if animated:
+        frames[0].save(encoded, format="GIF", save_all=True, append_images=frames[1:], duration=200, loop=0)
+    else:
+        frames[0].save(encoded, format="PNG")
+    image_bytes = encoded.getvalue()
 
     async def gateway_post(**kwargs):
         captured.update(kwargs)
-        # Minimal valid 1x1 transparent PNG.
         return {
-            "images": [
-                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+3n0Y5QAAAABJRU5ErkJggg=="
-            ]
+            "images": [base64.b64encode(image_bytes).decode("ascii")],
+            "usage": {"inputTokens": 100, "outputTokens": 200},
         }
 
-    async def save(**_kwargs):
-        return "/api/v1/fs/entity/images/vercel.png"
+    async def save(**kwargs):
+        captured["saved"] = kwargs
+        return extended_tools._carry_saved_image_details(
+            f"/api/v1/fs/entity/images/vercel.{output_format}", document_id="document-image",
+        )
 
     monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", credentials)
     monkeypatch.setattr(extended_tools, "_resolve_user_image_model", model)
@@ -250,13 +269,92 @@ async def test_managed_image_generation_uses_vercel_v4_protocol(monkeypatch):
         await extended_tools._generate_image_handler(
             prompt="A clean blue square",
             aspect_ratio="1:1",
+            output_format=output_format,
+            size="32x32",
+            **({"frame_count": 2, "frame_duration_ms": 200} if output_format == "gif" else {}),
         )
     )
 
-    assert result["model"] == "openai/gpt-image-2"
     assert captured["protocol"] == "image"
-    assert captured["model"] == "openai/gpt-image-2"
-    assert captured["payload"]["aspectRatio"] == "1:1"
+    assert captured["model"] == model_id
+    if output_format == "gif":
+        assert captured["payload"]["size"] == "32x32"
+        assert captured["payload"]["providerOptions"] == {"openai": {
+            "outputFormat": "gif", "frameCount": 2, "frameDurationMs": 200, "quality": "medium",
+        }}
+        if not animated:
+            assert "not an animated GIF" in result["error"]
+            assert "saved" not in captured
+            return
+        assert captured["saved"]["image_bytes"] == image_bytes
+        assert captured["saved"]["mime"] == "image/gif"
+        assert captured["saved"]["usage"]["input_tokens"] == 100
+        assert captured["saved"]["usage"]["output_tokens"] == 200
+        assert result["output_format"] == "gif"
+        assert result["frame_count"] == 2
+        assert result["frame_duration_ms"] == 200
+    else:
+        assert captured["payload"]["aspectRatio"] == "1:1"
+    assert result["model"] == model_id
+    assert result["document_id"] == "document-image"
+
+
+@pytest.mark.asyncio
+async def test_managed_gif_with_references_sends_files_and_gif_options(monkeypatch):
+    """The managed route carries the same GIF fields and reference images the native edit request does."""
+    from packages.core.ai.tools import extended_tools
+    from packages.core.services import vercel_ai_gateway
+
+    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
+
+    async def credentials(*_args, **_kwargs):
+        return "sk-or-test", "https://openrouter.ai/api/v1", False
+
+    async def model(*_args, **_kwargs):
+        return "openai/gpt-image-2.6-sunburst"
+
+    async def route(*_args, **_kwargs):
+        return ModelGatewayRoute(
+            api_key="vck_test", base_url="https://ai-gateway.vercel.sh/v1", provider="vercel",
+            source="official", source_detail="test",
+        )
+
+    encoded = io.BytesIO()
+    frames = [Image.new("RGB", (32, 32), color) for color in ("red", "blue")]
+    frames[0].save(encoded, format="GIF", save_all=True, append_images=frames[1:], duration=200, loop=0)
+    captured = {}
+
+    async def gateway_post(**kwargs):
+        captured.update(kwargs)
+        return {"images": [base64.b64encode(encoded.getvalue()).decode("ascii")], "usage": {}}
+
+    async def refs(_urls, *_args, **_kwargs):
+        return [("character.png", b"character", "image/png"), ("style.png", b"style", "image/png")]
+
+    async def save(**kwargs):
+        captured["saved"] = kwargs
+        return extended_tools._carry_saved_image_details(
+            "/api/v1/fs/entity/images/vercel.gif", document_id="document-gif",
+        )
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", credentials)
+    monkeypatch.setattr(extended_tools, "_resolve_user_image_model", model)
+    monkeypatch.setattr(extended_tools, "_resolve_official_model_route", route)
+    monkeypatch.setattr(extended_tools, "_load_image_references_for_upload", refs)
+    monkeypatch.setattr(vercel_ai_gateway, "vercel_gateway_post", gateway_post)
+    monkeypatch.setattr(extended_tools, "_save_generated_image_bytes", save)
+
+    result = json.loads(await extended_tools._generate_image_handler(
+        prompt="The character waves in this style.", output_format="gif", frame_count=2,
+        frame_duration_ms=200, size="32x32", reference_urls=["characters/cat.png", "styles/ink.png"],
+    ))
+
+    assert captured["payload"]["providerOptions"] == {"openai": {
+        "outputFormat": "gif", "frameCount": 2, "frameDurationMs": 200, "quality": "medium",
+    }}
+    assert [file["mediaType"] for file in captured["payload"]["files"]] == ["image/png", "image/png"]
+    assert captured["saved"]["mime"] == "image/gif"
+    assert result["document_id"] == "document-gif" and result["output_format"] == "gif"
 
 
 

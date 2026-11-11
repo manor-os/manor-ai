@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 
 import { api } from "../../lib/api";
-import { IconCheckCircle, IconFlow } from "../icons";
+import { t } from "../../lib/i18n";
 import Button from "../ui/Button";
 import IconTile from "../ui/IconTile";
 import LoadingSpinner from "../ui/LoadingSpinner";
@@ -48,29 +48,18 @@ export default function WorkflowTemplates({
     <Modal
       open={open}
       onClose={onClose}
-      title="Add a Flow template"
+      title={t("component.workflow_templates.title")}
       maxWidth="860px"
       bodyClassName="workflow-template-dialog-body"
     >
-      <div className="workflow-template-intro">
-        <IconFlow size={18} />
-        <div>
-          <strong>Templates install as independent Flows</strong>
-          <span>
-            Each template keeps its catalogue ID. Installation creates your own Workflow ID,
-            which you can connect to any Workspace, Task, or Automation.
-          </span>
-        </div>
-      </div>
-
       {templates.isLoading ? (
         <div className="workflow-template-state">
           <LoadingSpinner size={20} />
-          <span>Loading verified templates…</span>
+          <span className="sr-only">{t("component.workflow_templates.loading")}</span>
         </div>
       ) : templates.isError ? (
         <div className="workflow-template-state is-error">
-          Templates could not be loaded. Try again.
+          {t("component.workflow_templates.load_error")}
         </div>
       ) : (
         <div className="workflow-template-grid">
@@ -85,31 +74,27 @@ export default function WorkflowTemplates({
                   </IconTile>
                   <div>
                     <strong>{template.name}</strong>
-                    <span>{template.node_count} nodes · v{template.version}</span>
+                    <span>{t("component.workflow_templates.steps", { count: template.node_count })}</span>
                   </div>
-                  <span className="workflow-template-verified" title="The Flow graph passes platform validation">
-                    <IconCheckCircle size={13} />
-                    Graph verified
-                  </span>
                 </div>
 
                 <p>{template.description}</p>
 
-                <div className="workflow-template-requirements" aria-label="Setup requirements">
+                <div className="workflow-template-requirements" aria-label={t("ui.setup_requirements")}>
                   {template.requirements.slice(0, 3).map((requirement) => (
                     <span key={requirement}>{requirement}</span>
                   ))}
                 </div>
 
+                {/* A grid of choices has no single main action: every button is neutral. */}
                 <div className="workflow-template-card-footer">
-                  <code title={template.id}>{template.id}</code>
                   <Button
                     size="sm"
-                    variant={template.installed ? "outline" : "primary"}
+                    variant="outline"
                     loading={installing}
                     onClick={() => onPick(template)}
                   >
-                    {template.installed ? "Open Flow" : "Install"}
+                    {template.installed ? t("component.workflow_templates.open") : t("component.workflow_templates.add")}
                   </Button>
                 </div>
               </article>

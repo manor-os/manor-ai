@@ -11,7 +11,7 @@ import {
   scheduleRecoverableErrorAutoReload,
 } from "./utils/recoverableErrors";
 
-const VERSION_POLL_INTERVAL_MS = 30_000;
+const VERSION_POLL_INTERVAL_MS = 300_000;
 const VERSION_CHECK_TIMEOUT_MS = 10_000;
 const VERSION_DISMISS_KEY = "manor-version-refresh-dismissed";
 const CHUNK_DISMISS_KEY = "manor-chunk-refresh-dismissed";
@@ -118,7 +118,6 @@ export default function VersionRefreshManager() {
         id,
         type: "info",
         title: t("component.version_refresh.new_version_title"),
-        message: t("component.version_refresh.new_version_message"),
         duration: 0,
         actionLabel: t("component.version_refresh.refresh_now"),
         onAction: () => reloadToLatestVersion(),
@@ -135,7 +134,6 @@ export default function VersionRefreshManager() {
         id: CHUNK_ERROR_TOAST_ID,
         type: "warning",
         title: t("component.version_refresh.page_needs_refresh_title"),
-        message: t("component.version_refresh.page_needs_refresh_message"),
         duration: 0,
         actionLabel: t("component.version_refresh.refresh_now"),
         onAction: () => reloadToLatestVersion(ApplicationReloadMode.RecoverAssets),
@@ -159,8 +157,12 @@ export default function VersionRefreshManager() {
       currentVersionToastId = null;
     };
 
+    let checkingVersion = false;
     const checkVersion = async () => {
+      if (!active || checkingVersion || document.visibilityState === "hidden") return;
+      checkingVersion = true;
       const deployedVersion = await fetchDeployedVersion();
+      checkingVersion = false;
       if (!active || !deployedVersion || deployedVersion === __APP_VERSION__) {
         if (deployedVersion === __APP_VERSION__) clearUpdateToast();
         return;

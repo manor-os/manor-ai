@@ -107,7 +107,7 @@ export default function Card({
             <div style={{ flex: 1, minWidth: 0 }}>
               {title && (
                 <div style={{
-                  fontSize: 14, fontWeight: 700, color: "#1c1917",
+                  fontSize: 14, fontWeight: 700, color: "var(--text-strong)",
                   overflow: "hidden",
                   display: "-webkit-box",
                   WebkitLineClamp: 2,
@@ -120,7 +120,7 @@ export default function Card({
               )}
               {description && (
                 <p style={{
-                  fontSize: 12, color: "#78716c", margin: 0, lineHeight: 1.45,
+                  fontSize: 12, color: "var(--text-muted)", margin: 0, lineHeight: 1.45,
                   display: "-webkit-box",
                   WebkitLineClamp: 2, WebkitBoxOrient: "vertical" as const,
                   overflow: "hidden",

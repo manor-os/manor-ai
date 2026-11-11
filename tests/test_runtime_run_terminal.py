@@ -26,6 +26,7 @@ from packages.core.models.runtime_run import (
     SandboxRunnerStatus,
 )
 from packages.core.models.task import Message
+from packages.core.ai.runtime.control import RuntimeAgentCheckpoint
 from packages.core.services.runtime_event_stream import parse_sse_frame
 from packages.core.services.runtime_run_service import project_runtime_run_status
 from packages.core.services.runtime_run_terminal import (
@@ -207,6 +208,73 @@ async def test_retryable_allocation_failure_leaves_the_chat_waiting(db_session) 
     assert await _notices(db_session, run.id) == []
     projection = await project_runtime_run_status(db_session, run, poll_after_seconds=5)
     assert projection["queue"]["ticket"] == reservation.id
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("failure", ["allocation", "lease", "queue", "uncommitted_checkpoint", "capacity", "unavailable", "rejected"])
+async def test_exhausted_sandbox_resumes_original_checkpoint_for_summary(db_session, failure):
+    from packages.core.services.runtime_run_service import claim_runtime_run_execution
+
+    now = datetime.now(timezone.utc)
+    run, message, reservation = await _parked_run(db_session, now=now)
+    version_before = run.version
+    run.checkpoint = RuntimeAgentCheckpoint(
+        messages=[{"role": "user", "content": "Make the PDF using my previous answers."}],
+        usage={"input_tokens": 42}, rounds=3, tool_calls_made=["request_input"],
+        pending_tool_call={"id": "pdf-call", "name": "generate_file", "arguments": {}},
+    ).to_dict()
+    if failure in {"queue", "uncommitted_checkpoint"}:
+        if failure == "uncommitted_checkpoint":
+            # The live worker still owns an older checkpoint; a ticket that
+            # never parked must not turn that stale call into a summary.
+            reservation.status = SandboxReservationStatus.PENDING_CHECKPOINT.value
+            run.lease_owner = "original-worker"
+            run.lease_expires_at = now + timedelta(seconds=60)
+        reservation.deadline_at = now - timedelta(seconds=1)
+        await expire_sandbox_reservations(db_session, now=now)
+        reason = "sandbox_queue_timeout"
+    else:
+        runner = await _allocating(db_session, reservation, attempts=5)
+        reason = "sandbox_allocation_failed"
+        if failure == "lease":
+            reservation.next_attempt_at = now - timedelta(seconds=1)
+            await recover_stale_sandbox_allocations(db_session, now=now, max_attempts=5)
+        elif failure in {"capacity", "unavailable", "rejected"}:
+            reservation.deadline_at = now - timedelta(seconds=1)
+            reason = {"capacity": "sandbox_capacity_timeout", "unavailable": "sandbox_runner_unavailable",
+                      "rejected": "sandbox_allocation_rejected"}[failure]
+            await fail_sandbox_allocation(
+                db_session, reservation_id=reservation.id,
+                error="dependency_install_failed: private.example.test/token", now=now,
+                outcome={"rejected": "fatal"}.get(failure, failure),
+            )
+        else:
+            for _ in range(2):  # duplicate allocator delivery must not enqueue another summary
+                await fail_sandbox_allocation(db_session, reservation_id=reservation.id,
+                                             error="sandbox_dependency_install_failed", now=now, max_attempts=5)
+        assert runner.active_count == 0
+    await db_session.flush()
+    if failure == "uncommitted_checkpoint":
+        await _assert_failed_and_settled(db_session, run, message, reason=reason, version_before=version_before)
+        return
+    assert run.status == "queued"
+    assert run.status_reason == "sandbox_failure_summary"
+    assert run.reservation_id is None
+    checkpoint = RuntimeAgentCheckpoint.from_dict(run.checkpoint)
+    assert checkpoint.messages[0]["content"] == "Make the PDF using my previous answers."
+    assert checkpoint.usage == {"input_tokens": 42}
+    assert checkpoint.pending_tool_result["id"] == "pdf-call"
+    assert checkpoint.pending_tool_result["terminal_failure"] == reason
+    assert json.loads(checkpoint.pending_tool_result["content"])["error"] == reason
+    assert "private.example.test" not in checkpoint.pending_tool_result["content"]
+    assert (await project_runtime_run_status(db_session, run, poll_after_seconds=5))["queue"] is None
+    assert message.content == PARTIAL_REPLY  # the model, not the scheduler, owns the final reply
+    events = list((await db_session.scalars(select(RuntimeOutboxEvent).where(
+        RuntimeOutboxEvent.aggregate_id == run.id,
+    ))).all())
+    assert [event.event_type for event in events] == ["runtime.execute_run"]
+    assert await claim_runtime_run_execution(db_session, run_id=run.id, worker_id="summary-worker", now=now) is run
+    assert await claim_runtime_run_execution(db_session, run_id=run.id, worker_id="duplicate-worker", now=now) is None
 
 
 @pytest.mark.integration

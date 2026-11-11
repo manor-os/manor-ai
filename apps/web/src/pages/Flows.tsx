@@ -1,9 +1,11 @@
-import { useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { t } from "../lib/i18n";
+import { displayReadInterval } from "../lib/readRefreshPolicy";
+import { usePageVisible } from "../lib/usePageVisible";
+import { isOlderWorkflowRunSnapshot, selectedWorkflowRunRefetchInterval, workflowRunListRefetchInterval } from "../lib/workspaceLiveRefresh";
 import { workflowPath, workflowRunPath } from "../lib/workflowRoutes";
 import { useToastStore } from "../stores/toast";
 import PageHeader, {
@@ -15,7 +17,6 @@ import ConfirmDialog from "../components/ui/ConfirmDialog";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
 import EmptyState from "../components/ui/EmptyState";
 import Button from "../components/ui/Button";
-import AiEditButton from "../components/ui/AiEditButton";
 import AiEditPreviewControls from "../components/ui/AiEditPreviewControls";
 import Input from "../components/ui/Input";
 import Textarea from "../components/ui/Textarea";
@@ -49,7 +50,9 @@ import WorkflowDeployModal from "../components/workflows/WorkflowDeployModal";
 import WorkflowRunInputModal from "../components/workflows/WorkflowRunInputModal";
 import WorkflowRunResumeControl from "../components/workflows/WorkflowRunResumeControl";
 import WorkflowRunRetryControl from "../components/workflows/WorkflowRunRetryControl";
+import ChatMarkdown from "../components/ChatMarkdown";
 import WorkflowCanvas, { NodeIcon, type CanvasStep } from "../components/workflows/WorkflowCanvas";
+import { agentListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
 import WorkflowNodePalette from "../components/workflows/WorkflowNodePalette";
 import WorkflowNodeConfigPanel from "../components/workflows/WorkflowNodeConfigPanel";
 import { workflowStepOutputs } from "../lib/workflowBindings";
@@ -98,6 +101,7 @@ import {
 } from "../components/workflows/workflowRunDisplay";
 import { getPreferredTimeZone } from "../lib/format";
 import WorkflowErrorText from "../components/workflows/WorkflowErrorText";
+import "./Flows.css";
 
 const ACTIVE_RUN_STATUSES = new Set(["pending", "running", "paused"]);
 
@@ -128,10 +132,14 @@ interface Flow {
   tags?: string[];
   status: "active" | "draft";
   steps: FlowStep[];
+  /** Set only on list summaries, whose `steps` are empty. */
+  step_count?: number | null;
   last_run?: string;
   created_by?: string | null;
   created_at: string;
   updated_at?: string | null;
+  /** Moves on every save; sent back so a save made elsewhere is never overwritten. */
+  version?: number;
 }
 
 interface WorkflowAiPreview {
@@ -224,16 +232,16 @@ const TRIGGER_LABELS: Record<string, string> = {
 };
 
 const FLOW_ICON_OPTIONS = [
-  { value: "flow", label: "Workflow" },
+  { value: "flow", label: t("ui.workflow") },
   { value: "llm", label: "AI" },
-  { value: "image", label: "Image" },
-  { value: "video", label: "Video" },
-  { value: "rag", label: "Knowledge" },
-  { value: "classifier", label: "Classify" },
-  { value: "http", label: "Web" },
-  { value: "code", label: "Code" },
-  { value: "notify", label: "Notify" },
-  { value: "wait", label: "Schedule" },
+  { value: "image", label: t("ui.image") },
+  { value: "video", label: t("ui.video") },
+  { value: "rag", label: t("ui.knowledge") },
+  { value: "classifier", label: t("ui.classify") },
+  { value: "http", label: t("ui.web") },
+  { value: "code", label: t("ui.code") },
+  { value: "notify", label: t("ui.notify") },
+  { value: "wait", label: t("ui.schedule") },
 ] as const;
 
 function workflowIconGlyph(icon?: string, size = 18) {
@@ -243,7 +251,7 @@ function workflowIconGlyph(icon?: string, size = 18) {
 }
 
 const STATUS_DOT: Record<string, string> = {
-  pending: "#a8a29e",
+  pending: "#aeaeb2",
   running: "#cf9b44",
   done: "#4f9c84",
   error: "#d65f59",
@@ -284,7 +292,7 @@ function WorkflowMetadataPanel({ workflowId }: { workflowId: string }) {
     return (
       <div className="workflow-metadata-state" role="status">
         <LoadingSpinner size={20} />
-        <span>{t("page.flows.details_loading")}</span>
+        <span className="sr-only">{t("page.flows.details_loading")}</span>
       </div>
     );
   }
@@ -502,7 +510,7 @@ function WorkflowFinalResultPanel({
     <section
       className="workflow-final-result"
       role="region"
-      aria-label="Workflow final result"
+      aria-label={t("ui.workflow_final_result")}
       aria-live="polite"
     >
       <div className="workflow-final-result-header">
@@ -524,8 +532,8 @@ function WorkflowFinalResultPanel({
           type="button"
           className="workflow-final-result-close"
           onClick={onClose}
-          title="Close final result"
-          aria-label="Close final result"
+          title={t("ui.close_final_result")}
+          aria-label={t("ui.close_final_result")}
         >
           <IconClose size={15} />
         </button>
@@ -544,7 +552,7 @@ function WorkflowFinalResultPanel({
             )}
             <div className="workflow-final-result-failure-actions">
               {onRunAgain && <Button variant="outline" size="sm" onClick={onRunAgain}>
-                Edit inputs and run again
+                {t("ui.edit_inputs_and_run_again")}
               </Button>}
             </div>
           </section>
@@ -556,9 +564,9 @@ function WorkflowFinalResultPanel({
           </div>
           <div className={`workflow-final-result-content${failed && !failedWithOutput ? " is-failed" : ""}`}>
             {outputPending && !hasWorkflowOutput(output) ? (
-              <span className="workflow-final-result-empty">Loading the run output…</span>
+              <span className="workflow-final-result-empty">{t("ui.loading_the_run_output")}</span>
             ) : !hasWorkflowOutput(output) ? (
-              <span className="workflow-final-result-empty">This run did not produce a final output.</span>
+              <span className="workflow-final-result-empty">{t("ui.this_run_did_not_produce_a_final_output")}</span>
             ) : packageOutput ? (
               <div className="workflow-release-package">
                 <div className="workflow-release-package-hero">
@@ -569,13 +577,13 @@ function WorkflowFinalResultPanel({
                   <p>{String(packageOutput.summary || "Your release files are ready to review.")}</p>
                 </div>
                 <div className="workflow-release-package-group">
-                  <span>Audio & cover</span>
+                  <span>{t("ui.audio_cover")}</span>
                   <div className="workflow-release-package-files">
                     {packageAssets.map(renderPackageFile)}
                   </div>
                 </div>
                 <div className="workflow-release-package-group">
-                  <span>Start here</span>
+                  <span>{t("ui.start_here")}</span>
                   <div className="workflow-release-package-files">
                     {essentialFiles.map(renderPackageFile)}
                   </div>
@@ -610,7 +618,7 @@ function WorkflowFinalResultPanel({
                   </div>
                 )}
                 {listedFiles.length > 0 && (
-                  <div className="workflow-final-result-artifacts" aria-label="Output files">
+                  <div className="workflow-final-result-artifacts" aria-label={t("ui.output_files")}>
                     {primaryFiles.map((artifact, index) => renderArtifact(artifact, index))}
                     {otherFiles.length > 0 && (
                       <details className="workflow-final-result-more">
@@ -645,9 +653,13 @@ function WorkflowFinalResultPanel({
                     ))}
                   </dl>
                 ) : media.length === 0 && !showHero ? (
-                  <pre className={typeof output === "string" ? "is-text" : undefined}>
-                    {typeof output === "string" ? output : JSON.stringify(output, null, 2)}
-                  </pre>
+                  typeof output === "string" ? (
+                    // Agent text reads like its chat reply: links and integration
+                    // links render (an integration link opens its connect panel).
+                    <div className="workflow-final-result-text"><ChatMarkdown content={output} /></div>
+                  ) : (
+                    <pre>{JSON.stringify(output, null, 2)}</pre>
+                  )
                 ) : null}
               </>
             )}
@@ -657,7 +669,7 @@ function WorkflowFinalResultPanel({
         {runInputs.length > 0 && (
           <details className="workflow-final-result-inputs">
             <summary>
-              <span>Inputs</span>
+              <span>{t("ui.inputs")}</span>
               <span>{runInputs.length}</span>
             </summary>
             <dl>
@@ -678,14 +690,14 @@ function WorkflowFinalResultPanel({
         <div className="workflow-final-result-actions">
           <span className="workflow-final-result-source">Stopped at {failure.stepName}</span>
           <Button variant="outline" size="sm" onClick={() => onOpenNode(failure.stepId)}>
-            Open failed node
+            {t("ui.open_failed_node")}
           </Button>
         </div>
       ) : result?.stepId && (
         <div className="workflow-final-result-actions">
           <span className="workflow-final-result-source">Output from {result.stepName}</span>
           <Button variant="outline" size="sm" onClick={() => onOpenNode(result.stepId!)}>
-            Open source node
+            {t("ui.open_source_node")}
           </Button>
         </div>
       )}
@@ -698,11 +710,28 @@ function WorkflowFinalResultPanel({
 /*  Component                                                          */
 /* ------------------------------------------------------------------ */
 
-export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBack?: () => void } = {}) {
+/** `embedded`: the workflow library inside Settings › AI keeps its header in the panel. */
+const WORKFLOW_RUN_STATUS_KEYS: Record<string, string> = {
+  starting: "ui.workflow_run_starting",
+  pending: "ui.workflow_run_pending",
+  running: "ui.workflow_run_running",
+  paused: "ui.workflow_run_paused",
+  completed: "ui.workflow_run_completed",
+  failed: "ui.workflow_run_failed",
+  cancelled: "ui.workflow_run_cancelled",
+};
+
+function workflowRunStatusLabel(status: string | undefined): string {
+  const key = status ? WORKFLOW_RUN_STATUS_KEYS[status] : undefined;
+  return key ? t(key) : status || "";
+}
+
+export default function Flows({ run, onBack, embedded = false }: { run?: WorkflowHistoryRun; onBack?: () => void; embedded?: boolean } = {}) {
   const queryClient = useQueryClient();
   const toast = useToastStore();
   const location = useLocation();
   const navigate = useNavigate();
+  const visible = usePageVisible();
   const [searchParams, setSearchParams] = useSearchParams();
   const { workflowId: requestedWorkflowId } = useParams<{ workflowId: string }>();
   const requestedRunId = run?.id || searchParams.get("run") || searchParams.get("workflow_run");
@@ -717,7 +746,6 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
   const [deployFlow, setDeployFlow] = useState<Flow | null>(null);
   const [configStepId, setConfigStepId] = useState<string | null>(null);
   const [addFromId, setAddFromId] = useState<string | null>(null);
-  const [canvasFull, setCanvasFull] = useState(false);
   const [showIssues, setShowIssues] = useState(false);
   const [runResult, setRunResult] = useState<any>(null);
   const [showFinalResult, setShowFinalResult] = useState(false);
@@ -733,9 +761,11 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
     queryFn: ({ signal }) => api.workflows.getRun(runResult.id, false, signal),
     enabled: Boolean(runResult?.id) && !streaming && runResult?.capabilities?.can_control === true
       && (["failed", "cancelled"].includes(runResult?.status || "") || (runResult?.status === "completed"
-        && ["needs_input", "revision_required"].includes(runResult?.business_outcome))),
+        && ["needs_input", "revision_required"].includes(runResult?.business_outcome))) && visible,
     staleTime: 15_000,
-    refetchInterval: 30_000,
+    retry: false,
+    refetchInterval: (query) => displayReadInterval(query.state, 30_000),
+    refetchOnWindowFocus: "always",
   });
   const [runInputFlow, setRunInputFlow] = useState<Flow | null>(null);
   // Inputs of the run being repeated, so "run again" only asks for changes.
@@ -775,6 +805,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
   const [identityIcon, setIdentityIcon] = useState("flow");
   const [identityNameError, setIdentityNameError] = useState("");
   const [workflowAiPreview, setWorkflowAiPreview] = useState<WorkflowAiPreview | null>(null);
+  const [workflowAiTurnLocked, setWorkflowAiTurnLocked] = useState(false);
   const workflowAiPreviewRef = useRef<WorkflowAiPreview | null>(null);
   const workflowAiCommitCoordinator = useRef(createAiEditCommitCoordinator()).current;
   const selectedFlowRef = useRef<Flow | null>(null);
@@ -782,6 +813,11 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
   // save's reply may replace the local steps (an older one must not undo a
   // later edit).
   const canvasSaveSeqRef = useRef(0);
+  // Saves go out one at a time, each carrying the version the previous one
+  // returned: the editor never conflicts with itself, and a save made by
+  // someone else in between is refused instead of silently overwritten.
+  const saveChainRef = useRef<Promise<unknown>>(Promise.resolve());
+  const savedVersionRef = useRef<Record<string, number>>({});
   selectedFlowRef.current = selectedFlow;
   const flowContextMenu = useContextMenu();
 
@@ -800,15 +836,35 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
   // never leak standalone test results from the previously opened workflow.
   useEffect(() => setSingleResults({}), [selectedFlow?.id]);
 
+  const catalogScope = useCatalogScope();
+  const { data: agentList = [] } = useQuery({
+    ...agentListQueryOptions(catalogScope),
+    enabled: !!catalogScope,
+  });
+  const agentsById = useMemo(
+    () => Object.fromEntries((agentList as { id: string; name: string; avatar_url?: string | null }[]).map((agent) => [agent.id, agent])),
+    [agentList],
+  );
   const { data: flows, isLoading } = useQuery({
-    queryKey: ["workflows"],
-    queryFn: () => api.workflows.list(),
+    queryKey: ["workflows", "summary"],
+    queryFn: () => api.workflows.listSummaries(),
+    enabled: visible,
   });
 
   const requestedDefinition = useQuery({
     queryKey: ["workflow-definition", requestedWorkflowId],
     queryFn: () => api.workflows.get(requestedWorkflowId!),
-    enabled: Boolean(requestedWorkflowId),
+    enabled: Boolean(requestedWorkflowId) && visible,
+    retry: false,
+  });
+  // Older links name the workflow instead of giving its id.
+  const namedWorkflowId = requestedDefinition.isError
+    ? (flows as Flow[] | undefined)?.find((flow) => flow.name === requestedWorkflowId)?.id
+    : undefined;
+  const namedDefinition = useQuery({
+    queryKey: ["workflow-definition", namedWorkflowId],
+    queryFn: () => api.workflows.get(namedWorkflowId!),
+    enabled: Boolean(namedWorkflowId),
     retry: false,
   });
 
@@ -856,9 +912,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
       selectedFlow?.id === requestedWorkflowId
       || selectedFlow?.name === requestedWorkflowId
     ) return;
-    const requested = requestedDefinition.data
-      || (flows as Flow[] | undefined)?.find((flow) => flow.id === requestedWorkflowId)
-      || (flows as Flow[] | undefined)?.find((flow) => flow.name === requestedWorkflowId);
+    const requested = (requestedDefinition.data || namedDefinition.data) as Flow | undefined;
     if (requested) {
       if (
         workflowAiPreviewRef.current
@@ -868,7 +922,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
       }
       setSelectedFlow(requested);
     }
-  }, [readOnly, flows, requestedDefinition.data, requestedWorkflowId, selectedFlow?.id]);
+  }, [readOnly, namedDefinition.data, requestedDefinition.data, requestedWorkflowId, selectedFlow?.id]);
 
   const closeWorkflow = () => {
     if (readOnly && onBack) { onBack(); return; }
@@ -884,18 +938,22 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
 
   const { data: runs } = useQuery({
     queryKey: ["workflow-runs", selectedFlow?.id],
-    queryFn: () => (selectedFlow ? api.workflows.runs(selectedFlow.id) : Promise.resolve([])),
-    enabled: !!selectedFlow,
+    queryFn: ({ signal }) => (selectedFlow ? api.workflows.runs(selectedFlow.id, signal) : Promise.resolve([])),
+    enabled: Boolean(selectedFlow) && visible,
     // A long timer resumes in Celery, outside this browser request. Keep the
     // active run fresh until the worker reaches a terminal state so the canvas
     // does not remain stuck on the initial "Paused" response.
     refetchInterval: (query) => {
-      const latest = (query.state.data as any[] | undefined)?.[0];
+      const runRows = (query.state.data as Array<{ status?: string | null }> | undefined) || [];
       // Poll an active run closely; otherwise check slowly for runs started
       // elsewhere (Chat, API, schedules) so their reviews show up here.
-      return latest && ["pending", "running", "paused"].includes(latest.status) ? 2_000 : 20_000;
+      return displayReadInterval(
+        query.state,
+        workflowRunListRefetchInterval(runRows),
+      );
     },
-    refetchIntervalInBackground: true,
+    retry: false,
+    refetchOnWindowFocus: "always",
   });
 
   // Opening a flow should immediately restore its newest run onto the canvas;
@@ -930,40 +988,10 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
     && newerActiveRun.id !== runResult.id
     && !ACTIVE_RUN_STATUSES.has(runResult.status);
 
-  // Chat result cards deep-link to an exact run. It may be older than the
-  // compact first history page, so hydrate it directly when necessary.
-  useEffect(() => {
-    if (readOnly || !selectedFlow || !requestedRunId) return;
-    if (runResult?.id === requestedRunId) return;
-    if (runs?.some((run: any) => run.id === requestedRunId)) return;
-    let active = true;
-    void api.workflows.getRun(requestedRunId).then((detail: any) => {
-      if (!active || detail?.workflow_id !== selectedFlow.id) return;
-      setRunResult(detail);
-    }).catch(() => {
-      // Keep the workflow definition usable when an old run is unavailable.
-    });
-    return () => { active = false; };
-  }, [readOnly, requestedRunId, runResult?.id, runs, selectedFlow?.id]);
-
-  // Run lists are intentionally compact and omit node-level results. Hydrate a
-  // selected summary once so reopening a workflow restores its canvas state
-  // and progress instead of showing an empty 0/N terminal run.
+  // Compact list rows need full detail; an explicit link can name an older run
+  // outside the first history page. Both are read by the same query below.
   const runResultHasDetail = !!runResult
     && Object.prototype.hasOwnProperty.call(runResult, "step_results");
-  useEffect(() => {
-    if (readOnly || !runResult?.id || runResultHasDetail) return;
-    let active = true;
-    void api.workflows.getRun(runResult.id).then((detail: any) => {
-      if (!active) return;
-      setRunResult((current: any) => (
-        current?.id === detail?.id ? { ...current, ...detail } : current
-      ));
-    }).catch(() => {
-      // Keep the compact history row usable if detail hydration is unavailable.
-    });
-    return () => { active = false; };
-  }, [readOnly, runResult?.id, runResultHasDetail]);
 
   // Reveal a result reached in this page session, or one explicitly opened
   // from a result link. Merely opening a Flow keeps its previous run unobtrusive.
@@ -985,6 +1013,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
     if (readOnly || !runResult || !runs?.length) return;
     const refreshed = runs.find((run: any) => run.id === runResult.id);
     if (!refreshed) return;
+    if (isOlderWorkflowRunSnapshot(runResult, refreshed)) return;
     const resultCount = Object.keys(runResult.step_results || {}).length;
     const refreshedCount = Object.keys(refreshed.step_results || {}).length;
     const refreshedHasResults = Object.prototype.hasOwnProperty.call(refreshed, "step_results");
@@ -994,7 +1023,8 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
       // Compact polling rows must never erase the full node results received
       // from the SSE completion frame or the detail endpoint.
       setRunResult((current: any) => (
-        current?.id === refreshed.id ? { ...current, ...refreshed } : current
+        current?.id === refreshed.id && !isOlderWorkflowRunSnapshot(current, refreshed)
+          ? { ...current, ...refreshed } : current
       ));
     }
     // Runs resumed or retried from this page finish in the worker, so the
@@ -1004,37 +1034,36 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
     const reloadKey = `${refreshed.id}:${refreshed.status}:${refreshed.completed_at || ""}`;
     if (runDetailReloadRef.current === reloadKey) return;
     runDetailReloadRef.current = reloadKey;
-    void api.workflows.getRun(refreshed.id).then((detail: any) => {
-      // Full detail replaces the snapshot so canvas and final output agree.
-      setRunResult((current: any) => (
-        current?.id === detail?.id ? detail : current
-      ));
-    }).catch(() => {
-      // The compact row already updated the status; detail can load on reopen.
-    });
-  }, [readOnly, runs, runResult]);
+    void queryClient.invalidateQueries({
+      queryKey: ["workflow-run-flow-detail", refreshed.id], exact: true,
+      refetchType: visible ? "active" : "none",
+    }, { cancelRefetch: false });
+  }, [readOnly, runs, runResult, queryClient, visible]);
 
-  // A run working in the worker (not streamed to this page) is followed by
-  // reloading its detail, so each node's state shows as it changes.
-  const runIsWorking = !readOnly && !!runResult && !streaming && (
-    ["running", "pending"].includes(runResult.status)
-    || (
-      runResult.status === "paused"
-      && workflowNodeDisplayStatus((runResult.step_results || {})[runResult.current_step_id] || {}) === "running"
-    )
-  );
+  // One cancellable source owns hydration, live trace and the final receipt.
+  const detailRunId = requestedRunId || runResult?.id;
+  const liveRunDetail = useQuery({
+    queryKey: ["workflow-run-flow-detail", detailRunId],
+    queryFn: ({ signal }) => api.workflows.getRun(detailRunId!, true, signal),
+    enabled: !readOnly && !streaming && Boolean(detailRunId && selectedFlow) && visible,
+    retry: false,
+    refetchInterval: (query) => displayReadInterval(
+      query.state,
+      selectedWorkflowRunRefetchInterval(query.state.data?.status),
+    ),
+    refetchOnWindowFocus: "always",
+  });
   useEffect(() => {
-    if (!runIsWorking || !runResult?.id) return;
-    const runId = runResult.id;
-    const timer = window.setInterval(() => {
-      void api.workflows.getRun(runId).then((detail: any) => {
-        setRunResult((current: any) => (current?.id === detail?.id ? { ...current, ...detail } : current));
-      }).catch(() => {
-        // The compact run list keeps polling; the next tick can retry.
-      });
-    }, 2_500);
-    return () => window.clearInterval(timer);
-  }, [runIsWorking, runResult?.id]);
+    const detail = liveRunDetail.data;
+    if (!detail || detail.workflow_id !== selectedFlow?.id) return;
+    setRunResult((current: any) => {
+      if (current?.id !== detail.id) return requestedRunId === detail.id ? detail : current;
+      // A read begun before a terminal list update must not make the run look
+      // active again. Its active query data keeps polling until final detail arrives.
+      if (isOlderWorkflowRunSnapshot(current, detail)) return current;
+      return { ...current, ...detail };
+    });
+  }, [liveRunDetail.data, requestedRunId, selectedFlow?.id]);
 
   // Install by stable catalogue id; the returned workflow id is the runtime
   // identity used by bindings, Tasks, Automations, Proposals, and subflows.
@@ -1139,9 +1168,21 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
     },
   });
 
+  const saveWorkflow = (id: string, changes: Record<string, any>) => {
+    const save = saveChainRef.current.catch(() => undefined).then(async () => {
+      const shown = selectedFlowRef.current?.id === id ? Number(selectedFlowRef.current?.version) || 0 : 0;
+      const known = Math.max(savedVersionRef.current[id] || 0, shown);
+      const saved = await api.workflows.update(id, known ? { ...changes, expected_version: known } : changes);
+      savedVersionRef.current[id] = Number(saved?.version) || known;
+      return saved;
+    });
+    saveChainRef.current = save;
+    return save;
+  };
+
   const updateMutation = useMutation({
     mutationFn: ({ id, canvasSaveSeq: _canvasSaveSeq, ...changes }: { id: string; canvasSaveSeq?: number; [key: string]: any }) =>
-      api.workflows.update(id, changes),
+      saveWorkflow(id, changes),
     onSuccess: (updated: any, variables) => {
       queryClient.invalidateQueries({ queryKey: ["workflows"] });
       queryClient.invalidateQueries({ queryKey: ["workflow-metadata", updated.id] });
@@ -1158,8 +1199,20 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
     // Saves (add node, AI edit, config, drag) previously failed silently — the
     // API layer suppresses 401/403 toasts, so an expired session made clicking
     // "do nothing". Surface every failure with an actionable message.
-    onError: (e: any) => {
-      if (e?.status === 401 || e?.status === 403) {
+    onError: (e: any, variables) => {
+      if (e?.code === "workflow.error.edited_elsewhere") {
+        // Someone else saved first: show their version so the edit can be redone on top of it.
+        toast.error(t("page.flows.edited_elsewhere_title"), t("workflow.error.edited_elsewhere"));
+        void api.workflows.get(variables.id).then((latest: Flow) => {
+          savedVersionRef.current[latest.id] = Number(latest.version) || 0;
+          if (selectedFlowRef.current?.id === latest.id) {
+            canvasSaveSeqRef.current += 1;
+            selectedFlowRef.current = latest;
+            setSelectedFlow(latest);
+          }
+          queryClient.invalidateQueries({ queryKey: ["workflows"] });
+        }).catch(() => undefined);
+      } else if (e?.status === 401 || e?.status === 403) {
         toast.error("Session expired", "Refresh the page and sign in again to save your changes.");
       } else {
         toast.error("Couldn't save the workflow", e?.message || "Please try again.");
@@ -1212,7 +1265,13 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
       closeEditorLiveChat();
     }
     closeDetail();
-    setSelectedFlow(flow);
+    if (typeof flow.step_count === "number") {
+      // A list row has no graph. Load it fresh, since the last edit may be seconds old.
+      setSelectedFlow(null);
+      queryClient.removeQueries({ queryKey: ["workflow-definition", flow.id] });
+    } else {
+      setSelectedFlow(flow);
+    }
     const next = new URLSearchParams(searchParams);
     next.delete("workflow");
     next.delete("run");
@@ -1382,6 +1441,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
           return true;
         },
         rollback: discardWorkflowAiPreview,
+        setTurnLocked: setWorkflowAiTurnLocked,
         commitCoordinator: workflowAiCommitCoordinator,
       }),
     });
@@ -1389,7 +1449,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
 
   // Add a node of `type`, linking it from `addFromId` (a node's "+" output) or,
   // failing that, the end of the current chain.
-  const addNode = (type: string) => {
+  const addNode = (type: string, plainLabel?: string) => {
     if (!selectedFlow) return;
     const steps = (selectedFlow.steps || []).map((s: any) => ({ ...s, next: [...(s.next || [])] }));
     const id = `n_${Date.now().toString(36)}${steps.length}`;
@@ -1401,12 +1461,16 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
       const position = ap ? { x: ap.x, y: ap.y + 130 } : { x: 80, y: 220 };
       steps.push({ id, type: "note", name: "Note", config: { text: "" }, next: [], position });
     } else {
-      const label = type.charAt(0).toUpperCase() + type.slice(1);
+      const label = plainLabel || type.charAt(0).toUpperCase() + type.slice(1);
+      // "A person checks" is an approval wait, ready to run as added.
+      const config = type === "wait" && plainLabel
+        ? { wait_type: "approval", options: ["approve", "revise"], approval_values: ["approve"], response_variable: `${id}_decision` }
+        : {};
       if (addFromId) {
         // added from a node's "+" output handle → wire it from that node
         const source = steps.find((s: any) => s.id === addFromId);
         if (source) source.next.push(id);
-        steps.push({ id, type, name: label, config: {}, next: [] });
+        steps.push({ id, type, name: label, config, next: [] });
       } else {
         // top "Add node" button → drop an UNCONNECTED node next to the rightmost
         // node (never auto-wire it to the end/terminal node). The user draws the
@@ -1416,14 +1480,14 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
           ? positioned.reduce((a: any, b: any) => (b.position.x > a.position.x ? b : a))
           : null;
         const position = anchor ? { x: anchor.position.x + 260, y: anchor.position.y } : { x: 120, y: 340 };
-        steps.push({ id, type, name: label, config: {}, next: [], position });
+        steps.push({ id, type, name: label, config, next: [], position });
       }
     }
     setShowAddStep(false);
     setAddFromId(null);
     updateMutation.mutate(
       { id: selectedFlow.id, steps },
-      { onSuccess: () => toast.success(type === "note" ? "Note added" : "Node added") },
+      { onSuccess: () => toast.success(type === "note" ? t("component.workflow_palette.note_added") : t("component.workflow_palette.step_added")) },
     );
   };
 
@@ -1540,6 +1604,26 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
     setRunInputFlow(flow);
   };
 
+  const runFromList = async (summary: Flow) => {
+    let flow: Flow;
+    try {
+      flow = await queryClient.fetchQuery({
+        queryKey: ["workflow-definition", summary.id],
+        queryFn: () => api.workflows.get(summary.id) as Promise<Flow>,
+        staleTime: 0,
+      });
+    } catch {
+      toast.error(t("page.flows.details_failed"));
+      return;
+    }
+    if (validateWorkflow(flow.steps || []).some((issue) => issue.level === "error")) {
+      // Reports the errors on the canvas instead of asking for inputs first.
+      void executeWorkflow(flow).catch(() => { /* Reported by executeWorkflow. */ });
+      return;
+    }
+    requestWorkflowRun(flow);
+  };
+
   const runInputModal = (
     <WorkflowRunInputModal
       flow={runInputFlow}
@@ -1604,7 +1688,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
       <div className="workflow-identity-form">
         <fieldset className="workflow-icon-fieldset">
           <legend>{t("page.flows.icon")}</legend>
-          <div className="workflow-icon-options" role="radiogroup" aria-label="Workflow icon">
+          <div className="workflow-icon-options" role="radiogroup" aria-label={t("ui.workflow_icon")}>
             {FLOW_ICON_OPTIONS.map((option) => {
               const selected = identityIcon === option.value;
               return (
@@ -1651,7 +1735,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
   /* ---------------------------------------------------------------- */
 
   if (requestedWorkflowId && selectedFlow?.id !== requestedWorkflowId && selectedFlow?.name !== requestedWorkflowId) {
-    return requestedDefinition.isError ? <section role="alert" className="workflow-run-history-list-state is-error">
+    return (requestedDefinition.isError && !namedWorkflowId) || namedDefinition.isError ? <section role="alert" className="workflow-run-history-list-state is-error">
       <p>{t("component.workspace_app_view.target_unavailable")}</p>
       <Button variant="ghost" onClick={closeWorkflow}>{t("component.workflow_run_history.back")}</Button>
       <Button onClick={() => void requestedDefinition.refetch()}>{t("component.workflow_run_history.try_again")}</Button>
@@ -1678,6 +1762,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
         // a run — so you can see each node's result without opening it.
         let out = "";
         if (rr.skipped) out = "skipped — needs config";
+        else if (rr.wait_type === "connection" && rr.connection_label) out = t("component.integration_connect.run_status", { provider: String(rr.connection_label) });
         else if (rr.error) out = String(rr.error);
         else if (rr.output == null || rr.output === "") out = "(no output)";
         else out = typeof rr.output === "string" ? rr.output : JSON.stringify(rr.output);
@@ -1702,7 +1787,6 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
     const issues = validateWorkflow(steps as any[]);
     const issueById = issuesByNode(issues);
     const errorCount = issues.filter((i) => i.level === "error").length;
-    const triggerKind = flow.trigger || flow.trigger_type || "manual";
 
     // Entry inputs are collected first; execution then lights up each node.
     const runStep = () => {
@@ -1723,7 +1807,9 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
       runProgress.processed, runProgress.total, streaming ? "running" : lastRun?.status,
     );
     const showBanner = streaming || !!lastRun;
-    const bannerStatus = (workflowRunBackgroundWait(lastRun) ? "running" : lastRun?.status) || (streaming ? "starting" : undefined);
+    // A run waiting for an integration says which one, not just "paused".
+    const waitingFor = lastRun?.status === "paused" ? String(lastRun?.resume_action?.connection_label || lastRun?.resume_action?.connection_provider || "") : "";
+    const bannerStatus = (waitingFor ? t("component.integration_connect.run_status", { provider: waitingFor }) : workflowRunBackgroundWait(lastRun) ? "running" : lastRun?.status) || (streaming ? "starting" : undefined);
     const runBannerColor = lastRun
         ? lastRun.status === "completed" ? "#4f9c84" : lastRun.status === "failed" ? "#d65f59" : "#cf9b44"
         : streaming ? "#0f766e" : null;
@@ -1787,23 +1873,24 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
       });
     };
     return (
-      <div className={readOnly ? "workflow-run-view" : undefined} style={{ height: "100%", display: readOnly ? "grid" : "flex", flexDirection: "column", padding: readOnly ? 0 : "1rem", overflow: readOnly ? "auto" : "hidden", position: "relative", zIndex: 10 }}>
+      <div className={readOnly ? "workflow-run-view" : undefined} style={{ height: "100%", display: readOnly ? "grid" : "flex", flexDirection: "column", padding: 0, overflow: readOnly ? "auto" : "hidden", position: "relative", zIndex: 10 }}>
         {/* Back + editor identity + a consistent metadata/action toolbar. */}
         <div className="workflow-editor-header">
           <button
             type="button"
             className="workflow-editor-back"
-            aria-label={readOnly ? t("component.workflow_run_history.back") : workflowReturnTo ? "Back to chat" : "Back to flows"}
-            title={readOnly ? t("component.workflow_run_history.back") : workflowReturnTo ? "Back to chat" : "Back to flows"}
+            aria-label={t("component.workflow_run_history.back")}
+            title={t("component.workflow_run_history.back")}
             onClick={() => {
               closeWorkflow();
             }}
           >
             <IconChevronLeft size={16} />
+            {!readOnly && <span>{t("nav.flows")}</span>}
           </button>
           <div className="workflow-editor-identity">
-            <IconTile className="workflow-editor-identity-icon" size={40}>
-              {workflowIconGlyph(flow.icon, 20)}
+            <IconTile className="workflow-editor-identity-icon" size={28}>
+              {workflowIconGlyph(flow.icon, 15)}
             </IconTile>
             <div className="workflow-editor-heading">
               <PageHeaderTitle variant="editor">
@@ -1812,18 +1899,18 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
                   className="workflow-editor-identity-edit"
                   onClick={() => openWorkflowIdentityEditor()}
                   disabled={Boolean(workflowAiPreview)}
-                  aria-label="Edit workflow name, description, and icon"
-                  title="Edit workflow details"
+                  aria-label={t("ui.edit_workflow_name_description_and_icon")}
+                  title={t("ui.edit_workflow_details")}
                 >
                   <span>{flow.name}</span>
                   <IconEdit size={15} />
                 </button>}
               </PageHeaderTitle>
-              <p>{readOnly ? fmtRunTime(lastRun?.started_at || lastRun?.created_at) : flow.description || "Add a description"}</p>
+              {readOnly && <p>{fmtRunTime(lastRun?.started_at || lastRun?.created_at)}</p>}
             </div>
           </div>
           <div className="workflow-editor-controls">
-            <div className="workflow-editor-meta" aria-label="Workflow status">
+            <div className="workflow-editor-meta" aria-label={t("ui.workflow_status")}>
               {readOnly ? <>
                 <StatusBadge type={lastRun?.status === "failed" ? "error" : "gray"} dot>
                   {t(workflowRunStateKey(lastRun?.status || "pending"))}
@@ -1837,71 +1924,39 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
                 </span>}
               </> : <>{(() => {
                 const ok = issues.length === 0;
-                const state = ok ? "valid" : errorCount > 0 ? "error" : "warning";
+                // A healthy graph says nothing; only problems get a badge.
+                if (ok) return null;
+                const state = errorCount > 0 ? "error" : "warning";
                 return (
                   <button
                     type="button"
                     className={`workflow-editor-validation is-${state}`}
                     onClick={() => !ok && setShowIssues((v) => !v)}
-                    title={ok ? "No issues" : `${issues.length} issue${issues.length === 1 ? "" : "s"}`}
+                    title={ok ? t("ui.workflow_no_issues") : t("ui.workflow_issue_count", { count: issues.length })}
                     disabled={ok}
                   >
                     <span className="workflow-editor-validation-icon" aria-hidden="true">{ok ? "✓" : "!"}</span>
-                    {ok ? "Valid" : <span className="mono">{issues.length} issue{issues.length === 1 ? "" : "s"}</span>}
+                    {ok ? t("ui.workflow_valid") : <span>{t("ui.workflow_issue_count", { count: issues.length })}</span>}
                   </button>
                 );
               })()}
-              <StatusBadge type={flow.status === "active" ? "active" : "gray"} dot>
-                {flow.status === "active" ? t("page.flows.active") : t("page.flows.draft")}
-              </StatusBadge>
-              <StatusBadge type="gray">
-                {t(TRIGGER_LABELS[triggerKind] || triggerKind)}
-              </StatusBadge>
+              {/* Active is the normal state; the trigger step on the canvas says how it starts. */}
+              {flow.status !== "active" && (
+                <StatusBadge type="gray" dot>{t("page.flows.draft")}</StatusBadge>
+              )}
               </>}
             </div>
-            <div className="workflow-editor-actions" role="toolbar" aria-label="Workflow actions">
-              {!readOnly && <><AiEditButton
-                className="workflow-editor-action workflow-editor-action-ai"
-                onClick={openWorkflowAiEdit}
-                disabled={updateMutation.isPending}
-              />
-              <Button
-                className="workflow-editor-action"
-                variant="outline"
-                onClick={() => openAddStep(steps.length)}
-                disabled={Boolean(workflowAiPreview)}
-                title="Add node"
-                ariaLabel="Add node"
-              >
-                <IconPlus size={17} />
-              </Button>
-              </>}
-              {!readOnly && <Button
-                className="workflow-editor-action"
-                variant="outline"
-                title="Deploy workflow"
-                ariaLabel="Deploy workflow"
-                disabled={Boolean(workflowAiPreview)}
-                onClick={() => {
-                  if (errorCount > 0) {
-                    setShowIssues(true);
-                    toast.error("Workflow isn't deployable", "Fix the graph errors first.");
-                    return;
-                  }
-                  setDeployFlow(flow);
-                }}
-              >
-                <IconUpload size={16} />
-              </Button>}
+            <div className="workflow-editor-actions" role="toolbar" aria-label={t("ui.workflow_actions")}>
               {!readOnly && <Button
                 className="workflow-editor-action"
                 variant="primary"
                 onClick={() => runStep()}
                 disabled={streaming || errorCount > 0 || Boolean(workflowAiPreview)}
-                title={errorCount > 0 ? "Fix workflow errors before running" : t("page.flows.run")}
-                ariaLabel={streaming ? t("page.flows.starting") : t("page.flows.run")}
+                title={errorCount > 0 ? t("page.flows.fix_before_running") : t("page.flows.test_run")}
+                ariaLabel={streaming ? t("page.flows.starting") : t("page.flows.test_run")}
               >
                 {streaming ? <LoadingSpinner size={15} /> : <IconPlay size={16} />}
+                <span>{t("page.flows.test_run")}</span>
               </Button>}
               <Button
                 className="workflow-editor-action"
@@ -1916,17 +1971,33 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
               >
                 <IconClock size={16} />
               </Button>
-              {!readOnly && <Button
-                className="workflow-editor-action"
-                variant="danger"
-                onClick={() => setDeleteTarget(flow.id)}
-                disabled={streaming || deleteMutation.isPending || Boolean(workflowAiPreview)}
-                loading={deleteMutation.isPending && deleteTarget === flow.id}
-                title={t("page.flows.delete_flow")}
-                ariaLabel={t("page.flows.delete_flow")}
-              >
-                {!(deleteMutation.isPending && deleteTarget === flow.id) && <IconTrash size={16} />}
-              </Button>}
+              {/* Rare and irreversible actions wait behind one menu. */}
+              {!readOnly && <Dropdown
+                align="right"
+                trigger={(
+                  <Button className="workflow-editor-action" variant="ghost" title={t("nav.more")} ariaLabel={t("nav.more")}
+                    disabled={streaming || Boolean(workflowAiPreview)}>
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                      <circle cx="3.5" cy="8" r="1.3" /><circle cx="8" cy="8" r="1.3" /><circle cx="12.5" cy="8" r="1.3" />
+                    </svg>
+                  </Button>
+                )}
+                items={[
+                  { key: "deploy", label: t("page.flows.deploy"), icon: <IconUpload size={14} /> },
+                  { key: "delete", label: t("page.flows.delete_flow"), icon: <IconTrash size={14} />, danger: true },
+                ]}
+                onSelect={(key: string) => {
+                  if (key === "deploy") {
+                    if (errorCount > 0) {
+                      setShowIssues(true);
+                      toast.error("Workflow isn't deployable", "Fix the graph errors first.");
+                      return;
+                    }
+                    setDeployFlow(flow);
+                  }
+                  if (key === "delete") setDeleteTarget(flow.id);
+                }}
+              />}
             </div>
           </div>
         </div>
@@ -1948,39 +2019,31 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
         {/* Visual canvas; AI edit uses the same global floating chat as the file editors. */}
         {(() => {
         const canvasSurface = (
-        <div style={{ position: "relative", flex: 1, minHeight: 0, background: "#fff", borderRadius: 24, padding: 8, boxShadow: "0 4px 24px rgba(0,0,0,0.04)" }}>
-          <button
-            onClick={() => setCanvasFull((f) => !f)}
-            title={canvasFull ? "Exit fullscreen" : "Fullscreen"}
-            style={{
-              position: "absolute", top: 16, right: 16, zIndex: 6,
-              width: 34, height: 34, borderRadius: 9, border: "none", cursor: "pointer",
-              background: "var(--surface-panel)", color: "var(--text-muted)",
-              boxShadow: "0 1px 3px rgba(28,25,23,0.12)",
-              display: "flex", alignItems: "center", justifyContent: "center",
-            }}
-          >
-            <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
-              {canvasFull ? (
-                <path d="M9 9V4.5M9 9H4.5M9 9L3.75 3.75M15 9h4.5M15 9V4.5M15 9l5.25-5.25M9 15v4.5M9 15H4.5M9 15l-5.25 5.25M15 15h4.5M15 15v4.5m0-4.5l5.25 5.25" />
-              ) : (
-                <path d="M3.75 3.75v4.5m0-4.5h4.5m-4.5 0L9 9M3.75 20.25v-4.5m0 4.5h4.5m-4.5 0L9 15M20.25 3.75h-4.5m4.5 0v4.5m0-4.5L15 9m5.25 11.25h-4.5m4.5 0v-4.5m0 4.5L15 15" />
-              )}
-            </svg>
-          </button>
+        <div style={{ position: "relative", flex: 1, minHeight: 0, background: "var(--surface-panel)", borderRadius: 14, overflow: "hidden" }}>
+          {!readOnly && (
+            <button
+              type="button"
+              className="workflow-canvas-add"
+              onClick={() => openAddStep(steps.length)}
+              disabled={Boolean(workflowAiPreview)}
+            >
+              <IconPlus size={14} />
+              <span>{t("component.workflow_palette.title")}</span>
+            </button>
+          )}
           {showBanner && (
             <div
               className="workflow-run-banner"
               style={{
                 position: "absolute", top: 16, left: "50%", transform: "translateX(-50%)", zIndex: 6,
                 display: "flex", alignItems: "center", gap: 8, padding: "5px 12px", borderRadius: 999,
-                background: "var(--surface-panel)", boxShadow: "0 1px 3px rgba(28,25,23,0.12)",
+                background: "var(--surface-panel)", boxShadow: "0 1px 3px rgba(29, 29, 31,0.12)",
                 fontSize: 12, fontWeight: 600, color: "var(--text-muted)",
                 ...(readOnly ? { left: 16, right: 60, transform: "none", flexWrap: "wrap", borderRadius: 8 } : {}),
               }}
             >
-              <span style={{ width: 8, height: 8, borderRadius: "50%", background: runBannerColor || "#a8a29e", animation: streaming ? "pulse 1.2s ease-in-out infinite" : "none" }} />
-              <span style={{ color: "var(--text-strong)", textTransform: "capitalize" }}>{bannerStatus}</span>
+              <span style={{ width: 8, height: 8, borderRadius: "50%", background: runBannerColor || "#aeaeb2", animation: streaming ? "pulse 1.2s ease-in-out infinite" : "none" }} />
+              <span style={{ color: "var(--text-strong)" }}>{waitingFor ? bannerStatus : workflowRunStatusLabel(bannerStatus)}</span>
               {lastRun?.status !== "completed" && runPercent !== null && <span className="mono" style={{ color: "var(--text-faint)" }}>{Math.floor(runPercent)}%</span>}
               {runBackgroundWait && <span style={{ color: "var(--text-faint)" }}>· {runBackgroundWait}</span>}
               {!streaming && lastRun?.error && <span style={{ color: "#d65f59", maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>· {lastRun.error}</span>}
@@ -1990,8 +2053,8 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
                   className="workflow-run-banner-action"
                   onClick={() => pauseMutation.mutate(lastRun.id)}
                   disabled={pauseMutation.isPending || cancelRunMutation.isPending}
-                  aria-label="Pause workflow after the current node"
-                  title="Pause after the current node finishes"
+                  aria-label={t("ui.pause_workflow_after_the_current_node")}
+                  title={t("ui.pause_after_the_current_node_finishes")}
                 >
                   <IconPause size={12} />
                   {pauseMutation.isPending ? "Pausing…" : "Pause"}
@@ -2000,6 +2063,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
               {runCanResume && (
                 <WorkflowRunResumeControl
                   runId={lastRun.id}
+                  action={lastRun.resume_action}
                   disabled={cancelRunMutation.isPending}
                   onResumed={(updated) => { setRunResult(updated); void queryClient.invalidateQueries({ queryKey: ["workflow-run-history-detail"] }); }}
                 />
@@ -2010,11 +2074,11 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
                   className="workflow-run-banner-action is-danger"
                   onClick={() => setCancelRunTarget(lastRun.id)}
                   disabled={cancelRunMutation.isPending}
-                  aria-label="Stop workflow run"
-                  title="Stop before another node starts"
+                  aria-label={t("ui.stop_workflow_run")}
+                  title={t("ui.stop_before_another_node_starts")}
                 >
                   <IconStop size={12} />
-                  Stop
+                  {t("ui.stop")}
                 </button>
               )}
               {runCanRetry && (
@@ -2023,8 +2087,8 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
                   className="workflow-run-banner-action"
                   onClick={() => retryMutation.mutate(recoveryRun)}
                   disabled={retryMutation.isPending}
-                  aria-label="Retry workflow from the authorized checkpoint"
-                  title="Continue from the authorized recovery checkpoint"
+                  aria-label={t("ui.retry_workflow_from_the_authorized_checkpoint")}
+                  title={t("ui.continue_from_the_authorized_recovery_checkpoint")}
                 >
                   <IconRefresh size={12} />
                   {retryMutation.isPending ? "Retrying…" : "Retry"}
@@ -2043,7 +2107,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
                   onClick={() => setShowFinalResult(true)}
                   style={{ height: 24, padding: "0 7px", fontSize: 11, whiteSpace: "nowrap", flexShrink: 0 }}
                 >
-                  View result
+                  {t("ui.view_result")}
                 </Button>
               )}
               {!streaming && showNewerActiveRun && (
@@ -2061,7 +2125,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
                     setSearchParams(next, { replace: true, state: location.state });
                     setRunResult(newerActiveRun);
                   }}
-                  title="A newer run of this Flow is still working or waiting for your decision"
+                  title={t("ui.a_newer_run_of_this_flow_is_still_working_or_wai")}
                 >
                   {newerActiveRun.status === "paused" ? "Newer run needs you" : "Open running run"}
                 </button>
@@ -2070,13 +2134,14 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
           )}
           <WorkflowCanvas
             steps={steps as unknown as CanvasStep[]}
+            agents={agentsById}
             fitOnResize={readOnly}
             statusById={statusById}
             previewById={previewById}
             outputById={outputById}
-            onRunNode={readOnly || workflowAiPreview ? undefined : runSingleNode}
+            onRunNode={readOnly || workflowAiPreview || workflowAiTurnLocked ? undefined : runSingleNode}
             issueById={readOnly ? undefined : issueById}
-            onStepsChange={readOnly || workflowAiPreview ? undefined : (next) => {
+            onStepsChange={readOnly || workflowAiPreview || workflowAiTurnLocked ? undefined : (next) => {
               if (!flow.id) return;
               const previous = flow;
               const canvasSaveSeq = canvasSaveSeqRef.current + 1;
@@ -2099,21 +2164,23 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
             onNodeOpen={workflowAiPreview ? undefined : openNode}
             onAddFrom={readOnly || workflowAiPreview ? undefined : (id) => { setAddFromId(id); setShowAddStep(true); }}
           />
+          {!readOnly && !workflowAiPreview && (
+            <button
+              type="button"
+              className="workflow-talk-to-manor"
+              onClick={openWorkflowAiEdit}
+              disabled={updateMutation.isPending}
+            >
+              {t("page.flows.tell_manor")}
+            </button>
+          )}
         </div>
         );
-        const editorBody = (
-          <div
-            className="workflow-editor-body"
-            style={
-              canvasFull
-                ? { position: "fixed", inset: 0, zIndex: 1000, background: "var(--surface-app)", padding: 8, display: "flex", gap: 8 }
-                : { flex: 1, minHeight: 0, display: "flex", gap: 12 }
-            }
-          >
+        return (
+          <div className="workflow-editor-body" style={{ flex: 1, minHeight: 0, display: "flex", gap: 12 }}>
             {canvasSurface}
           </div>
         );
-        return canvasFull ? createPortal(editorBody, document.body) : editorBody;
         })()}
 
         {showFinalResult && lastRun && (
@@ -2142,7 +2209,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
         <Modal
           open={showAddStep}
           onClose={() => setShowAddStep(false)}
-          title="Add node"
+          title={t("component.workflow_palette.title")}
         >
           <WorkflowNodePalette onPick={addNode} />
         </Modal>
@@ -2166,7 +2233,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
               style={{
                 width: "100%",
                 maxWidth: 420,
-                background: "#fff",
+                background: "var(--surface-panel)",
                 boxShadow: "0 20px 60px rgba(0,0,0,0.15)",
                 height: "100%",
                 overflowY: "auto",
@@ -2175,12 +2242,12 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
               }}
             >
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
-                <h3 style={{ fontSize: 17, fontWeight: 900, color: "#1c1917", margin: 0 }}>{t("page.flows.step_config")}</h3>
+                <h3 style={{ fontSize: 17, fontWeight: 900, color: "var(--text-strong)", margin: 0 }}>{t("page.flows.step_config")}</h3>
                 <button
                   onClick={() => setShowStepPanel(false)}
-                  onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.color = "#1c1917"; }}
-                  onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.color = "#a8a29e"; }}
-                  style={{ background: "transparent", border: "none", cursor: "pointer", color: "#a8a29e", transition: "color 0.2s", padding: 4 }}
+                  onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.color = "#1d1d1f"; }}
+                  onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.color = "#aeaeb2"; }}
+                  style={{ background: "transparent", border: "none", cursor: "pointer", color: "var(--text-muted)", transition: "color 0.2s", padding: 4 }}
                 >
                   <IconClose size={16} />
                 </button>
@@ -2200,8 +2267,8 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
                     {STEP_ICONS[editingStep.type]}
                   </div>
                   <div>
-                    <p style={{ fontSize: 14, fontWeight: 700, color: "#292524", margin: 0 }}>{editingStep.name}</p>
-                    <p style={{ fontSize: 11, color: "#a8a29e", margin: 0, textTransform: "capitalize" as const, fontWeight: 600 }}>{editingStep.type}</p>
+                    <p style={{ fontSize: 14, fontWeight: 700, color: "var(--text-strong)", margin: 0 }}>{editingStep.name}</p>
+                    <p style={{ fontSize: 11, color: "var(--text-muted)", margin: 0, textTransform: "capitalize" as const, fontWeight: 600 }}>{editingStep.type}</p>
                   </div>
                 </div>
                 <Input
@@ -2235,17 +2302,17 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
         {showRunHistory && (
           <div
             style={{
-              position: "fixed", top: 74, right: 24, zIndex: 40, width: 300, maxHeight: "72vh",
+              position: "absolute", top: 72, right: 12, zIndex: 40, width: 300, maxHeight: "72vh",
               display: "flex", flexDirection: "column",
               background: "var(--surface-panel)", borderRadius: 16,
-              boxShadow: "0 1px 3px rgba(28,25,23,0.10), 0 12px 32px rgba(28,25,23,0.10)", overflow: "hidden",
+              boxShadow: "0 1px 3px rgba(29, 29, 31,0.10), 0 12px 32px rgba(29, 29, 31,0.10)", overflow: "hidden",
             }}
           >
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "13px 15px" }}>
-              <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text-strong)" }}>Runs</div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text-strong)" }}>{t("ui.runs")}</div>
               <button
                 onClick={() => setShowRunHistory(false)}
-                title="Close"
+                title={t("ui.close")}
                 style={{ width: 26, height: 26, borderRadius: 7, border: "none", cursor: "pointer", background: "transparent", color: "var(--text-faint)", display: "flex", alignItems: "center", justifyContent: "center" }}
               >
                 <IconClose size={14} />
@@ -2257,7 +2324,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
               ) : (
                 (runs || []).map((run: any) => {
                   const selected = runResult?.id === run.id;
-                  const color = RUN_STATUS_COLOR[run.status] || "#a8a29e";
+                  const color = RUN_STATUS_COLOR[run.status] || "#aeaeb2";
                   const stepCount = Object.keys(run.step_results || {}).length;
                   return (
                     <button
@@ -2270,8 +2337,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
                       style={{
                         display: "flex", alignItems: "center", gap: 10, padding: "9px 11px", borderRadius: 10,
                         border: "none", cursor: "pointer", textAlign: "left",
-                        background: selected ? "rgba(15,118,110,0.08)" : "var(--surface-muted)",
-                        boxShadow: selected ? "inset 0 0 0 1.5px rgba(15,118,110,0.40)" : "none",
+                        background: selected ? "rgba(118, 118, 128, 0.16)" : "var(--surface-muted)",
                         transition: "background .15s",
                       }}
                     >
@@ -2280,7 +2346,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
                         <div style={{ fontSize: 12.5, fontWeight: 600, color: "var(--text-strong)", textTransform: "capitalize" }}>{run.status}</div>
                         <div style={{ fontSize: 11, color: "var(--text-faint)" }}>{fmtRunTime(run.started_at)}</div>
                       </div>
-                      <span className="mono" style={{ fontSize: 11, color: "var(--text-faint)" }}>{stepCount}</span>
+                      {stepCount > 0 && <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{stepCount}</span>}
                     </button>
                   );
                 })
@@ -2293,10 +2359,10 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
         {showIssues && issues.length > 0 && (
           <div
             style={{
-              position: "fixed", top: 74, right: 24, zIndex: 41, width: 320, maxHeight: "72vh",
+              position: "absolute", top: 72, right: 12, zIndex: 41, width: 320, maxHeight: "72vh",
               display: "flex", flexDirection: "column",
               background: "var(--surface-panel)", borderRadius: 16,
-              boxShadow: "0 1px 3px rgba(28,25,23,0.10), 0 12px 32px rgba(28,25,23,0.10)", overflow: "hidden",
+              boxShadow: "0 1px 3px rgba(29, 29, 31,0.10), 0 12px 32px rgba(29, 29, 31,0.10)", overflow: "hidden",
             }}
           >
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "13px 15px" }}>
@@ -2305,7 +2371,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
               </div>
               <button
                 onClick={() => setShowIssues(false)}
-                title="Close"
+                title={t("ui.close")}
                 style={{ width: 26, height: 26, borderRadius: 7, border: "none", cursor: "pointer", background: "transparent", color: "var(--text-faint)", display: "flex", alignItems: "center", justifyContent: "center" }}
               >
                 <IconClose size={14} />
@@ -2353,7 +2419,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
           open={!!cancelRunTarget}
           onClose={() => { if (!cancelRunMutation.isPending) setCancelRunTarget(null); }}
           onConfirm={() => { if (cancelRunTarget) cancelRunMutation.mutate(cancelRunTarget); }}
-          title="Stop workflow run?"
+          title={t("ui.stop_workflow_run")}
           message="The current node may finish, including any external action already submitted. No additional nodes will start."
           confirmLabel="Stop run"
           cancelLabel="Keep running"
@@ -2408,7 +2474,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
       {/* Header */}
       <PageHeader
         title={t("nav.flows")}
-        subtitle={t("page.flows.subtitle")}
+        subtitle={embedded ? undefined : t("page.flows.subtitle")}
         toolbar={(
           <SmartToolbar
             searchValue={search}
@@ -2466,9 +2532,6 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
             gap: 24,
           }}>
             {filtered.map((flow: any) => {
-              const stepCount = (flow.steps || []).length;
-              const flowErrorCount = validateWorkflow(flow.steps || [])
-                .filter((issue) => issue.level === "error").length;
               return (
                 <CompactCard
                   key={flow.id}
@@ -2489,7 +2552,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
                   meta={
                     <>
                       <span className="mono" style={{ fontSize: 11, color: "var(--text-faint)", fontWeight: 600 }}>
-                        {stepCount}
+                        {flow.step_count ?? 0}
                       </span>
                       <span
                         title={flow.status === "active" ? t("page.flows.active") : t("page.flows.draft")}
@@ -2497,7 +2560,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
                           width: 7,
                           height: 7,
                           borderRadius: "50%",
-                          background: flow.status === "active" ? "#4f9c84" : "#a8a29e",
+                          background: flow.status === "active" ? "#4f9c84" : "#aeaeb2",
                         }}
                       />
                     </>
@@ -2506,9 +2569,9 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
                     <div className="workflow-card-actions">
                       <button
                         className="workflow-card-action-button"
-                        onClick={() => { if (flowErrorCount === 0) requestWorkflowRun(flow); }}
-                        disabled={streaming || flowErrorCount > 0}
-                        title={flowErrorCount > 0 ? "Fix workflow errors before running" : t("page.flows.run")}
+                        onClick={() => void runFromList(flow)}
+                        disabled={streaming}
+                        title={t("page.flows.run")}
                         aria-label={`${t("page.flows.run")} ${flow.name}`}
                       >
                         <IconPlay size={14} />
@@ -2588,7 +2651,7 @@ export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBac
             rows={3}
           />
           <div>
-            <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: "#57534e", marginBottom: 6 }}>{t("page.flows.trigger_type")}</label>
+            <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: "var(--text-muted)", marginBottom: 6 }}>{t("page.flows.trigger_type")}</label>
             <select
               value={formTrigger}
               onChange={(e) => setFormTrigger(e.target.value as any)}

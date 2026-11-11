@@ -275,6 +275,42 @@ def test_revision_feedback_is_the_note_not_an_edit_of_read_only_material():
     assert split_revision_feedback(None, "note") == (None, "note")
 
 
+def test_final_post_review_only_allows_editorial_fields_and_uses_video_feedback():
+    from packages.core.services.workflow_chat_approvals import (
+        workflow_review_matches_original,
+        workflow_review_revision_note,
+    )
+
+    config = {
+        "review_editable_fields": ["title", "description", "tags"],
+        "review_revision_field": "video_change_request",
+    }
+    original = {
+        "title": "Original title",
+        "description": "Original description",
+        "tags": ["original"],
+        "video_change_request": "",
+        "account": "immutable-account",
+        "review_artifacts": [{"document_id": "video-1"}],
+    }
+    edited = {
+        **original,
+        "title": "Edited title",
+        "description": "",
+        "tags": [],
+        "video_change_request": "Tighten the lip sync.",
+    }
+
+    assert workflow_review_matches_original(original, edited, config)
+    assert workflow_review_revision_note(config, edited) == "Tighten the lip sync."
+    assert not workflow_review_matches_original(
+        original, {**edited, "account": "other-account"}, config,
+    )
+    assert not workflow_review_matches_original(
+        original, {**edited, "review_artifacts": []}, config,
+    )
+
+
 @pytest.mark.asyncio
 async def test_reviewed_files_reported_by_path_open_their_document(db_session):
     from packages.core.models.base import generate_ulid

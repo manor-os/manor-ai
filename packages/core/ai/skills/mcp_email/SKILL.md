@@ -20,7 +20,7 @@ This MCP authenticates with stored IMAP/SMTP **credentials** (no OAuth). If a to
 
 - `list_folders` — enumerate mailbox folders (IMAP has folders, not Gmail-style labels). Run this first when the user names a folder.
 - `list_messages` — list messages (optionally scoped to a folder). Returns message **UIDs**, not bodies.
-- `get_message` — fetch one message by `uid` (headers + body).
+- `get_message` — one message by `uid`: sender, recipients, subject, date, body as text and `attachments`. A long body arrives in pages: while `next_offset` is set, call again with `offset=<next_offset>` and read every page before summarizing or archiving the email.
 - `list_attachments` / `download_attachment` — inspect and fetch received MIME attachments as raw base64.
 - `save_attachment_to_workspace` — download one attachment, save it at the current Workspace root (or Knowledge root without a Workspace), project it to Knowledge, and return extracted text plus a `document_id`/viewer link.
 - `list_threads` / `get_thread` — reconstruct conversations from `Message-ID`, `In-Reply-To`, and `References`. Pass `search_folders` including Sent when both sides of a conversation are needed.

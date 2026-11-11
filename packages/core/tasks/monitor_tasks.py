@@ -1,13 +1,16 @@
-"""Monitoring Celery tasks — daily health briefing, heartbeat check, SLA sweep.
-
-Ported from manor-multi-agent's system_monitor.py and heartbeat.py into
-manor-os's Celery Beat architecture.
+"""Monitoring Celery tasks — HITL reminders, digest, SLA sweep, readiness.
 
 Tasks:
-  daily_health_briefing  — runs at 8am daily, generates a health report per entity
-  heartbeat_check        — runs every 30 min, proactive agent attention in active conversations
-  sla_breach_check       — runs every 5 min, flips ``Task.sla_breached`` and
-                          fires escalation rules when SLA windows expire
+  hitl_waiting_reminder     — reminds people about cards waiting on them
+  workspace.digest_sweep    — one daily digest per person
+  sla_breach_check          — runs every 5 min, flips ``Task.sla_breached`` and
+                              fires escalation rules when SLA windows expire
+  workspace_readiness_check — setup monitoring and readiness-driven reviews
+
+The former daily health briefing (a per-entity stats push that went out even
+when every number was zero) and the 30-minute heartbeat check (a canned message
+written into channel conversations but never sent to the channel) were retired;
+the digest and reminders cover what people need to act on.
 """
 from __future__ import annotations
 
@@ -16,24 +19,15 @@ import hashlib
 import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from packages.core.constants.goals import GoalStatus
-from packages.core.constants.task import TaskStatus
-from packages.core.constants.execution import (
-    ExecutionPlanStatus,
-    ExecutionStepStatus,
-)
 from packages.core.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
 MONITOR_ENABLED = os.getenv("MONITOR_ENABLED", "true").lower() != "false"
-HEARTBEAT_OK_MARKER = "HEARTBEAT_OK"
-# Skip proactive messages if the conversation already has a recent assistant
-# message within this many minutes.
-HEARTBEAT_COOLDOWN_MINUTES = 30
 
 
 def _run_async(coro):
@@ -42,609 +36,7 @@ def _run_async(coro):
 
 
 # ---------------------------------------------------------------------------
-# 1. Daily Health Briefing
-# ---------------------------------------------------------------------------
-
-@celery_app.task(bind=True, name="monitor.daily_health_briefing", max_retries=1)
-def daily_health_briefing(self):
-    """Generate and deliver a daily health briefing for every active entity.
-
-    Gathers task stats, agent execution metrics, scheduled job health, and
-    goal progress, then formats them into a structured 3-section report
-    saved as a system notification for each entity.
-    """
-    if not MONITOR_ENABLED:
-        logger.info("daily_health_briefing: disabled via MONITOR_ENABLED=false")
-        return
-
-    try:
-        _run_async(_async_daily_health_briefing())
-    except Exception as exc:
-        logger.error("daily_health_briefing failed: %s", exc, exc_info=True)
-        raise self.retry(exc=exc, countdown=300)
-
-
-async def _async_daily_health_briefing():
-    from sqlalchemy import select
-
-    from packages.core.database import create_worker_session
-    from packages.core.models.user import Entity
-
-    async with create_worker_session()() as db:
-        # Get all active entities
-        result = await db.execute(
-            select(Entity).where(Entity.deleted_at.is_(None))
-        )
-        entities = list(result.scalars().all())
-
-    if not entities:
-        logger.info("daily_health_briefing: no active entities found")
-        return
-
-    logger.info("daily_health_briefing: generating briefings for %d entities", len(entities))
-
-    for entity in entities:
-        try:
-            await _generate_entity_briefing(entity.id, entity.name)
-        except Exception as e:
-            logger.warning(
-                "daily_health_briefing: failed for entity=%s: %s",
-                entity.id, e,
-            )
-
-
-async def _generate_entity_briefing(entity_id: str, entity_name: str):
-    """Gather metrics and save a health briefing notification for one entity."""
-    from sqlalchemy import select
-
-    from packages.core.database import create_worker_session
-    from packages.core.models.user import User
-
-    now = datetime.now(timezone.utc)
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-
-    async with create_worker_session()() as db:
-        # ── Task stats ──
-        task_stats = await _query_task_stats(db, entity_id, now, today_start)
-
-        # ── Agent execution metrics (last 24h) ──
-        exec_stats = await _query_execution_stats(db, entity_id, now)
-
-        # ── Scheduled job health ──
-        job_stats = await _query_job_stats(db, entity_id)
-
-        # ── Goal progress ──
-        goal_stats = await _query_goal_stats(db, entity_id)
-
-        # ── Format the report ──
-        report = _format_briefing(
-            entity_name=entity_name,
-            date_str=now.strftime("%Y-%m-%d"),
-            task_stats=task_stats,
-            exec_stats=exec_stats,
-            job_stats=job_stats,
-            goal_stats=goal_stats,
-        )
-
-        # ── Save as notification for each admin/owner user in the entity ──
-        from packages.core.services.notification_service import create_notification
-
-        result = await db.execute(
-            select(User).where(
-                User.entity_id == entity_id,
-                User.deleted_at.is_(None),
-                User.status == "active",
-                User.role.in_(["owner", "admin"]),
-            )
-        )
-        admin_users = list(result.scalars().all())
-
-        if not admin_users:
-            logger.debug("daily_health_briefing: no admin users for entity=%s, logging only", entity_id)
-            logger.info("daily_health_briefing [%s]:\n%s", entity_id, report[:500])
-            return
-
-        # Structured payload for the rich UI renderer. Mirrors the text
-        # report so the web app can draw stat chips + action checklist
-        # instead of showing the raw divider-heavy plaintext.
-        alerts: list[str] = []
-        if task_stats["overdue"] > 0:
-            alerts.append(f"{task_stats['overdue']} overdue task(s)")
-        if task_stats["blocked"] > 0:
-            alerts.append(f"{task_stats['blocked']} blocked task(s)")
-        if task_stats["stalled"] > 0:
-            alerts.append(f"{task_stats['stalled']} stalled task(s)")
-        if job_stats["broken"] > 0:
-            alerts.append(f"{job_stats['broken']} broken scheduled job(s)")
-        if goal_stats["stuck_hitl"] > 0:
-            alerts.append(f"{goal_stats['stuck_hitl']} goal(s) awaiting human input")
-
-        actions: list[str] = []
-        if task_stats["overdue"] > 0:
-            actions.append(f"Review {task_stats['overdue']} overdue task(s) and update deadlines or status")
-        if task_stats["stalled"] > 0:
-            actions.append(f"Check {task_stats['stalled']} stalled in-progress task(s)")
-        if goal_stats["stuck_hitl"] > 0:
-            actions.append(f"Respond to {goal_stats['stuck_hitl']} goal(s) waiting for your input")
-        if job_stats["broken"] > 0:
-            actions.append(f"Investigate {job_stats['broken']} broken scheduled job(s)")
-        if task_stats["blocked"] > 0:
-            actions.append(f"Unblock {task_stats['blocked']} blocked task(s)")
-
-        briefing_meta = {
-            "kind": "daily_briefing",
-            "date": now.strftime("%Y-%m-%d"),
-            "entity_name": entity_name,
-            "tasks": task_stats,
-            "executions": exec_stats,
-            "jobs": job_stats,
-            "goals": goal_stats,
-            "alerts": alerts,
-            "action_items": actions,
-            "link": "/dashboard",
-        }
-
-        for user in admin_users:
-            await create_notification(
-                db,
-                entity_id=entity_id,
-                user_id=user.id,
-                type="system_health",
-                title=f"Daily Briefing — {now.strftime('%b %d, %Y')}",
-                body=report,
-                meta=briefing_meta,
-            )
-
-        await db.commit()
-        logger.info(
-            "daily_health_briefing: delivered to %d users for entity=%s",
-            len(admin_users), entity_id,
-        )
-
-
-async def _query_task_stats(db, entity_id: str, now: datetime, today_start: datetime) -> dict:
-    """Query task statistics for the briefing."""
-    from sqlalchemy import select, func
-    from packages.core.models.task import Task
-    from packages.core.services.task_deadlines import task_deadline_overdue_expr
-    from packages.core.services.workspace_health_metrics import stalled_task_clause
-
-    # Total open tasks
-    r = await db.execute(
-        select(func.count()).select_from(Task).where(
-            Task.entity_id == entity_id,
-            Task.status.in_((TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED,)),
-        )
-    )
-    open_count = r.scalar_one()
-
-    # Overdue tasks (have a deadline in the past, still not completed)
-    r = await db.execute(
-        select(func.count()).select_from(Task).where(
-            Task.entity_id == entity_id,
-            Task.status.in_((TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED,)),
-            Task.deadline.isnot(None),
-            task_deadline_overdue_expr(Task.deadline, now_expr=now, current_date_expr=today_start.date()),
-        )
-    )
-    overdue_count = r.scalar_one()
-
-    # Blocked tasks
-    r = await db.execute(
-        select(func.count()).select_from(Task).where(
-            Task.entity_id == entity_id,
-            Task.status == TaskStatus.BLOCKED,
-        )
-    )
-    blocked_count = r.scalar_one()
-
-    # Completed today
-    r = await db.execute(
-        select(func.count()).select_from(Task).where(
-            Task.entity_id == entity_id,
-            Task.status == TaskStatus.COMPLETED,
-            Task.completed_at >= today_start,
-        )
-    )
-    completed_today = r.scalar_one()
-
-    # Stalled: in progress with no status change for STALLED_AFTER — the
-    # same definition the launch review and Workspace health use.
-    r = await db.execute(
-        select(func.count()).select_from(Task).where(
-            Task.entity_id == entity_id,
-            stalled_task_clause(now),
-        )
-    )
-    stalled_count = r.scalar_one()
-
-    return {
-        "open": open_count,
-        "overdue": overdue_count,
-        "blocked": blocked_count,
-        "completed_today": completed_today,
-        "stalled": stalled_count,
-    }
-
-
-async def _query_execution_stats(db, entity_id: str, now: datetime) -> dict:
-    """Query agent execution metrics for the last 24 hours."""
-    from sqlalchemy import select, func
-    from packages.core.models.scheduler import AgentExecution
-    from packages.core.services.workspace_health_metrics import success_rate
-
-    AGENT_EXECUTION_SUCCEEDED = "completed"
-    AGENT_EXECUTION_FAILED = ("failed", "error")
-
-    since = now - timedelta(hours=24)
-
-    # Total executions in the last 24h
-    r = await db.execute(
-        select(func.count()).select_from(AgentExecution).where(
-            AgentExecution.entity_id == entity_id,
-            AgentExecution.created_at >= since,
-        )
-    )
-    total = r.scalar_one()
-
-    if total == 0:
-        return {"total": 0, "success_rate": None, "avg_turns": 0.0, "total_tokens": 0}
-
-    # Only finished executions are judged: running and cancelled ones are not.
-    status_counts = dict((await db.execute(
-        select(AgentExecution.status, func.count()).where(
-            AgentExecution.entity_id == entity_id,
-            AgentExecution.created_at >= since,
-            AgentExecution.status.in_(
-                (AGENT_EXECUTION_SUCCEEDED,) + AGENT_EXECUTION_FAILED
-            ),
-        ).group_by(AgentExecution.status)
-    )).all())
-    rate = success_rate(
-        status_counts.get(AGENT_EXECUTION_SUCCEEDED, 0),
-        sum(status_counts.get(status, 0) for status in AGENT_EXECUTION_FAILED),
-    )
-
-    # Average turns
-    r = await db.execute(
-        select(func.avg(AgentExecution.turns_used)).where(
-            AgentExecution.entity_id == entity_id,
-            AgentExecution.created_at >= since,
-        )
-    )
-    avg_turns = r.scalar_one() or 0.0
-
-    return {
-        "total": total,
-        # Percent of judged executions; None when none finished.
-        "success_rate": None if rate is None else round(rate * 100, 1),
-        "avg_turns": round(float(avg_turns), 1),
-        "total_tokens": 0,  # token_usage is JSONB, skip deep aggregation for now
-    }
-
-
-async def _query_job_stats(db, entity_id: str) -> dict:
-    """Query scheduled job health."""
-    from sqlalchemy import select, func
-    from packages.core.models.scheduler import ScheduledJob
-
-    # Total enabled jobs
-    r = await db.execute(
-        select(func.count()).select_from(ScheduledJob).where(
-            ScheduledJob.entity_id == entity_id,
-            ScheduledJob.enabled == True,  # noqa: E712
-        )
-    )
-    enabled_count = r.scalar_one()
-
-    # Jobs with errors
-    r = await db.execute(
-        select(func.count()).select_from(ScheduledJob).where(
-            ScheduledJob.entity_id == entity_id,
-            ScheduledJob.enabled == True,  # noqa: E712
-            ScheduledJob.last_status == "error",
-        )
-    )
-    error_count = r.scalar_one()
-
-    # Jobs with consecutive errors >= 3 (likely broken)
-    r = await db.execute(
-        select(func.count()).select_from(ScheduledJob).where(
-            ScheduledJob.entity_id == entity_id,
-            ScheduledJob.enabled == True,  # noqa: E712
-            ScheduledJob.consecutive_errors >= 3,
-        )
-    )
-    broken_count = r.scalar_one()
-
-    return {
-        "enabled": enabled_count,
-        "errored": error_count,
-        "broken": broken_count,
-    }
-
-
-async def _query_goal_stats(db, entity_id: str) -> dict:
-    """Query plan + step health for the daily briefing.
-
-    The old implementation counted GoalRun + StepRun rows. Those tables
-    are gone; the new equivalents are ExecutionPlan (Planner output)
-    and ExecutionStep (atomic node). "Stuck HITL" now means a step in
-    ``waiting_human`` status.
-    """
-    from sqlalchemy import select, func
-    from packages.core.models.execution import ExecutionPlan, ExecutionStep
-
-    # Active plans (running)
-    r = await db.execute(
-        select(func.count()).select_from(ExecutionPlan).where(
-            ExecutionPlan.entity_id == entity_id,
-            ExecutionPlan.status.in_((ExecutionPlanStatus.RUNNING, ExecutionPlanStatus.PENDING_APPROVAL, ExecutionPlanStatus.PAUSED,)),
-        )
-    )
-    active_plans = r.scalar_one()
-
-    # Plans with steps waiting on human input
-    r = await db.execute(
-        select(func.count(func.distinct(ExecutionStep.plan_id))).where(
-            ExecutionStep.entity_id == entity_id,
-            ExecutionStep.step_status == ExecutionStepStatus.WAITING_HUMAN,
-        )
-    )
-    stuck_plans = r.scalar_one()
-
-    return {
-        "active": active_plans,
-        "stuck_hitl": stuck_plans,
-    }
-
-
-def _format_briefing(
-    *,
-    entity_name: str,
-    date_str: str,
-    task_stats: dict,
-    exec_stats: dict,
-    job_stats: dict,
-    goal_stats: dict,
-) -> str:
-    """Format stats into the structured 3-section report."""
-    # ── Platform Health ──
-    alerts = []
-    if task_stats["overdue"] > 0:
-        alerts.append(f"{task_stats['overdue']} overdue task(s)")
-    if task_stats["blocked"] > 0:
-        alerts.append(f"{task_stats['blocked']} blocked task(s)")
-    if task_stats["stalled"] > 0:
-        alerts.append(f"{task_stats['stalled']} stalled task(s) (no status change in 48h)")
-    if job_stats["broken"] > 0:
-        alerts.append(f"{job_stats['broken']} scheduled job(s) with repeated failures")
-    if goal_stats["stuck_hitl"] > 0:
-        alerts.append(f"{goal_stats['stuck_hitl']} goal(s) waiting for human input")
-    alert_text = "; ".join(alerts) if alerts else "All clear"
-    exec_success = (
-        "n/a" if exec_stats.get("success_rate") is None else f"{exec_stats['success_rate']}%"
-    )
-
-    # ── Action items ──
-    action_items = []
-    if task_stats["overdue"] > 0:
-        action_items.append(f"Review {task_stats['overdue']} overdue task(s) and update deadlines or status")
-    if task_stats["stalled"] > 0:
-        action_items.append(f"Check {task_stats['stalled']} stalled in-progress task(s)")
-    if goal_stats["stuck_hitl"] > 0:
-        action_items.append(f"Respond to {goal_stats['stuck_hitl']} goal(s) waiting for your input")
-    if job_stats["broken"] > 0:
-        action_items.append(f"Investigate {job_stats['broken']} broken scheduled job(s)")
-    if task_stats["blocked"] > 0:
-        action_items.append(f"Unblock {task_stats['blocked']} blocked task(s)")
-    if not action_items:
-        action_items.append("No urgent actions required today.")
-
-    action_lines = "\n".join(f"  {i+1}. {item}" for i, item in enumerate(action_items))
-
-    return (
-        f"Manor Daily Briefing — {date_str}\n"
-        f"Entity: {entity_name}\n"
-        f"\n"
-        f"--- Platform Health ---\n"
-        f"  Tasks: {task_stats['open']} open | {task_stats['overdue']} overdue | "
-        f"{task_stats['completed_today']} completed today\n"
-        f"  Agent Executions (24h): {exec_stats['total']} total | "
-        f"{exec_success} success | avg {exec_stats['avg_turns']} turns\n"
-        f"  Scheduled Jobs: {job_stats['enabled']} enabled | "
-        f"{job_stats['errored']} errored | {job_stats['broken']} broken\n"
-        f"  Goals: {goal_stats['active']} active | {goal_stats['stuck_hitl']} awaiting human input\n"
-        f"  Alerts: {alert_text}\n"
-        f"\n"
-        f"--- Business Overview ---\n"
-        f"  Open workload: {task_stats['open']} tasks across all workspaces\n"
-        f"  Stalled work: {task_stats['stalled']} task(s) with no status change in 48h\n"
-        f"  Blocked: {task_stats['blocked']} task(s) needing intervention\n"
-        f"\n"
-        f"--- Action Items ---\n"
-        f"{action_lines}\n"
-    )
-
-
-# ---------------------------------------------------------------------------
-# 2. Heartbeat Check
-# ---------------------------------------------------------------------------
-
-@celery_app.task(bind=True, name="monitor.heartbeat_check")
-def heartbeat_check(self):
-    """Check active conversations for proactive agent attention needs.
-
-    Looks at conversations with recent activity, checks if the assigned agent
-    has overdue/stalled tasks or stuck goals, and posts a proactive message
-    if attention is needed.
-    """
-    try:
-        _run_async(_async_heartbeat_check())
-    except Exception as exc:
-        logger.error("heartbeat_check failed: %s", exc, exc_info=True)
-
-
-async def _async_heartbeat_check():
-    from sqlalchemy import select
-
-    from packages.core.database import create_worker_session
-    from packages.core.models.task import Conversation
-    from packages.core.services.conversation_messages import add_message
-
-    now = datetime.now(timezone.utc)
-    recent_cutoff = now - timedelta(hours=2)
-    cooldown_cutoff = now - timedelta(minutes=HEARTBEAT_COOLDOWN_MINUTES)
-
-    async with create_worker_session()() as db:
-        # Find active conversations that have messages in the last 2 hours
-        # and have an assigned agent
-        result = await db.execute(
-            select(Conversation).where(
-                Conversation.status == "active",
-                Conversation.agent_id.isnot(None),
-                Conversation.channel != "webchat",
-            )
-        )
-        conversations = list(result.scalars().all())
-
-        if not conversations:
-            return
-
-        checked = 0
-        notified = 0
-
-        for conv in conversations:
-            try:
-                should_notify, message = await _check_conversation_attention(
-                    db, conv, now, recent_cutoff, cooldown_cutoff,
-                )
-                checked += 1
-
-                if should_notify and message:
-                    await add_message(
-                        db, conv.id,
-                        role="assistant",
-                        content=message,
-                    )
-                    notified += 1
-            except Exception as e:
-                logger.debug(
-                    "heartbeat_check: error checking conv=%s: %s",
-                    conv.id, e,
-                )
-
-        if notified:
-            await db.commit()
-
-        if checked:
-            logger.info(
-                "heartbeat_check: checked %d conversations, sent %d proactive messages",
-                checked, notified,
-            )
-
-
-async def _check_conversation_attention(
-    db,
-    conv,
-    now: datetime,
-    recent_cutoff: datetime,
-    cooldown_cutoff: datetime,
-) -> tuple[bool, str | None]:
-    """Check if a conversation's agent needs to proactively notify the user.
-
-    Returns (should_notify, message_text).
-    """
-    from sqlalchemy import select, func
-    from packages.core.models.task import Message, Task
-    from packages.core.models.execution import ExecutionStep
-    from packages.core.services.task_deadlines import task_deadline_overdue_expr
-    from packages.core.services.workspace_health_metrics import stalled_task_clause
-
-    # Check if there are recent messages (last 2 hours)
-    r = await db.execute(
-        select(func.count()).select_from(Message).where(
-            Message.conversation_id == conv.id,
-            Message.created_at >= recent_cutoff,
-        )
-    )
-    recent_msg_count = r.scalar_one()
-    if recent_msg_count == 0:
-        return False, None  # No recent activity, skip
-
-    # Check if there's already a recent assistant message (cooldown)
-    r = await db.execute(
-        select(func.count()).select_from(Message).where(
-            Message.conversation_id == conv.id,
-            Message.role == "assistant",
-            Message.created_at >= cooldown_cutoff,
-        )
-    )
-    recent_assistant_count = r.scalar_one()
-    if recent_assistant_count > 0:
-        return False, None  # Already messaged recently, skip
-
-    # ── Gather attention signals ──
-    attention_items: list[str] = []
-
-    # 1. Overdue tasks assigned to this agent
-    r = await db.execute(
-        select(func.count()).select_from(Task).where(
-            Task.entity_id == conv.entity_id,
-            Task.agent_id == conv.agent_id,
-            Task.status.in_((TaskStatus.PENDING, TaskStatus.IN_PROGRESS,)),
-            Task.deadline.isnot(None),
-            task_deadline_overdue_expr(Task.deadline, now_expr=now, current_date_expr=now.date()),
-        )
-    )
-    overdue_tasks = r.scalar_one()
-    if overdue_tasks > 0:
-        attention_items.append(f"{overdue_tasks} overdue task(s) assigned to me")
-
-    # 2. Stalled tasks — the shared stall definition (no status change in 48h)
-    r = await db.execute(
-        select(func.count()).select_from(Task).where(
-            Task.entity_id == conv.entity_id,
-            Task.agent_id == conv.agent_id,
-            stalled_task_clause(now),
-        )
-    )
-    stalled_tasks = r.scalar_one()
-    if stalled_tasks > 0:
-        attention_items.append(f"{stalled_tasks} stalled task(s) with no status change in 48h")
-
-    # 3. Plans with steps waiting on human input.
-    # The old query joined by conversation_id; the new ExecutionPlan
-    # doesn't carry that field directly, so we scope to entity-wide
-    # pending HITL — the heartbeat message is per-conversation but the
-    # surfaced count is "plans needing your attention overall", which
-    # is actually the more useful framing for a single-operator system.
-    r = await db.execute(
-        select(func.count(func.distinct(ExecutionStep.plan_id))).where(
-            ExecutionStep.entity_id == conv.entity_id,
-            ExecutionStep.step_status == ExecutionStepStatus.WAITING_HUMAN,
-        )
-    )
-    stuck_plans = r.scalar_one()
-    if stuck_plans > 0:
-        attention_items.append(f"{stuck_plans} plan(s) waiting for your input")
-
-    if not attention_items:
-        return False, None
-
-    # ── Format proactive message ──
-    items_text = "\n".join(f"- {item}" for item in attention_items)
-    message = (
-        f"Heads up — I noticed a few items that may need your attention:\n\n"
-        f"{items_text}\n\n"
-        f"Let me know if you'd like me to help with any of these."
-    )
-
-    return True, message
-
-
-# ---------------------------------------------------------------------------
-# 3. HITL Waiting Reminder
+# 1. HITL Waiting Reminder
 # ---------------------------------------------------------------------------
 
 @celery_app.task(bind=True, name="monitor.hitl_waiting_reminder", max_retries=1)
@@ -655,8 +47,14 @@ def hitl_waiting_reminder(self):
         return
 
     try:
-        from packages.core.services.hitl_reminders import run_hitl_reminder_sweep
+        from packages.core.services.hitl_reminders import (
+            run_hitl_reminder_sweep,
+            run_unanswered_authorization_expiry,
+        )
 
+        expired = _run_async(run_unanswered_authorization_expiry())
+        if expired:
+            logger.info("hitl_waiting_reminder: skipped %d unanswered authorization(s)", expired)
         delivered = _run_async(run_hitl_reminder_sweep())
         if delivered:
             logger.info("hitl_waiting_reminder: delivered %d reminder(s)", delivered)
@@ -679,8 +77,27 @@ def workspace_digest_sweep() -> int:
     return sent
 
 
+@celery_app.task(name="workspace.attention_sweep")
+def workspace_attention_sweep() -> dict:
+    """Reconcile attention items with platform state, then tell what is due (every 5 min).
+
+    Deterministic and read-only over source tables. Telling happens only for
+    entities with the ``attention_delivery`` flag on (attention.delivery).
+    """
+    if not MONITOR_ENABLED:
+        logger.info("workspace_attention_sweep: disabled via MONITOR_ENABLED=false")
+        return {}
+    from packages.core.attention.sweep import run_attention_sweep
+
+    results = _run_async(run_attention_sweep())
+    changed = {key: stats for key, stats in results.items() if any(stats.values())}
+    if changed:
+        logger.info("workspace_attention_sweep: %s", changed)
+    return results
+
+
 # ---------------------------------------------------------------------------
-# 4. SLA Breach Check
+# 2. SLA Breach Check
 # ---------------------------------------------------------------------------
 #
 # Periodic sweep that flips ``Task.sla_breached`` to True for any open
@@ -749,11 +166,11 @@ async def _async_readiness_check() -> int:
     from packages.core.database import create_worker_session
     from packages.core.models.workspace import Workspace, AgentSubscription
     from packages.core.models.goal import Goal
-    from packages.core.models.document import Integration
     from packages.core.services.notification_service import create_notification_once
     from packages.core.services.workspace_readiness import (
         evaluate_workspace_blocking_setup,
     )
+    from packages.core.strategist.context import workspace_configured_provider_keys
 
     triggered = 0
     async with create_worker_session()() as db:
@@ -784,26 +201,30 @@ async def _async_readiness_check() -> int:
                         AgentSubscription.status == "active",
                     )
                 )).scalar_one()
-                goal_count = (await db.execute(
-                    select(func.count()).select_from(Goal).where(
+                active_goals = list((await db.execute(
+                    select(Goal).where(
                         Goal.workspace_id == ws.id,
                         Goal.status == GoalStatus.ACTIVE.value,
                     )
-                )).scalar_one()
-                integration_count = (await db.execute(
-                    select(func.count()).select_from(Integration).where(
-                        Integration.entity_id == ws.entity_id,
-                        Integration.status == "active",
-                    )
-                )).scalar_one()
+                )).scalars().all())
+                # Only providers this Workspace works with count: a new
+                # integration elsewhere in the entity is not news here.
+                providers = await workspace_configured_provider_keys(
+                    db, ws, active_goals,
+                )
                 current = {
                     "agents": agent_count,
-                    "goals": goal_count,
-                    "integrations": integration_count,
+                    "goals": len(active_goals),
+                    "integration_providers": len(providers),
                 }
                 changed = any(
                     current[key] > last_check.get(key, 0)
-                    for key in ("agents", "goals", "integrations")
+                    for key in ("agents", "goals")
+                ) or (
+                    # No baseline yet (first check after this key existed):
+                    # record it without starting a review.
+                    "integration_providers" in last_check
+                    and current["integration_providers"] > last_check["integration_providers"]
                 )
 
             if changed:
@@ -811,7 +232,7 @@ async def _async_readiness_check() -> int:
                 try:
                     from packages.core.tasks.ai_tasks import run_strategist_review
                     diff_parts = []
-                    for key in ("agents", "goals", "integrations"):
+                    for key in ("agents", "goals", "integration_providers"):
                         old = last_check.get(key, 0)
                         new = current[key]
                         if new > old:
@@ -850,6 +271,8 @@ async def _async_readiness_check() -> int:
             if locked_ws is None or locked_ws.deleted_at is not None:
                 await db.rollback()
                 continue
+            from packages.core.attention.delivery import delivery_enabled
+
             new_settings = dict(locked_ws.settings or {})
             new_settings["_readiness_snapshot"] = current
             blueprint = new_settings.get("_blueprint")
@@ -866,7 +289,8 @@ async def _async_readiness_check() -> int:
                 blueprint = dict(blueprint)
                 blueprint["setup_monitor"] = monitor
                 new_settings["_blueprint"] = blueprint
-                if incident_started:
+                # With attention delivery on, setup_incomplete tells instead.
+                if incident_started and not await delivery_enabled(db, locked_ws.entity_id):
                     recipient = str(
                         new_settings.get("created_by_user_id") or ""
                     ).strip()

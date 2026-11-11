@@ -452,3 +452,67 @@ class TestPublish:
         _mk(root, "d.csv", b"a,b")
         with pytest.raises(sp.SitePublishError, match="index.html"):
             await sp.publish(db_session, entity_id=eid, rel_path="d.csv", name="Bad")
+
+
+class TestSiteAddress:
+    @pytest.fixture(autouse=True)
+    def _hosting(self, monkeypatch):
+        from packages.core.config import get_settings
+
+        settings = get_settings()
+        monkeypatch.setattr(settings, "MANOR_SITES_DOMAIN", "Sites.Example.com")
+        monkeypatch.setattr(settings, "MANOR_SITES_PUBLIC_SCHEME", "https")
+        monkeypatch.setattr(settings, "MANOR_SITES_PUBLIC_PORT", "")
+        return settings
+
+    @staticmethod
+    def _site(**overrides):
+        values = {"slug": "acme", "custom_domain": None, "domain_status": None}
+        return SimpleNamespace(**{**values, **overrides})
+
+    def test_platform_address_defaults_to_https_without_port(self):
+        assert sp.site_public_url(self._site()) == "https://acme.sites.example.com"
+
+    def test_local_scheme_and_port_shape_the_platform_address(self, _hosting, monkeypatch):
+        monkeypatch.setattr(_hosting, "MANOR_SITES_PUBLIC_SCHEME", "http")
+        monkeypatch.setattr(_hosting, "MANOR_SITES_PUBLIC_PORT", "5213")
+        site = self._site(custom_domain="www.acme.com", domain_status="active")
+        assert sp.site_platform_url(site) == "http://acme.sites.example.com:5213"
+        # A verified custom domain is still what visitors use.
+        assert sp.site_public_url(site) == "https://www.acme.com"
+
+    def test_pending_custom_domain_falls_back_to_platform_address(self):
+        site = self._site(custom_domain="www.acme.com", domain_status="pending")
+        assert sp.site_public_url(site) == "https://acme.sites.example.com"
+
+    def test_no_address_without_a_sites_domain(self, _hosting, monkeypatch):
+        monkeypatch.setattr(_hosting, "MANOR_SITES_DOMAIN", "")
+        assert sp.site_public_url(self._site()) == ""
+
+
+def test_site_addresses_are_built_only_by_site_publisher():
+    """Guard: every site URL comes from site_public_url / site_platform_url.
+
+    Hand-built ``f"https://{site.slug}.{domain}"`` strings drifted before:
+    they ignored custom domains and could not follow a local scheme/port.
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    builder = re.compile(r"""[fF][rR]?["'][^"'\n]*://\{[^}\n]*(?:slug|custom_domain)[^}\n]*\}""")
+    contract = "packages/core/services/site_publisher.py"
+    violations = []
+    for scan_root in ("packages", "apps/api"):
+        for path in sorted((root / scan_root).rglob("*.py")):
+            rel = path.relative_to(root).as_posix()
+            if rel == contract or "__pycache__" in path.parts:
+                continue
+            for lineno, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
+                if builder.search(line):
+                    violations.append(f"{rel}:{lineno}: {line.strip()[:160]}")
+    assert not violations, (
+        "Build site addresses with site_publisher.site_public_url / site_platform_url:\n"
+        + "\n".join(violations)
+    )
+    assert builder.search((root / contract).read_text(encoding="utf-8")), "guard pattern no longer matches the builder"

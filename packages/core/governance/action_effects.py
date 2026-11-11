@@ -160,6 +160,7 @@ _DECLARED: dict[str, ActionEffect] = {
     # ── Skills / workflows / automations ───────────────────────────────────
     "workspace.skill.delete": _DELETION,
     "workspace.workflow.delete": _DELETION,
+    "workspace.stat.delete": _DELETION,
     "workspace.workflow.deploy": _PUBLISHING,
     "workspace.workflow.run": _effect("external", "workspace"),
     "workspace.workflow.youtube.publish": _PUBLISHING,
@@ -168,6 +169,10 @@ _DECLARED: dict[str, ActionEffect] = {
     "workspace.automation.update": _AUTOMATION,
     "workspace.automation.run": _AUTOMATION,
     "workspace.automation.delete": _DELETION,
+    # A person's own "Always allow" choices: reading them, or undoing one
+    # (which only makes the next action ask again). Nothing adds a rule here.
+    "workspace.approval_rule.list": _effect("read", "read", "Lists the person's saved Always-allow choices."),
+    "workspace.approval_rule.revoke": _effect("reversible", "workspace", "Undoes an Always-allow choice; the action asks again."),
     "workspace.automation.agent_initiative.create": _AUTOMATION,
     "workspace.automation.agent_initiative.update": _AUTOMATION,
     "workspace.automation.agent_initiative.mute": _AUTOMATION,
@@ -281,12 +286,15 @@ _FAMILY_EFFECTS: tuple[tuple[str, str, ActionEffect], ...] = (
         "external", "automation", "Strategist proposal cohort (packages.core.proposals.constants).",
     )),
 )
-# Discovery tools read only the Agent's own tool/skill catalog or its own
-# context archive, never user data. They do not cross the consent gate even
+# Discovery tools read only the Agent's own tool/skill catalog, its own
+# context archive or the stored evidence of the step it is retrying, never
+# other user data. They do not cross the consent gate even
 # under an explicit ``read: ask`` (owner decision Q3); hard authorization still
 # applies. acquire_capabilities search/prepare stay ordinary READ_ONLY reads.
+# stop_step_needs_person reads nothing and only ends the Agent's own step.
 DISCOVERY_LEAF_TOOL_NAMES = frozenset({
     "search_tools", "list_skills", "get_skill_details", "read_context_archive",
+    "read_step_recovery", "stop_step_needs_person",
 })
 _EXACT_FAMILY_EFFECTS: Mapping[str, ActionEffect] = MappingProxyType({
     "skill.invoke": _leaf(

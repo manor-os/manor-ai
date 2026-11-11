@@ -55,14 +55,14 @@ export const THEME_COLORS: Record<
     hoverBorder: "rgba(244,114,182,0.5)",
   },
   default: {
-    glow: "#a8a29e",
+    glow: "#aeaeb2",
     gradient: "linear-gradient(135deg, #efedea, #f4f7fa)",
-    hoverBorder: "rgba(28,25,23,0.2)",
+    hoverBorder: "rgba(29, 29, 31,0.2)",
   },
 };
 
 export const FALLBACK_COLORS = [
-  { bg: "#efedea", fg: "#57534e" },
+  { bg: "#efedea", fg: "#6e6e73" },
   { bg: "#e3e9f1", fg: "#3f57a0" },
   { bg: "#f3e5ed", fg: "#a04a72" },
   { bg: "#ece9f5", fg: "#6443a0" },

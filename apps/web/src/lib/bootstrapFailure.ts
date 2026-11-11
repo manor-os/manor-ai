@@ -5,7 +5,7 @@ export function renderBootstrapFailure(rootId: string, appName = "Manor", error?
   if (!root) return;
 
   const panel = document.createElement("main");
-  panel.style.cssText = "min-height:100vh;display:grid;place-items:center;padding:24px;font-family:system-ui,sans-serif;color:#292524;background:#fafaf9";
+  panel.style.cssText = "min-height:100vh;display:grid;place-items:center;padding:24px;font-family:system-ui,sans-serif;color:#2c2c2e;background:#fafafa";
 
   const content = document.createElement("div");
   content.style.cssText = "max-width:420px;text-align:center";

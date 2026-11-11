@@ -115,6 +115,12 @@ def execution(monkeypatch):
             "failed",
             {"code": "error", "message": "Provider failed"},
         ),
+        (
+            '{"stop_reason":"error","error_code":"sandbox_allocation_failed","error":"The PDF could not be prepared."}',
+            False,
+            "failed",
+            {"code": "sandbox_allocation_failed", "message": "The PDF could not be prepared."},
+        ),
         ('{"stop_reason":"cancelled"}', True, "cancelled", None),
     ],
 )

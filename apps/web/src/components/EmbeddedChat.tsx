@@ -1,5 +1,6 @@
 import ApprovalModeTrigger from "./approvals/ApprovalModeTrigger";
 import { getPreferredTimeZone } from "../lib/format";
+import { isPersonalAgentConversation } from "../lib/agentConversations";
 import ImagePreview from "./file-preview/ImagePreview";
 import {
   lazy,
@@ -44,7 +45,6 @@ import {
   isInternalFilePermissionMessage,
   isRedundantApprovalResolutionReceipt,
   isTerminalStreamSnapshot,
-  hitlActionTranscriptText,
   hasActivePersistedChatStream,
   mergeChatStreamSnapshot,
   mergeResolvedWorkflowMessage,
@@ -84,17 +84,20 @@ import {
   recoverRuntimeChatSession,
   shouldIgnoreLocallyStoppedStreamUpdate,
   useChatStreamStore,
+  decideRuntimeApproval,
+  parkedApprovalDecision,
 } from "../stores/chatStream";
 import { answerRuntimeHumanInput } from "../stores/chatStream";
 import { RuntimeHumanInputCard } from "./ui/RuntimeHumanInputCard";
+import MessageQuestionOptions from "./ui/MessageQuestionOptions";
+import { workspaceDraftQuestion } from "../lib/recommendedOptions";
 import { useAuthStore } from "../stores/auth";
 import { useDisplayPreferences } from "../stores/displayPreferences";
 import { chatComposerDraftKey, useChatComposerDraft } from "../lib/useChatComposerDraft";
 import { useToastStore } from "../stores/toast";
 import type { Agent, Document, UserSummary, Workspace } from "../lib/types";
 import ChatMarkdown from "./ChatMarkdown";
-import WorkflowResultCard from "./WorkflowResultCard";
-import CreatedResourceCard from "./CreatedResourceCard";
+import AssistantReplyResults from "./chat/AssistantReplyResults";
 import AssistantMessageBlocks, {
   assistantPendingActionKindForMessage,
 } from "./AssistantMessageBlocks";
@@ -119,12 +122,12 @@ import {
 import ManorAvatar from "./ui/ManorAvatar";
 import AgentActivityOrb, { inferAgentActivity } from "./ui/AgentActivityOrb";
 import ThemeAwareImage from "./ui/ThemeAwareImage";
-import WorkspaceIntroDialog from "./workspaces/WorkspaceIntroDialog";
+import AgentWelcome from "./chat/AgentWelcome";
+import ManorWelcome from "./chat/ManorWelcome";
 import UserAvatar from "./ui/UserAvatar";
 import ChatActionCard, { ApprovalSummary } from "./ui/ChatActionCard";
 import ApprovalActionBar from "./ui/ApprovalActionBar";
 import { isTikTokPublishApproval } from "./workflows/TikTokPublishReview";
-import InlineTips from "./ui/InlineTips";
 import WorkspaceRailVisual from "./ui/WorkspaceRailVisual";
 import { DEFAULT_APPROVAL_OPTIONS } from "../lib/approvalOptions";
 import ToolCallList from "./ui/ToolCallList";
@@ -174,6 +177,7 @@ import {
   getChatModeInputPlaceholder,
   type ChatModePayload,
 } from "./ChatModeBriefPanel";
+import { isSiteAttachment } from "../lib/publishedSites";
 import {
   CHAT_MESSAGE_REFERENCE_CARD_LIMIT,
   type ChatMessageDisplayProjectionOptions,
@@ -257,6 +261,7 @@ import {
   blueprintCoverDataUrl,
   blueprintOilPaintingCoverUrl,
 } from "../services/blueprintCoverTemplate";
+import "./EmbeddedChat.css";
 
 
 interface AgentInfo extends Pick<Agent, "entity_id" | "workspace_id" | "workspace_name" | "visibility" | "description"> {
@@ -2852,38 +2857,6 @@ const SIDE_HUSTLE_SAMPLE_DEFINITIONS: Record<
         chip_2: "Parody",
       },
     },
-    {
-      id: "liubang-marketplace-drama",
-      preview: "video",
-      sampleSrc: "/assets/samples/artifacts/video/templates/liubang-marketplace-drama.mp4",
-      copy: {
-        title: "Historical Marketplace Drama",
-        outcome: "Stage a cinematic historical marketplace exchange with synchronized character dialogue.",
-        prompt: "Remix this historical marketplace drama for my scene. Preserve the cinematic ancient-market setting, strong hero framing, expressive character performance, period costumes, background crowd, grounded props, and synchronized spoken dialogue while replacing the characters, script, location, objects, and dramatic conflict.",
-        label: "Video template",
-        preview_title: "Historical Marketplace Drama",
-        line_1: "Cinematic period character exchange",
-        line_2: "Marketplace · dialogue · 16:9",
-        chip_1: "Historical",
-        chip_2: "Dialogue",
-      },
-    },
-    {
-      id: "stickman-reset-retry",
-      preview: "video",
-      sampleSrc: "/assets/samples/artifacts/video/templates/stickman-reset-retry.mp4",
-      copy: {
-        title: "Stickman Reset & Retry Explainer",
-        outcome: "Explain a reset-and-retry workflow with a simple hand-drawn character sequence.",
-        prompt: "Remix this hand-drawn workflow explainer for my process. Preserve the clean monochrome line art, simple stick-character acting, labeled blocks, visible reset prop, spacious white background, and easy-to-follow motion while replacing the labels, process steps, objects, character actions, and teaching message.",
-        label: "Video template",
-        preview_title: "Stickman Reset & Retry Explainer",
-        line_1: "Hand-drawn workflow animation",
-        line_2: "Reset · retry · square explainer",
-        chip_1: "Explainer",
-        chip_2: "Workflow",
-      },
-    },
   ],
   research: [
     {
@@ -4217,7 +4190,7 @@ function WorkspaceSampleQuickPreview({
             {blueprintStatus === "loading" && (
               <div className="workspace-blueprint-preview-loading" role="status">
                 <LoadingSpinner size={14} />
-                {t("component.embedded_chat.loading_workspace_details")}
+                <span className="sr-only">{t("component.embedded_chat.loading_workspace_details")}</span>
               </div>
             )}
 
@@ -4271,7 +4244,7 @@ function WorkspaceSampleQuickPreview({
                 {isInstallableWorkspace && installationStatus === "loading" && (
                   <span className="workspace-sample-installation-status" role="status">
                     <LoadingSpinner size={12} />
-                    {t("component.embedded_chat.checking_installation")}
+                    <span className="sr-only">{t("component.embedded_chat.checking_installation")}</span>
                   </span>
                 )}
                 {isInstallableWorkspace && installationStatus === "error" && (
@@ -4662,7 +4635,7 @@ function FlowTemplateSamples() {
     return (
       <div className="workspace-flow-template-state" role="status">
         <LoadingSpinner size={20} />
-        <span>{t("component.embedded_chat.flow_templates.loading")}</span>
+        <span className="sr-only">{t("component.embedded_chat.flow_templates.loading")}</span>
       </div>
     );
   }
@@ -6870,6 +6843,8 @@ export function deriveMessageArtifacts(
   });
 
   msg.attachments?.forEach((attachment, attachmentIndex) => {
+    // A published website has its own card, not an artifact.
+    if (isSiteAttachment(attachment)) return;
     // Persisted rows carry the snake_case FileRef; older rows camelCase.
     const ref = normalizeFileRef(attachment);
     const documentId = ref.document_id || "";
@@ -7518,7 +7493,7 @@ function PresentationArtifactCanvas({
         if (cancelled || !canvasRef.current) return;
         const viewer = new PPTXViewer({
           canvas: canvasRef.current,
-          backgroundColor: "#ffffff",
+          backgroundColor: "var(--surface-panel)",
           slideSizeMode: "fit",
         });
         viewerRef.current = viewer;
@@ -9132,9 +9107,14 @@ export default function EmbeddedChat({
   );
   const [activeCapability, setActiveCapability] =
     useState<WorkspaceCapability>("workspace");
-  const [ideaComposer, setIdeaComposer] = useState<IdeaComposerSelection | null>(
-    { mode: "new-idea", origin: "default" },
-  );
+  const [ideaComposer, setIdeaComposer] = useState<IdeaComposerSelection | null>(null);
+  const [welcomeMoreOpen, setWelcomeMoreOpen] = useState(false);
+  const { data: welcomeWorkspaces = [], isSuccess: welcomeWorkspacesReady } = useQuery<Workspace[]>({
+    queryKey: ["workspaces"],
+    queryFn: () => api.workspaces.list(),
+    staleTime: 60_000,
+  });
+
   const ideaComposerMode = ideaComposer?.mode ?? null;
   const [chatMode, setChatMode] = useState<ChatBoxMode>("auto");
   const chatModeRef = useRef(chatMode);
@@ -9194,6 +9174,18 @@ export default function EmbeddedChat({
   const composerDraftKeyRef = useRef(composerDraftKey);
   composerDraftKeyRef.current = composerDraftKey;
   const [input, setInput] = useChatComposerDraft(composerDraftKey);
+  // Another page can hand Manor a sentence to review and send: /chat?ask=...
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const ask = params.get("ask");
+    if (!ask) return;
+    setInput(ask);
+    params.delete("ask");
+    const search = params.toString();
+    navigate(`${location.pathname}${search ? `?${search}` : ""}`, { replace: true });
+    window.setTimeout(() => composerEditorRef.current?.focus(), 0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.search]);
   const [draftSessionKey, setDraftSessionKey] = useState<string | undefined>(
     initialSession && !initialSession.convId ? initialSession.key : undefined,
   );
@@ -9250,7 +9242,7 @@ export default function EmbeddedChat({
       : undefined;
   const [runtimeInputBusy, setRuntimeInputBusy] = useState(false);
   const submitRuntimeHumanInput = useCallback(
-    async (answer: string, fields?: Record<string, string>, choice?: string) => {
+    async (answer: string, fields?: Record<string, unknown>, choice?: string) => {
       const sessionKey = currentSessionKeyRef.current;
       if (!sessionKey) return;
       setRuntimeInputBusy(true);
@@ -9775,11 +9767,12 @@ export default function EmbeddedChat({
   const resolveLatestAgentConversationId = useCallback(async () => {
     if (!agentId) return undefined;
     const convs = await api.chat.listConversations();
+    // Same conversation the sidebar's direct chat row points at, not an integration channel's.
     const latest = (convs || []).find(
-      (conv: any) => conv.agent_id === agentId && !conv.workspace_id,
+      (conv) => conv.agent_id === agentId && isPersonalAgentConversation(conv, currentUser?.id),
     );
     return latest?.id;
-  }, [agentId]);
+  }, [agentId, currentUser?.id]);
 
   const loadConversationMessages = useCallback(
     async (
@@ -10162,13 +10155,10 @@ export default function EmbeddedChat({
       setSelectedAgent(null);
       setMentionedAgent(null);
       setSelectedMentions([]);
-      // Cosmetic re-arm of the empty-state focus only — origin "default" keeps
-      // it from attaching a skill to whatever the user types next.
-      setIdeaComposer(
-        chatModeRef.current === "auto"
-          ? { mode: "new-idea", origin: "default" }
-          : null,
-      );
+      // A new conversation opens on the plain Manor welcome; idea modes start
+      // only when the person picks one under "See what else I can do".
+      setIdeaComposer(null);
+      setWelcomeMoreOpen(false);
       setConversationLoading(false);
       resumedRef.current = false;
       return;
@@ -10707,7 +10697,7 @@ export default function EmbeddedChat({
 
   /* ---- HITL actions ---- */
   const handleHITLAction = useCallback(
-    async (hitlId: string, action: string, review?: unknown) => {
+    async (hitlId: string, action: string, review?: unknown, receipt?: string) => {
       const targetHitl = messages.flatMap((message) => message.hitl_requests || [])
         .find((hitl) => hitl.id === hitlId);
       const requiresTikTokValidation = Boolean(targetHitl && isTikTokPublishApproval(targetHitl));
@@ -10715,11 +10705,22 @@ export default function EmbeddedChat({
         items.map((msg) => ({
           ...msg,
           hitl_requests: msg.hitl_requests?.map((h) =>
-            h.id === hitlId ? { ...h, resolved: true, resolution: action } : h,
+            h.id === hitlId ? { ...h, resolved: true, resolution: receipt || action } : h,
           ),
         }));
       const updatedMessages = requiresTikTokValidation ? messages : markResolved(messages);
       setMessages(updatedMessages);
+      if (targetHitl?.runtime_run_id) {
+        // A durable run is parked on this approval: decide it against the
+        // run, which then resumes; no chat turn is started.
+        try {
+          await decideRuntimeApproval(String(targetHitl.runtime_run_id), hitlId, parkedApprovalDecision(action));
+        } catch (error) {
+          setMessages(messages);
+          throw error;
+        }
+        return;
+      }
 
       const hitlMessage = JSON.stringify({
         hitl_id: hitlId,
@@ -10727,15 +10728,13 @@ export default function EmbeddedChat({
         ...(review !== undefined ? { payload: { review } } : {}),
       });
       const now = new Date().toISOString();
+      // The card collapses to "You chose …"; no separate receipt bubble,
+      // except TikTok's, which says it is waiting for the platform.
       const msgsForHitl = [
         ...updatedMessages,
-        {
-          role: "user" as const,
-          content: requiresTikTokValidation && action === "approve"
-            ? "Submitted TikTok publishing confirmation."
-            : hitlActionTranscriptText(action),
-          timestamp: now,
-        },
+        ...(requiresTikTokValidation && action === "approve"
+          ? [{ role: "user" as const, content: "Submitted TikTok publishing confirmation.", timestamp: now }]
+          : []),
         { role: "assistant" as const, content: "", timestamp: now },
       ];
       const sessionKey =
@@ -10744,31 +10743,35 @@ export default function EmbeddedChat({
         setDraftSessionKey(sessionKey);
       }
 
-      await startStream(
-        () =>
-          api.chat.stream(hitlMessage, currentConvId, {
-            agentId: resolvedAgentId,
-          }),
-        currentConvId,
-        msgsForHitl,
-        (newConvId) => {
-          void queryClient.invalidateQueries({ queryKey: ["conversations"] });
-          if (currentSessionKeyRef.current === sessionKey) {
-            setCurrentConvId(newConvId);
-            setDraftSessionKey(undefined);
-            onConversationResolved?.(newConvId);
+      try {
+        const completedSessionKey = await startStream(
+          () => api.chat.stream(hitlMessage, currentConvId, { agentId: resolvedAgentId }),
+          currentConvId, msgsForHitl,
+          (newConvId) => {
+            void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+            if (currentSessionKeyRef.current === sessionKey) {
+              setCurrentConvId(newConvId);
+              setDraftSessionKey(undefined);
+              onConversationResolved?.(newConvId);
+            }
+          }, sessionKey,
+        ).finally(async () => {
+          if (requiresTikTokValidation && currentConvId) {
+            await loadConversationMessages(currentConvId, {
+              allowSettledStreamRefresh: true, backgroundRefresh: true, onlyIfStillCurrent: true,
+            });
           }
-        },
-        sessionKey,
-      ).finally(async () => {
-        if (requiresTikTokValidation && currentConvId) {
-          await loadConversationMessages(currentConvId, {
-            allowSettledStreamRefresh: true, backgroundRefresh: true, onlyIfStillCurrent: true,
-          });
+        });
+        const latest = useChatStreamStore.getState().sessions[completedSessionKey]?.messages.at(-1);
+        if (typeof latest?.content === "string" && latest.content.startsWith("Error: ")) {
+          throw new Error(latest.content.slice("Error: ".length));
         }
-      });
-      await invalidateAgentInitiativeQueries(queryClient);
-      queryClient.invalidateQueries({ queryKey: ["conversations"] });
+        await invalidateAgentInitiativeQueries(queryClient);
+        queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      } catch (error) {
+        setMessages(messages);
+        throw error;
+      }
     },
     [
       currentConvId,
@@ -10965,13 +10968,13 @@ export default function EmbeddedChat({
             <div style={{ display: "flex", alignItems: "center" }}>
               <h2
                 style={{
-                  fontSize: 16,
+                  fontSize: 15,
                   fontWeight: 600,
-                  color: "#292524",
+                  color: "var(--text-strong)",
                   lineHeight: 1.3,
                 }}
               >
-                {title}
+                {title === "Manor AI" ? "Manor" : title}
               </h2>
             </div>
             {assistantWorking ? (
@@ -10985,7 +10988,7 @@ export default function EmbeddedChat({
               >
                 <AgentActivityOrb activity={activeAgentActivity} />
               </div>
-            ) : (
+            ) : subtitle ? (
               <div
                 style={{
                   display: "flex",
@@ -10993,16 +10996,15 @@ export default function EmbeddedChat({
                   marginTop: 2,
                 }}
               >
-                <span style={{ fontSize: 11, color: "#78716c" }}>
-                  {subtitle || t("page.app_layout.your_ai_chief_of_staff")}
+                <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                  {subtitle}
                 </span>
               </div>
-            )}
+            ) : null}
           </div>
         </div>
         {(currentConvId || streamingConvId || showWorkspaceIntro || onNewConversation) && (
           <div className="embedded-chat-header-actions">
-            {!isSimple && showWorkspaceIntro && <WorkspaceIntroDialog />}
             {onNewConversation && (
               <Button
                 variant="ghost"
@@ -11098,13 +11100,35 @@ export default function EmbeddedChat({
               <div ref={chatContentRef} className="chat-scroll-content">
               {showConversationSkeleton ? (
                 <ChatMessagesSkeleton rows={5} />
+              ) : messages.length === 0 && isAgentConversation ? (
+                <AgentWelcome
+                  agentId={agentId!}
+                  name={title}
+                  avatarUrl={avatarUrl}
+                  onPrompt={(text) => {
+                    setInput(text);
+                    window.setTimeout(() => composerEditorRef.current?.focus(), 0);
+                  }}
+                />
               ) : messages.length === 0 && (isSimple ? (
                 <div className="workspace-welcome">
                   <h1>{t("component.chat_input_footer.simple_placeholder")}</h1>
                   <p>{t("component.floating_chat.ask_anything_attach_files_or_use_voice_input")}</p>
                 </div>
               ) : (
-                <WorkspaceWelcome
+                <>
+                <ManorWelcome
+                  firstRun={welcomeWorkspacesReady && welcomeWorkspaces.length === 0}
+                  workspaces={welcomeWorkspaces}
+                  onPrompt={(text) => {
+                    setIdeaComposer(null);
+                    setInput(text);
+                    window.setTimeout(() => composerEditorRef.current?.focus(), 0);
+                  }}
+                  moreOpen={welcomeMoreOpen}
+                  onToggleMore={() => setWelcomeMoreOpen((open) => !open)}
+                />
+                {welcomeMoreOpen && <WorkspaceWelcome
                   activeCapability={activeCapability}
                   activeIdeaMode={ideaComposerMode}
                   onCapabilityChange={(capability) => {
@@ -11118,7 +11142,8 @@ export default function EmbeddedChat({
                   onIdeaQuickAction={handleIdeaQuickAction}
                   onIdeaModeChange={handleIdeaModeChange}
                   onValidationStart={handleValidationStart}
-                />
+                />}
+                </>
               ))}
 
               {messages.length > 0 && currentHistoryState?.hasMore && (
@@ -11233,12 +11258,6 @@ export default function EmbeddedChat({
                   <div
                     className={`chat-message-col ${msg.role === "user" ? "chat-message-col--user" : ""}`}
                   >
-                    <span
-                      className={`chat-sender-name ${msg.role === "user" ? "chat-sender-name--user" : ""}`}
-                    >
-                      {msg.role === "user" ? t("page.chat_history.you") : title}
-                    </span>
-
                     {/* Tool Calls */}
                     {!hasAssistantBlocks && visibleTools.length > 0 && (
                       <ToolCallList tools={visibleTools} keyPrefix={i} hideDetails={isSimple} streaming={isLatestStreaming} />
@@ -11462,24 +11481,14 @@ export default function EmbeddedChat({
                           pendingActionKind={assistantPendingActionKindForMessage(msg)}
                           hitlRequests={msg.hitl_requests}
                           responseSurfaceSubmissionReceipts={responseSurfaceSubmissionReceipts}
+                          collapseLongFinal
                         />
-                        {createdResources.map((resource) => (
-                          <CreatedResourceCard
-                            key={`${resource.kind}:${resource.id}`}
-                            resource={resource}
-                            returnTo={messageReturnTo}
-                          />
-                        ))}
-                        {msg.workflow_result && (
-                          <WorkflowResultCard
-                            result={msg.workflow_result}
-                            returnTo={messageReturnTo}
-                          />
-                        )}
-                        <ChatMessageReferenceStrip
+                        <AssistantReplyResults
                           references={messageDisplay.references}
-                          inlineFileCards
+                          sites={messageDisplay.sites}
                           returnTo={messageReturnTo}
+                          toolCalls={msg.tool_calls}
+                          workflowResult={msg.workflow_result}
                         />
                       </MessageBubble>
                     )}
@@ -11505,33 +11514,29 @@ export default function EmbeddedChat({
                             />
                           ) : (
                             <>
-                              <ChatMarkdown
-                                content={renderedBubbleContent}
-                                isUser={false}
-                                streaming={
-                                  assistantWorking &&
-                                  i === messages.length - 1 &&
-                                  msg.role === "assistant"
-                                }
-                                returnTo={messageReturnTo}
-                              />
-                              {createdResources.map((resource) => (
-                                <CreatedResourceCard
-                                  key={`${resource.kind}:${resource.id}`}
-                                  resource={resource}
+                              <CollapsibleSentMessage
+                                text={renderedBubbleContent}
+                                tone="assistant"
+                                enabled={!(assistantWorking && i === messages.length - 1)}
+                              >
+                                <ChatMarkdown
+                                  content={renderedBubbleContent}
+                                  isUser={false}
+                                  showFilesInPlace
+                                  streaming={
+                                    assistantWorking &&
+                                    i === messages.length - 1 &&
+                                    msg.role === "assistant"
+                                  }
                                   returnTo={messageReturnTo}
                                 />
-                              ))}
-                              {msg.workflow_result && (
-                                <WorkflowResultCard
-                                  result={msg.workflow_result}
-                                  returnTo={messageReturnTo}
-                                />
-                              )}
-                              <ChatMessageReferenceStrip
+                              </CollapsibleSentMessage>
+                              <AssistantReplyResults
                                 references={messageDisplay.references}
-                                inlineFileCards
+                                sites={messageDisplay.sites}
                                 returnTo={messageReturnTo}
+                                toolCalls={msg.tool_calls}
+                                workflowResult={msg.workflow_result}
                               />
                             </>
                           )}
@@ -11589,6 +11594,19 @@ export default function EmbeddedChat({
                           onDontSuggestAgain={() => void handleWorkspaceRecommendationOptOut()}
                         />
                       )}
+
+                    {/* Create Workspace in chat: the architect's question as answer
+                        buttons; a pick is the user's next message. Only the latest. */}
+                    {msg.role === "assistant" && i === messages.length - 1 && !assistantWorking && (() => {
+                      const draftQuestion = workspaceDraftQuestion(messageArtifacts[i]);
+                      return draftQuestion ? (
+                        <MessageQuestionOptions
+                          question={draftQuestion}
+                          onAnswer={(answer) => { void handleSend(answer, []); }}
+                          onOther={() => document.querySelector<HTMLElement>(".chat-composer-rich-editor")?.focus()}
+                        />
+                      ) : null;
+                    })()}
 
                     {msg.role === "assistant" && (
                       <ArtifactSummaryCards
@@ -11675,10 +11693,6 @@ export default function EmbeddedChat({
             variant={outputOpen ? "embedded-output-open" : "embedded"}
           />
 
-          {!isSimple && <div className="chat-tip-bar">
-            <InlineTips surface="general_chat" placement="composer" />
-          </div>}
-
           <WorkflowRunHost
             conversationId={currentConvId || streamingConvId}
             groups={workflowRunGroups}
@@ -11726,7 +11740,7 @@ export default function EmbeddedChat({
                 ? t("component.embedded_chat.idea_validation.placeholder")
                 : messages.length === 0 && ideaComposerMode === "new-idea"
                   ? t("component.embedded_chat.idea_generation.placeholder")
-                : messages.length === 0
+                : messages.length === 0 && welcomeMoreOpen
                 ? activeCapabilityConfig.placeholder
                 : t("component.chat_input_footer.message_agent_placeholder", { agent: title })
             }

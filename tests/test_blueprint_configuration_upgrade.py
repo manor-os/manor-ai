@@ -96,6 +96,26 @@ def test_configuration_three_way_decisions(current, source, previous, expected):
     assert configuration_action(current, source, previous) == expected
 
 
+def test_machine_translations_are_not_a_customers_edit():
+    # Production, 2026-10-31: Workspace translation added Chinese step names
+    # to an untouched delivered install, so every Workflow looked customized
+    # and the changed one was kept as the customer's old version.
+    def step(name, *, zh=None, auto=True):
+        overlay = {"zh": {"name": zh, **({"_auto": "c1fb"} if auto else {})}} if zh else None
+        return {"id": "compose", "name": name, **({"i18n": overlay} if overlay else {})}
+
+    installed = {"steps": [step("Compose the song")]}
+    translated = {"steps": [step("Compose the song", zh="创作歌曲")]}
+    improved = {"steps": [step("Compose the song (asks again when declined)")]}
+    previous = {"source_content": installed, "installed_content": installed}
+
+    assert configuration_action(translated, improved, previous) == "update"
+    assert configuration_action(translated, installed, previous) == "unchanged"
+    # A person's own translation drops the machine mark and is kept as theirs.
+    edited = {"steps": [step("Compose the song", zh="作曲", auto=False)]}
+    assert configuration_action(edited, improved, previous) == "keep_yours"
+
+
 def test_shell_projection_preserves_runtime_and_shared_assets():
     payload = _payload()
     payload["recipe"]["operating_model"]["settings"] = {
@@ -165,6 +185,41 @@ def test_governance_source_retains_installed_hard_block_choice():
     assert demoted["approval"]["rules"][0]["effect"] == "ask"
     assert allowed["approval"]["rules"][0]["effect"] == "deny"
     assert "automated_runs_always_allow" not in allowed
+
+
+@pytest.mark.asyncio
+async def test_a_page_field_added_after_install_is_not_a_customers_edit(db_session):
+    # Staging, 2026-11-04: `asks` and `choices` joined the page's normal form
+    # after Video Studio Beta installed, so its untouched page read as
+    # customized and the upgrade would have kept the old page.
+    from packages.core.services.workspace_app_view import normalize_app_view_config
+
+    key = "workspace_configuration:operating_model/app_view"
+    installed = {"version": 1, "title": "Original page"}
+    saved = {name: value for name, value in normalize_app_view_config(installed).items()
+             if name not in {"asks", "choices"}}
+    baseline = {"entries": {key: {
+        "kind": "workspace_configuration",
+        "path": ["operating_model", "app_view"],
+        "source_content": {"value": saved},
+        "installed_content": {"value": saved},
+    }}}
+    payload = _payload()
+    payload["recipe"]["operating_model"]["app_view"] = {"version": 1, "title": "Improved page"}
+    workspace = await _workspace(db_session)
+
+    workspace.operating_model = {"app_view": installed}
+    await db_session.flush()
+    planned = await plan_configuration(db_session, workspace=workspace, payload=payload, baseline=baseline)
+    page = next(item for item in planned["items"] if item["key"] == key)
+    assert (page["action"], page["conflict"]) == ("update", False)
+
+    # A person's own edit is still theirs.
+    workspace.operating_model = {"app_view": {"version": 1, "title": "My page"}}
+    await db_session.flush()
+    planned = await plan_configuration(db_session, workspace=workspace, payload=payload, baseline=baseline)
+    page = next(item for item in planned["items"] if item["key"] == key)
+    assert (page["action"], page["conflict"]) == ("keep_yours", True)
 
 
 @pytest.mark.asyncio

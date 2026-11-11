@@ -1,3 +1,4 @@
+import { startVisiblePolling } from "../lib/visiblePolling";
 /**
  * SitePublishAction — one icon button shared by the file viewer and editor.
  *
@@ -129,7 +130,7 @@ function PublishConfirmation({
             })}
           </p>
           <div>
-            <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-stone-500">
+            <div className="mb-2 text-xs font-semibold text-stone-500">
               {t("sites.autoConnectionReady")}
             </div>
             <div className="divide-y divide-stone-100 rounded-lg border border-stone-200 bg-white">
@@ -288,7 +289,7 @@ function SiteConnectionsPanel({
 
   return (
     <div>
-      <div className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-stone-500">
+      <div className="mb-1.5 text-xs font-semibold text-stone-500">
         {t("sites.manorConnections")}
       </div>
       <div className="space-y-3 rounded-lg bg-stone-50 p-3">
@@ -483,7 +484,7 @@ function SiteDrawerBody({
         </div>
       )}
       <div>
-        <div className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-stone-500">
+        <div className="mb-1.5 text-xs font-semibold text-stone-500">
           {t("sites.platformUrl")}
         </div>
         {site.platform_url ? (
@@ -526,7 +527,7 @@ function SiteDrawerBody({
       )}
 
       <div>
-        <div className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-stone-500">
+        <div className="mb-1.5 text-xs font-semibold text-stone-500">
           {t("sites.customDomain")}
         </div>
         <div className="flex items-center gap-2">
@@ -816,10 +817,11 @@ export default function SitePublishAction({
   const domainStatus = site?.domain_status;
   useEffect(() => {
     if (!drawerOpen || !siteId || domainStatus !== "pending") return;
-    const timer = setInterval(() => {
-      api.sites.checkDomain(siteId).then(setSite).catch(() => undefined);
-    }, 15000);
-    return () => clearInterval(timer);
+    const poll = startVisiblePolling(async (signal) => {
+      const fresh = await api.sites.checkDomain(siteId, signal);
+      if (!signal.aborted) setSite(fresh);
+    }, 30_000, { immediate: false });
+    return poll.stop;
   }, [drawerOpen, siteId, domainStatus]);
 
   // Keep the drawer (body + footer actions) in sync with the current state.

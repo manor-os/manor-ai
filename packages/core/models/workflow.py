@@ -185,6 +185,8 @@ class WorkflowRun(Base, TimestampMixin):
             "terminal_effects_next_attempt_at",
             "id",
         ),
+        # A child run names its parent here; the subflow lookups filter on it.
+        Index("ix_workflow_runs_parent_run_id", text("(trigger_data->>'parent_run_id')")),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)

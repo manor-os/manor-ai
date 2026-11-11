@@ -4,7 +4,6 @@ import { t } from "../../lib/i18n";
 import PageHeader from "../../components/ui/PageHeader";
 import SmartToolbar from "../../components/ui/SmartToolbar";
 import TabSwitcher from "../../components/ui/TabSwitcher";
-import PeopleNavigation from "../../components/PeopleNavigation";
 
 /**
  * Internal team section in Team & Clients.
@@ -26,8 +25,19 @@ export default function TeamLayout() {
   return (
     <div className="h-full flex flex-col overflow-hidden">
       <PageHeader
-        title={t("nav.people")}
-        tabs={<PeopleNavigation />}
+        title={t("nav.team")}
+        // The page's main switch sits on the title row, like every Settings page.
+        tabs={(
+          <TabSwitcher
+            ariaLabel={t("page.people.internal_team")}
+            tabs={[
+              { key: "people", label: t("page.team_layout.people") },
+              { key: "roles", label: t("page.team_layout.roles") },
+            ]}
+            value={currentTab}
+            onChange={(k) => navigate(k === "roles" ? "/team/roles" : "/team")}
+          />
+        )}
         toolbar={currentTab === "people" ? (
           <SmartToolbar
             searchValue={teamSearch}
@@ -39,22 +49,11 @@ export default function TeamLayout() {
         actions={teamControls.actions}
       />
 
-      <div className="mb-4 flex min-w-0 shrink-0 flex-wrap items-center justify-between gap-3">
-        <div className="min-w-0">
-          <TabSwitcher
-            appearance="minimal"
-            size="sm"
-            ariaLabel={t("page.people.internal_team")}
-            tabs={[
-              { key: "people", label: t("page.team_layout.people") },
-              { key: "roles", label: t("page.team_layout.roles") },
-            ]}
-            value={currentTab}
-            onChange={(k) => navigate(k === "roles" ? "/team/roles" : "/team")}
-          />
+      {teamControls.toolbar && (
+        <div className="mb-4 flex min-w-0 shrink-0 flex-wrap items-center gap-3">
+          {teamControls.toolbar}
         </div>
-        {teamControls.toolbar}
-      </div>
+      )}
 
       {/* Subpage body */}
       <div className="flex-1 overflow-hidden min-h-0">

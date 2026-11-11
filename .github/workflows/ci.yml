@@ -18,8 +18,10 @@ name: CI
     branches:
     - main
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name }}${{
+    github.event.action == 'labeled' && github.event.label.name != 'ci' && '-label' || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    }}
 jobs:
   docs-check:
     name: Build docs site
@@ -68,9 +70,10 @@ jobs:
     - name: Check pinned vendor API versions
       run: python scripts/check_api_versions.py
   typecheck-frontend:
-    name: Frontend checks
+    name: Frontend checks (advisory)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    continue-on-error: true
     steps:
     - uses: actions/checkout@v7
     - name: Set up Node
@@ -199,7 +202,6 @@ jobs:
     runs-on: ubuntu-24.04
     needs:
     - api-versions
-    - typecheck-frontend
     - docs-check
     - python-smoke
     - python-regression

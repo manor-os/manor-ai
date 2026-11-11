@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from sqlalchemy import (
-    BigInteger, Boolean, DateTime, Index, Integer, JSON, Numeric, String, Text, func,
+    BigInteger, Boolean, DateTime, Index, Integer, JSON, Numeric, String, Text, func, text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -27,6 +27,15 @@ class TokenUsageLog(Base):
         Index("ix_token_usage_agent", "entity_id", "agent_id"),
         Index("ix_token_usage_workspace", "entity_id", "workspace_id", "created_at"),
         Index("ix_token_usage_source_created", "source", "created_at"),
+        Index("ix_token_usage_operation", "operation_id"),
+        Index(
+            "ix_token_usage_media_job", "media_job_id",
+            postgresql_where=text("media_job_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_token_usage_task", "task_id",
+            postgresql_where=text("task_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
@@ -66,6 +75,15 @@ class TokenUsageLog(Base):
     source: Mapped[Optional[str]] = mapped_column(String(50))
     billing_mode: Mapped[Optional[str]] = mapped_column(String(20))
     """Billing route for the call: platform / byok / mixed."""
+    operation_id: Mapped[Optional[str]] = mapped_column(String(100))
+    """The run that made the call: a Workflow run id or an External Agent run id.
+    A media job's own id is ``credit_usage_logs.media_job_id``. Matches
+    ``credit_usage_logs.operation_id`` so a BYOK row (no credit row) can still
+    be tied back to its run."""
+    media_job_id: Mapped[Optional[str]] = mapped_column(String(26))
+    """The media job (video) a BYOK row records; ``None`` for every other call."""
+    task_id: Mapped[Optional[str]] = mapped_column(String(26))
+    """The Task whose execution made the call; ``None`` outside Task work."""
     api_key_source: Mapped[Optional[str]] = mapped_column(String(30))
     """Credential source used for the call: platform / byok / legacy."""
     pricing_source: Mapped[Optional[str]] = mapped_column(String(50))

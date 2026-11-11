@@ -228,7 +228,7 @@ services:
       DATABASE_POOL_TIMEOUT: ${DATABASE_POOL_TIMEOUT:-10}
       DATABASE_POOL_RECYCLE: ${DATABASE_POOL_RECYCLE:-1800}
       DATABASE_ADMISSION_LIMIT: ${DATABASE_ADMISSION_LIMIT:-0}
-      DATABASE_MAX_WAITERS: ${DATABASE_MAX_WAITERS:-14}
+      DATABASE_MAX_WAITERS: ${DATABASE_MAX_WAITERS:-64}
       DATABASE_ADMISSION_TIMEOUT: ${DATABASE_ADMISSION_TIMEOUT:-2}
       DATABASE_HOLD_WARN_SECONDS: ${DATABASE_HOLD_WARN_SECONDS:-5}
       DATABASE_STATEMENT_TIMEOUT_MS: ${DATABASE_STATEMENT_TIMEOUT_MS:-0}
@@ -240,7 +240,7 @@ services:
       REDIS_RATE_LIMIT_ENABLED: ${REDIS_RATE_LIMIT_ENABLED:-false}
       CHAT_RATE_LIMIT_REQUESTS: ${CHAT_RATE_LIMIT_REQUESTS:-30}
       CHAT_RATE_LIMIT_WINDOW_SECONDS: ${CHAT_RATE_LIMIT_WINDOW_SECONDS:-60}
-      API_RATE_LIMIT_REQUESTS: ${API_RATE_LIMIT_REQUESTS:-200}
+      API_RATE_LIMIT_REQUESTS: ${API_RATE_LIMIT_REQUESTS:-600}
       API_RATE_LIMIT_WINDOW_SECONDS: ${API_RATE_LIMIT_WINDOW_SECONDS:-60}
       DEGRADED_MODE: ${DEGRADED_MODE:-false}
       DEGRADED_DISABLE_CHAT_STREAM: ${DEGRADED_DISABLE_CHAT_STREAM:-true}
@@ -768,6 +768,7 @@ services:
   nango-postgres:
     image: postgres:15-alpine
     container_name: manor-os-nango-postgres
+    restart: unless-stopped
     profiles: ["nango"]
     environment:
       POSTGRES_DB: nango
@@ -789,6 +790,7 @@ services:
     # all work in this single-container setup.
     image: nangohq/nango-server:latest
     container_name: manor-os-nango
+    restart: unless-stopped
     profiles: ["nango"]
     ports:
       - "3003:3003"

@@ -41,6 +41,13 @@ def load_docs_deploy() -> dict:
     return yaml.safe_load(text.replace("\non:", "\n'on':", 1))
 
 
+# PRs to dev opt in to CI with the `ci` label; an unrelated label adds no run.
+CI_LABEL = (
+    "contains(github.event.pull_request.labels.*.name, 'ci') && "
+    "(github.event.action != 'labeled' || github.event.label.name == 'ci')"
+)
+
+
 def load_docs_ci() -> dict:
     text = DOCS_CI.read_text()
     return yaml.safe_load(text.replace("\non:", "\n'on':", 1))
@@ -56,7 +63,10 @@ def test_ci_uses_private_three_stage_triggers_and_public_pr_triggers() -> None:
         assert triggers["pull_request"]["branches"] == ["dev", "main"]
         assert triggers["push"]["branches"] == ["main"]
     else:
-        assert triggers["pull_request"]["branches"] == ["dev", "main"]
+        # PRs to dev run CI only after the `ci` label is added.
+        assert triggers["pull_request"] == {
+            "branches": ["dev", "main"], "types": ["opened", "synchronize", "reopened", "labeled"],
+        }
         assert triggers["push"]["branches"] == ["dev"]
         assert triggers["merge_group"] == {"types": ["checks_requested"]}
 

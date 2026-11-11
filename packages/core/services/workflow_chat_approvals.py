@@ -94,6 +94,28 @@ def workflow_review_is_editable(config: dict[str, Any]) -> bool:
     return _review_variable(config) is not None
 
 
+def workflow_review_editable_fields(config: dict[str, Any]) -> tuple[str, ...] | None:
+    """Configured review fields that may change; ``None`` keeps legacy edits."""
+    fields = config.get("review_editable_fields")
+    if fields is None:
+        return None
+    if not isinstance(fields, list):
+        return ()
+    return tuple(dict.fromkeys(
+        item.strip() for item in fields if isinstance(item, str) and item.strip()
+    ))
+
+
+def workflow_review_revision_field(config: dict[str, Any]) -> str | None:
+    field = config.get("review_revision_field")
+    return field.strip() if isinstance(field, str) and field.strip() else None
+
+
+def workflow_review_is_revision_choice(choice: str) -> bool:
+    normalized = re.sub(r"[-\s]+", "_", choice.strip().lower())
+    return normalized in {"revise", "request_revision", "request_changes", "changes_requested"}
+
+
 def _review_matches_original(original: Any, submitted: Any) -> bool:
     if original is None:
         return isinstance(submitted, (dict, list, str))
@@ -102,6 +124,45 @@ def _review_matches_original(original: Any, submitted: Any) -> bool:
     if isinstance(original, list):
         return isinstance(submitted, list)
     return isinstance(submitted, type(original))
+
+
+def _review_value_matches_type(original: Any, submitted: Any) -> bool:
+    if type(submitted) is not type(original):
+        return False
+    if isinstance(original, list):
+        item_types = {type(item) for item in original}
+        return not item_types or all(type(item) in item_types for item in submitted)
+    return True
+
+
+def workflow_review_matches_original(
+    original: Any, submitted: Any, config: dict[str, Any],
+) -> bool:
+    """Keep packet identity immutable while allowing configured editorial edits."""
+    if not _review_matches_original(original, submitted):
+        return False
+    editable = workflow_review_editable_fields(config)
+    if editable is None:
+        return True
+    if not isinstance(original, dict) or not isinstance(submitted, dict):
+        return False
+    allowed = set(editable)
+    revision_field = workflow_review_revision_field(config)
+    if revision_field:
+        allowed.add(revision_field)
+    return all(
+        submitted[key] == value if key not in allowed
+        else _review_value_matches_type(value, submitted[key])
+        for key, value in original.items()
+    )
+
+
+def workflow_review_revision_note(config: dict[str, Any], review: Any) -> str | None:
+    field = workflow_review_revision_field(config)
+    if not field or not isinstance(review, dict):
+        return None
+    value = review.get(field)
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def workflow_chat_wait_config(
@@ -250,12 +311,21 @@ async def resolve_chat_workflow_wait(
         submitted_review = None
     review_edited = False
     review_variable = _review_variable(config)
+    original_review = (run.variables or {}).get(review_variable) if review_variable else None
+    revising = workflow_review_is_revision_choice(normalized_choice)
     if submitted_review is not None and normalized_choice not in cancel_choices:
         if not review_variable:
             return "This approval material is not editable."
-        original_review = (run.variables or {}).get(review_variable)
-        if not _review_matches_original(original_review, submitted_review):
+        if not workflow_review_matches_original(original_review, submitted_review, config):
             return "The edited approval material no longer matches the Workflow packet shape."
+        if revising:
+            note = workflow_review_revision_note(config, submitted_review) or note
+    review_for_decision = submitted_review if submitted_review is not None else original_review
+    if revising and workflow_review_revision_field(config) and not note:
+        return "A change request is required before revising this post."
+    if normalized_choice == "approve" and workflow_review_revision_note(config, review_for_decision):
+        return "Submit the video change request or clear it before approving this post."
+    if submitted_review is not None and normalized_choice not in cancel_choices:
         run.variables = {
             **dict(run.variables or {}),
             review_variable: deepcopy(submitted_review),

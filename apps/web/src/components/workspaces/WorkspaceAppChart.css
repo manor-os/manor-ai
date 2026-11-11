@@ -1,0 +1,61 @@
+/* A chart block: ink for one series, the chart palette for several, hairline grid, numbers in tabular figures. */
+.workspace-app-chart { display: grid; gap: 10px; min-width: 0; }
+.workspace-app-chart__head { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px 12px; min-height: 20px; }
+.workspace-app-chart__legend { display: flex; flex: 1 1 auto; flex-wrap: wrap; gap: 4px 14px; margin: 0; padding: 0; color: var(--text-muted); font-size: 12px; list-style: none; }
+.workspace-app-chart__legend li { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.workspace-app-chart__swatch { display: inline-block; flex: 0 0 auto; width: 8px; height: 8px; margin-inline-end: 6px; border-radius: 2px; vertical-align: middle; }
+.workspace-app-chart__legend .workspace-app-chart__swatch { margin-inline-end: 0; }
+.workspace-app-chart__toggle { padding: 2px 0; border: 0; background: none; color: var(--text-muted); font: inherit; font-size: 12px; cursor: pointer; }
+.workspace-app-chart__toggle:hover { color: var(--text-strong); }
+.workspace-app-chart__toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+.workspace-app-chart__plot { position: relative; min-width: 0; overflow: hidden; }
+.workspace-app-chart__plot svg { display: block; }
+.workspace-app-chart__grid { stroke: var(--glass-hairline); stroke-width: 1; }
+.workspace-app-chart__axis { fill: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.workspace-app-chart__target { stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 4 3; }
+.workspace-app-chart__crosshair { stroke: var(--text-muted); stroke-width: 1; }
+.workspace-app-chart__tooltip { position: absolute; top: 0; display: grid; gap: 2px; min-width: 120px; max-width: 220px; padding: 6px 10px; border-radius: 8px; background: var(--surface-panel); box-shadow: var(--shadow-md); font-size: 12px; font-variant-numeric: tabular-nums; pointer-events: none; }
+.workspace-app-chart__tooltip div { color: var(--text-muted); }
+.workspace-app-chart__tooltip strong { display: flex; align-items: center; color: var(--text-strong); font-weight: 600; }
+/* Rows: a bar per category (bars, stacks, a leaderboard, a funnel). */
+.workspace-app-chart__rows, .workspace-app-chart__funnel { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; font-size: 12px; }
+.workspace-app-chart__rows > li { display: grid; grid-template-columns: minmax(64px, 30%) minmax(0, 1fr) auto; align-items: center; gap: 10px; min-width: 0; }
+.workspace-app-chart__rows.is-ranked > li { grid-template-columns: 18px minmax(64px, 30%) minmax(0, 1fr) auto; }
+.workspace-app-chart__rank { color: var(--text-muted); text-align: right; }
+.workspace-app-chart__row-name { overflow: hidden; color: var(--text-default); text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-chart__row-value { color: var(--text-strong); font-weight: 600; text-align: right; white-space: nowrap; }
+.workspace-app-chart__row-bars { display: grid; gap: 2px; min-width: 0; }
+.workspace-app-chart__track { display: block; height: 8px; overflow: hidden; border-radius: 4px; background: var(--surface-muted); }
+.workspace-app-chart__track > span { display: block; height: 100%; border-radius: 4px; background: var(--text-strong); }
+.workspace-app-chart__stack { display: flex !important; gap: 1px; background: transparent !important; }
+.workspace-app-chart__stack > span { flex: 0 1 0; min-width: 0; }
+.workspace-app-chart__funnel > li { display: grid; grid-template-columns: minmax(64px, 30%) minmax(0, 1fr) auto; align-items: center; gap: 4px 10px; min-width: 0; }
+.workspace-app-chart__funnel-bar { display: flex; justify-content: center; height: 18px; border-radius: 4px; background: var(--surface-muted); overflow: hidden; }
+.workspace-app-chart__funnel-bar > span { display: block; height: 100%; border-radius: 4px; background: var(--chart-series-1); }
+.workspace-app-chart__conversion { grid-column: 2 / -1; color: var(--text-muted); font-size: 11px; }
+.workspace-app-chart__funnel-overall { display: block !important; color: var(--text-muted); }
+/* A donut and its shares beside it; under it on a phone. */
+.workspace-app-chart__donut { display: flex; align-items: center; flex-wrap: wrap; gap: 16px 24px; min-width: 0; }
+.workspace-app-chart__donut svg { flex: 0 0 auto; }
+.workspace-app-chart__donut-total { fill: var(--text-strong); font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.workspace-app-chart__shares { display: grid; flex: 1 1 200px; gap: 6px; min-width: 0; margin: 0; padding: 0; font-size: 12px; list-style: none; }
+.workspace-app-chart__shares li { display: flex; justify-content: space-between; gap: 12px; min-width: 0; }
+.workspace-app-chart__shares li > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A heatmap: one cell per row and column, the busiest the strongest. */
+.workspace-app-chart__heatmap { display: grid; gap: 2px; align-items: center; min-width: 0; font-size: 10px; }
+.workspace-app-chart__heat-name { padding-inline-end: 6px; color: var(--text-muted); white-space: nowrap; }
+.workspace-app-chart__heat-cell { display: block; aspect-ratio: 1; min-height: 8px; border-radius: 2px; background: var(--chart-series-1); }
+.workspace-app-chart__heat-cell[data-empty] { background: var(--surface-muted); opacity: 1; }
+.workspace-app-chart__heat-axis { overflow: visible; color: var(--text-muted); white-space: nowrap; }
+.workspace-app-chart__table { max-width: 100%; overflow-x: auto; }
+.workspace-app-chart__table table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.workspace-app-chart__table :is(th, td) { padding: 6px 8px; border-bottom: 0.5px solid var(--border-subtle); text-align: left; white-space: nowrap; }
+.workspace-app-chart__table td { text-align: right; }
+.workspace-app-chart__table th[scope="row"] { color: var(--text-default); font-weight: 500; }
+.workspace-app-chart__table thead th { color: var(--text-muted); font-weight: 600; }
+.workspace-app-chart__empty, .workspace-app-chart__note { margin: 0; color: var(--text-muted); font-size: 12px; }
+.workspace-app-chart__sparkline { display: block; flex: 0 0 auto; color: var(--text-muted); overflow: visible; }
+@media (max-width: 480px) {
+  .workspace-app-chart__rows > li, .workspace-app-chart__funnel > li { grid-template-columns: minmax(56px, 34%) minmax(0, 1fr) auto; gap: 8px; }
+  .workspace-app-chart__rows.is-ranked > li { grid-template-columns: 14px minmax(56px, 32%) minmax(0, 1fr) auto; }
+}

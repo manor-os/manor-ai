@@ -140,6 +140,8 @@ _RUNNER_UNAVAILABLE_STATUSES = frozenset({502, 503})
 #: ``last_error`` label of a ticket waiting for (or expired waiting for) an
 #: unavailable runner.
 RUNNER_UNAVAILABLE_ERROR = "sandbox_runner_unavailable"
+#: ``last_error`` label of a ticket whose bounded retries of a runner error ran out.
+ALLOCATION_FAILED_ERROR = "sandbox_allocation_failed"
 
 
 def parse_memory_mb(value: Any) -> int | None:
@@ -465,7 +467,11 @@ def classify_allocation_error(exc: BaseException) -> tuple[str, str]:
       config, a dependency install that failed, a wrong exit IP, an isolation
       that cannot be resolved), or reported lacking a capability it needs
       (``runner_outdated``). It fails at once.
-    * ``retry``: anything else (other 5xx, timeouts); bounded retries as before.
+    * ``retry``: anything else (other 5xx such as an exit proxy that could not
+      be verified, timeouts); bounded retries as before.
+
+    The text is ``"<runner code>: <message>"`` plus what the runner's error
+    body adds (``_runner_error_context``), so the ticket says why it failed.
     """
 
     status = getattr(exc, "status_code", None)
@@ -473,6 +479,7 @@ def classify_allocation_error(exc: BaseException) -> tuple[str, str]:
     detail = str(exc).strip()
     label = str(code or (f"http_{status}" if status else exc.__class__.__name__))
     text_ = f"{label}: {detail}" if detail and detail != label else label
+    text_ += _runner_error_context(getattr(exc, "body", None))
     if status == 429 or code in CAPACITY_ERROR_CODES:
         return "capacity", text_[:2000]
     if _runner_unavailable(exc, status=status, code=code):
@@ -481,7 +488,61 @@ def classify_allocation_error(exc: BaseException) -> tuple[str, str]:
         # A runner that reported it lacks what the request needs refuses the
         # same request on every attempt, like a request it rejects.
         return "fatal", text_[:2000]
-    return "retry", exc.__class__.__name__
+    return "retry", text_[:2000]
+
+
+def _runner_error_context(body: Any) -> str:
+    """What a runner's error body says beyond its message: an egress gateway's reason, exit code and log."""
+
+    if not isinstance(body, dict):
+        return ""
+    parts = []
+    reason = body.get("reason")
+    if isinstance(reason, str) and _ERROR_CODE.match(reason):
+        parts.append(f"reason {reason}")
+    if isinstance(body.get("gateway_exit_code"), int) and not isinstance(body.get("gateway_exit_code"), bool):
+        parts.append(f"gateway exit {body['gateway_exit_code']}")
+    log = body.get("gateway_log")
+    if isinstance(log, str) and log.strip():
+        parts.append(f"gateway log: {log.strip()[:1000]}")
+    return f" ({'; '.join(parts)})" if parts else ""
+
+
+_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+#: How a failed ticket's error names the runner answer it ended on:
+#: ``"<queue label>: last runner answer: <runner code>: <message>"``.
+_LAST_ANSWER = ": last runner answer: "
+
+
+def last_runner_code(error: str | None) -> str:
+    """The runner code a ticket's ``last_error`` ended on, under any queue labels; "" when none.
+
+    ``sandbox_allocation_failed: last runner answer: egress_unverified: ...``
+    gives ``egress_unverified``; a bare queue label (``sandbox_queue_timeout``)
+    is no runner answer.
+    """
+
+    text_ = str(error or "")
+    while True:
+        head, sep, rest = text_.partition(_LAST_ANSWER)
+        if not sep or not _ERROR_CODE.match(head.strip()):
+            break
+        text_ = rest
+    if ":" not in text_:
+        return ""
+    label = text_.split(":", 1)[0].strip()
+    return label if _ERROR_CODE.match(label) else ""
+
+
+_REASON = re.compile(r"\(reason ([a-z][a-z0-9_]{0,63})[;)]")
+
+
+def last_runner_reason(error: str | None) -> str:
+    """The ``reason`` the runner gave with the answer a ticket's ``last_error`` ended on; "" when none."""
+
+    # The first: the reason precedes the gateway's log, which could quote anything.
+    found = _REASON.search(str(error or ""))
+    return found.group(1) if found else ""
 
 
 def _runner_unavailable(exc: BaseException, *, status: Any, code: Any) -> bool:
@@ -1166,7 +1227,8 @@ async def expire_sandbox_reservations(
             reason = "sandbox_capacity_timeout" if waited_for_capacity else "sandbox_queue_timeout"
         reservation.status = SandboxReservationStatus.EXPIRED.value
         reservation.completed_at = current_time
-        if waited_for_capacity:
+        if waited_for_capacity or (reservation.last_error and not waited_for_runner):
+            # A ticket requeued after a failed attempt keeps that attempt's answer.
             reservation.last_error = f"{reason}: last runner answer: {reservation.last_error}"[:2000]
         elif not waited_for_runner:
             reservation.last_error = reason
@@ -1187,13 +1249,7 @@ async def expire_sandbox_reservations(
         # run that moved on to a later reservation must not be failed by a
         # stale one it abandoned.
         if run is not None and run.reservation_id == reservation.id:
-            await finish_runtime_run_out_of_loop(
-                db,
-                run,
-                status=RuntimeRunStatus.FAILED,
-                reason=reason,
-                now=current_time,
-            )
+            await _finish_failed_sandbox_run(db, run, reservation, reason=reason, now=current_time)
     return len(rows) + await _release_abandoned_task_allocations(db, now=current_time)
 
 
@@ -1527,13 +1583,7 @@ async def recover_stale_sandbox_allocations(
             reservation.completed_at = current_time
             reservation.next_attempt_at = None
             if _run_parked_on(run, reservation):
-                await finish_runtime_run_out_of_loop(
-                    db,
-                    run,
-                    status=RuntimeRunStatus.FAILED,
-                    reason="sandbox_allocation_failed",
-                    now=current_time,
-                )
+                await _finish_failed_sandbox_run(db, run, reservation, reason="sandbox_allocation_failed", now=current_time)
         else:
             reservation.status = SandboxReservationStatus.REQUEUED.value
             reservation.next_attempt_at = current_time + timedelta(seconds=retry_delay_seconds)
@@ -2169,7 +2219,7 @@ async def fail_sandbox_allocation(
     else:
         will_fail = expired or reservation.attempt_count >= max_attempts
         final_status = SandboxReservationStatus.FAILED.value
-        run_reason = "sandbox_allocation_failed"
+        run_reason = ALLOCATION_FAILED_ERROR
     run = None
     if will_fail and reservation.runtime_run_id:
         run = (
@@ -2202,6 +2252,10 @@ async def fail_sandbox_allocation(
         # Labelled while it waits too, so the expiry sweep and the requester
         # see what the ticket was waiting for.
         last_error = f"{RUNNER_UNAVAILABLE_ERROR}: last runner answer: {error}"
+    elif outcome == "retry" and will_fail:
+        # Retries ran out: the platform gave up, the runner refused nothing.
+        # The label says so; the runner's answer stays (``last_runner_code``).
+        last_error = f"{ALLOCATION_FAILED_ERROR}: last runner answer: {error}"
     else:
         last_error = str(error)
     reservation.last_error = last_error[:2000]
@@ -2212,13 +2266,7 @@ async def fail_sandbox_allocation(
         reservation.completed_at = current_time
         reservation.next_attempt_at = None
         if _run_parked_on(run, reservation):
-            await finish_runtime_run_out_of_loop(
-                db,
-                run,
-                status=RuntimeRunStatus.FAILED,
-                reason=run_reason,
-                now=current_time,
-            )
+            await _finish_failed_sandbox_run(db, run, reservation, reason=run_reason, now=current_time)
     else:
         reservation.status = SandboxReservationStatus.REQUEUED.value
         if waits:
@@ -2231,6 +2279,67 @@ async def fail_sandbox_allocation(
             delay = retry_delay_seconds
         reservation.next_attempt_at = current_time + timedelta(seconds=delay)
     return reservation
+
+
+async def _finish_failed_sandbox_run(
+    db: AsyncSession, run: RuntimeRun, reservation: SandboxReservation,
+    *, reason: str, now: datetime,
+) -> None:
+    """Return an exhausted resource failure to the original model for its reply.
+
+    The reservation remains failed. Only a host-written result for the exact
+    parked call resumes; the loop's final-only lane cannot retry tools. Invalid
+    historical checkpoints still use the reliable terminal fallback.
+    """
+    if run.reservation_id != reservation.id or run.status in RuntimeRunStatus.terminal():
+        return
+    if run.status in {RuntimeRunStatus.CANCEL_REQUESTED.value, RuntimeRunStatus.CANCELLING.value}:
+        await finish_runtime_run_out_of_loop(db, run, status=RuntimeRunStatus.CANCELLED, reason="user_cancelled", now=now)
+        return
+    from packages.core.ai.runtime.control import RuntimeAgentCheckpoint
+
+    try:
+        if not isinstance(run.checkpoint, dict):
+            raise ValueError("no parked transcript")
+        checkpoint = RuntimeAgentCheckpoint.from_dict(run.checkpoint)
+        if (
+            not checkpoint.messages or run.status != RuntimeRunStatus.WAITING_RESOURCE.value
+            or run.lease_owner or run.lease_expires_at
+        ):
+            raise ValueError("no parked transcript")
+    except (TypeError, ValueError, KeyError):
+        await finish_runtime_run_out_of_loop(db, run, status=RuntimeRunStatus.FAILED, reason=reason, now=now)
+        return
+    detail = (
+        "No execution environment became available before the wait deadline."
+        if reason in {"sandbox_queue_timeout", "sandbox_capacity_timeout"} else
+        "The execution environment remained unavailable until the wait deadline."
+        if reason == RUNNER_UNAVAILABLE_ERROR else
+        "The dependencies needed to prepare the execution environment could not be installed."
+        if "dependency_install_failed" in (reservation.last_error or "") or "dependency install failed" in (reservation.last_error or "").lower() else
+        "The execution environment rejected the allocation request."
+        if reason == "sandbox_allocation_rejected" else
+        "The execution environment could not be started after the allocation attempts were exhausted."
+    )
+    checkpoint.pending_tool_result = {
+        "id": checkpoint.pending_tool_call["id"],
+        "content": json.dumps({"status": "error", "error": reason, "message": detail,
+                               "allocation_attempts": reservation.attempt_count}),
+        # Host control, outside the model/provider tool-result text.
+        "terminal_failure": reason,
+    }
+    run.checkpoint = checkpoint.to_dict()
+    run.status = RuntimeRunStatus.QUEUED.value
+    run.status_reason = "sandbox_failure_summary"
+    run.reservation_id = None
+    run.lease_owner = None
+    run.lease_expires_at = None
+    run.version += 1
+    db.add(RuntimeOutboxEvent(
+        event_type="runtime.execute_run", aggregate_id=run.id,
+        dedupe_key=f"runtime.execute_run:{run.id}:sandbox-failure:{reservation.id}",
+        payload={"run_id": run.id}, available_at=now, created_at=now,
+    ))
 
 
 async def load_sandbox_reservation(
@@ -2611,6 +2720,7 @@ __all__ = [
     "claim_due_sandbox_runner_health_checks",
     "CAPACITY_ERROR_CODES",
     "RUNNER_MEMORY_KEY",
+    "ALLOCATION_FAILED_ERROR",
     "RUNNER_UNAVAILABLE_ERROR",
     "RUNNER_UNAVAILABLE_ERROR_CODES",
     "SANDBOX_MEMORY_KEY",
@@ -2637,6 +2747,8 @@ __all__ = [
     "wake_exec_slot_wait",
     "fail_sandbox_allocation",
     "is_pool_managed_runner",
+    "last_runner_code",
+    "last_runner_reason",
     "load_sandbox_reservation",
     "memory_need_on_runner",
     "next_waiting_ticket_need",

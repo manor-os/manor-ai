@@ -91,3 +91,43 @@ def tool_operation_denied_error(tool_name: str, arguments: dict[str, Any]) -> st
         "No action was executed. A later step of this Flow owns that operation; "
         "finish this step's own work and report its result."
     )
+
+
+# A Workflow agent step may declare what it must leave behind, e.g.
+# ``"expects": ["files"]`` for a step that saves a draft. The host checks the
+# run's receipt ledger, never the model's own summary: a step whose declared
+# output was not produced does not complete.
+STEP_EXPECTS_KEY = "expects"
+
+
+class StepExpectation(StrEnum):
+    # At least one saved file (a Document or workspace file receipt).
+    FILES = "files"
+    # At least one confirmed external action (a sent message, a published post ...).
+    EFFECTS = "effects"
+
+
+# Approval categories of an action that reached people outside the Workspace.
+# Status checks, lookups and in-Workspace changes are actions too, but none of
+# them is the outside action an ``effects`` step promises.
+OUTWARD_EFFECT_CATEGORIES = frozenset({"communication", "publishing"})
+
+
+def parse_step_expectations(value: Any) -> tuple[StepExpectation, ...]:
+    """Return the declared expectations or raise ValueError for a malformed list."""
+    if not isinstance(value, list) or not value:
+        raise ValueError(
+            "must be a non-empty list of " + ", ".join(f"'{item.value}'" for item in StepExpectation)
+        )
+    parsed: list[StepExpectation] = []
+    for item in value:
+        try:
+            expectation = StepExpectation(str(item).strip().lower())
+        except ValueError:
+            raise ValueError(
+                f"has unknown value {item!r}; use "
+                + ", ".join(f"'{member.value}'" for member in StepExpectation)
+            ) from None
+        if expectation not in parsed:
+            parsed.append(expectation)
+    return tuple(parsed)

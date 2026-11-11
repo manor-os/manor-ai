@@ -144,12 +144,13 @@ ADMITTED = {
     ("prepare_creative_studio", ""), ("prepare_narration_timeline", ""), ("prepare_recording", ""),
     ("probe_media", ""), ("query_ledger", ""), ("query_scheduled_jobs", ""), ("rag", ""),
     ("read_content_ledger", ""), ("read_file", ""), ("read_finance_ledger", ""),
-    ("read_recruiting_ledger", ""), ("read_relationship_ledger", ""), ("read_stickman_topic_ledger", ""),
+    ("read_recruiting_ledger", ""), ("read_relationship_ledger", ""),
     ("record_content_ledger", ""), ("record_finance_ledger", ""), ("record_recruiting_ledger", ""),
-    ("record_relationship_ledger", ""), ("record_stickman_topic_ledger", ""),
-    ("record_youtube_publication", ""), ("record_youtube_workspace_metrics", ""), ("render_frame_samples", ""),
+    ("record_relationship_ledger", ""),
+    ("record_youtube_publication", ""),
+    ("render_frame_samples", ""),
     ("render_recording", ""), ("render_response_surface", ""), ("replace_file", ""), ("request_input", ""),
-    ("resume_workflow_run", ""), ("run_scheduled_job_now", ""), ("sandbox_cancel", ""), ("sandbox_create", ""),
+    ("resume_workflow_run", ""), ("retry_workflow_run", ""), ("run_scheduled_job_now", ""), ("sandbox_cancel", ""), ("sandbox_create", ""),
     ("sandbox_destroy", ""), ("sandbox_exec", ""), ("sandbox_read_file", ""), ("sandbox_save_result", ""),
     ("sandbox_status", ""), ("sandbox_write_file", ""), ("search_documents", ""), ("search_tasks", ""),
     ("search_tools", ""), ("start_workspace_flow", ""), ("still_to_video", ""),
@@ -177,18 +178,25 @@ ADMITTED = {
     # Only adds reviews to the caller's own conversation.
     ("workspace_agent", "hold_for_approval"),
     ("workspace_agent", "list_knowledge"), ("workspace_agent", "operation/apply_draft"),
+    # Audience reads use only the trusted run Workspace and retain the manager check.
+    ("workspace_agent", "operation/app_audience"),
     ("workspace_agent", "operation/create_draft"), ("workspace_agent", "operation/design_app"),
     ("workspace_agent", "operation/discard_draft"),
     ("workspace_agent", "operation/get_current"), ("workspace_agent", "operation/patch_draft"),
     ("workspace_agent", "operation/preview_diff"), ("workspace_agent", "operation/validate_draft"),
+    # Read-only reads of the trusted run Workspace's page, behind the manager check.
+    ("workspace_agent", "operation/test_app"),
     ("workspace_agent", "read_delegation_result"), ("workspace_agent", "record_stat_assessment"),
     ("workspace_agent", "remove_knowledge_document"), ("workspace_agent", "request_strategist_review"),
     ("workspace_agent", "resolve_hitl"), ("workspace_agent", "search"),
     ("workspace_agent", "start_task"),
     ("workspace_agent", "update_goal_value"), ("workspace_agent", "update_knowledge_policy"),
     ("workspace_agent", "update_task_runtime"), ("workspace_agent", "visualize_ledgers"),
+    ("workspace_agent", "list_attention"),
     ("workspace_operation", "apply_draft"), ("workspace_operation", "create_draft"),
+    ("workspace_operation", "app_audience"),
     ("workspace_operation", "design_app"),
+    ("workspace_operation", "test_app"),
     ("workspace_operation", "discard_draft"), ("workspace_operation", "get_current"),
     ("workspace_operation", "patch_draft"), ("workspace_operation", "preview_diff"),
     ("workspace_operation", "validate_draft"),
@@ -1119,12 +1127,14 @@ _UNCHECKED_ARGUMENT_KEYS = {
     "expected_channel_id": "an external YouTube channel id the public video must match",
     "expected_video_id": "an external YouTube video id",
     "folder_ids": "Knowledge folders; every listed document passes document_access",
+    "from_step_id": "a step of the Workflow run named by run_id",
     "force_normalize_segment_ids": "segments of the call's own narration timeline",
     "reservation_id": "an entry of the run Workspace's Ledger",
     "reverses_entry_id": "an entry of the run Workspace's Ledger",
     "run_id": "a Workflow run; _workflow_outside requires the run Workspace's",
     "session_id": "the run's own video edit session",
     "shape_id": "a shape inside the file being patched (file path checks apply)",
+    "step_id": "a step of the Workflow run named by run_id",
     "source_record_id": "an entry of the run Workspace's Ledger",
     "supersedes_entry_id": "an entry of the run Workspace's Ledger",
     "template_id": "a response surface template",
@@ -1255,6 +1265,13 @@ async def test_collaborator_resolves_approval_cards_only_in_the_granted_workspac
             assert not (await resolve(workspace_id, hitl_type)).allowed, (workspace_id, hitl_type)
     await _issuer_leaves(db_session, r.id, customer)
     assert not (await resolve(target, "authorize")).allowed
+    # A model may still be designing when the grant's issuer leaves. Its
+    # later self-check must not read through the retained derived seat.
+    from packages.core.services.workspace_app_selfcheck import candidate_read_probe
+
+    async with _gated(db_session, customer, p.id):
+        probe = candidate_read_probe(workspace_id=target, entity_id=customer, user_id=p.id)
+        assert await probe({}, []) is None
 
 
 @pytest.mark.asyncio
@@ -1266,6 +1283,7 @@ async def test_collaborator_operation_drafts_name_only_their_workspace_agents(cl
     # by the collaborator without the apply-time recheck; the Workspace's own
     # Agent, or a member's draft, being refused.
     from packages.core.models.workspace import Agent, AgentSubscription
+    from packages.core.ai.runtime.workspace_operation_actions import runtime_workspace_operation_action
     from packages.core.services import workspace_operation_service as operations
 
     p, r, customer, target, other = await _trial(client, db_session)
@@ -1276,6 +1294,27 @@ async def test_collaborator_operation_drafts_name_only_their_workspace_agents(cl
     own = Agent(entity_id=customer, workspace_id=target, name="Trial agent", status="active")
     db_session.add_all([company, own])
     await db_session.commit()
+    async with _gated(db_session, customer, p.id):
+        audience = json.loads(await runtime_workspace_operation_action(
+            entity_id=customer, workspace_id=target, user_id=p.id,
+            params={"action": "app_audience", "workspace_id": other},
+        ))
+        assert audience["purpose"]["name"] == (await db_session.get(Workspace, target)).name
+        home_entity = p.entity_id
+        tested_inside = json.loads(await runtime_workspace_operation_action(
+            entity_id=customer, workspace_id=target, user_id=p.id, params={"action": "test_app"},
+        ))
+        assert tested_inside.get("items"), tested_inside
+        await db_session.refresh(p)
+        assert p.entity_id == home_entity  # the scoped read never switches the persisted home company
+        outside = json.loads(await runtime_workspace_operation_action(
+            entity_id=customer, workspace_id=other, user_id=p.id, params={"action": "app_audience"},
+        ))
+        assert outside["error"] == "blocked_by_permission" and "people" not in outside
+        tested = json.loads(await runtime_workspace_operation_action(
+            entity_id=customer, workspace_id=other, user_id=p.id, params={"action": "test_app"},
+        ))
+        assert tested["error"] == "blocked_by_permission" and "items" not in tested
     refused = "collaborator_reference_outside_workspace"
 
     def mapped(**mapping):

@@ -15,7 +15,6 @@ from packages.core.blueprints.installer import InstallError, _bind_blueprint_cha
 from packages.core.blueprints.setup_preflight import BlueprintSetupPreflightFactory
 from packages.core.blueprints.upgrade import (
     LIVE_SETUP_STATE_KEYS,
-    RESTORE_POINT_KEY,
     BlueprintUpgradePlanChangedError,
     apply,
     revert,
@@ -31,6 +30,7 @@ from packages.core.services.channel_bindings import (
     snapshot_channel_binding,
 )
 from packages.core.services.workspace_readiness import evaluate_workspace_blocking_setup
+from test_blueprint_upgrade_and_revert import stored_restore_point
 from test_channel_binding_upgrade_revert import _scenario, _upgrade
 
 
@@ -58,11 +58,11 @@ async def test_requirement_only_upgrade_has_a_durable_idempotent_undo(db_session
     assert result["can_revert"] is True
     assert _setup_state(workspace) != before
     assert snapshot_channel_binding(binding) == binding_before
-    point = copy.deepcopy(workspace.settings[BLUEPRINT_SETTINGS_KEY][RESTORE_POINT_KEY])
+    point = copy.deepcopy(await stored_restore_point(db_session, workspace))
     await db_session.refresh(workspace)
     repeated = await _upgrade(db_session, workspace, account, payload)
     assert repeated["can_revert"] is True
-    assert workspace.settings[BLUEPRINT_SETTINGS_KEY][RESTORE_POINT_KEY] == point
+    assert await stored_restore_point(db_session, workspace) == point
 
     undo = await revert(db_session, workspace=workspace, by_user_id=account.owner_user_id)
     assert "reason" not in undo

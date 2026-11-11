@@ -109,19 +109,28 @@ async def test_an_idle_long_poll_waits_without_holding_a_transaction(db_session,
 
 
 
-async def test_an_instruction_queued_for_a_waiting_worker_reaches_it_at_once(db_session, factory) -> None:
+async def test_an_instruction_queued_for_a_waiting_worker_reaches_it_at_once(db_session, factory, monkeypatch) -> None:
     from packages.core.workers.instructions import queue_instruction
 
     worker = await _account(
         db_session, entity_id="ent_lp_4", user_id="user_lp_4", worker_id="worker_lp_4", targeted_only=True,
     )
+    waiting = asyncio.Event()
+    real_wait = wake.wait_for_wake
+
+    async def watched_wait(worker_id: str, timeout: float) -> bool | None:
+        waiting.set()
+        return await real_wait(worker_id, timeout)
+
+    monkeypatch.setattr(wake, "wait_for_wake", watched_wait)
 
     async def poll():
         async with factory() as db:
             return await _heartbeat_inner(_beat(20), await db.get(Worker, worker.id), db), time.monotonic()
 
     polling = asyncio.create_task(poll())
-    await asyncio.sleep(0.5)
+    # Initial checkout may be slow; measure only after the heartbeat enters its wait.
+    await asyncio.wait_for(waiting.wait(), timeout=10)
     queued_at = time.monotonic()
     assert await queue_instruction("worker_lp_4", "open_view", {"session_id": "s1"})
     response, returned_at = await asyncio.wait_for(polling, timeout=10)

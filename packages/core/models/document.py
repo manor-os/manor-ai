@@ -1,14 +1,17 @@
 """Document, document group, and integration models."""
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Index, String, Text, func, text
+from sqlalchemy import BigInteger, Boolean, DateTime, Index, String, Text, event, func, text
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, attributes, mapped_column, object_session
 
 from .base import Base, TimestampMixin, generate_ulid
+
+logger = logging.getLogger(__name__)
 
 
 class VectorStatus:
@@ -74,6 +77,10 @@ class Document(Base, TimestampMixin):
     file_size: Mapped[Optional[int]] = mapped_column(BigInteger)
     file_type: Mapped[Optional[str]] = mapped_column(String(20))
     mime_type: Mapped[Optional[str]] = mapped_column(String(100))
+    # SHA-256 of the source bytes, when a writer or the display-variant task
+    # computed it. Names the content version of signed media URLs
+    # (packages/core/services/media_urls.py); null means "not known yet".
+    content_sha256: Mapped[Optional[str]] = mapped_column(String(64))
     # pgvector embedding is managed via raw SQL (not in model) to avoid
     # requiring the vector extension at table creation time.
     # The embedding column is added by Alembic migration when pgvector is available.
@@ -102,6 +109,60 @@ class Document(Base, TimestampMixin):
     pii_detected: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     quarantine_status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="clean")
     # clean | pending_scan | quarantined | rejected
+
+
+@event.listens_for(Document, "before_update")
+def _forget_content_sha256_on_new_bytes(_mapper, _connection, document: Document) -> None:
+    # Many writers replace a file's bytes and only update its size.
+    # A digest they did not refresh in the same flush no longer names the
+    # content, so drop it; media_urls falls back to a size/path/mtime version.
+    if attributes.get_history(document, "content_sha256").has_changes():
+        return
+    if any(attributes.get_history(document, key).has_changes() for key in ("file_size", "file_url")):
+        document.content_sha256 = None
+
+
+# What names a Document's bytes for its display variants (media_urls.content_version).
+_DISPLAY_SOURCE_KEYS = ("fs_path", "file_size", "content_sha256", "mime_type")
+
+
+def _source_identity_changed(document: Document) -> bool:
+    if any(attributes.get_history(document, key).has_changes() for key in _DISPLAY_SOURCE_KEYS):
+        return True
+    # Same size and path, new bytes: the change pipeline records a new mtime.
+    history = attributes.get_history(document, "metadata_")
+    if not history.has_changes():
+        return False
+    before = (history.deleted[0] if history.deleted else None) or {}
+    after = (history.added[0] if history.added else None) or {}
+    return before.get("file_integrity") != after.get("file_integrity")
+
+
+def _schedule_display_variants(document: Document) -> None:
+    from packages.core.services.media_variants import schedule_display_variants_after_commit
+
+    session = object_session(document)
+    if session is None:
+        return
+    try:
+        schedule_display_variants_after_commit(session, document)
+    except Exception:  # noqa: BLE001 - a thumbnail must never fail the write
+        logger.debug("display variant scheduling failed for %s", document.id, exc_info=True)
+
+
+# Every writer, not only Knowledge sync: MCP files, generated media, video
+# exports and sandbox rows create Documents directly. Dispatch happens after
+# commit and only when the current version has no recorded thumb, so the
+# worker recording its own result does not schedule again.
+@event.listens_for(Document, "after_insert")
+def _schedule_display_variants_for_new_document(_mapper, _connection, document: Document) -> None:
+    _schedule_display_variants(document)
+
+
+@event.listens_for(Document, "after_update")
+def _schedule_display_variants_for_new_bytes(_mapper, _connection, document: Document) -> None:
+    if _source_identity_changed(document):
+        _schedule_display_variants(document)
 
 
 class DocumentChunk(Base):

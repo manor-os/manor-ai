@@ -22,6 +22,7 @@
   "workspace_operations": {
     "workspace_actions": [
       "search",
+      "list_attention",
       "create_task",
       "update_task_runtime",
       "start_task",

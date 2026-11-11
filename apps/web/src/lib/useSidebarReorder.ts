@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useRef, useState, type ButtonHTMLAttributes } from "react";
 import {
   moveSidebarWorkspace as moveSidebarItem,
+  orderSidebarConversations,
+  placeSidebarConversation,
   readWorkspaceSidebarPreferences as readSidebarPreferences,
+  type ConversationRanking,
   type WorkspaceSidebarPreferences as SidebarPreferences,
 } from "./workspaceChatSidebar";
 
@@ -9,15 +12,17 @@ export function useSidebarReorder<T extends { id: string }>(
   storageKey: string | null,
   items: T[],
   disabled: boolean,
+  ranking?: ConversationRanking<T>,
 ) {
   const restored = useMemo(() => readSidebarPreferences(storageKey), [storageKey]);
   const [saved, setSaved] = useState({ key: storageKey, value: restored });
   const preferences = saved.key === storageKey ? saved.value : restored;
   const orderedItems = useMemo(() => {
+    if (ranking) return orderSidebarConversations(items, preferences.order, ranking);
     if (preferences.mode !== "manual") return items;
     const rank = new Map(preferences.order.map((id, index) => [id, index]));
     return [...items].sort((a, b) => (rank.get(a.id) ?? Infinity) - (rank.get(b.id) ?? Infinity) || 0);
-  }, [items, preferences]);
+  }, [items, preferences, ranking]);
   const drag = useRef<{ id: string; pointerId: number; x: number; y: number; moved: boolean; target?: { id: string; after: boolean } } | null>(null);
   const dragClick = useRef<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; after: boolean } | null>(null);
@@ -39,8 +44,10 @@ export function useSidebarReorder<T extends { id: string }>(
 
   const move = (id: string, target: string, after = false) => {
     const order = orderedItems.map((item) => item.id);
-    const next = moveSidebarItem(order, id, target, after);
-    if (next === order) return;
+    const next = ranking
+      ? placeSidebarConversation(order, preferences.order, new Set(orderedItems.filter(ranking.attention).map((item) => item.id)), id, target, after)
+      : moveSidebarItem(order, id, target, after);
+    if (next === order || next === preferences.order) return;
     const value: SidebarPreferences = { mode: "manual", order: next };
     setSaved({ key: storageKey, value });
     if (storageKey) {

@@ -10,7 +10,7 @@ from xml.etree.ElementTree import ParseError
 from defusedxml import ElementTree as SafeElementTree
 from defusedxml.common import DefusedXmlException
 
-from packages.core.contracts.file_engine import TEXT_CONTENT_TYPES
+from packages.core.contracts.file_engine import DELIMITED_FILE_TYPES, TEXT_CONTENT_TYPES
 
 @dataclass(frozen=True)
 class DetectedFileType:
@@ -118,6 +118,11 @@ def _resolve_detected_extension(declared_ext: str | None, sniffed_ext: str | Non
     # "csv" only means the first line has a comma: Markdown prose without a
     # heading matches too, so it never overrides a declared text type.
     if declared_ext in _PRESERVE_DECLARED_TEXT_EXTS and sniffed_ext in {"txt", "csv"}:
+        return declared_ext
+    # "md" only means Markdown syntax somewhere, and a CSV cell may hold a
+    # [link](url): a declared delimited table stays a table. (A declared JSON
+    # or diagram that is Markdown is still corrected.)
+    if declared_ext in DELIMITED_FILE_TYPES and sniffed_ext == "md":
         return declared_ext
     return sniffed_ext or declared_ext
 

@@ -106,6 +106,28 @@ async def test_setup_input_does_not_wait_for_declared_ready_job(db_session):
     assert await _initial_run(db_session, result.workspace_id) is not None
 
 
+async def test_blueprint_installs_its_manual_jobs(db_session):
+    # Both manual shapes run only on request and need no clock.
+    payload = _base_payload(**{"recipe.scheduled_jobs": [
+        {"job_id": "manual-kind", "schedule_kind": "manual",
+         "execution_type": "strategist_review", "execution_target": {}},
+        {"job_id": "manual-type", "job_type": "manual", "schedule_kind": None,
+         "execution_type": "strategist_review", "execution_target": {}},
+    ]})
+    result = await install_blueprint(
+        db_session, entity_id=generate_ulid(), payload=payload, mode=InstallMode.LIVE,
+    )
+    rows = (await db_session.execute(
+        select(ScheduledJob.job_type, ScheduledJob.schedule_kind, ScheduledJob.name).where(
+            ScheduledJob.workspace_id == result.workspace_id,
+            ScheduledJob.id.in_(result.scheduled_job_ids),
+        )
+    )).all()
+    assert {(job_type, kind) for job_type, kind, _ in rows} == {("cron", "manual"), ("manual", None)}
+    # Declared without a name, each still gets one to be listed under.
+    assert sorted(name for *_, name in rows) == ["Manual kind", "Manual type"]
+
+
 @pytest.mark.parametrize("mode,automatic", [(InstallMode.SIMULATE, True), (InstallMode.LIVE, False)])
 async def test_simulation_and_manual_install_do_not_stage_live_review(db_session, mode, automatic):
     result = await install_blueprint(

@@ -257,6 +257,8 @@ def external_reply_decision_intent(value: Any) -> HumanDecisionIntent:
     choice = str(value or "").strip().lower()
     if choice == "confirm":
         return HumanDecisionIntent.APPROVE
+    if choice == "approve_and_save_rule":
+        return HumanDecisionIntent.APPROVE_STANDING
     if choice == "rejected":
         return HumanDecisionIntent.DENY
     if choice == "cancel":

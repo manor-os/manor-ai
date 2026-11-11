@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -166,7 +166,9 @@ async def _base_seq(db: AsyncSession, scope: TranscriptScope) -> int | None:
     )).scalar_one_or_none()
 
 
-async def _working_history(db: AsyncSession, scope: TranscriptScope) -> tuple[list[dict], dict | None]:
+async def _working_history(
+    db: AsyncSession, scope: TranscriptScope,
+) -> tuple[list[dict], ConversationTranscriptItem | None]:
     base_seq = await _base_seq(db, scope)
     if base_seq is None:
         return [], None
@@ -174,20 +176,51 @@ async def _working_history(db: AsyncSession, scope: TranscriptScope) -> tuple[li
     base = items[0]
     history = list((base.payload or {}).get("messages") or [])
     history.extend(item.payload for item in items[1:] if item.kind == TRANSCRIPT_KIND_MESSAGE)
-    return history, base.payload or {}
+    return history, base
 
 
-async def _represented_message_ids(db: AsyncSession, scope: TranscriptScope) -> set[str]:
-    rows = (await db.execute(
-        select(ConversationTranscriptItem.source_message_id, ConversationTranscriptItem.payload).where(
+async def _sync_start(db: AsyncSession, scope: TranscriptScope, base_seq: int) -> tuple[int, datetime]:
+    """(seq, created_at) where the check for rows no run wrote starts.
+
+    One snapshot before the working base, or the stream's first item: a
+    compaction is written when its run ends, so rows that arrived while it ran,
+    or replies still streaming when it started, are in no item before it. Older
+    rows were synced by an earlier turn, and the read stays the same size
+    however long the conversation grows.
+    """
+    previous = (await db.execute(
+        select(ConversationTranscriptItem.seq, ConversationTranscriptItem.created_at).where(
             *_stream(scope),
+            ConversationTranscriptItem.kind.in_(_BASE_KINDS),
+            ConversationTranscriptItem.seq < base_seq,
+        ).order_by(ConversationTranscriptItem.seq.desc()).limit(1)
+    )).first()
+    if previous is None:
+        previous = (await db.execute(
+            select(ConversationTranscriptItem.seq, ConversationTranscriptItem.created_at).where(
+                *_stream(scope),
+            ).order_by(ConversationTranscriptItem.seq).limit(1)
+        )).one()
+    return previous.seq, previous.created_at
+
+
+async def _represented_message_ids(db: AsyncSession, scope: TranscriptScope, *, from_seq: int) -> set[str]:
+    # Only snapshots record source ids in their payload; message payloads hold
+    # tool outputs and are never read here.
+    snapshot_ids = case(
+        (ConversationTranscriptItem.kind.in_(_BASE_KINDS), ConversationTranscriptItem.payload["source_message_ids"]),
+        else_=None,
+    )
+    rows = (await db.execute(
+        select(ConversationTranscriptItem.source_message_id, snapshot_ids).where(
+            *_stream(scope), ConversationTranscriptItem.seq >= from_seq,
         )
     )).all()
     ids: set[str] = set()
-    for source_id, payload in rows:
+    for source_id, source_ids in rows:
         if source_id:
             ids.add(source_id)
-        ids.update(str(value) for value in ((payload or {}).get("source_message_ids") or []) if value)
+        ids.update(str(value) for value in (source_ids if isinstance(source_ids, list) else []) if value)
     return ids
 
 
@@ -319,16 +352,14 @@ async def load_or_import_transcript(
             "covered_through": datetime.now(timezone.utc).isoformat(),
         }, None)], run_id=None)
         return imported
-    # Rows no run wrote since the transcript started (notifications, other
-    # entry points) still belong in the model's history.
-    first_created = (await db.execute(
-        select(func.min(ConversationTranscriptItem.created_at)).where(*_stream(scope))
-    )).scalar_one()
-    represented = await _represented_message_ids(db, scope) | set(exclude_message_ids)
+    # Rows no run wrote (notifications, other entry points) still belong in
+    # the model's history.
+    start_seq, started_at = await _sync_start(db, scope, base.seq)
+    represented = await _represented_message_ids(db, scope, from_seq=start_seq) | set(exclude_message_ids)
     rows_since = external_rows or _conversation_external_rows(db, scope)
     external = [
         (TRANSCRIPT_KIND_MESSAGE, message, row_id)
-        for row_id, message in await rows_since(first_created, represented)
+        for row_id, message in await rows_since(started_at, represented)
     ]
     if external:
         await _append(db, scope, external, run_id=None)

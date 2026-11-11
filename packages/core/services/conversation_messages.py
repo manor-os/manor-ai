@@ -13,6 +13,7 @@ from packages.core.ai.runtime.output_policy import (
     runtime_assistant_stream_interrupted_content,
 )
 from packages.core.models.base import generate_ulid
+from packages.core.services.decision_recommendation import ensure_recommendation
 from packages.core.models.runtime_run import RuntimeRun, RuntimeRunStatus
 from packages.core.models.task import Conversation, Message
 from packages.core.models.workspace import AgentSubscription
@@ -71,6 +72,8 @@ async def add_message(
         await authorize_private_persistence(db, conversation_id)
     author_kind = "agent" if role == "assistant" else "system" if role == "system" else "user"
     action = pending_action if isinstance(pending_action, dict) and pending_action.get("kind") else None
+    if action is not None:
+        action = ensure_recommendation(action)
     msg = Message(
         id=generate_ulid(),
         conversation_id=conversation_id,
@@ -95,15 +98,31 @@ async def add_message(
     )
     await db.flush()
 
-    await _publish_workspace_chat_message_event(
-        db,
-        conversation_id=conversation_id,
-        message_id=msg.id,
-        message_kind=msg.message_kind,
-        author_kind=msg.author_kind,
-        has_pending_action=action is not None,
-    )
+    await _queue_workspace_chat_message_event(db, msg)
     return msg
+
+
+async def _queue_workspace_chat_message_event(db: AsyncSession, message: Message) -> None:
+    """Tell the Workspace's clients about a new message once it commits.
+
+    Every connected member refetches on the event, so it must not arrive
+    before the message is readable: a Workflow worker writes a card long
+    before it commits the run. Personal conversations stream over SSE to
+    their owner and get no event here.
+    """
+    try:
+        conv = (await db.execute(
+            select(Conversation).where(Conversation.id == message.conversation_id)
+        )).scalar_one_or_none()
+        if not (conv and conv.workspace_id):
+            return
+        from packages.core.workspace_chat.service import queue_workspace_chat_message_event_after_commit
+
+        queue_workspace_chat_message_event_after_commit(
+            db, entity_id=conv.entity_id, workspace_id=conv.workspace_id, message=message,
+        )
+    except Exception:
+        logger.debug("Failed to queue workspace chat message event", exc_info=True)
 
 
 async def _publish_workspace_chat_message_event(
@@ -115,9 +134,11 @@ async def _publish_workspace_chat_message_event(
     author_kind: str,
     has_pending_action: bool,
 ) -> None:
-    """Notify other workspace clients that a chat message changed.
+    """Notify other workspace clients that a committed chat message changed.
 
-    Best-effort: looks up the conversation's workspace, and if it is a
+    Call it after the commit (a new message goes through
+    ``_queue_workspace_chat_message_event``). Best-effort: looks up the
+    conversation's workspace, and if it is a
     workspace conversation, publishes a ``workspace_chat_message`` event so
     every connected member's UI refetches. Non-workspace conversations are
     skipped (personal chat streams over SSE to its single owner)."""
@@ -270,6 +291,8 @@ async def save_or_update_assistant_stream_message(
                 if isinstance(pending_action, dict) and pending_action.get("kind")
                 else None
             )
+            if action is not None:
+                action = ensure_recommendation(action)
             if message_id:
                 existing_meta = (await save_db.execute(
                     select(Message.meta).where(

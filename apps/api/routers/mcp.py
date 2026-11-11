@@ -5,8 +5,9 @@ GET  /api/v1/mcp/transfers/{id}        download an export (capability URL)
 PUT  /api/v1/mcp/transfers/{id}        upload a local file (capability URL)
 
 Bearer tokens must carry the MCP audience: they come from the OAuth flow a
-self-registered client runs (see oauth_provider / oauth_metadata). A missing or
-invalid token gets the RFC 9728 challenge that starts that flow.
+self-registered client runs (see oauth_provider / oauth_metadata), or are a
+personal access token (``manor_pat_…``) the user created for this resource. A
+missing or invalid token gets the RFC 9728 challenge that starts that flow.
 """
 from __future__ import annotations
 
@@ -21,6 +22,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from apps.api.deps import authenticate_token_claims
 from apps.api.mcp import (
     tools_blueprint,
+    tools_chat,
+    tools_create,
     tools_delivery,
     tools_knowledge,
     tools_work,
@@ -32,16 +35,17 @@ from apps.api.mcp.protocol import PARSE_ERROR, SUPPORTED_PROTOCOL_VERSIONS, McpD
 from apps.api.mcp.registry import ToolContext
 from apps.api.routers.oauth_metadata import MCP_PATH, protected_resource_metadata_url, public_origin
 from packages.core.database import get_db
+from packages.core.services import personal_access_tokens as pats
 from packages.core.services.auth_service import decode_token
-from packages.core.services.oauth_provider_service import MCP_TOKEN_AUDIENCE
+from packages.core.services.oauth_provider_service import MCP_SCOPE, MCP_TOKEN_AUDIENCE
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["mcp"])
 
 _TOOLS = [
-    *tools_workspace.TOOLS, *tools_knowledge.TOOLS, *tools_work.TOOLS,
-    *tools_blueprint.TOOLS, *tools_delivery.TOOLS,
+    *tools_workspace.TOOLS, *tools_create.TOOLS, *tools_chat.TOOLS, *tools_knowledge.TOOLS,
+    *tools_work.TOOLS, *tools_blueprint.TOOLS, *tools_delivery.TOOLS,
 ]
 dispatcher = McpDispatcher(_TOOLS)
 
@@ -55,6 +59,17 @@ def _challenge(request: Request, error: str | None = None) -> JSONResponse:
     return JSONResponse(
         {"error": error or "unauthorized"},
         status_code=status.HTTP_401_UNAUTHORIZED,
+        headers={"WWW-Authenticate": header},
+    )
+
+
+def _insufficient_scope(request: Request, tool: str) -> JSONResponse:
+    """MCP step-up: the client may sign in again asking for the named scope."""
+    header = (f'Bearer error="insufficient_scope", scope="{MCP_SCOPE}", '
+              f'resource_metadata="{protected_resource_metadata_url(request)}"')
+    return JSONResponse(
+        {"error": "insufficient_scope", "error_description": f"{tool} needs the '{MCP_SCOPE}' scope"},
+        status_code=status.HTTP_403_FORBIDDEN,
         headers={"WWW-Authenticate": header},
     )
 
@@ -73,17 +88,28 @@ async def _admit(request: Request, db: AsyncSession) -> tuple[dict | None, Respo
     """
     authorization = request.headers.get("authorization") or ""
     scheme, _, token = authorization.partition(" ")
+    token = token.strip()
     if scheme.lower() != "bearer" or not token:
         return None, _challenge(request)
-    claims = decode_token(token.strip(), audience=MCP_TOKEN_AUDIENCE)
+    personal = pats.is_personal_access_token(token)
+    if personal:
+        claims = await pats.token_claims(db, token, audience=MCP_TOKEN_AUDIENCE)
+    else:
+        claims = decode_token(token, audience=MCP_TOKEN_AUDIENCE)
     if not claims:
         return None, _challenge(request, "invalid_token")
     try:
-        await authenticate_token_claims(request, claims, db)
+        user = await authenticate_token_claims(request, claims, db)
     except HTTPException as e:
         if e.status_code == status.HTTP_401_UNAUTHORIZED:
             return None, _challenge(request, "invalid_token")
         return None, JSONResponse({"error": e.detail}, status_code=e.status_code)
+    if personal:
+        claims["role"] = user.role  # as an OAuth token carries it, for the internal REST token
+        if await pats.record_use(db, claims["azp"].removeprefix(pats.AUTHORIZED_PARTY_PREFIX)):
+            await db.commit()
+        else:
+            await db.rollback()
     return claims, None
 
 
@@ -109,6 +135,11 @@ async def mcp_endpoint(request: Request, db: AsyncSession = Depends(get_db)):
 
     client = (request.client.host, request.client.port) if request.client else None
     ctx = ToolContext(api=ManorApi(request.app, claims=claims, client=client), claims=claims, request=request)
+    # Refuse the whole request before anything runs, rather than half a batch.
+    for item in message if isinstance(message, list) else [message]:
+        tool = dispatcher.beyond_scope(item, ctx)
+        if tool is not None:
+            return _insufficient_scope(request, tool)
     if isinstance(message, list):
         responses = [r for r in [await dispatcher.handle(m, ctx) for m in message] if r is not None]
         reply = responses or None

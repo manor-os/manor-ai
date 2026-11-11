@@ -21,12 +21,17 @@ const group = (page: Page) => page.locator(".workspace-chat-output-panes");
 const app = (page: Page) => group(page).locator('[data-pane-id="app"]');
 const chat = (page: Page) => group(page).locator('[data-pane-id="chat"]');
 const fraction = async (page: Page) => (await app(page).boundingBox())!.width / (await group(page).boundingBox())!.width;
-const closeApp = async (page: Page) => {
-  const toggle = page.getByRole("button", { name: "Hide workspace app", exact: true });
-  if (await toggle.isVisible()) await toggle.click();
-  else await page.getByRole("button", { name: "Open chat", exact: true }).click();
+// The header switch lives over the chat; an App alone on screen carries its own way out.
+const display = async (page: Page, mode: "Chat" | "Split" | "App") => {
+  const fromApp = mode === "Chat"
+    ? page.getByRole("button", { name: "Open chat", exact: true })
+    : mode === "Split" ? page.locator(".workspace-app-view__split") : null;
+  if (fromApp && await fromApp.isVisible()) return fromApp.click();
+  await page.locator(".workspace-app-display-switch").getByRole("button", { name: mode, exact: true }).click();
 };
-const reopenApp = (page: Page) => page.getByRole("button", { name: "Open workspace app", exact: true }).click();
+const closeApp = (page: Page) => display(page, "Chat");
+// A wide window comes back side by side; a phone has room for one pane.
+const reopenApp = (page: Page) => display(page, (page.viewportSize()?.width ?? 0) > 920 ? "Split" : "App");
 const openFixture = async (page: Page) => {
   await page.goto("/e2e/fixtures/workspace-app-pane.html");
   await expect(page.getByText("Prepare and review articles", { exact: true })).toBeVisible();
@@ -49,7 +54,7 @@ for (const width of [2048, 1440, 1000, 390]) {
     await openFixture(page);
     if (width > 920) {
       await expect(chat(page)).toBeVisible();
-      await expect.poll(() => fraction(page)).toBeCloseTo(1 / 3, 2);
+      await expect.poll(() => fraction(page)).toBeCloseTo(1 / 2, 2);
       const splitter = group(page).getByRole("separator");
       await splitter.focus();
       await expect(splitter).toBeFocused();
@@ -96,6 +101,7 @@ for (const side of ["app", "chat"] as const) {
   test(`dragging ${side} to the edge fills the other pane and remembers it`, async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
     await openFixture(page);
+    await expect.poll(() => fraction(page)).toBeCloseTo(1 / 2, 2);
     await dragToFraction(page, side === "app" ? 0.97 : 0.03);
     const remaining = side === "app" ? chat(page) : app(page);
     const collapsed = side === "app" ? app(page) : chat(page);
@@ -106,13 +112,10 @@ for (const side of ["app", "chat"] as const) {
     await expect(remaining).toBeVisible();
     await page.getByRole("button", { name: "Switch Workspace", exact: true }).click();
     await expect(collapsed).toBeHidden();
-    if (side === "chat") {
-      await page.getByRole("button", { name: "Open chat", exact: true }).click();
-    }
     await reopenApp(page);
     await expect(app(page)).toBeVisible();
     await expect(chat(page)).toBeVisible();
-    await expect.poll(() => fraction(page)).toBeCloseTo(1 / 3, 2);
+    await expect.poll(() => fraction(page)).toBeCloseTo(1 / 2, 2);
   });
 }
 
@@ -122,7 +125,6 @@ test("splitter keyboard controls can fill either pane", async ({ page }) => {
   await group(page).getByRole("separator").press("Home");
   await expect(chat(page)).toBeHidden();
   expect(await fraction(page)).toBeGreaterThan(0.99);
-  await page.getByRole("button", { name: "Open chat", exact: true }).click();
   await reopenApp(page);
   await group(page).getByRole("separator").press("End");
   await expect(app(page)).toBeHidden();

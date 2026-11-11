@@ -1,8 +1,9 @@
 """Chat endpoints — SSE streaming, synchronous chat, conversations, messages, export, sharing."""
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import Any
+from typing import Any, Literal
 
 import json
 import os
@@ -21,6 +22,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.errors import CodedError
 
+from packages.core.services.decision_recommendation import (
+    project_hitl_entries,
+    project_recommendation,
+    strip_internal_rule_mentions,
+)
 from packages.core.services.workspace_app_sections import WORKSPACE_APP_ACTION_META_KEY
 from packages.core.database import get_db
 from packages.core.constants.agents import is_master_agent
@@ -30,11 +36,23 @@ from packages.core.constants.conversation import (
 )
 from packages.core.ai.runtime import (
     ChatSurface,
-    EditorCurrentDocumentTooLargeError,
     render_editor_current_document_user_context,
     runtime_parse_editor_context,
     runtime_run_chat_turn,
     runtime_stream_chat_turn,
+)
+from packages.core.ai.runtime.editor_document import (
+    EDITOR_DOCUMENT_SNAPSHOT_KEY,
+    EDITOR_DOCUMENT_UPLOAD_MAX_BYTES,
+    build_editor_document_map,
+    create_editor_document_snapshot,
+)
+from packages.core.ai.runtime.file_actions import runtime_entity_file_root
+from packages.core.ai.runtime.file_context import (
+    EDITOR_CURRENT_DOCUMENT_MAX_CHARS,
+    EDITOR_DOCUMENT_MAP_KEY,
+    editor_context_without_inline_document_content,
+    editor_current_document_content,
 )
 from packages.core.ai.runtime.surfaces import infer_chat_surface
 from packages.core.ai.runtime.output_policy import (
@@ -74,9 +92,13 @@ from packages.core.services.conversation_messages import (
 from packages.core.services.conversation_visibility import (
     is_internal_file_permission_marker,
 )
+from packages.core.services.chat_history_access import (
+    can_read_conversation,
+    is_stream_placeholder_message as _is_stream_placeholder_message,
+    visible_chat_messages as _visible_chat_messages,
+)
 from packages.core.services.web_access_denial_projection import project_web_access_denials
 from packages.core.services.conversation_records import (
-    is_channel_history_conversation,
     list_conversations,
     list_messages,
     list_messages_before,
@@ -132,7 +154,7 @@ from packages.core.services.workspace_access import (
 )
 from apps.api.chat_audio import SpeechRequest, acquire_audio_lease, authenticated_audio_scope, chat_speech_response
 from apps.api.deps import enforce_plan_resource, get_current_user
-from apps.api.streaming_concurrency import acquire_chat_stream_lease
+from apps.api.streaming_concurrency import LeasedStreamingResponse, acquire_chat_stream_lease
 from packages.core.services.runtime_run_service import (
     RuntimeRunNotFoundError,
     cancel_runtime_run_resources,
@@ -143,6 +165,7 @@ from packages.core.services.runtime_run_service import (
 from packages.core.services.runtime_human_input import (
     RuntimeHumanInputError,
     answer_runtime_human_input,
+    supersede_parked_approval_run,
 )
 from packages.core.services.response_surfaces import (
     registered_response_surface_template_action,
@@ -968,7 +991,7 @@ def _to_chat_message_response(
         refs=message.refs,
         meta=response_meta,
         pending_action=(
-            message.pending_action
+            project_recommendation(message.pending_action)
             if isinstance(message.pending_action, dict) and message.pending_action.get("kind")
             else None
         ),
@@ -1120,7 +1143,7 @@ async def _chat_streaming_response(
                 headers[_CLIENT_MESSAGE_ID_HEADER] = client_message_id
         if response_surface_event_id:
             headers[_RESPONSE_SURFACE_EVENT_ID_HEADER] = response_surface_event_id
-        return StreamingResponse(
+        return LeasedStreamingResponse(
             lease.wrap(source),
             media_type="text/event-stream",
             headers=headers,
@@ -1166,6 +1189,7 @@ def _chat_mode_blocked_tools(
             "get_workflow_run",
             "cancel_workflow_run",
             "resume_workflow_run",
+            "retry_workflow_run",
         }
         return set(runtime_registered_tool_names()) - allowed
     return {"start_workspace_flow", "run_workflow"}
@@ -1211,18 +1235,27 @@ def _message_limit_meta(message) -> dict:
     }
 
 
+def _approval_receipt_meta(approval_text: str | None) -> dict:
+    """Marks the user line an approval click saves ("Approved the requested
+    action."): the model reads it, but the card shows the choice itself, so
+    chat lists leave the line out."""
+    return {"approval_receipt": True} if approval_text else {}
+
+
 def _message_hitl_requests(message) -> list[dict] | None:
     meta = message.meta or {}
     requests = meta.get("hitl_requests")
-    return requests if isinstance(requests, list) else None
+    return project_hitl_entries(requests) if isinstance(requests, list) else None
 
 
 def _message_public_content(message) -> str:
-    return runtime_public_assistant_message_content(
+    content = runtime_public_assistant_message_content(
         message.content,
         message.meta,
         message.tool_calls,
     )
+    # Cards stored before the fix carried rule ids; never show them.
+    return strip_internal_rule_mentions(content) if getattr(message, "role", None) != "user" and content else content
 
 
 def _message_public_tool_calls(message):
@@ -1270,44 +1303,6 @@ def _parse_csv_names(value: str | list[str] | tuple[str, ...] | None) -> list[st
         return []
     names = value.split(",") if isinstance(value, str) else value
     return [str(name).strip() for name in names if str(name or "").strip()]
-
-
-def _is_stream_placeholder_message(message) -> bool:
-    meta = message.meta or {}
-    return (
-        message.role == "assistant"
-        and meta.get("stream_status") in {"running", "streaming"}
-    )
-
-
-def _visible_chat_messages(messages: list) -> list:
-    """Filter chat transcript rows without letting hidden rows consume the UI limit."""
-    visible_reversed = []
-    later_completed_origins: set[str] = set()
-    later_unscoped_completed_assistant_seen = False
-    for message in reversed(messages):
-        is_placeholder = _is_stream_placeholder_message(message)
-        if message.role == "user" and is_internal_file_permission_marker(message.content):
-            continue
-        meta = message.meta or {}
-        origin_user_message_id = str(
-            meta.get(ORIGIN_USER_MESSAGE_ID_META_KEY) or ""
-        ).strip()
-        if is_placeholder:
-            if origin_user_message_id in later_completed_origins:
-                continue
-            if (
-                not origin_user_message_id
-                and later_unscoped_completed_assistant_seen
-            ):
-                continue
-        visible_reversed.append(message)
-        if message.role == "assistant" and not is_placeholder:
-            if origin_user_message_id:
-                later_completed_origins.add(origin_user_message_id)
-            else:
-                later_unscoped_completed_assistant_seen = True
-    return list(reversed(visible_reversed))
 
 
 def _is_runtime_approval_rejected_message(content: str | None) -> bool:
@@ -1392,21 +1387,9 @@ def _terminal_runtime_approval_outcome(metadata: dict | None) -> str | None:
 
 
 async def _can_access_conversation(db: AsyncSession, conv: Conversation, user: User) -> bool:
-    if conv.entity_id != user.entity_id:
-        return False
-    # Workspace conversations are shared inside the organization/workspace.
-    # Personal Manor AI / agent DM conversations stay private to the owner.
-    if conv.workspace_id is not None:
-        return await user_can_read_workspace_id(
-            db,
-            workspace_id=conv.workspace_id,
-            entity_id=user.entity_id,
-            user_id=user.id,
-            role=user.role,
-        )
-    if is_channel_history_conversation(conv):
-        return True
-    return conv.user_id == user.id
+    return await can_read_conversation(
+        db, conv, user_id=user.id, entity_id=user.entity_id, role=user.role,
+    )
 
 
 async def _get_accessible_conversation(
@@ -1549,16 +1532,18 @@ async def answer_chat_runtime_run_input(
         )
     except RuntimeHumanInputError as exc:
         status = 404 if exc.code == "run_not_found" else 409
-        if exc.code == "answer_required":
+        if exc.code in {"answer_required", "answer_invalid"}:
             status = 422
         raise HTTPException(status, exc.detail) from exc
     # The answer is part of the conversation, not only of the checkpoint: a
     # reload must show what the person said — the option they picked and
     # any note or field they filled in.
+    from packages.core.ai.runtime.human_input import input_field_answer_text
+
     choice = str(req.choice or "").strip()
     note = (req.answer or "").strip()
     filled = "; ".join(
-        f"{key}: {value}" for key, value in (req.fields or {}).items() if str(value or "").strip()
+        f"{key}: {text}" for key, value in (req.fields or {}).items() if (text := input_field_answer_text(value))
     )
     answer_text = "\n".join(part for part in (
         choice, note if note != choice else "", filled,
@@ -1576,6 +1561,48 @@ async def answer_chat_runtime_run_input(
         await dispatch_runtime_outbox_once()
     except Exception:  # noqa: BLE001 — the outbox sweeper retries delivery
         logger.warning("Runtime outbox dispatch after human input failed run=%s", run_id, exc_info=True)
+    return await project_runtime_run_status(
+        db,
+        run,
+        poll_after_seconds=get_settings().SANDBOX_QUEUE_POLL_SECONDS,
+    )
+
+
+class RuntimeRunApprovalRequest(BaseModel):
+    request_id: str
+    decision: Literal["approve", "reject"]
+
+
+@router.post("/runs/{run_id}/approval")
+async def decide_chat_runtime_run_approval(
+    run_id: str,
+    req: RuntimeRunApprovalRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Approve or reject the approval a run is parked on; the run resumes."""
+    from packages.core.services.runtime_human_input import decide_runtime_parked_approval
+
+    await _get_owned_runtime_run(db, run_id, user)
+    try:
+        run = await decide_runtime_parked_approval(
+            db,
+            run_id=run_id,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            request_id=req.request_id,
+            approve=req.decision == "approve",
+        )
+    except RuntimeHumanInputError as exc:
+        status = {"run_not_found": 404, "not_allowed": 403}.get(exc.code, 409)
+        raise HTTPException(status, exc.detail) from exc
+    await db.commit()
+    from packages.core.tasks.runtime_tasks import dispatch_runtime_outbox_once
+
+    try:
+        await dispatch_runtime_outbox_once()
+    except Exception:  # noqa: BLE001 — the outbox sweeper retries delivery
+        logger.warning("Runtime outbox dispatch after approval failed run=%s", run_id, exc_info=True)
     return await project_runtime_run_status(
         db,
         run,
@@ -2477,6 +2504,55 @@ def _is_direct_media_generation_turn(direct_tool_calls: list[dict] | None) -> bo
     return False
 
 
+async def _pending_card_kind(
+    db: AsyncSession,
+    conversation_id: str,
+    message_id: str | None,
+) -> str | None:
+    """The kind of the still-open card a reply points at, in this conversation only."""
+    if not message_id:
+        return None
+    pending_action = (await db.execute(
+        select(Message.pending_action).where(
+            Message.id == message_id,
+            Message.conversation_id == conversation_id,
+            Message.resolved_at.is_(None),
+        )
+    )).scalar_one_or_none()
+    kind = pending_action.get("kind") if isinstance(pending_action, dict) else None
+    return str(kind) if kind else None
+
+
+# A reply must not leave the card it replaced open: the user would still see Approve on it.
+_CARD_REPLY_CLOSING = {
+    "workspace_operation_review": (
+        'reject this card with workspace_resolve_hitl (action="reject", note = their reply), then put the '
+        "changed version up for review."
+    ),
+    "human_input": 'pass their reply to this card with workspace_resolve_hitl (action="respond").',
+    "needs_input": 'pass their reply to this card with workspace_resolve_hitl (action="respond").',
+}
+_CARD_REPLY_CLOSING_DEFAULT = "act on it, and tell them the card is still open if it needs their choice."
+
+
+def _with_card_reply_context(llm_message: str | list, message_id: str, kind: str) -> str | list:
+    """Tell the agent which card this message answers; the saved message stays as typed."""
+    section = (
+        f'<pending_card_reply message_id="{message_id}" kind="{kind}">\n'
+        "The user typed this as their reply to your open card instead of choosing one of its options. "
+        "Read it as their answer to that card. If it only asks a question, answer it and leave the card "
+        f"open. Otherwise {_CARD_REPLY_CLOSING.get(kind, _CARD_REPLY_CLOSING_DEFAULT)}\n"
+        "</pending_card_reply>"
+    )
+    if isinstance(llm_message, str):
+        return f"{llm_message}\n\n{section}"
+    return [
+        {**part, "text": f"{part['text']}\n\n{section}"}
+        if index == 0 and part.get("type") == "text" else part
+        for index, part in enumerate(llm_message)
+    ]
+
+
 def _stream_llm_message_with_attachments(
     llm_base_message: str,
     attachments: FileAttachments,
@@ -2513,11 +2589,48 @@ def _stream_llm_message_with_attachments(
     return text_part
 
 
-def _parse_editor_context_request(value: str | dict | None) -> dict | None:
-    try:
-        return runtime_parse_editor_context(value)
-    except EditorCurrentDocumentTooLargeError as exc:
-        raise HTTPException(status_code=413, detail=str(exc)) from exc
+async def _parse_editor_context_request(
+    value: str | dict | None,
+    *,
+    entity_id: str,
+    document: UploadFile | None = None,
+) -> dict | None:
+    """Parse editor context, moving a document too large for the prompt to a snapshot."""
+    context = runtime_parse_editor_context(value)
+    if context is None:
+        return None
+    content = editor_current_document_content(context)
+    if document is not None:
+        raw = await document.read(EDITOR_DOCUMENT_UPLOAD_MAX_BYTES + 1)
+        if len(raw) > EDITOR_DOCUMENT_UPLOAD_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="This document is too large to edit with AI.")
+        try:
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(status_code=422, detail="The editor document must be UTF-8 text.") from exc
+    elif content is None or len(content) <= EDITOR_CURRENT_DOCUMENT_MAX_CHARS:
+        return context
+    else:
+        try:
+            size = len(content.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise HTTPException(status_code=422, detail="The editor document must be UTF-8 text.") from exc
+        if size > EDITOR_DOCUMENT_UPLOAD_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="This document is too large to edit with AI.")
+    root = runtime_entity_file_root(entity_id)
+    if not root:
+        raise HTTPException(status_code=413, detail="This document is too large to edit with AI.")
+    snapshot = await asyncio.to_thread(create_editor_document_snapshot, root, content)
+    document_map = await asyncio.to_thread(
+        build_editor_document_map,
+        content,
+        file_type=f"{context.get('file_type') or ''} {context.get('document_name') or ''}",
+    )
+    return {
+        **editor_context_without_inline_document_content(context),
+        EDITOR_DOCUMENT_SNAPSHOT_KEY: snapshot.to_context(),
+        EDITOR_DOCUMENT_MAP_KEY: document_map,
+    }
 
 
 def _chat_mode_payload_summary(payload: dict) -> str:
@@ -2877,6 +2990,8 @@ async def chat_stream(
         None, max_length=140, pattern=r"^(workflow|service|automation|action):[A-Za-z0-9_.:-]{1,128}$",
     ),
     workspace_context: bool = Form(False),
+    # The pending card this message answers, from "Something else…" on that card.
+    reply_to_message_id: str | None = Form(None, max_length=64),
     thread_ref_kind: str | None = Form(None),
     thread_ref_id: str | None = Form(None),
     document_ids: str | None = Form(None),
@@ -2888,6 +3003,9 @@ async def chat_stream(
     disable_tools: bool = Form(False),
     blocked_tools: str | None = Form(None),
     editor_context: str | None = Form(None),
+    # A document too large for the prompt, as this turn's snapshot. File parts
+    # have no size limit in the form parser; ordinary fields stop at 1 MB.
+    editor_document: UploadFile | None = File(None),
     conversation_surface: str | None = Form(None),
     ephemeral: bool = Form(False),
     files: list[UploadFile] = File(default=[]),
@@ -2903,10 +3021,13 @@ async def chat_stream(
     # A correlation receipt only: it never selects a row or authorizes a retry.
     client_message_id = client_message_id if isinstance(client_message_id, str) else None
     workspace_app_action = workspace_app_action if isinstance(workspace_app_action, str) else None
+    reply_to_message_id = reply_to_message_id if isinstance(reply_to_message_id, str) else None
     requested_conversation_surface = _parse_chat_conversation_surface(
         conversation_surface
     )
-    parsed_editor_context = _parse_editor_context_request(editor_context)
+    parsed_editor_context = await _parse_editor_context_request(
+        editor_context, entity_id=user.entity_id, document=editor_document,
+    )
     ai_edit_target: AiEditTargetIdentity | None = None
     if requested_conversation_surface is ConversationSurfaceKind.AI_EDIT:
         if not parsed_editor_context:
@@ -3362,6 +3483,9 @@ async def chat_stream(
     save_user_message = True
     resolved_conversation_id = str(conv.id)
     origin_user_message = None
+    replied_card_kind = await _pending_card_kind(db, conv.id, reply_to_message_id)
+    if replied_card_kind:
+        llm_message = _with_card_reply_context(llm_message, reply_to_message_id, replied_card_kind)
     try:
         replacement, resolved_saved_text, save_user_message, approval_runtime_metadata = await resolve_chat_approval_turn(
             db,
@@ -3404,6 +3528,7 @@ async def chat_stream(
                     attachments=attachments.attachment_refs or None,
                     meta={
                         "author_user_id": user.id,
+                        **_approval_receipt_meta(resolved_saved_text),
                         **({"client_message_id": client_message_id} if client_message_id else {}),
                     },
                 )
@@ -3440,6 +3565,7 @@ async def chat_stream(
                     attachments=attachments.attachment_refs or None,
                     meta={
                         "author_user_id": user.id,
+                        **_approval_receipt_meta(resolved_saved_text),
                         **({"client_message_id": client_message_id} if client_message_id else {}),
                     },
                 )
@@ -3533,6 +3659,7 @@ async def chat_stream(
                 ),
                 meta={
                     "author_user_id": user.id,
+                    **_approval_receipt_meta(approval_saved_text),
                     **({"client_message_id": client_message_id} if client_message_id else {}),
                     **(
                         {"response_surface_submission": parsed_response_surface_submission}
@@ -3544,6 +3671,7 @@ async def chat_stream(
                         if workspace_app_action and workspace_id
                         else {}
                     ),
+                    **({"reply_to_message_id": reply_to_message_id} if replied_card_kind else {}),
                 },
             )
         assistant_placeholder = await create_assistant_stream_placeholder(
@@ -3588,6 +3716,11 @@ async def chat_stream(
             runtime_metadata_payload["agent_subscription_id"] = (
                 response_surface_agent_subscription_id
             )
+        # A run parked on an approval must not lock the conversation: this
+        # message supersedes it (its approval closes, its card settles).
+        await supersede_parked_approval_run(
+            db, conversation_id=conv.id, entity_id=user.entity_id, user_id=user.id, message=message,
+        )
         # Persisted browser Chat always owns a resumable run. Human input,
         # cancellation and reconnect must not depend on Sandbox placement or
         # the legacy inline execution setting. Ephemeral turns return above.
@@ -3733,7 +3866,9 @@ async def chat_message(
         editor_context = body.get("editor_context", editor_context)
     if message is None:
         raise HTTPException(422, "message is required")
-    parsed_editor_context = _parse_editor_context_request(editor_context)
+    parsed_editor_context = await _parse_editor_context_request(
+        editor_context, entity_id=user.entity_id,
+    )
 
     voice_approval_action = (
         getattr(request.state, "voice_approval_action", None)
@@ -3943,7 +4078,7 @@ async def chat_message(
                 role="user",
                 content=resolved_saved_text or saved_user_base,
                 attachments=attachments.attachment_refs or None,
-                meta={"author_user_id": user.id},
+                meta={"author_user_id": user.id, **_approval_receipt_meta(resolved_saved_text)},
             )
         assistant_msg = await add_message(
             db,
@@ -3972,7 +4107,7 @@ async def chat_message(
                 role="user",
                 content=resolved_saved_text or saved_user_base,
                 attachments=attachments.attachment_refs or None,
-                meta={"author_user_id": user.id},
+                meta={"author_user_id": user.id, **_approval_receipt_meta(resolved_saved_text)},
             )
         assistant_msg = await add_message(
             db,
@@ -4056,7 +4191,7 @@ async def chat_message(
             origin_user_message = await add_message(
                 db, conv.id, role="user", content=saved_text,
                 attachments=attachments.attachment_refs or None,
-                meta={"author_user_id": user.id},
+                meta={"author_user_id": user.id, **_approval_receipt_meta(approval_saved_text)},
             )
     await db.commit()
 
@@ -4189,16 +4324,16 @@ async def create_agent_draft_conversation(
 @router.get("/conversations", response_model=list[ConversationResponse])
 async def list_my_conversations(
     workspace_id: str | None = Query(None),
+    channel: str | None = Query(None),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     from sqlalchemy import func, select as sa_select
     from packages.core.models.task import Message as MessageModel
 
-    convs = await list_conversations(db, user.entity_id, user.id)
-    # Filter by workspace if specified
-    if workspace_id and convs:
-        convs = [c for c in convs if c.workspace_id == workspace_id]
+    convs = await list_conversations(
+        db, user.entity_id, user.id, workspace_id=workspace_id, channel=channel,
+    )
     if convs:
         convs = [c for c in convs if await _can_access_conversation(db, c, user)]
     if not convs:

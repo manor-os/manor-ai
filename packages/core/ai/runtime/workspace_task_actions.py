@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 import re
 from typing import Any
 
@@ -323,6 +324,27 @@ async def _resolve_owner_binding(
     return None, None, sorted(by_key)
 
 
+async def _owners_named_in_text(
+    db: Any, *, entity_id: str, workspace_id: str, text: str,
+) -> dict[str, str]:
+    """The Workspace's Agents a Task's own text names, as {name: service_key}."""
+    from packages.core.models.workspace import Agent, AgentSubscription
+
+    rows = (await db.execute(
+        select(Agent.name, AgentSubscription.service_key)
+        .join(Agent, Agent.id == AgentSubscription.agent_id)
+        .where(
+            AgentSubscription.entity_id == entity_id,
+            AgentSubscription.workspace_id == workspace_id,
+            AgentSubscription.status == "active",
+        )
+    )).all()
+    return {
+        str(name): str(key) for name, key in rows
+        if name and key and len(str(name).strip()) > 1 and str(name).strip() in text
+    }
+
+
 def _missing_service_keys(requested: list[str], available: list[str]) -> list[str]:
     available_set = set(available)
     return [key for key in requested if key not in available_set]
@@ -455,16 +477,24 @@ async def runtime_workspace_create_task_action(
         return _dumps({"error": "workspace_id is required; use this tool only inside workspace chat"})
 
     try:
-        from packages.core.ai.runtime.execution_origin import runtime_origin_task_id
+        from packages.core.ai.runtime.execution_origin import runtime_origin_task_id, runtime_tool_is_chat_turn
         from packages.core.database import async_session
         from packages.core.services import task_service
         from packages.core.services.workspace_service import record_activity
 
-        start_requested = _truthy(
+        explicit_start = (
             raw_params.get("start")
             if raw_params.get("start") is not None
             else raw_params.get("run_now") or raw_params.get("execute")
         )
+        # Work asked for in Chat runs as a Task the Workspace Agent assigns. It
+        # waits only when the user said so, or when it is for a named person.
+        start_by_default = (
+            all(raw_params.get(key) is None for key in ("start", "run_now", "execute"))
+            and not raw_params.get("assignee_id")
+            and runtime_tool_is_chat_turn(raw_params, entity_id=entity_id)
+        )
+        start_requested = start_by_default or _truthy(explicit_start)
         task_type = str(raw_params.get("task_type") or TaskType.GENERAL.value)
         requested_owner = str(
             raw_params.get("owner_service_key") or raw_params.get("service_key") or raw_params.get("agent_type") or ""
@@ -541,6 +571,25 @@ async def runtime_workspace_create_task_action(
                         "Choose one of available_service_keys or ask the user to clarify."
                     ),
                 })
+            if not owner_service_key and len(available_service_keys) > 1 and not raw_params.get("agent_id"):
+                named = await _owners_named_in_text(
+                    db, entity_id=entity_id, workspace_id=workspace_id,
+                    text="\n".join(str(raw_params.get(key) or "") for key in (
+                        "title", "description", "runtime_instructions",
+                    )),
+                )
+                if len(set(named.values())) == 1:
+                    # Live: "由成本分析员执行" in the instructions and no owner, so the
+                    # Workspace Agent ran every stage the user had given to its Agents.
+                    return _dumps({
+                        "error": "owner_named_not_set",
+                        "named_owners": named,
+                        "message": (
+                            "This Task names " + ", ".join(f"{n} ({k})" for n, k in named.items())
+                            + " but sets no owner_service_key, so that Agent would not run it. Pass "
+                            "owner_service_key for the Agent that owns it. Nothing was created."
+                        ),
+                    })
             missing_delegate_keys = _missing_service_keys(delegate_service_keys, available_service_keys)
             if missing_delegate_keys:
                 return _dumps({
@@ -554,6 +603,28 @@ async def runtime_workspace_create_task_action(
                 })
             if owner_service_key and not delegate_service_keys:
                 delegate_service_keys = [owner_service_key]
+            from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
+            from packages.core.services.workflow_project_service import open_run_project_marks
+
+            flow_run_id = runtime_tool_call_context_from_kwargs(raw_params).workflow_run_id
+            if flow_run_id:
+                # Staging 2026-11-03: the article Flow's editor handed its revision to the writer as a
+                # Task, which nobody ran; the Flow's own next step was already that revision.
+                own_projects = await open_run_project_marks(
+                    db, entity_id=entity_id, workspace_id=workspace_id, run_id=flow_run_id,
+                )
+                task_text = "\n".join(str(raw_params.get(key) or "") for key in (
+                    "title", "description", "runtime_instructions",
+                ))
+                if any(mark in task_text for mark in own_projects):
+                    return _dumps({
+                        "error": "flow_owns_this_work",
+                        "message": (
+                            "This Workflow run already owns this project, and its later steps do the next work on it. "
+                            "Finish this step and return your result; do not hand the work on as a Task. "
+                            "Nothing was created."
+                        ),
+                    })
 
             runtime_context = _merge_runtime_context(
                 {},
@@ -673,10 +744,12 @@ async def runtime_workspace_create_task_action(
                 execution is not None
                 and execution.runtime_kind is TaskRuntimeKind.MANUAL
             ):
-                return _dumps({
-                    "error": "task_executor_unavailable",
-                    "message": "Assign an active workspace Agent before starting this task.",
-                })
+                if not start_by_default:
+                    return _dumps({
+                        "error": "task_executor_unavailable",
+                        "message": "Assign an active workspace Agent before starting this task.",
+                    })
+                execution = None  # Nothing can run it yet: keep the request as a pending Task.
             # Foreground interactive and human-decision adapters share the
             # factory/lifecycle boundary but are not background dispatches.
             dispatch_requested = bool(
@@ -777,6 +850,12 @@ async def runtime_workspace_create_task_action(
             "owner_resolution": {
                 "owner_service_key": task.owner_service_key,
                 "owner_subscription_id": task.owner_subscription_id,
+                **({"unowned": (
+                    "No owner_service_key was given, so the Workspace Agent runs this Task itself. "
+                    "If the user named an Agent for this or later stages, pass its owner_service_key "
+                    "when creating them."
+                ), "available_service_keys": available_service_keys}
+                    if not task.owner_service_key and len(available_service_keys or []) > 1 else {}),
             },
             "goal_links": {
                 "goal_ids": (task.details or {}).get("goal_ids") or [],
@@ -786,6 +865,12 @@ async def runtime_workspace_create_task_action(
     except Exception as exc:  # noqa: BLE001
         logger.exception("workspace_create_task failed")
         return _dumps({"error": f"failed to create workspace task: {exc}"})
+
+
+_UPDATE_TASK_RUNTIME_FIELDS = (
+    "runtime_instructions", "required_refs", "rules", "knowledge_query",
+    "required_capabilities", "start", "depends_on_task_ids",
+)
 
 
 async def runtime_workspace_update_task_runtime_action(
@@ -798,11 +883,26 @@ async def runtime_workspace_update_task_runtime_action(
     params: dict[str, Any] | None = None,
 ) -> str:
     raw_params = dict(params or {})
+    # The same alias create_task takes: "instructions" was dropped here while
+    # the call reported success, so a user's correction never reached the Task.
+    if "instructions" in raw_params and not str(raw_params.get("runtime_instructions") or "").strip():
+        raw_params["runtime_instructions"] = raw_params["instructions"]
     task_id = str(raw_params.get("task_id") or "").strip()
     if not task_id:
         return _dumps({"error": "task_id is required"})
     if not workspace_id:
         return _dumps({"error": "workspace_id is required; use this tool only inside workspace chat"})
+    if not any(raw_params.get(field) for field in _UPDATE_TASK_RUNTIME_FIELDS):
+        # A call whose every field is unknown changed nothing; saying "updated"
+        # would let a correction vanish.
+        return _dumps({
+            "error": "nothing_to_update",
+            "message": "None of these fields was given: " + ", ".join(_UPDATE_TASK_RUNTIME_FIELDS) + ".",
+            "unknown_fields": sorted(
+                key for key in raw_params
+                if key not in {"task_id", *_UPDATE_TASK_RUNTIME_FIELDS} and not key.startswith("_")
+            ),
+        })
 
     try:
         from packages.core.database import async_session
@@ -842,9 +942,52 @@ async def runtime_workspace_update_task_runtime_action(
                 user_id=user_id or None,
             )
             details["runtime_context"] = runtime
+            change = str(raw_params.get("runtime_instructions") or "").strip()
+            from packages.core.services.task_state_machine import TERMINAL_STATUSES
+
+            if change and task.status in TERMINAL_STATUSES:
+                # A finished Task never runs again: recording the change here
+                # would report it applied while the deliverable keeps the old values.
+                return _dumps({
+                    "error": "task_already_finished",
+                    "task": _workspace_task_to_dict(task),
+                    "message": (
+                        f"This Task is {task.status} and will not run again, so the change cannot "
+                        "reach it. To apply it, create a follow-up Task with create_task that revises "
+                        "this Task's deliverables with the change (same owner_service_key, start=true), "
+                        "and tell the user. Nothing was changed."
+                    ),
+                })
+            if change:
+                # A change after creation outranks the description the Task
+                # was created with (task_brief shows it first).
+                details["changes"] = [*(details.get("changes") or [])[-19:], {
+                    "at": datetime.now(timezone.utc).isoformat(), "text": change[:4000],
+                }]
+
+            linked = _as_clean_list(raw_params.get("depends_on_task_ids"))
+            waiting_on_predecessors = False
+            if linked:
+                # A stage created without its predecessors is linked now: the
+                # dependency watcher releases it when they complete, or it
+                # starts here if they already have.
+                if task.status != TaskStatus.PENDING:
+                    return _dumps({"error": "task_not_pending",
+                                   "message": "Only a pending Task can wait for predecessor Tasks."})
+                known = set((await db.execute(select(Task.id).where(
+                    Task.id.in_(linked), Task.entity_id == entity_id, Task.workspace_id == workspace_id,
+                ))).scalars().all())
+                unknown = [item for item in linked if item not in known or item == task.id]
+                if unknown:
+                    return _dumps({"error": "unknown_predecessor_tasks", "task_ids": unknown})
+                details["depends_on_task_ids"] = linked
+                from packages.core.services.task_dependencies import details_with_dependency_state
+
+                details.update(await details_with_dependency_state(db, task, details))
+                waiting_on_predecessors = details.get("dependency_status") not in (None, "completed")
 
             execution = manual = None
-            if _truthy(raw_params.get("start")):
+            if (_truthy(raw_params.get("start")) or linked) and not waiting_on_predecessors:
                 execution, refusal = await resolve_task_start(db, task, details)
                 if refusal:
                     return _dumps(refusal)
@@ -907,12 +1050,38 @@ async def runtime_workspace_update_task_runtime_action(
                 details={"task_id": task_id, "runtime_context": runtime},
                 user_id=user_id or None,
             )
+            finished_predecessors: list[dict[str, str]] = []
+            if change and (predecessor_ids := _as_clean_list(details.get("depends_on_task_ids"))):
+                finished_predecessors = [
+                    {"id": row.id, "title": row.title} for row in (await db.execute(
+                        select(Task).where(
+                            Task.id.in_(predecessor_ids), Task.entity_id == entity_id,
+                            Task.status.in_(list(TERMINAL_STATUSES)),
+                        )
+                    )).scalars().all()
+                ]
             await db.commit()
             await db.refresh(updated)
 
         payload = {"updated": True, "started": started, "task": _workspace_task_to_dict(updated)}
+        if finished_predecessors:
+            # Live: the change reached stages 2 and 3, while stage 1 had already
+            # finished and its deliverable kept the replaced budget.
+            payload["finished_predecessors"] = finished_predecessors
+            payload["finished_predecessors_note"] = (
+                "These earlier Tasks already finished and will not see this change. If it affects "
+                "their deliverables, create a follow-up Task that revises them."
+            )
         if started:
             payload["next"] = STARTED_NEXT
+        elif waiting_on_predecessors:
+            payload["next"] = "It waits for its predecessor Tasks and starts when they complete."
+        elif change and updated.status == TaskStatus.IN_PROGRESS:
+            payload["next"] = (
+                "This Task is already running: it receives this change at its next step. Check its "
+                "output when it completes; if a step it finished earlier used what this change "
+                "replaces, it should have redone that step."
+            )
         return _dumps(payload)
     except Exception as exc:  # noqa: BLE001
         logger.exception("workspace_update_task_runtime failed")

@@ -207,6 +207,24 @@ async def test_dynamic_handler_dict_is_json_without_changing_execution_boundary(
 
 
 @pytest.mark.asyncio
+async def test_a_dynamic_handler_gate_knows_its_run_and_the_handler_does_not(monkeypatch):
+    """Staging 2026-11-05: without the run id the workflow gate refused every host-armed tool."""
+    from packages.core.ai.runtime import tool_execution
+
+    context = {"_workflow_run_id_from_context": "run-1"}
+    prepare = AsyncMock(side_effect=lambda **kwargs: RuntimePreparedToolExecution(arguments=dict(kwargs["arguments"])))
+    monkeypatch.setattr(tool_execution, "runtime_prepare_tool_execution", prepare)
+    seen: list[dict] = []
+    await runtime_execute_scoped_dynamic_tool_handler(
+        tool_name="test_tool", arguments={"missing": "a file"},
+        handler=lambda arguments: seen.append(arguments) or "ok",
+        entity_id="entity-1", user_id="user-1", gate_context=context,
+    )
+    assert prepare.await_args.kwargs["arguments"] == {"missing": "a file", **context}
+    assert seen == [{"missing": "a file"}]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("result", [
     RuntimePreflightValidationError('{"error":"invalid_request"}'),
     RuntimeNoEffectToolResult.document_target_exists(),

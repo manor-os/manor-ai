@@ -12,7 +12,6 @@ from celery import Task
 from celery.exceptions import Ignore, Retry
 from celery.result import EagerResult
 
-from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.constants.task import TaskStatus
 from packages.core.constants.execution import (
     ScheduledChildAdmissionStatus,
@@ -839,7 +838,7 @@ def _compact_error(error_msg: str, *, limit: int = 500) -> str:
     return compact[: limit - 1].rstrip() + "..."
 
 
-async def _post_strategist_failure_card(
+async def _handle_strategist_terminal_failure(
     *,
     workspace_id: str,
     trigger,
@@ -847,13 +846,34 @@ async def _post_strategist_failure_card(
     run_id: str | None = None,
     job_id_str: str | None = None,
 ) -> None:
-    """Surface terminal Strategist failures where the operator already works."""
+    """Settle a review that ran out of retries without handing it to a person.
+
+    Only running out of credit is something the operator must act on, so only
+    that is said in chat, as plain information. Any other failure is the
+    platform's: ops is told, and the next review (its schedule, or the next
+    event) runs as usual. No Retry card is posted.
+    """
+    reason = _compact_error(error_msg)
+    if not str(error_msg or "").startswith("credits_exhausted"):
+        from packages.core.services.platform_faults import report_platform_fault
+
+        await report_platform_fault(
+            target=f"workspace:{workspace_id}",
+            code="strategist_review_failed",
+            summary=f"A Strategist review failed after its retries: {reason}",
+            context={
+                "trigger": getattr(trigger, "label", trigger),
+                "run_id": run_id,
+                "job_id": job_id_str,
+            },
+        )
+        return
+
     from sqlalchemy import select
     from packages.core.database import create_worker_session
     from packages.core.models.workspace import Workspace
     from packages.core.workspace_chat import service as chat_service
 
-    reason = _compact_error(error_msg)
     session_factory = create_worker_session()
     async with session_factory() as db:
         workspace = (await db.execute(
@@ -864,31 +884,18 @@ async def _post_strategist_failure_card(
         )).scalar_one_or_none()
         if not workspace:
             return
-
-        body = (
-            "The workspace review could not be completed.\n\n"
-            f"Reason: {reason}\n\n"
-            "Fix the issue if needed, then retry the review from here."
-        )
         await chat_service.post_message(
             db,
             entity_id=workspace.entity_id,
             workspace_id=workspace.id,
-            body=body,
+            body=(
+                "This workspace review was skipped because the account is out of "
+                "credit. Reviews continue on their usual schedule once credit is "
+                "added."
+            ),
             message_kind="system",
             author_kind="system",
             refs=[{"type": "workspace", "id": workspace.id}],
-            pending_action={
-                "kind": PendingActionKind.RETRY_STRATEGIST_REVIEW.value,
-                "workspace_id": workspace.id,
-                # Display/audit only — the retry re-enqueues as
-                # HUMAN_REQUESTED because a person clicked the button.
-                "trigger": getattr(trigger, "label", trigger),
-                "run_id": run_id,
-                "job_id": job_id_str,
-                "error": reason,
-                "options": ["retry"],
-            },
         )
         await db.commit()
 
@@ -1618,6 +1625,14 @@ def run_entity_chat_extraction_sweep(self):
         raise self.retry(exc=exc, countdown=900)
 
 
+@celery_app.task(name="memory.migrate_layers", max_retries=0, soft_time_limit=900, time_limit=960)
+def migrate_memory_layers():
+    """Move earlier memory (review candidates, summaries, old files) into the layer files."""
+    from packages.core.memory.migrate_layers import migrate_pending_entities
+
+    return _run_async(migrate_pending_entities())
+
+
 @celery_app.task(bind=True, max_retries=2, name="learning.apply_candidate")
 def apply_learning_candidate_async(
     self,
@@ -1771,7 +1786,7 @@ def run_strategist_review(
             )
 
     async def _notify_failure(error_msg: str):
-        await _post_strategist_failure_card(
+        await _handle_strategist_terminal_failure(
             workspace_id=workspace_id,
             trigger=review_trigger,
             error_msg=error_msg,
@@ -1964,6 +1979,21 @@ def run_workspace_stat_collection(
         job_id_str=job_id_str,
         countdown_on_retry=300,
     )
+
+
+async def _terminal_task_result(session_factory, task_id: str) -> dict[str, Any] | None:
+    """The scheduler settlement result of a Task that has already ended."""
+
+    from sqlalchemy import select
+
+    from packages.core.models.task import Task
+    from packages.core.services.task_state_machine import TERMINAL_STATUSES
+
+    async with session_factory() as db:
+        task = (await db.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
+        if task is None or task.status not in TERMINAL_STATUSES:
+            return None
+        return _task_terminal_result(task)
 
 
 def _task_terminal_result(task) -> dict[str, Any]:
@@ -2994,6 +3024,22 @@ def run_agent_task(
                 or result.get("recovery_suspended")
             ):
                 return result
+            if scheduled_run_id and result is None:
+                # A Task that has ended never runs again, so settling its
+                # occurrence needs no execution lease. Without this a terminal
+                # delivery that meets a lease not yet released (e.g. a person
+                # cancels a BLOCKED Task) is dropped and the run stays open.
+                terminal = _run_async(_terminal_task_result(session_factory, task_id))
+                if terminal is not None:
+                    _update_job_run_status(
+                        session_factory,
+                        task_id,
+                        terminal,
+                        scheduled_run_id=scheduled_run_id,
+                        scheduled_job_id=scheduled_job_id,
+                        celery_task=self,
+                    )
+                    return {**terminal, "settled_without_execution_claim": True}
             if claim_recheck:
                 return {
                     "task_id": task_id,
@@ -3688,8 +3734,11 @@ def _scheduled_agent_result_projection(*, task, job, result: dict):
         or has_initiative_task_marker(getattr(task, "details", None))
     ):
         return None
+    from packages.core.services.scheduler_service import scheduled_job_delivery_mode
+
+    # Local eval 2026-11-03: a Monday reminder completed and reached nobody.
     delivery_mode = str(
-        job.default_delivery_mode
+        scheduled_job_delivery_mode(job)
         or (task.details or {}).get("default_delivery_mode")
         or ""
     ).strip()
@@ -5052,16 +5101,24 @@ def workflow_terminal_effect_sweep():
 async def _recover_expired_workflow_claims(*, limit: int = 25) -> dict[str, int]:
     """Resume or settle runs whose execution owner disappeared.
 
-    A run resumes from its durable step boundary when its interrupted nodes
+    That is an expired lease, or a node still marked running with no lease
+    at all. A run resumes from its durable step boundary when its interrupted nodes
     are replay-safe and fails with an explicit reason when they are not; the
     decision lives in ``WorkflowRunner._recover_lost_execution_claim``.
     """
-    from sqlalchemy import func, select
+    from sqlalchemy import func, or_, select
 
     from packages.core.ai.workflow_runner import WorkflowRunner
     from packages.core.database import create_worker_session
     from packages.core.models.execution_claim import RuntimeExecutionClaim
     from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workflow_claim_recovery import (
+        MANUAL_STEP_EXECUTION_DRIVER,
+        WORKFLOW_EXECUTION_DRIVER_TRIGGER_FIELD,
+    )
+    from packages.core.services.workflow_run_execution_claim import (
+        WORKFLOW_RUN_EXECUTION_LEASE_TTL_SECONDS,
+    )
 
     factory = create_worker_session()
     async with factory() as db:
@@ -5080,6 +5137,32 @@ async def _recover_expired_workflow_claims(*, limit: int = 25) -> dict[str, int]
             .order_by(RuntimeExecutionClaim.expires_at, WorkflowRun.id)
             .limit(max(1, min(int(limit), 100)))
         )).all())
+        # A running node with no lease at all: its owner exited without
+        # settling the run (a crash in its own failure handling) and the clean
+        # exit released the lease, so no expiry will ever surface it. A run a
+        # person steps through waits for their next step instead.
+        grace = timedelta(seconds=WORKFLOW_RUN_EXECUTION_LEASE_TTL_SECONDS)
+        driver = WorkflowRun.trigger_data[WORKFLOW_EXECUTION_DRIVER_TRIGGER_FIELD].astext
+        candidates += [
+            (run_id, None)
+            for run_id, in (await db.execute(
+                select(WorkflowRun.id)
+                .outerjoin(
+                    RuntimeExecutionClaim,
+                    RuntimeExecutionClaim.claim_key == "workflow-run:" + WorkflowRun.id,
+                )
+                .where(
+                    WorkflowRun.status == "running",
+                    RuntimeExecutionClaim.claim_key.is_(None),
+                    WorkflowRun.execution_trace[-1]["status"].astext == "running",
+                    or_(driver.is_(None), driver != MANUAL_STEP_EXECUTION_DRIVER),
+                    func.coalesce(WorkflowRun.updated_at, WorkflowRun.created_at)
+                    <= func.now() - grace,
+                )
+                .order_by(WorkflowRun.id)
+                .limit(max(1, min(int(limit), 100)))
+            )).all()
+        ]
     settled = 0
     resumed = 0
     for run_id, expired_token in candidates:
@@ -5087,7 +5170,7 @@ async def _recover_expired_workflow_claims(*, limit: int = 25) -> dict[str, int]
             status = await WorkflowRunner._recover_lost_execution_claim(
                 run_id,
                 session_factory=factory,
-                expired_claim_token=expired_token,
+                **({"expired_claim_token": expired_token} if expired_token else {}),
             )
             settled += int(status in {"failed", "cancelled"})
             resumed += int(status in {"pending", "running"})
@@ -5625,6 +5708,64 @@ def send_agent_greetings(self, entity_id: str, workspace_id: str,
         raise self.retry(exc=exc, countdown=10)
 
 
+# A storage outage costs no credits to wait out, because the task checks storage
+# before calling the model. 30 s doubling five times covers about 15 minutes.
+_STARTER_DOCUMENT_STORAGE_RETRIES = 5
+
+
+async def _record_starter_document_failure(
+    *,
+    entity_id: str,
+    workspace_id: str,
+    group_id: str,
+    group_name: str,
+    starter_task_key: str | None,
+    error: Exception,
+) -> None:
+    """Retries are spent: tell ops and release the group's reserved starter status.
+
+    While the status stays ``scheduled`` the Strategist treats the document as in
+    flight and will not propose it, so ``failed`` lets normal planning pick it up.
+    """
+    from sqlalchemy import select
+
+    from packages.core.database import create_worker_session
+    from packages.core.models.document import DocumentGroup
+    from packages.core.services.knowledge_starter import with_starter_document_settings
+    from packages.core.services.platform_faults import report_platform_fault
+
+    try:
+        async with create_worker_session()() as db:
+            group = (await db.execute(
+                select(DocumentGroup).where(
+                    DocumentGroup.id == group_id,
+                    DocumentGroup.entity_id == entity_id,
+                )
+            )).scalar_one_or_none()
+            starter = (group.settings or {}).get("starter_document") if group is not None else None
+            if group is not None and (starter or {}).get("status") != "ready":
+                settings = with_starter_document_settings(
+                    group.settings,
+                    group_name=group.name or group_name,
+                    status="failed",
+                )
+                if starter_task_key:
+                    settings["starter_document"]["task_key"] = starter_task_key
+                group.settings = settings
+                await db.commit()
+    except Exception:
+        logger.exception("Could not record starter document failure for group %s", group_id)
+    await report_platform_fault(
+        target=f"workspace:{workspace_id}",
+        code="knowledge_starter_document_failed",
+        summary=(
+            "A Knowledge starter document was not created after its retries: "
+            f"{type(error).__name__}: {error}"
+        ),
+        context={"entity_id": entity_id, "group_id": group_id, "group_name": group_name},
+    )
+
+
 @celery_app.task(bind=True, max_retries=2)
 def generate_knowledge_content(
     self, entity_id: str, workspace_id: str,
@@ -5632,8 +5773,9 @@ def generate_knowledge_content(
     workspace_name: str, workspace_kind: str, primary_work: str,
     starter_task_key: str | None = None,
     source_excerpt: str | None = None,
+    outline: list[str] | None = None,
 ):
-    """Generate starter document for an approved knowledge base."""
+    """Generate starter document for an approved knowledge base, covering ``outline`` when given."""
     logger.info("Generating knowledge content: group=%s name=%s", group_id, group_name)
 
     async def _generate():
@@ -5642,9 +5784,13 @@ def generate_knowledge_content(
         )
         from packages.core.database import create_worker_session
         from packages.core.models.document import DocumentGroup, DocumentGroupMember
-        from packages.core.services.knowledge_starter import with_starter_document_settings
+        from packages.core.services.knowledge_starter import (
+            require_markdown_storage,
+            with_starter_document_settings,
+        )
         from sqlalchemy import select
 
+        require_markdown_storage()
         completion = await runtime_execute_knowledge_starter_document_completion(
             entity_id=entity_id,
             workspace_id=workspace_id,
@@ -5654,6 +5800,7 @@ def generate_knowledge_content(
             workspace_kind=workspace_kind,
             primary_work=primary_work,
             source_excerpt=source_excerpt,
+            **({"outline": outline} if outline else {}),
         )
         content = completion.content
 
@@ -5712,5 +5859,20 @@ def generate_knowledge_content(
     except CreditExhaustedError:
         logger.warning("Knowledge gen for group %s skipped: credits exhausted", group_id)
     except Exception as exc:
+        from packages.core.services.entity_fs import EntityFilesystemError
+
         logger.error("Knowledge gen failed for group %s: %s", group_id, exc)
-        raise self.retry(exc=exc, countdown=30)
+        storage_fault = isinstance(exc, (EntityFilesystemError, OSError))
+        retry_limit = _STARTER_DOCUMENT_STORAGE_RETRIES if storage_fault else self.max_retries
+        if self.request.retries < retry_limit:
+            countdown = 30 * (2 ** self.request.retries) if storage_fault else 30
+            raise self.retry(exc=exc, countdown=countdown, max_retries=retry_limit)
+        _run_async(_record_starter_document_failure(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            group_id=group_id,
+            group_name=group_name,
+            starter_task_key=starter_task_key,
+            error=exc,
+        ))
+        raise

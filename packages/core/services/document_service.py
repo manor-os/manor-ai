@@ -38,6 +38,10 @@ from packages.core.services.tool_cache_version import bump_tool_cache_version
 
 logger = logging.getLogger(__name__)
 
+# Documents an agent or tool produced. They are finished files, unlike a
+# placeholder that an upload or a background job fills in later.
+GENERATED_DOCUMENT_SOURCES = ("ai_generated", "sandbox", "bash", "agent", "elevenlabs", "mcp")
+
 
 async def _invalidate_document_preview_versions(
     entity_root: str,
@@ -454,6 +458,7 @@ def _document_scope_conditions(
     include_generated_assets: bool = True,
     media_kinds: Sequence[str] | None = None,
     exclude_work_artifacts: bool = False,
+    include_workspace_chat_uploads: bool = True,
 ) -> list:
     """Shared WHERE clauses for the visible-document scope.
 
@@ -464,7 +469,7 @@ def _document_scope_conditions(
     """
     workspace_values = _document_filter_values(workspace_id, workspace_ids)
     visible_path = _visible_fs_path_clause()
-    if workspace_values:
+    if workspace_values and include_workspace_chat_uploads:
         visible_path = or_(
             visible_path,
             _workspace_chat_upload_clause(entity_id, workspace_values),
@@ -476,7 +481,7 @@ def _document_scope_conditions(
     ]
     if not include_generated_assets:
         generated_media = and_(
-            Document.source.in_(("ai_generated", "sandbox", "bash", "agent", "elevenlabs", "mcp")),
+            Document.source.in_(GENERATED_DOCUMENT_SOURCES),
             or_(
                 Document.mime_type.ilike("image/%"),
                 Document.mime_type.ilike("video/%"),
@@ -639,7 +644,9 @@ async def storage_usage(
     name_search: str | None = None,
     folder_ids: set[str] | None = None,
     workspace_id: str | None = None,
+    workspace_ids: Sequence[str] | None = None,
     include_generated_assets: bool = True,
+    include_workspace_chat_uploads: bool = True,
 ) -> tuple[int, int]:
     """Total ``(size_bytes, file_count)`` for visible documents in scope.
 
@@ -654,7 +661,9 @@ async def storage_usage(
         entity_id,
         name_search=name_search,
         workspace_id=workspace_id,
+        workspace_ids=workspace_ids,
         include_generated_assets=include_generated_assets,
+        include_workspace_chat_uploads=include_workspace_chat_uploads,
     )
     q = select(
         func.coalesce(func.sum(Document.file_size), 0),
@@ -666,6 +675,40 @@ async def storage_usage(
         q = q.where(Document.folder_id.in_(folder_ids))
     row = (await db.execute(q)).one()
     return int(row[0] or 0), int(row[1] or 0)
+
+
+async def storage_usage_by_workspace(
+    db: AsyncSession, entity_id: str,
+) -> tuple[list[tuple[str, str, int]], int]:
+    """Bytes each live Workspace holds, and the bytes all of them hold together.
+
+    Counts what the plan's storage limit counts, so a Workspace chat upload
+    outside the knowledge base is left out. A document shared with two
+    Workspaces counts in each of them but once in the combined total.
+    Returns ``([(workspace_id, name, bytes), ...] largest first, combined)``.
+    """
+    from packages.core.models.workspace import Workspace
+
+    workspaces = (await db.execute(
+        select(Workspace.id, Workspace.name).where(
+            Workspace.entity_id == entity_id, Workspace.deleted_at.is_(None),
+        )
+    )).all()
+    if not workspaces:
+        return [], 0
+    sizes = []
+    for workspace in workspaces:
+        size, _count = await storage_usage(
+            db, entity_id, workspace_id=workspace.id, include_workspace_chat_uploads=False,
+        )
+        if size:
+            sizes.append((workspace.id, workspace.name, size))
+    if not sizes:
+        return [], 0
+    combined, _count = await storage_usage(
+        db, entity_id, workspace_ids=[w.id for w in workspaces], include_workspace_chat_uploads=False,
+    )
+    return sorted(sizes, key=lambda item: -item[2]), combined
 
 
 async def get_document(
@@ -867,6 +910,16 @@ async def _folder_default_visibility(
     return "private"
 
 
+def _inline_text_in_metadata(metadata: dict | None) -> str | None:
+    """Return the document text a metadata dict holds in place of a stored file."""
+    meta = metadata if isinstance(metadata, dict) else {}
+    for key in ("content", "content_text"):
+        value = meta.get(key)
+        if isinstance(value, str):
+            return value
+    return None
+
+
 async def create_document(
     db: AsyncSession, entity_id: str, *,
     name: str, fs_path: str | None = None, file_url: str | None = None,
@@ -891,6 +944,12 @@ async def create_document(
     # the new-row branch of upsert_document_by_fs_path), so this is the single
     # chokepoint that enforces the storage limit across ALL add paths — uploads,
     # AI drafts, URL/Drive imports, and agent/sandbox-generated files alike.
+    # It also refuses a generated document that arrives without its content,
+    # because nothing fills that row in later and agents cannot read it.
+    if source in GENERATED_DOCUMENT_SOURCES and not (
+        fs_path or file_url or _inline_text_in_metadata(metadata)
+    ):
+        raise ValueError(f"Generated document {name!r} has no stored content")
     if not skip_storage_check:
         await _enforce_storage_limit(db, entity_id)
     doc = Document(
@@ -1370,12 +1429,7 @@ async def add_document_to_group(
 
 def _metadata_text_content(doc: Document) -> str | None:
     """Return legacy inline document text stored before FS projection existed."""
-    meta = doc.metadata_ if isinstance(doc.metadata_, dict) else {}
-    for key in ("content", "content_text"):
-        value = meta.get(key)
-        if isinstance(value, str):
-            return value
-    return None
+    return _inline_text_in_metadata(doc.metadata_)
 
 
 class _EditorHtmlToDocgenText(HTMLParser):

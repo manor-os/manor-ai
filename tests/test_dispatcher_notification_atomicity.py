@@ -933,3 +933,47 @@ async def test_chat_realtime_queue_waits_for_outer_commit_and_tracks_savepoints(
         entity_id=entity_id,
         workspace_id=workspace_id,
     ) == 1
+
+
+@pytest.mark.asyncio
+async def test_workspace_chat_writers_announce_a_message_only_once_it_commits(
+    db_session,
+    monkeypatch,
+):
+    """A client refetching on the event must find the message.
+
+    A Workflow worker writes an approval card long before it commits the run;
+    an event sent at write time made the open Chat refetch too early, and the
+    card stayed hidden until the page was reloaded.
+    """
+    from packages.core.services.conversation_messages import add_message
+
+    entity_id = generate_ulid()
+    workspace_id = generate_ulid()
+    db_session.add(Workspace(
+        id=workspace_id, entity_id=entity_id, name="Commit-time chat events",
+        status="active", operating_model={}, settings={},
+    ))
+    await db_session.commit()
+    publish = AsyncMock()
+    monkeypatch.setattr(chat_service, "_publish_workspace_chat_event", publish)
+
+    posted = await chat_service.post_message(
+        db_session, entity_id=entity_id, workspace_id=workspace_id, body="Run started",
+    )
+    card = await add_message(
+        db_session, posted.conversation_id, role="system", content="Approve the draft",
+        message_kind="hitl_request", pending_action={"kind": "workflow_approval", "options": ["approve"]},
+    )
+    await asyncio.sleep(0)
+    assert publish.await_count == 0
+    await db_session.commit()
+    await asyncio.sleep(0)
+    assert [call.args[1]["message_id"] for call in publish.await_args_list] == [posted.id, card.id]
+    assert publish.await_args_list[1].args[1]["has_pending_action"] is True
+
+    publish.reset_mock()
+    await add_message(db_session, posted.conversation_id, role="system", content="Never saved")
+    await db_session.rollback()
+    await asyncio.sleep(0)
+    assert publish.await_count == 0

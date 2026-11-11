@@ -46,6 +46,10 @@ def _normalize(value: Any, *, parent_key: str = "") -> Any:
         # where it is the portable graph key and must be compared.
         if parent_key != "steps":
             drop_keys.add("id")
+        elif value.get("type") in ("end", "stop") and value.get("next") == []:
+            # Older terminal steps omit next; the runtime treats both forms
+            # as having no outgoing edges.
+            drop_keys.add("next")
         normalized = {
             key: _normalize(item, parent_key=key)
             for key, item in sorted(value.items())

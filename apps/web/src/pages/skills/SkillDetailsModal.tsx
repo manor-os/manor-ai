@@ -185,8 +185,6 @@ export function SkillDetailsModal({
         inset: 0,
         zIndex: 20000,
         background: "var(--modal-overlay-bg)",
-        backdropFilter: "blur(5px)",
-        WebkitBackdropFilter: "blur(5px)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -204,9 +202,7 @@ export function SkillDetailsModal({
           height: "min(86vh, 900px)",
           overflow: "hidden",
           background: "var(--modal-bg)",
-          backdropFilter: "blur(20px) saturate(1.08)",
-          WebkitBackdropFilter: "blur(20px) saturate(1.08)",
-          borderRadius: 18,
+          borderRadius: "var(--modal-radius)",
           boxShadow: "var(--modal-shadow)",
           display: "flex",
           flexDirection: "column",
@@ -222,7 +218,7 @@ export function SkillDetailsModal({
         >
           <div style={{ minWidth: 0 }}>
             <p
-              className="text-xs font-semibold text-stone-500 uppercase tracking-wide"
+              className="text-xs font-semibold text-stone-500"
               style={{ margin: "0 0 4px" }}
             >
               {t("page.skills.skill_details")}
@@ -338,7 +334,7 @@ export function SkillDetailsModal({
                       : "transparent",
                   boxShadow:
                     selected === OVERVIEW_KEY
-                      ? "0 1px 2px rgba(28,25,23,0.06)"
+                      ? "0 1px 2px rgba(29, 29, 31,0.06)"
                       : "none",
                   color:
                     selected === OVERVIEW_KEY
@@ -441,7 +437,6 @@ export function SkillDetailsModal({
                         color: "var(--text-default)",
                         lineHeight: 1.6,
                         fontSize: 13,
-                        letterSpacing: "0.005em",
                       }}
                     >
                       {usage}
@@ -468,7 +463,6 @@ export function SkillDetailsModal({
                         listStyle: "disc",
                         color: "var(--text-default)",
                         fontSize: 13,
-                        letterSpacing: "0.005em",
                       }}
                     >
                       {scenarios.map((scenario) => (

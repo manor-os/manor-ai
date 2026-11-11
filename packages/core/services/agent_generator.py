@@ -7,15 +7,19 @@ description, category, tags, and a detailed persona/system_prompt).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, AsyncIterator, Coroutine, Tuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.ai.llm_client import llm_prompt_cache_key_scope
 from packages.core.ai.response_language import resolve_response_locale
+from packages.core.ai.runtime.billing import runtime_usage_subsource_scope
 from packages.core.ai.runtime.completions import runtime_execute_text_completion
 from packages.core.constants.agent_capabilities import AGENT_CAPABILITY_SELECTION_LIMIT
 from packages.core.i18n import get_locale, t
@@ -30,8 +34,10 @@ from packages.core.services.skill_bundle import (
 logger = logging.getLogger(__name__)
 
 _AGENT_SOURCE = "agent_generator"
+# Capability matching is logged apart from the caller that asked for it.
+_CAPABILITY_MATCH_USAGE = "capability_match"
 
-_CAPABILITY_SCAN_MAX_ITEMS = 120
+_CAPABILITY_SCAN_MAX_ITEMS = 200
 _CAPABILITY_SCAN_MAX_CHARS = 48_000
 _CAPABILITY_SCAN_MAX_CHUNKS = 12
 # Capability selection favors deterministic completion over burst latency.
@@ -43,6 +49,20 @@ _CAPABILITY_REVIEW_MAX_CHARS = 96_000
 _CAPABILITY_REDUCTION_SELECTION_LIMIT = AGENT_CAPABILITY_SELECTION_LIMIT
 _CAPABILITY_COMPLETION_MAX_ATTEMPTS = 2
 _CAPABILITY_PROVIDER_CALL_BUDGET = 48
+# Wall-clock bound on one whole selection. Each provider call has its own
+# deadlines (60 s to start a stream, then up to 600 s buffered), so with up to
+# 48 calls a stalled provider kept an Architect turn silent for hours while it
+# held its chat stream slot. Normal selections finish in well under a minute.
+_CAPABILITY_MATCH_TIMEOUT_SECONDS = 240.0
+
+
+def _capability_match_timeout_seconds() -> float:
+    raw = os.getenv("AGENT_CAPABILITY_MATCH_TIMEOUT_SECONDS")
+    try:
+        seconds = float(raw) if raw not in (None, "") else _CAPABILITY_MATCH_TIMEOUT_SECONDS
+    except ValueError:
+        seconds = _CAPABILITY_MATCH_TIMEOUT_SECONDS
+    return seconds if seconds > 0 else _CAPABILITY_MATCH_TIMEOUT_SECONDS
 
 
 class AgentCapabilitySelectionPhase(StrEnum):
@@ -143,8 +163,12 @@ Rules:
   or rewrite an id. Return [] when this chunk contains no relevant candidate.
 - Include both a focused Skill or BusinessCapability and a plausible exact
   low-level action when the final reviewer needs to compare their coverage.
+  The reviewer sees every tool of a recalled BusinessCapability and can keep
+  only the ones the agent needs.
+- A row with action_ids lists one MCP server's actions: each is a candidate, so
+  return the exact ids of the actions the agent may need, not the server.
 - An MCP candidate without an action suffix represents the complete server and
-  grants all of its listed actions. Select it when the role needs that MCP;
+  grants all of its actions. Select it when the role needs that MCP;
   execution-time instructions and approvals still govern which actions it uses.
 - Never include action-level write, delete, send, purchase, or publish
   candidates unless the request genuinely requires that effect.
@@ -169,8 +193,11 @@ Rules:
   generated agent summary. Select the smallest sufficient capability set.
 - Copy ids exactly from the supplied shortlist. Never invent, shorten,
   translate, rewrite, or restore an id that is not in the shortlist.
-- Prefer one focused Skill or BusinessCapability over many low-level tools when
-  it covers the requested workflow.
+- A BusinessCapability grants every tool listed in its actions. Select it only
+  when the agent needs most of those tools; when it needs only some, select
+  those exact tool ids instead, and they cover the capability just as well.
+- Prefer one focused Skill over many low-level tools when it covers the
+  requested workflow.
 - Treat Skills or MCP providers that perform the same role as alternatives.
   Select one ready option; if none are ready, retain only the single best setup
   intent. Select multiple overlapping alternatives only when the request
@@ -277,7 +304,7 @@ async def _match_agent_capabilities(
     recall without trusting model-created names; the final review can only
     choose exact ids from the actor-scoped shortlist.
     """
-    payload = capability_catalog.prompt_payload()
+    payload = capability_catalog.scan_payload()
     if not payload:
         return capability_catalog.resolve([])
     chunks = _chunk_capability_payload(payload)
@@ -289,31 +316,41 @@ async def _match_agent_capabilities(
     semaphore = asyncio.Semaphore(budget.scan_concurrency)
 
     async def scan_chunk(index: int, chunk: list[dict[str, Any]]) -> list[str]:
-        allowed_ids = {
-            str(item.get("id") or "").strip()
-            for item in chunk
-            if str(item.get("id") or "").strip()
-        }
+        allowed_ids = _capability_ids(chunk)
+        # Every Agent this actor matches scans the same chunks, so the chunk
+        # belongs to the cacheable prefix; only the request after it varies.
+        scan_prompt = (
+            f"{AGENT_CAPABILITY_SCAN_SYSTEM_PROMPT}\n\n"
+            f"## Semantic scan chunk {index + 1} of {len(chunks)}\n\n"
+            f"{_compact_json(chunk)}"
+        )
         messages = [
-            {"role": "system", "content": AGENT_CAPABILITY_SCAN_SYSTEM_PROMPT},
+            {"role": "system", "content": scan_prompt},
             {
                 "role": "user",
                 "content": (
                     f"{request_context}\n\n"
-                    f"## Semantic scan chunk {index + 1} of {len(chunks)}\n\n"
-                    f"{_compact_json(chunk)}"
+                    f"Return the candidates from semantic scan chunk {index + 1} "
+                    f"of {len(chunks)} that this agent may genuinely need."
                 ),
             },
         ]
+        # Routes that pick a cache machine per key need the same key for the
+        # same prefix, whichever conversation or Agent asked for the scan.
+        cache_key = "manor-capability-scan-" + hashlib.sha256(
+            scan_prompt.encode("utf-8")
+        ).hexdigest()[:32]
         async with semaphore:
-            return await _complete_capability_ids(
-                messages=messages,
-                entity_id=entity_id,
-                allowed_ids=allowed_ids,
-                phase=f"semantic scan chunk {index + 1}",
-                phase_kind=AgentCapabilitySelectionPhase.SCAN,
-                budget=budget,
-            )
+            with llm_prompt_cache_key_scope(cache_key):
+                return await _complete_capability_ids(
+                    messages=messages,
+                    entity_id=entity_id,
+                    allowed_ids=allowed_ids,
+                    phase=f"semantic scan chunk {index + 1}",
+                    phase_kind=AgentCapabilitySelectionPhase.SCAN,
+                    budget=budget,
+                    drop_unknown=True,
+                )
 
     scan_results = await _gather_capability_batch(*(
         scan_chunk(index, chunk) for index, chunk in enumerate(chunks)
@@ -323,14 +360,12 @@ async def _match_agent_capabilities(
         for chunk_ids in scan_results
         for catalog_id in chunk_ids
     }
-    shortlist = [
-        item for item in payload if str(item.get("id") or "") in recalled_ids
-    ]
+    shortlist = capability_catalog.review_payload(recalled_ids)
     if not shortlist:
         logger.info(
             "AI Agent semantic capability scan chunks=%s catalog=%s shortlist=0",
             len(chunks),
-            len(payload),
+            len(capability_catalog.candidates),
         )
         return capability_catalog.resolve([])
 
@@ -365,7 +400,7 @@ async def _match_agent_capabilities(
         "AI Agent semantic capability match chunks=%s catalog=%s shortlist=%s "
         "status=%s selected=%s",
         len(chunks),
-        len(payload),
+        len(capability_catalog.candidates),
         len(shortlist),
         plan.status.value,
         list(plan.selected_catalog_ids),
@@ -382,12 +417,28 @@ async def match_agent_capabilities(
 ):
     """Public semantic matcher shared by Agent and Workspace creation."""
 
-    return await _match_agent_capabilities(
-        prompt=prompt,
-        spec=spec,
-        entity_id=entity_id,
-        capability_catalog=capability_catalog,
-    )
+    seconds = _capability_match_timeout_seconds()
+    deadline = asyncio.timeout(seconds)
+    try:
+        async with deadline:
+            return await _match_agent_capabilities(
+                prompt=prompt,
+                spec=spec,
+                entity_id=entity_id,
+                capability_catalog=capability_catalog,
+            )
+    except TimeoutError as exc:
+        if not deadline.expired():
+            raise
+        logger.warning(
+            "AI Agent capability selection timed out after %.0fs entity=%s",
+            seconds,
+            entity_id,
+        )
+        raise AgentCapabilitySelectionError(
+            f"capability selection did not finish within {seconds:.0f}s; "
+            "the model provider is not responding"
+        ) from exc
 
 
 def _agent_capability_request_context(*, prompt: str, spec: dict[str, Any]) -> str:
@@ -438,9 +489,10 @@ def _chunk_capability_payload(
 
 def _capability_ids(payload: list[dict[str, Any]]) -> set[str]:
     return {
-        str(item.get("id") or "").strip()
+        catalog_id
         for item in payload
-        if str(item.get("id") or "").strip()
+        for catalog_id in (str(value or "").strip() for value in (item.get("id"), *item.get("action_ids", ())))
+        if catalog_id
     }
 
 
@@ -521,8 +573,13 @@ async def _complete_capability_ids(
     phase_kind: AgentCapabilitySelectionPhase,
     budget: AgentCapabilitySelectionBudget,
     selection_limit: int = AGENT_CAPABILITY_SELECTION_LIMIT,
+    drop_unknown: bool = False,
 ) -> list[str]:
-    """Complete and validate one bounded semantic selection, retrying once."""
+    """Complete and validate one bounded semantic selection, retrying once.
+
+    A recall scan may ``drop_unknown``: it only proposes, and the review can
+    choose only from candidates that exist, so an invented id costs nothing.
+    """
 
     last_error: Exception | None = None
     for attempt in range(_CAPABILITY_COMPLETION_MAX_ATTEMPTS):
@@ -537,15 +594,16 @@ async def _complete_capability_ids(
                 ),
             })
         budget.reserve(phase_kind)
-        completion = await runtime_execute_text_completion(
-            attempt_messages,
-            entity_id=entity_id,
-            source=_AGENT_SOURCE,
-            temperature=0.1,
-            # Exact MCP ids can be long. Leave enough output room for the
-            # catalog's supported selection maximum.
-            max_tokens=8000,
-        )
+        with runtime_usage_subsource_scope(_CAPABILITY_MATCH_USAGE):
+            completion = await runtime_execute_text_completion(
+                attempt_messages,
+                entity_id=entity_id,
+                source=_AGENT_SOURCE,
+                temperature=0.1,
+                # Exact MCP ids can be long. Leave enough output room for the
+                # catalog's supported selection maximum.
+                max_tokens=8000,
+            )
         try:
             raw = completion.content
             if not raw or not raw.strip():
@@ -569,12 +627,12 @@ async def _complete_capability_ids(
                 catalog_id for catalog_id in selected_ids
                 if catalog_id not in allowed_ids
             ]
-            if unknown:
+            if unknown and not drop_unknown:
                 raise AgentCapabilitySelectionError(
                     f"{phase} returned unknown or inaccessible capability ids: "
                     + ", ".join(unknown)
                 )
-            return selected_ids
+            return [catalog_id for catalog_id in selected_ids if catalog_id in allowed_ids]
         except (ValueError, TypeError) as exc:
             last_error = exc
             if attempt + 1 >= _CAPABILITY_COMPLETION_MAX_ATTEMPTS:

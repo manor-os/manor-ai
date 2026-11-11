@@ -20,7 +20,6 @@ from packages.core.services.mcp_account_tool_catalog import (
 
 def test_mcp_server_kind_factory_classifies_origin_not_transport_alone():
     assert MCPServerKindFactory.from_server("gmail", "builtin") is MCPServerKind.MANAGED
-    assert MCPServerKindFactory.from_server("stripe", "http") is MCPServerKind.MANAGED
     assert MCPServerKindFactory.from_server("paypal", "http") is MCPServerKind.MANAGED
     assert MCPServerKindFactory.from_server("customer-mcp", "http") is MCPServerKind.CUSTOM
     assert MCPServerKindFactory.from_server("customer-cli", "stdio") is MCPServerKind.CUSTOM
@@ -175,20 +174,6 @@ def test_integration_operation_catalog_normalizes_remote_cache():
     assert operations[0]["resource"] == "Issue"
 
 
-def test_official_unknown_operation_ignores_cached_read_hint() -> None:
-    operations, _source = integration_operation_catalog(
-        server_key="stripe",
-        transport="http",
-        tools_cached={
-            "tools": [{
-                "name": "future_stripe_tool",
-                "effect": "read",
-                "annotations": {"readOnlyHint": True},
-            }],
-        },
-    )
-
-    assert operations[0]["effect"] == "write"
 
 
 def test_account_tool_catalog_factory_unions_tools_with_account_provenance():

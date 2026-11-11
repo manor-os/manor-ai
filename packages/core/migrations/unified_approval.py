@@ -43,7 +43,8 @@ _EXPIRE_FAILED_TASK_REQUEST = {'status': 'expired', 'resolved_reason': 'approval
 _EXPIRE_UNIDENTIFIED_FAILED_STEP_REQUEST = {'status': 'expired', 'resolved_reason': 'approval_migration_unidentified_failed_step'}
 _EXPIRE_LEGACY_CHROME_GRANT = {'status': 'expired', 'resolved_reason': 'approval_migration_provider_outcome_unverified'}
 _INVALIDATE_UNVERIFIABLE_ROOM_REQUEST = {'status': 'invalidated', 'resolved_reason': 'approval_migration_unverifiable'}
-NEW_SEMANTICS_PLAN_MODES = ('new_semantics_conservative_v1', 'new_semantics_conservative_v2')
+NEW_SEMANTICS_PLAN_MODES = ('new_semantics_conservative_v1', 'new_semantics_conservative_v2',
+                            'new_semantics_conservative_v3')
 
 
 def _can_retire_legacy_chrome_grant(request, source):

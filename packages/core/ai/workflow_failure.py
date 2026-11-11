@@ -25,6 +25,7 @@ import re
 from typing import Any
 
 from packages.core.i18n import t
+from packages.core.services.workflow_contracts import workflow_step_label
 
 PLATFORM_FAILURE_KIND = "platform_error"
 PLATFORM_FAILURE_LOCALES = ("en", "zh")
@@ -59,6 +60,11 @@ def names_record_id(text: str) -> bool:
     return bool(_RECORD_ID.search(text or ""))
 
 
+def strip_record_ids(text: str) -> str:
+    """Text for a person: record ids out, and the punctuation they left behind."""
+    return re.sub(r"\s+([;:,.])", r"\1", _RECORD_ID.sub("", text or ""))
+
+
 def workflow_platform_failure(
     fault: dict[str, Any],
     *,
@@ -72,7 +78,7 @@ def workflow_platform_failure(
     output (a stable code plus the redacted raw tool payload), or a runtime
     error the agent loop itself returned, such as a context overflow.
     """
-    step_name = str(step.get("name") or step.get("id") or "").strip()
+    step_name = workflow_step_label(step)
     return {
         "kind": PLATFORM_FAILURE_KIND,
         "code": str(fault.get("code") or "internal_error"),
@@ -266,7 +272,7 @@ def _first_sentence(text: str) -> str:
 
 
 def _step_name(step: dict[str, Any]) -> str:
-    return str(step.get("name") or step.get("id") or "").strip()
+    return workflow_step_label(step)
 
 
 def _step_failed(step: dict[str, Any]) -> str:

@@ -25,11 +25,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
-from sqlalchemy import select
+from sqlalchemy import literal_column, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 from packages.core.constants.blueprints import BlueprintStatus
-from packages.core.blueprints.freshness import FIRST_CONTENT_VERSION
+from packages.core.blueprints.freshness import FIRST_CONTENT_VERSION, BlueprintDigest
 from packages.core.blueprints.payload import detect_version
 from packages.core.blueprints.catalogue import get_platform_blueprints
 from packages.core.blueprints.registry import next_release_version, record_release
@@ -51,9 +52,6 @@ RETIRED_PLATFORM_BLUEPRINT_SLUGS = (
     "solo-video-account-studio-v1",
     "solo-productized-service-os-v1",
     "solo-digital-product-store-v1",
-    # Replaced by jr-ai-music-first-release-automatic-goals-v1.
-    "jr-music-release-beginner-v1",
-    "jr-ai-music-first-release-automatic-goals-v4",
     # Single-request document helpers do not justify standalone Workspaces.
     # Keep their source examples and existing installs, but withdraw listings.
     "practical-meeting-notes-v1",
@@ -97,6 +95,8 @@ class BlueprintRowReference:
 async def resolve_blueprint_rows(
     db: AsyncSession,
     references: Mapping[str, BlueprintRowReference],
+    *,
+    load_payload: bool = True,
 ) -> dict[str, WorkspaceBlueprint]:
     """Resolve Blueprint rows in two batched queries.
 
@@ -104,7 +104,10 @@ async def resolve_blueprint_rows(
     predate durable ids (null id or ``builtin:<slug>`` alias). Any other exact
     id is authoritative even when the row is archived or another Marketplace
     item has the same slug.
+
+    ``load_payload=False`` leaves each row's payload unread.
     """
+    options = () if load_payload else (defer(WorkspaceBlueprint.payload),)
     normalized = {
         key: BlueprintRowReference(
             blueprint_id=str(ref.blueprint_id or "").strip() or None,
@@ -124,7 +127,7 @@ async def resolve_blueprint_rows(
     rows_by_id: dict[str, WorkspaceBlueprint] = {}
     if candidate_ids:
         rows = (await db.execute(
-            select(WorkspaceBlueprint).where(
+            select(WorkspaceBlueprint).options(*options).where(
                 WorkspaceBlueprint.id.in_(candidate_ids),
             )
         )).scalars().all()
@@ -148,7 +151,7 @@ async def resolve_blueprint_rows(
 
     if unresolved_slugs:
         legacy_rows = (await db.execute(
-            select(WorkspaceBlueprint).where(
+            select(WorkspaceBlueprint).options(*options).where(
                 WorkspaceBlueprint.entity_id.is_(None),
                 WorkspaceBlueprint.slug.in_(unresolved_slugs),
             )
@@ -159,6 +162,55 @@ async def resolve_blueprint_rows(
                 resolved[key] = legacy_by_slug[ref.blueprint_slug]
 
     return resolved
+
+
+# (row id, row version) -> the payload's digest, or None for an empty payload.
+# Postgres gives a row a new ``xmin`` (the writing transaction) on every
+# update, so a committed version is never answered from another version's
+# entry. Only versions older than every transaction this snapshot still sees
+# running are cached: they are committed and were not written here (a row this
+# transaction rewrites keeps one ``xmin``).
+_PAYLOAD_DIGESTS: dict[tuple[str, int], BlueprintDigest | None] = {}
+_PAYLOAD_DIGEST_LIMIT = 1024
+_ROW_VERSION = literal_column("workspace_blueprints.xmin")
+_SETTLED = literal_column(
+    "age(workspace_blueprints.xmin) > age(pg_snapshot_xmin(pg_current_snapshot())::xid)"
+)
+
+
+async def blueprint_payload_digests(
+    db: AsyncSession, row_ids: set[str],
+) -> dict[str, tuple[BlueprintDigest, str]]:
+    """Published digests and content versions from the same row snapshots."""
+    if not row_ids:
+        return {}
+    published = select(
+        WorkspaceBlueprint.id, WorkspaceBlueprint.content_version, _ROW_VERSION, _SETTLED,
+    ).where(WorkspaceBlueprint.status == BlueprintStatus.PUBLISHED)
+    versions = (await db.execute(published.where(WorkspaceBlueprint.id.in_(row_ids)))).all()
+    digests = {}
+    missing = []
+    for row_id, content_version, version, settled in versions:
+        key = (row_id, version)
+        if settled and key in _PAYLOAD_DIGESTS:
+            if (digest := _PAYLOAD_DIGESTS[key]) is not None:
+                digests[row_id] = (digest, content_version)
+        else:
+            missing.append(row_id)
+    if missing:
+        for row_id, content_version, version, settled, payload in (await db.execute(
+            published.add_columns(WorkspaceBlueprint.payload)
+            .where(WorkspaceBlueprint.id.in_(missing))
+        )).all():
+            digest = BlueprintDigest.of(payload) if isinstance(payload, dict) and payload else None
+            if digest is not None:
+                digests[row_id] = (digest, content_version)
+            if not settled:
+                continue
+            if len(_PAYLOAD_DIGESTS) >= _PAYLOAD_DIGEST_LIMIT:
+                _PAYLOAD_DIGESTS.pop(next(iter(_PAYLOAD_DIGESTS)))
+            _PAYLOAD_DIGESTS[(row_id, version)] = digest
+    return digests
 
 
 async def resolve_blueprint_row(

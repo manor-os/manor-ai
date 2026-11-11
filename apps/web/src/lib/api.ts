@@ -5,6 +5,7 @@ import {
   restorePersistentSession,
   signInPath,
 } from "./persistentSession";
+import type { RecommendedQuestion } from "./recommendedOptions";
 import { EMBED } from "../embed/embedContext";
 import { endEmbeddedSession } from "../embed/embeddedSession";
 import type { KnowledgeContentSearchResponse } from "./knowledgeLayout";
@@ -96,6 +97,7 @@ import type {
 } from "./agentInitiativeTypes";
 
 import { useToastStore } from "../stores/toast";
+import { useConnectionStatus } from "../stores/connectionStatus";
 import { normalizeLocale, t } from "./i18n";
 import { browserImageBlob, prepareChatUploadFile } from "./browserImage";
 import {
@@ -119,14 +121,25 @@ const API_BASE = "/api/v1";
 export type ConnectionKind = "integration" | "oauth_account";
 /** A coding agent (public OAuth client) signed in as the current user. */
 export interface OAuthConnection {
+  /** "oauth": an app's sign-in (id = refresh-token family); "personal_token": an access key. */
+  kind: "oauth" | "personal_token";
   id: string;
-  client_id: string;
+  client_id?: string | null;
   name: string;
   verified: boolean;
   entity_id: string;
   connected_at: string;
-  last_used_at: string;
-  expires_at: string;
+  last_used_at?: string | null;
+  /** Null for an access key that never expires. */
+  expires_at?: string | null;
+  /** Access keys only: "mcp" (every tool) or "mcp:read" (read-only tools). */
+  scope?: string | null;
+  /** Access keys only: the key's first characters, to recognise it. */
+  token_prefix?: string | null;
+}
+export interface PersonalAccessTokenCreated extends OAuthConnection {
+  /** The key itself; returned once and never again. */
+  token: string;
 }
 export interface ConnectionShareMember {
   user_id: string;
@@ -158,38 +171,9 @@ export enum ConversationSurfaceKind {
   OrdinaryChat = "chat",
   AiEdit = "ai_edit",
 }
-const BACKEND_UNAVAILABLE_TOAST_ID = "backend-unavailable";
 const RATE_LIMIT_TOAST_ID = "api-rate-limit";
 let rateLimitUntil = 0;
 let backendUnavailableUntil = 0;
-
-export type DashboardAppliedModuleChange = {
-  action: "create" | "update" | "remove";
-  module?: Record<string, unknown> | null;
-  module_id?: string | null;
-};
-
-export type DashboardSuggestLayoutResult = {
-  version: number;
-  widgets: Array<{ id: string; visible: boolean }>;
-  modules: any[];
-  assistant_message?: string | null;
-  changed_module_id?: string | null;
-  conversation_id?: string | null;
-  tool_calls: string[];
-  hitl_requests: Array<Record<string, unknown>>;
-  preview_created: boolean;
-  applied_module_changes?: DashboardAppliedModuleChange[];
-  widgets_changed?: boolean;
-};
-
-export type DashboardSuggestJobResponse = {
-  job_id: string;
-  status: "running" | "succeeded" | "failed" | "cancelled";
-  error?: string | null;
-  error_code?: string | null;
-  result?: DashboardSuggestLayoutResult | null;
-};
 
 export type TaskBoardPreferences = {
   mode: "kanban" | "list";
@@ -205,6 +189,9 @@ export type WorkspaceAttentionReminder = {
   kind: string;
   summary: string;
   created_at: string;
+  /** The run that waits on this card, and the run hosting it (a sub-flow's parent). */
+  workflow_run_id?: string | null;
+  workflow_host_run_id?: string | null;
 };
 
 type PaginatedMessagesResponse<T> = {
@@ -261,24 +248,47 @@ export type WorkspaceAppActionInput = WorkspaceChatEntrypoint["inputs"][number] 
 export type WorkspaceAppFormField = {
   key: string;
   label: string;
-  type: "text" | "long_text" | "file" | "number" | "select";
+  type: "text" | "long_text" | "file" | "number" | "select" | "picture_choice";
   required: boolean;
   placeholder: string;
   options: string[];
+  /** picture_choice only: the name shown for each option, in option order. */
+  option_labels?: string[];
+  /** picture_choice only: the page picture for each option (a /blueprints/… path), in option order. */
+  option_images?: string[];
 };
 
 export type WorkspaceAppDataContextKind = "project" | "launch_run" | "workspace";
-export type WorkspaceAppDataBlockType = "progress" | "records" | "documents" | "metrics" | "summary" | "project_rollup" | "references" | "packs" | "gallery";
+export type WorkspaceAppDataBlockType = "progress" | "records" | "documents" | "metrics" | "summary" | "project_rollup" | "references" | "packs" | "gallery" | "chart";
 
 export type WorkspaceAppSummaryField = {
   label: string;
   field: string[];
-  format?: "text" | "status" | "date" | "link" | "link_list" | "document" | "provider";
+  format?: WorkspaceAppFieldFormat;
+  /** The currency a money field reads in (CNY, USD). */
+  currency?: string | null;
   hide_when_empty?: boolean;
   labels?: Record<string, string>;
   /** Fallback paths shown beside the value, e.g. the account of a provider. */
   secondary?: string[][];
+  /** A `record` field's kind of record. */
+  project_type?: string;
+  /** `percent`: the stored number that means 100 %. */
+  scale?: 1 | 100;
+  /** `date_range`: the path of the date it ends on. */
+  end_field?: string[];
+  relative?: boolean;
+  /** `progress`: the whole, or the path that holds it. */
+  max?: number;
+  max_field?: string[];
+  unit?: string;
+  copy?: boolean;
+  /** A number drawn as a bar in its cell, as long as its share of the column's largest. */
+  bar?: boolean;
 };
+
+/** A Workspace record a `record` field names: its id and name (null when it has none to show). */
+export type WorkspaceAppRecordRef = { id: string; label?: string | null };
 
 /**
  * A read-only source declared by a Workspace App configuration.  The server
@@ -297,12 +307,27 @@ export type WorkspaceAppDataSource = {
   [key: string]: unknown;
 };
 
+/** A gallery block's presentation: its layout, the frame its files show in, version groups, and what each file offers. */
+export type WorkspaceAppBlockMedia = {
+  layout?: "grid" | "masonry" | "carousel" | "strip" | "board" | "list";
+  aspect?: "auto" | "9:16" | "4:5" | "3:4" | "1:1" | "4:3" | "16:9";
+  /** One card per record or result, its files as versions (9:16, 1:1, 16:9). */
+  group?: "record";
+  size_label?: boolean;
+  transparent?: boolean;
+  hover_play?: boolean;
+  details?: boolean;
+  download?: boolean;
+  comments?: boolean;
+};
+
 export type WorkspaceAppDataBlock = {
   key: string;
   type: WorkspaceAppDataBlockType;
   source: string;
   metrics_source?: string;
-  metrics_display?: "declared" | "configured";
+  /** "zero" shows every declared counter, an unread one as 0, without a tracking notice. */
+  metrics_display?: "declared" | "configured" | "zero";
   record_display?: {
     title?: { source: string; field: string[] };
     fields?: Array<{ label: string; source: string; field: string[]; labels?: Record<string, string>; format?: "text" | "provider"; secondary?: string[][] }>;
@@ -321,15 +346,129 @@ export type WorkspaceAppDataBlock = {
   stage_labels?: Record<string, string>;
   /** A packs block's plan: its cards follow the plan's order, a planned child a card before it starts. */
   plan?: string;
-  /** One App action per pack, opened with the pack's project filling ``input``; only in ``stages`` when given. */
-  item_action?: { action: string; label: string; input: string; stages?: string[] };
+  /** One App action per pack, scheduled item or summarised project, opened with it filling ``input``; only in ``stages`` when given. */
+  item_action?: WorkspaceAppCardAction;
+  /** More buttons on the same card (edit this dish, take it off the menu), after ``item_action``. */
+  item_actions?: WorkspaceAppCardAction[];
+  /** A list people narrow: by a field the source reads, or by stage. */
+  filters?: Array<{ field?: string[]; by?: "stage"; label: string }>;
+  /** A search over up to four text fields; ``label`` is its placeholder. */
+  search?: { fields: string[][]; label?: string };
+  /** How a progress block lays out its items: cards in a list (the default), a table with a column per
+   *  field, a board with a column per stage, a timeline, a gantt, places, or a tree of its child projects. */
+  view?: "list" | "table" | "board" | "timeline" | "gantt" | "places" | "tree";
+  /** The groupings a person picks from (the first applies first); each item carries its ``groups`` values. */
+  group_by?: Array<{ field?: string[]; by?: "stage"; label: string }>;
+  /** Rows a person can tick; the ticked ones can be exported and their totals read. */
+  select?: boolean;
+  /** A CSV of every record (or the ticked ones). */
+  export?: boolean;
+  /** Totals of numeric fields over every record the filters keep; the data carries them as ``totals``. */
+  totals?: Array<{ field: string[]; agg: "sum" | "avg" | "min" | "max" }>;
+  timeline?: { date_field: string[]; end_field?: string[]; depends_field?: string[] };
+  places?: { address_field: string[]; name_field?: string[]; lat_field?: string[]; lng_field?: string[] };
+  /** A tree's levels below each record: related_projects sources, read one parent at a time. */
+  tree?: { children: string[] };
+  /** A chart block's picture; the data carries what it draws as the block's ``chart``. */
+  chart?: WorkspaceAppChartConfig;
+  /** A scheduled item's action about its results (refresh this post's counts): an icon beside them that runs in place. */
+  result_action?: { action: string; label: string; input: string; stages?: string[] };
   /** A planned card's App action, its inputs filled from the card's parent project or plan code. */
   plan_action?: { action: string; label: string; inputs: Record<string, "parent" | "code"> };
+  /** A list's Add button in its header: opens the entry that adds a record, exactly as its tile does. */
+  add_action?: { action: string; label: string };
+  /** How a gallery presents its files; set, a file opens in the App's media viewer. */
+  media?: WorkspaceAppBlockMedia;
+  /** Each record shown the way its post will look on a platform; the data carries each item's ``preview``. */
+  preview?: WorkspaceAppBlockPreview;
   limit?: number;
 };
 
+export type WorkspaceAppChartKind = "line" | "area" | "bar" | "stacked_bar" | "stacked_area" | "donut" | "funnel" | "leaderboard" | "heatmap" | "scatter";
+export type WorkspaceAppChartBucket = "day" | "week" | "month" | "weekday" | "hour";
+export type WorkspaceAppChartFormat = "number" | "money" | "percent" | "duration";
+
+export type WorkspaceAppChartConfig = {
+  kind: WorkspaceAppChartKind;
+  x?: { field?: string[]; bucket?: WorkspaceAppChartBucket; by?: "stage" };
+  series?: { field?: string[]; bucket?: WorkspaceAppChartBucket; by?: "stage" };
+  y?: { field: string[] };
+  value?: { agg?: string; field?: string[] };
+  format: WorkspaceAppChartFormat;
+  currency?: string;
+  unit?: string;
+  scale?: 1 | 100;
+  labels?: Record<string, string>;
+  order?: string[];
+  limit?: number;
+  target?: { value?: number; goal?: string; label?: string };
+};
+
+/** What a chart block draws: categories (or time buckets) and a series of values over them, or points. */
+export type WorkspaceAppChartData = {
+  kind: WorkspaceAppChartKind;
+  format: WorkspaceAppChartFormat;
+  currency?: string;
+  unit?: string | null;
+  scale?: 1 | 100;
+  x_bucket?: WorkspaceAppChartBucket;
+  series_bucket?: WorkspaceAppChartBucket;
+  categories: Array<{ key: string; label: string; labelled?: boolean }>;
+  series: Array<{ key: string; label: string; description?: string; values: Array<number | null> }>;
+  points?: Array<{ x: number; y: number; label: string; series?: string }>;
+  total?: number;
+  /** How many records it read, whether there were more than it reads, and how many parts it left out. */
+  records: number;
+  truncated?: boolean;
+  hidden_categories?: number;
+  target?: { value: number; label?: string };
+};
+
+/** The platform frames a preview shows a post in: neutral approximations of layout and proportions. */
+export type WorkspaceAppPreviewPlatform = "instagram" | "instagram_reels" | "instagram_story" | "xiaohongshu" | "tiktok"
+  | "douyin" | "youtube_shorts" | "x" | "linkedin" | "facebook" | "youtube" | "wechat_article" | "wechat_moments" | "pinterest";
+
+/** A block's ``preview``: the frame (or each record's own platform), the paths each part reads and the layout. */
+export type WorkspaceAppBlockPreview = {
+  platform?: WorkspaceAppPreviewPlatform;
+  fields: Partial<Record<"platform" | "images" | "video" | "cover" | "title" | "caption" | "hashtags" | "account"
+    | "avatar" | "link" | "published_at" | "summary" | "thread" | "comments", string[]>>;
+  aspect?: WorkspaceAppBlockMedia["aspect"];
+  /** ``side_by_side`` puts the posts (a post's version for each platform) in one row; tabs on a phone. */
+  layout?: "feed" | "side_by_side";
+  group_field?: string[];
+};
+
+/** A picture or a clip of a post: a Document the viewer opens, or a public picture address. */
+export type WorkspaceAppPreviewFile = { document_id?: string; href?: string; image_url?: string; label?: string };
+
+/** One record as the post it will be (or was: a receipt adds the item's ``href`` and ``published_at``). */
+export type WorkspaceAppPostPreview = {
+  /** Its frame; null shows a plain post under ``platform_label``, a platform with no frame of its own. */
+  platform: WorkspaceAppPreviewPlatform | null;
+  platform_label?: string;
+  title?: string;
+  caption?: string;
+  account?: string;
+  summary?: string;
+  images?: WorkspaceAppPreviewFile[];
+  video?: WorkspaceAppPreviewFile;
+  cover?: WorkspaceAppPreviewFile;
+  avatar?: WorkspaceAppPreviewFile;
+  hashtags?: string[];
+  link?: string;
+  published_at?: string;
+  /** The posts after the first (an X thread). */
+  thread?: string[];
+  /** The replies a Workflow collected under the post. */
+  comments?: Array<{ text: string; author?: string; at?: string; likes?: number }>;
+  /** The row of a side-by-side layout it belongs in. */
+  group?: string;
+};
+
 export type WorkspaceAppDataDisplay = {
-  layout?: "stack" | "tabs";
+  /** ``grid``: a dashboard, charts and numbers two to a row. */
+  layout?: "stack" | "tabs" | "grid";
   groups?: Array<{ key: string; title: string; blocks: string[] }>;
   hidden?: boolean;
   hidden_blocks?: string[];
@@ -337,11 +476,103 @@ export type WorkspaceAppDataDisplay = {
   calendar?: {
     block: string;
     date_field: string[];
-    rollup_block: string;
-    context_block: string;
+    /** Absent on a Workspace-wide calendar, which may count its stages without one. */
+    rollup_block: string | null;
+    /** A period's own summary; a Workspace-wide calendar has no period, so none. */
+    context_block: string | null;
     attention_stages: string[];
     collection_title: string;
+    /** Progress blocks whose items join the calendar by date (a publish time's platform posts). */
+    extra_blocks?: string[];
+    /** Calendar-block stages whose items give way to their extra items (approved publish times). */
+    hide_stages?: string[];
+    /** What the calendar opens on; the person can switch to the other. Absent means a month. */
+    span?: "month" | "week";
+    /** Lays a week out as a schedule: a row per value of this field (a platform), a column per day. */
+    lane_field?: string[];
   };
+};
+
+/** How an App field shows its value: ``money`` with its ``currency``, ``rating`` as 0–5 stars, ``boolean`` as yes/no or its labels,
+ *  ``percent`` a 0–1 share, ``duration`` seconds, ``file_size`` bytes, ``progress`` a bar out of ``max``, ``date_range`` its value to ``end``. */
+export type WorkspaceAppFieldFormat = "text" | "status" | "date" | "link" | "link_list" | "document" | "provider" | "image"
+  | "record" | "number" | "money" | "boolean" | "rating" | "video" | "percent" | "duration" | "date_range" | "phone" | "email"
+  | "address" | "tags" | "progress" | "member" | "file_size" | "color" | "audio" | "images" | "code" | "clips" | "timeline"
+  | "sparkline";
+
+/** One file a ``clips`` field holds: a video's shot, one voice reading a line. */
+export type WorkspaceAppClipRef = { document_id: string; href: string; label?: string | null };
+
+/** A person or AI staff member a ``member`` field names, as the page shows them (never by id). */
+export type WorkspaceAppMemberRef = { name: string; kind: "user" | "agent" | "staff"; avatar_url?: string | null };
+
+/** One picture of an ``images`` field: a readable Document, or a public address. */
+export type WorkspaceAppImageRef = { href: string; document_id?: string | null; image_url?: string | null; label?: string | null };
+
+/** What one App field shows: its value in its format, and what that format adds beside it. */
+export type WorkspaceAppPresentedField = {
+  label: string;
+  value?: string | number | boolean | null;
+  format?: WorkspaceAppFieldFormat;
+  /** The currency a money field reads in (CNY, USD). */
+  currency?: string | null;
+  href?: string | null;
+  links?: Array<{ label: string; href: string }>;
+  /** Raw provider key of a `provider` field; the value is its display label. */
+  provider?: string | null;
+  secondary?: string | null;
+  /** An `image`, `video` or `audio` field's file: a readable Document, or (an image) a public address. */
+  document_id?: string | null;
+  image_url?: string | null;
+  /** A `record` field's records by name, and how many it names (or a `member` field's people) that are gone or unreadable. */
+  records?: WorkspaceAppRecordRef[];
+  unavailable?: number;
+  members?: WorkspaceAppMemberRef[];
+  images?: WorkspaceAppImageRef[];
+  tags?: string[];
+  /** A `date_range`'s end; `value` is its start. */
+  end?: string | null;
+  /** A `progress` field's whole; null when there is none to measure against. */
+  max?: number | null;
+  /** A `number` field's unit (g, 份). */
+  unit?: string | null;
+  /** A `date` field shown as time from now ("3 hours ago"). */
+  relative?: boolean;
+  /** The field offers a button that copies its value. */
+  copy?: boolean;
+  /** A media field's frame, an ``images`` field's layout, and a checkerboard behind a cut-out. */
+  aspect?: WorkspaceAppBlockMedia["aspect"];
+  layout?: "carousel" | "grid";
+  transparent?: boolean;
+  clips?: WorkspaceAppClipRef[];
+  /** A ``sparkline`` field's numbers, oldest first. */
+  points?: number[];
+  bar?: boolean;
+  /** A ``timeline`` field's segments, in seconds. */
+  segments?: Array<{ start: number; end: number; label?: string; track?: string }>;
+  /** What a picture or clip is shown against: the reference, the version before. */
+  compare?: { href: string; document_id?: string | null; image_url?: string | null; label?: string | null; mode: "slider" | "side_by_side" };
+  /** A video's captions file (.vtt or .srt). */
+  captions_document_id?: string | null;
+  /** What is said, highlighted as it plays: lines, or a captions file. */
+  transcript?: Array<{ start: number; end?: number; text: string; speaker?: string }>;
+  transcript_document_id?: string | null;
+  chapters?: Array<{ at: number; title: string }>;
+};
+
+/** A button on a record's card: it opens (or, with ``confirm``, runs after asking) an App entry with the
+ *  record as ``input``; ``prefill`` fills more of the entry's inputs from the record's own fields. */
+export type WorkspaceAppCardAction = {
+  action: string; label: string; input: string; stages?: string[];
+  /** "parent" fills the input with the item's parent project instead of the item. */
+  input_from?: "item" | "parent";
+  prefill?: Record<string, string[]>;
+  /** The question asked before it runs (Take this dish off the menu?); it then runs in place. */
+  confirm?: string;
+  /** On a gallery's file: the inputs that get the moment, or the span, picked on its player (seconds). */
+  time_input?: string;
+  start_input?: string;
+  end_input?: string;
 };
 
 export type WorkspaceAppDataComponent = {
@@ -370,26 +601,20 @@ export type WorkspaceAppDataContext = {
   label: string;
   href?: string | null;
   status?: string | null;
+  /** The words the project's Workflow gave where it stands (its ``display.status``). */
+  status_label?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
   project_type?: string | null;
   execution?: WorkspaceAppDataItem["execution"];
   summary?: WorkspaceAppDataContextSummary;
   /** On a card: the project's first image reference and how many of its children are done. */
-  cover?: { document_id: string; title?: string | null };
+  cover?: { document_id: string; title?: string | null; thumbnail_url?: string | null };
   progress?: { done: number; total: number; label: string };
 };
 
 export type WorkspaceAppDataContextSummary = {
-  fields: Array<{
-    label: string;
-    value?: string | number | boolean | null;
-    format?: "text" | "status" | "date" | "link" | "link_list" | "document" | "provider";
-    href?: string | null;
-    links?: Array<{ label: string; href: string }>;
-    provider?: string | null;
-    secondary?: string | null;
-  }>;
+  fields: WorkspaceAppPresentedField[];
   total: number;
   counts_by_stage: Record<string, number>;
   /** Unfinished items are already counted by their run (failed, cancelled, paused, pending). */
@@ -403,7 +628,9 @@ export type WorkspaceAppDataContextSummary = {
     fields: Array<{
       label: string;
       value?: string | number | boolean | null;
-      format?: "text" | "status" | "date" | "link" | "link_list" | "document" | "provider";
+      format?: WorkspaceAppFieldFormat;
+      /** The currency a money field reads in (CNY, USD). */
+      currency?: string | null;
       href?: string | null;
       links?: Array<{ label: string; href: string }>;
     }>;
@@ -433,10 +660,44 @@ export type WorkspaceAppDataMetric = {
   href?: string | null;
   viewer_url?: string | null;
   document_id?: string | null;
+  /** How a Stat's number is worked out, and the window it covers (rolling_7d). */
+  description?: string | null;
+  window?: string | null;
+};
+
+/** One file an App item shows, with what the file records about itself. */
+export type WorkspaceAppMediaFile = {
+  document_id: string;
+  title: string;
+  mime_type?: string | null;
+  file_size?: number | null;
+  updated_at?: string | null;
+  viewer_url?: string | null;
+  label?: string | null;
+  /** Signed manor-media thumbnail; absent means load it through the API. */
+  thumbnail_url?: string | null;
+  /** Its pixel size, declared shape ("9:16") and length in seconds, where the file records them. */
+  width?: number;
+  height?: number;
+  aspect?: string;
+  duration?: number;
+  /** How it was made, on a gallery that shows its files' details. */
+  details?: { source?: string; model?: string; provider?: string; prompt?: string; created_at?: string };
 };
 
 export type WorkspaceAppDataItem = WorkspaceAppDataMetric & {
+  /** What each card action fills its form with from this record, by entry key. */
+  action_values?: Record<string, Record<string, unknown>>;
   calendar_at?: string | null;
+  /** A schedule's row: the item's value of the calendar's ``lane_field``, and the platform it names. */
+  calendar_lane?: string;
+  calendar_lane_platform?: WorkspaceAppPreviewPlatform;
+  /** The post this record will be, on a block with ``preview``. */
+  preview?: WorkspaceAppPostPreview;
+  /** The words a project's Workflow gave where it stands (its ``display.status``). */
+  status_label?: string | null;
+  /** The project this related item belongs to (a publish time's campaign); an item action may act on it. */
+  parent_id?: string | null;
   /** A gallery card's result: the run that made the version shown, which opens it. */
   run_id?: string | null;
   /** How far a result still being made is, 1–99. */
@@ -450,7 +711,11 @@ export type WorkspaceAppDataItem = WorkspaceAppDataMetric & {
   pack?: {
     id: string; root: string; label: string; stage?: string | null; version?: string; code?: string; synopsis?: string; parent_id?: string;
     /** The child project's latest run: how its making is going, and whether it waits for a person. */
-    run?: { id: string; workflow_id: string; binding_id?: string | null; status: string; needs_you?: boolean };
+    run?: {
+      id: string; workflow_id: string; binding_id?: string | null; status: string; needs_you?: boolean;
+      /** The production stage it is working in, as its run page names it. */
+      stage?: string;
+    };
   };
   /** Verified as a result of its production, not a file a newer version is still writing. */
   delivered?: boolean;
@@ -466,8 +731,14 @@ export type WorkspaceAppDataItem = WorkspaceAppDataMetric & {
     run_id: string;
     status: string;
     current_step_id?: string | null;
+    /** The workflow the step belongs to, which names the phase a running item is in. */
+    workflow_name?: string | null;
+    /** The step as its workflow names it; a sub-flow's step leads with the sub-flow's name. */
+    current_step_label?: string | null;
     error?: string | null;
     href?: string | null;
+    /** A paused sub-flow waiting for a person: the run that holds the decision. */
+    waiting_run?: { run_id: string; status: string; current_step_id?: string | null; href?: string | null } | null;
   } | null;
   total?: number;
   counts_by_stage?: Record<string, number>;
@@ -480,7 +751,9 @@ export type WorkspaceAppDataItem = WorkspaceAppDataMetric & {
     fields: Array<{
       label: string;
       value?: string | number | boolean | null;
-      format?: "text" | "status" | "date" | "link" | "link_list" | "document" | "provider";
+      format?: WorkspaceAppFieldFormat;
+      /** The currency a money field reads in (CNY, USD). */
+      currency?: string | null;
       href?: string | null;
       links?: Array<{ label: string; href: string }>;
     }>;
@@ -492,29 +765,29 @@ export type WorkspaceAppDataItem = WorkspaceAppDataMetric & {
   last_run_at?: string | null;
   next_run_at?: string | null;
   stop_after?: string | null;
-  fields?: Array<{
-    label: string;
-    value?: string | number | boolean | null;
-    format?: "text" | "status" | "date" | "link" | "link_list" | "document" | "provider";
-    href?: string | null;
-    links?: Array<{ label: string; href: string }>;
-    /** Raw provider key of a `provider` field; the value is its display label. */
-    provider?: string | null;
-    secondary?: string | null;
-  }>;
+  fields?: WorkspaceAppPresentedField[];
   metrics?: WorkspaceAppDataMetric[];
   published_at?: string | null;
   tracking_status?: "pending" | "partial" | "configured" | null;
   conflict?: string | null;
-  media?: Array<{
-    document_id: string;
-    title: string;
-    mime_type?: string | null;
-    file_size?: number | null;
-    updated_at?: string | null;
-    viewer_url?: string | null;
-    label?: string | null;
-  }>;
+  media?: WorkspaceAppMediaFile[];
+  /** A gallery tile's record or result: tiles of one ``group`` are versions of one thing (``media.group``). */
+  group?: string | null;
+  /** Which finished version a result shows, and its earlier ones newest first (``versions: true``). */
+  version?: number;
+  versions?: Array<{ run_id: string; number: number; updated_at?: string | null; media: WorkspaceAppMediaFile[] }>;
+  /** A project file's signed manor-media thumbnail, when the server issues one. */
+  thumbnail_url?: string | null;
+  /** Each ``group_by`` choice's value for this record, in its order. */
+  groups?: string[];
+  /** A timeline or gantt item's start, end and the records it waits for. */
+  time?: { start: string | null; end?: string | null; depends_on?: string[] };
+  /** Where a places item is: its address, the place's name and its coordinates when it has them. */
+  place?: { address: string | null; name?: string; lat?: number; lng?: number };
+  /** How many projects sit under this record in a tree. */
+  child_count?: number;
+  /** A chart row named for people (a label, a date) rather than by a stored value. */
+  labelled?: boolean;
 };
 
 export type WorkspaceAppDataBlockResult = {
@@ -527,6 +800,16 @@ export type WorkspaceAppDataBlockResult = {
   summary?: string | null;
   next_cursor?: string | null;
   error?: { code?: string; message?: string } | null;
+  /** A list block's filters, each with the values its records hold, in its labels' words. */
+  filters?: Array<{ key: string; label: string; options: Array<{ value: string; label: string }> }>;
+  /** A board's stages in the order its source lists them, each a column even while empty. */
+  stages?: string[];
+  /** A chart block's picture. */
+  chart?: WorkspaceAppChartData;
+  /** A table's totals over every record its filters keep, each a field shown in its format. */
+  totals?: Array<WorkspaceAppPresentedField & { agg: "sum" | "avg" | "min" | "max" }>;
+  /** A tree level read under one record (1, 2). */
+  tree_level?: number;
 };
 
 export type WorkspaceAppDataContextsResponse = {
@@ -728,6 +1011,8 @@ export type WorkspaceAppQueueItem = WorkspaceAttentionReminder & {
   primary_option?: string;
   has_changes_option?: boolean;
   previews?: Array<{ document_id: string; name: string }>;
+  /** A run started outside any chat has no card (``message_id`` is empty): it opens at its page. */
+  workflow_run?: { workflow_id: string; run_id: string };
 };
 
 export type WorkspaceAppMetric = {
@@ -762,6 +1047,9 @@ export type WorkspaceAppMetric = {
     status: string;
   } | null;
   series: Array<{ at: string; value: number }>;
+  /** What the number means, from its Stat's or Goal's own definition, and the window a Stat covers. */
+  description?: string | null;
+  window?: string | null;
 };
 
 export type WorkspaceAppSectionData =
@@ -794,6 +1082,8 @@ export type WorkspaceAppView = {
     "job_type" | "schedule_kind" | "every_seconds" | "run_at" | "cron_expr" | "timezone" | "instructions" | "target_title" | "target_workflow_id">>;
   agent_options: Array<{ id: string; name: string }>;
   attachable_workflow_options?: Array<{ workflow_id: string; title: string; description: string; inputs: WorkspaceAppActionInput[] }>;
+  /** The data views in the viewer's language; ``config.components`` stays as authored for settings. */
+  components?: WorkspaceAppDataComponent[];
   config: WorkspaceAppViewConfig;
 };
 
@@ -1010,18 +1300,20 @@ function isBackendUnavailableStatus(status: number): boolean {
   return status >= 500;
 }
 
-function showBackendUnavailableToast() {
-  useToastStore.getState().addToast({
-    id: BACKEND_UNAVAILABLE_TOAST_ID,
-    type: "warning",
-    title: t("lib.api.reconnecting_title"),
-    message: t("lib.api.reconnecting_message"),
-    duration: 0,
-  });
+/**
+ * A request header for a route that depends on someone else, such as Stripe: its
+ * 5xx carries a reason worth showing, and says nothing about the connection to
+ * Manor, so reads don't pause and the "Reconnecting" state doesn't start. The
+ * caller shows the error, so these requests are silent too.
+ */
+const ROUTE_REPORTS_ITS_OWN_FAILURES = "X-Route-Reports-Own-Failures";
+
+function markBackendUnavailable() {
+  useConnectionStatus.setState({ reconnecting: true });
 }
 
-function clearBackendUnavailableToast() {
-  useToastStore.getState().removeToast(BACKEND_UNAVAILABLE_TOAST_ID);
+function markBackendAvailable() {
+  useConnectionStatus.setState({ reconnecting: false });
 }
 
 function getStoredLocale(): string {
@@ -1353,8 +1645,19 @@ export interface WorkspaceCreditUsageSummary {
 }
 
 /** One row of the per-source usage report. */
+export interface UsageDailyRow {
+  date: string;
+  input: number;
+  output: number;
+  total: number;
+  /** Credits charged that day, from the billing ledger. */
+  credits: number;
+}
+
+
 export interface UsageBySourceRow {
-  /** Agent / feature name, or "customer_trial" for a client trial this company paid for. */
+  /** Agent / feature name, "customer_trial" for a client trial this company
+   *  paid for, or "byok" for calls on the company's own model keys (no credits). */
   source: string;
   /** Server label for a customer_trial row: "Customer trial: <customer> / <Workspace>". */
   label?: string;
@@ -1407,6 +1710,8 @@ export interface WorkspaceEvaluationSnapshot {
   };
   dimensions: Record<string, any>;
   recommendations: string[];
+  /** Stable ids for `recommendations`, same order, for localized copy. */
+  recommendation_codes?: string[];
   evidence_summary: Record<string, number>;
   history?: Array<{
     evidence_id: string;
@@ -1437,6 +1742,9 @@ export interface WorkspaceDraftBlueprintSuggestion {
 export interface WorkspaceDraftMessage {
   role: "user" | "assistant";
   content: string;
+  /** The architect's question as answer buttons (recommended first); picking
+   *  one sends it as the user's next message. */
+  question?: RecommendedQuestion & { question?: string; answer_as?: string };
 }
 
 export interface WorkspaceDraft {
@@ -1448,6 +1756,8 @@ export interface WorkspaceDraft {
   messages: WorkspaceDraftMessage[];
   missing: string[];
   ready: boolean;
+  /** The Architect is answering on the server (a running or recovered turn). */
+  working?: boolean;
   suggested_blueprint: WorkspaceDraftBlueprintSuggestion | null;
   applied_blueprint_id: string | null;
   finalized_workspace_id: string | null;
@@ -1930,6 +2240,8 @@ export type WorkspaceSimulationRun = {
   updated_at: string | null;
   completed_at: string | null;
   decision_count: number;
+  /** How many decisions the walkthrough stops for. */
+  decision_total: number;
   runtime_version: string;
 };
 
@@ -1940,7 +2252,7 @@ export interface GovernancePresetSummary {
 }
 
 export interface UnmetRequirement {
-  kind: "channel" | "browser_session";
+  kind: "setup" | "channel" | "browser_session";
   detail: string;
   payload: Record<string, unknown>;
 }
@@ -2230,6 +2542,13 @@ export class DocumentUploadAuthChangedError extends Error {
   }
 }
 
+/** FastAPI's validation errors arrive as a list; the first says what to fix. */
+function validationErrorMessage(detail: unknown): string | null {
+  if (!Array.isArray(detail)) return null;
+  const message = (detail[0] as { msg?: unknown } | undefined)?.msg;
+  return typeof message === "string" && message ? message.replace(/^Value error, /, "") : null;
+}
+
 export function shouldShowRequestErrorToast(
   status: number,
   method: string | undefined,
@@ -2244,10 +2563,10 @@ export function shouldShowRequestErrorToast(
 }
 
 export function shouldRetryApiQuery(failureCount: number, error: unknown): boolean {
+  const failure = error as { status?: number; retryAfterMs?: number } | null;
   if (
-    error instanceof ApiError
-    && error.status >= 400
-    && error.status < 500
+    (typeof failure?.status === "number" && failure.status >= 400 && failure.status < 500)
+    || (typeof failure?.retryAfterMs === "number" && failure.retryAfterMs > 0)
   ) {
     return false;
   }
@@ -2575,7 +2894,24 @@ function pruneDocumentDownloadCache(protectedId?: string) {
   }
 }
 
+// Stream addresses act as the signed-in person, so they are kept per sign-in and dropped well before they expire.
+const documentStreamUrls = new Map<string, { url: Promise<string>; expiresAt: number }>();
+
+function documentStreamUrl(id: string): Promise<string> {
+  const key = `${getAuthToken() || ""}:${id}`;
+  const cached = documentStreamUrls.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.url;
+  const url = request<{ url: string; expires_in: number }>(`/documents/${encodeURIComponent(id)}/stream-url`).then((result) => {
+    documentStreamUrls.set(key, { url: Promise.resolve(result.url), expiresAt: Date.now() + Math.max(0, result.expires_in - 600) * 1000 });
+    return result.url;
+  });
+  documentStreamUrls.set(key, { url, expiresAt: Date.now() + 60_000 });
+  url.catch(() => documentStreamUrls.delete(key));
+  return url;
+}
+
 function invalidateDocumentDownloadCache(id?: string) {
+  documentStreamUrls.clear();
   if (id) {
     const persistedInvalidation = invalidateCachedFiles(`${API_BASE}/documents/${id}`);
     [id, `download:${id}`, `preview:${id}`, `thumbnail:${id}`].forEach((key) => {
@@ -3041,6 +3377,9 @@ async function waitForRateLimit(signal?: AbortSignal | null) {
 // network round trip; each caller gets its own copy so mutation stays local.
 const inflightReads = new Map<string, Promise<unknown>>();
 
+// Feature clients use the same authentication, overload cooldown and error contract.
+export { request as apiRequest };
+
 function request<T>(
   path: string,
   options: RequestInit = {},
@@ -3055,7 +3394,7 @@ function request<T>(
     && !options.body
     && authTokenOverride === undefined
     && rateLimitAttempt === 0
-    && Object.keys(headers).every((name) => name.toLowerCase() === "x-silent-error");
+    && Object.keys(headers).every((name) => name === ROUTE_REPORTS_ITS_OWN_FAILURES || name.toLowerCase() === "x-silent-error");
   if (!coalescible) return requestUncoalesced<T>(path, options, authTokenOverride, rateLimitAttempt);
 
   const key = [getAuthToken() || "", getStoredLocale(), headers["X-Silent-Error"] || "", path].join("\n");
@@ -3098,6 +3437,8 @@ async function requestUncoalesced<T>(
   if (token) headers["Authorization"] = `Bearer ${token}`;
   const suppressErrorToast = headers["X-Silent-Error"] === "1";
   if (suppressErrorToast) delete headers["X-Silent-Error"];
+  const routeReportsItsOwnFailures = headers[ROUTE_REPORTS_ITS_OWN_FAILURES] === "1";
+  if (routeReportsItsOwnFailures) delete headers[ROUTE_REPORTS_ITS_OWN_FAILURES];
 
   const isRead = ["GET", "HEAD"].includes((options.method || "GET").toUpperCase());
   if (isRead && Math.max(rateLimitUntil, backendUnavailableUntil) > Date.now()) {
@@ -3118,7 +3459,7 @@ async function requestUncoalesced<T>(
     });
   } catch (error) {
     if (isAbortError(error)) throw error;
-    if (!suppressErrorToast) showBackendUnavailableToast();
+    if (!suppressErrorToast) markBackendUnavailable();
     captureClientError(error, {
       handled: true,
       mechanism: "api.network",
@@ -3134,11 +3475,14 @@ async function requestUncoalesced<T>(
   const tokenIsCurrent = () => token === getAuthToken();
 
   if (!res.ok) {
-    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    const parsedBody = await res.json().catch(() => null);
+    const body = parsedBody ?? { detail: res.statusText };
     const detail = body.detail;
     const coded = _extractCodedDetail(detail);
-    if (isBackendUnavailableStatus(res.status)) {
-      if (!suppressErrorToast && !(res.status === 503 && coded.code === "database_busy")) showBackendUnavailableToast();
+    // A gateway's error page has no such message, and is still an outage.
+    const isRoutesOwnFailure = routeReportsItsOwnFailures && typeof parsedBody?.detail === "string";
+    if (isBackendUnavailableStatus(res.status) && !isRoutesOwnFailure) {
+      if (!suppressErrorToast && !(res.status === 503 && coded.code === "database_busy")) markBackendUnavailable();
       const err = new ApiError(res.status, t("lib.api.backend_unavailable"));
       err.code = coded.code;
       err.vars = coded.vars;
@@ -3185,7 +3529,9 @@ async function requestUncoalesced<T>(
       throw err;
     }
 
-    const message = (typeof detail === "string" ? detail : (detail as any)?.message) || res.statusText;
+    const message = (
+      typeof detail === "string" ? detail : validationErrorMessage(detail) ?? (detail as any)?.message
+    ) || res.statusText;
     // Pull i18n code + vars out of structured CodedError responses so we
     // can show the user a translated toast instead of raw English.
     const displayMessage = coded.code
@@ -3224,7 +3570,7 @@ async function requestUncoalesced<T>(
     throw err;
   }
 
-  clearBackendUnavailableToast();
+  markBackendAvailable();
   if (rateLimitUntil > 0 && Date.now() >= rateLimitUntil) {
     rateLimitUntil = 0;
     useToastStore.getState().removeToast(RATE_LIMIT_TOAST_ID);
@@ -3599,7 +3945,7 @@ async function uploadDocumentRequest(
       }
       try {
         const document = JSON.parse(xhr.responseText) as Document;
-        clearBackendUnavailableToast();
+        markBackendAvailable();
         finishResolve(document);
       } catch (error) {
         const invalidResponse = new ApiError(
@@ -3664,7 +4010,7 @@ async function requestStreamResponse(
       });
     } catch (error) {
       if (isAbortError(error)) throw error;
-      showBackendUnavailableToast();
+      markBackendUnavailable();
       captureClientError(error, {
         handled: true,
         mechanism: "api.network",
@@ -3674,7 +4020,7 @@ async function requestStreamResponse(
     }
 
     if (response.ok) {
-      clearBackendUnavailableToast();
+      markBackendAvailable();
       return response;
     }
 
@@ -3691,7 +4037,7 @@ async function requestStreamResponse(
     }
 
     if (isBackendUnavailableStatus(response.status)) {
-      showBackendUnavailableToast();
+      markBackendUnavailable();
       const err = new ApiError(response.status, t("lib.api.backend_unavailable"));
       captureClientError(err, {
         handled: true,
@@ -3853,6 +4199,22 @@ async function streamWorkflowRun(
   return result;
 }
 
+/** Only exact, same-origin task attachments may use the session's credentials. */
+export function parseTaskAttachmentUrl(url: string | undefined, origin = typeof window === "undefined" ? "" : window.location.origin): { taskId: string; filename: string } | null {
+  if (!url || !origin) return null;
+  try {
+    const parsed = new URL(url, origin);
+    if (parsed.origin !== origin || !/^https?:$/.test(parsed.protocol) || parsed.username || parsed.password) return null;
+    const match = /^\/api\/v1\/tasks\/([A-Za-z0-9_-]+)\/attachments\/([^/]+)$/.exec(parsed.pathname);
+    if (!match) return null;
+    const filename = decodeURIComponent(match[2]);
+    if (!filename || filename === "." || filename === ".." || /[/\\\x00-\x1f]/.test(filename)) return null;
+    return { taskId: match[1], filename };
+  } catch {
+    return null;
+  }
+}
+
 export function isLocalFsUrl(url: string | null | undefined): boolean {
   if (!url) return false;
   if (url.startsWith(`${API_BASE}/fs/`) || url.startsWith("/api/v1/fs/")) return true;
@@ -3914,7 +4276,15 @@ export interface WorkspaceArchitectTurnMeta {
   model?: string;
 }
 
+export interface WorkspaceRecommendations {
+  status: "pending" | "ready";
+  items: { blueprint_id: string | null; title: string; reason: string; brief: string }[];
+  sources: string[];
+}
+
 export interface WorkspaceDraftStreamHandlers {
+  /** Aborting closes the stream, which cancels the turn on the server. */
+  signal?: AbortSignal;
   onStart?: (info: { draft_id?: string; mode?: string }) => void;
   /** Called for every token chunk the LLM emits. */
   onToken?: (chunk: string) => void;
@@ -3966,13 +4336,13 @@ async function _streamFinalizeSSE(
       cache: "no-store",
     });
   } catch (error) {
-    showBackendUnavailableToast();
+    markBackendUnavailable();
     throw error;
   }
 
   if (!res.ok) {
     if (isBackendUnavailableStatus(res.status)) {
-      showBackendUnavailableToast();
+      markBackendUnavailable();
       throw new ApiError(res.status, t("lib.api.backend_unavailable"));
     }
 
@@ -3982,7 +4352,7 @@ async function _streamFinalizeSSE(
     throw new ApiError(res.status, msg);
   }
 
-  clearBackendUnavailableToast();
+  markBackendAvailable();
 
   const reader = res.body?.getReader();
   if (!reader) throw new Error("Stream not supported by runtime");
@@ -4076,15 +4446,17 @@ async function _streamDraftSSE(
       headers,
       body: JSON.stringify(body),
       cache: "no-store",
+      signal: handlers.signal,
     });
   } catch (error) {
-    showBackendUnavailableToast();
+    if ((error as Error).name === "AbortError") throw error;
+    markBackendUnavailable();
     throw error;
   }
 
   if (!res.ok) {
     if (isBackendUnavailableStatus(res.status)) {
-      showBackendUnavailableToast();
+      markBackendUnavailable();
       throw new ApiError(res.status, t("lib.api.backend_unavailable"));
     }
 
@@ -4107,7 +4479,7 @@ async function _streamDraftSSE(
     throw new ApiError(res.status, msg);
   }
 
-  clearBackendUnavailableToast();
+  markBackendAvailable();
 
   const reader = res.body?.getReader();
   if (!reader) throw new Error("Stream not supported by runtime");
@@ -4442,9 +4814,9 @@ export const api = {
     retractMessage: (id: string, messageId: string) => request<void>(
       `/chat/rooms/${encodeURIComponent(id)}/messages/${encodeURIComponent(messageId)}`, { method: "DELETE" },
     ),
-    retractions: (id: string, messageIds: string[]) => request<{ message_ids: string[] }>(
+    retractions: (id: string, messageIds: string[], signal?: AbortSignal) => request<{ message_ids: string[] }>(
       `/chat/rooms/${encodeURIComponent(id)}/message-retractions`, {
-        method: "POST", body: JSON.stringify({ message_ids: messageIds }),
+        method: "POST", body: JSON.stringify({ message_ids: messageIds }), signal,
       },
     ),
     files: (id: string, options: { before?: string; limit?: number; q?: string } = {}) => {
@@ -4778,6 +5150,17 @@ export const api = {
       if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
       return res.json() as Promise<{ filename: string; original_name: string; size: number; content_type: string; url: string }>;
     },
+    downloadAttachmentResponse: async (taskId: string, filename: string, options: ProtectedFileResponseOptions = {}): Promise<Response> => {
+      const token = await getReadyAuthToken();
+      const response = await fetchWithBusyRetry(`${API_BASE}/tasks/${encodeURIComponent(taskId)}/attachments/${encodeURIComponent(filename)}`, {
+        cache: "no-store",
+        redirect: "error",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        signal: options.signal,
+      });
+      if (!response.ok) throw new ApiError(response.status, "Download failed");
+      return response;
+    },
     fromTemplate: (templateId: string, overrides?: Partial<Task>) =>
       request<Task>("/tasks/from-template", {
         method: "POST",
@@ -4947,6 +5330,8 @@ export const api = {
         workspaceContext?: boolean;
         /** The Workspace App entry sending this request, so the App lists it under that entry. */
         workspaceAppAction?: string;
+        /** The open card this message answers. */
+        replyToMessageId?: string;
         threadRef?: { kind: "task" | "plan" | "goal"; id: string };
         chatMode?: string;
         chatModePayload?: Record<string, unknown>;
@@ -4967,6 +5352,8 @@ export const api = {
           supportsNativeFilePatch?: boolean | null;
           currentDocumentContent?: string | null;
         };
+        /** A document too large for the prompt, uploaded as this turn's snapshot. */
+        editorDocument?: string;
         conversationSurface?: ConversationSurfaceKind;
         ephemeral?: boolean;
         signal?: AbortSignal;
@@ -5003,14 +5390,26 @@ export const api = {
       if (opts?.manualSkillRefs?.length) form.append("manual_skill_refs", JSON.stringify(opts.manualSkillRefs));
       if (opts?.disableTools) form.append("disable_tools", "true");
       if (opts?.blockedTools?.length) form.append("blocked_tools", opts.blockedTools.join(","));
+      if (opts?.replyToMessageId) form.append("reply_to_message_id", opts.replyToMessageId);
       if (opts?.editorContext) form.append("editor_context", JSON.stringify(opts.editorContext));
+      if (opts?.editorDocument !== undefined) {
+        form.append(
+          "editor_document",
+          new Blob([opts.editorDocument], { type: "text/plain;charset=utf-8" }),
+          "current-document.txt",
+        );
+      }
       if (opts?.conversationSurface) form.append("conversation_surface", opts.conversationSurface);
       if (opts?.ephemeral) form.append("ephemeral", "true");
       for (const file of opts?.files || []) form.append("files", await prepareChatUploadFile(file));
       return requestStreamResponse("/chat/stream", form, opts?.signal);
     },
-    listConversations: (wsId?: string) =>
-      request<Conversation[]>(`/chat/conversations${wsId ? `?workspace_id=${wsId}` : ""}`),
+    listConversations: (wsId?: string, channel?: string) => {
+      const query = new URLSearchParams();
+      if (wsId) query.set("workspace_id", wsId);
+      if (channel) query.set("channel", channel);
+      return request<Conversation[]>(`/chat/conversations${query.size ? `?${query}` : ""}`);
+    },
     startAgentConversation: (agentId: string, title: string) =>
       request<Conversation>("/chat/conversations/agent-draft", {
         method: "POST",
@@ -5110,14 +5509,16 @@ export const api = {
   },
 
   mediaJobs: {
-    get: (id: string) => request<MediaJob>(`/media/jobs/${encodeURIComponent(id)}`),
+    get: (id: string, signal?: AbortSignal) => request<MediaJob>(`/media/jobs/${encodeURIComponent(id)}`, { signal }),
     /** Every version of one clip, oldest first. */
-    versions: (lineageRoot: string) => request<MediaJob[]>(
+    versions: (lineageRoot: string, signal?: AbortSignal) => request<MediaJob[]>(
       `/media/jobs?lineage_root=${encodeURIComponent(lineageRoot)}&limit=50`,
+      { signal },
     ),
     /** Every job a Workflow run started, newest first, regenerated versions included. */
-    forRun: (runId: string) => request<MediaJob[]>(
+    forRun: (runId: string, signal?: AbortSignal) => request<MediaJob[]>(
       `/media/jobs?run_id=${encodeURIComponent(runId)}&limit=50`,
+      { signal },
     ),
     regenerate: (id: string, input: MediaJobRegenerateInput) => request<MediaJob>(
       `/media/jobs/${encodeURIComponent(id)}/regenerate`,
@@ -5294,11 +5695,15 @@ export const api = {
       URL.createObjectURL(await fetchProtectedDocumentBlob(`preview:${id}`, `/documents/${id}/preview/content`, options)),
     previewBlob: (id: string, options?: DocumentBlobOptions): Promise<Blob> =>
       fetchProtectedDocumentBlob(`preview:${id}`, `/documents/${id}/preview/content`, options),
+    /** An address a `<video>`/`<audio>` plays from while it downloads; access is checked on every range. */
+    streamUrl: (id: string): Promise<string> => documentStreamUrl(id),
     previewResponse: (id: string, options?: DocumentResponseOptions): Promise<Response> =>
       fetchDocumentResponse(id, options, "preview/content"),
     thumbnail: (id: string, options?: DocumentThumbnailOptions): Promise<string> => fetchDocumentThumbnailUrl(id, options),
     imageThumbnail: (id: string, options?: DocumentThumbnailOptions): Promise<string> => fetchDocumentImageThumbnailUrl(id, options),
     localImageThumbnail: (file: Blob): Promise<string> => captureDocumentImageThumbnail(file),
+    documentThumbnail: (id: string, options?: DocumentThumbnailOptions): Promise<string> =>
+      fetchDocumentThumbnailUrl(id, options),
     presentationThumbnail: (id: string, options?: DocumentThumbnailOptions): Promise<string> =>
       fetchDocumentPresentationThumbnailUrl(id, options),
     videoThumbnail: (id: string, options?: DocumentThumbnailOptions): Promise<string> => fetchDocumentVideoThumbnailUrl(id, options),
@@ -5309,10 +5714,6 @@ export const api = {
         writePersistentThumbnailDataUrl(id, options?.version, dataUrl),
     },
     clearDownloadCache: (id?: string) => invalidateDocumentDownloadCache(id),
-    /** Protected media is fetched as a blob so raw FS URLs are not public. */
-    streamUrl: (doc: { entity_id: string; fs_path?: string | null; id: string }): string | null => {
-      return null;
-    },
     getSlides: (id: string) =>
       request<{ slides: { index: number; url: string }[]; total: number }>(`/documents/${id}/slides`),
     presentationObjectBlob: (
@@ -5893,7 +6294,15 @@ export const api = {
     deliveries: (id: string, signal?: AbortSignal) => request<ClientDeliveryReceipt[]>(`/clients/${id}/deliveries`, { signal }),
     prepareDelivery: (id: string, data: { contact_id: string; workspace_id: string; phase?: "trial" | "delivered"; knowledge_document_ids?: string[] }) => request<ClientDeliveryReceipt>(`/clients/${id}/deliveries`, { method: "POST", body: JSON.stringify(data) }),
     requestMaintenance: (clientId: string, deliveryId: string) => request<CollaborationGrant>(`/clients/${clientId}/deliveries/${deliveryId}/maintenance/request`, { method: "POST" }),
-    publishDeliveryUpdate: (clientId: string, deliveryId: string, data: { release_notes?: string }) => request<ClientDeliveryReceipt & { published: boolean }>(`/clients/${clientId}/deliveries/${deliveryId}/publish-update`, { method: "POST", body: JSON.stringify(data) }),
+    publishDeliveryUpdate: (clientId: string, deliveryId: string, data: { release_notes?: string }) => request<ClientDeliveryReceipt & { published: boolean; offered?: { workspace_id: string; version: string } | null }>(`/clients/${clientId}/deliveries/${deliveryId}/publish-update`, { method: "POST", body: JSON.stringify(data) }),
+    // A Blueprint built elsewhere (git, staging) as the delivery's next release; dry_run previews it.
+    publishDeliveryUpdateFile: (clientId: string, deliveryId: string, file: File, data: { release_notes?: string; dry_run?: boolean }) => {
+      const body = new FormData();
+      body.append("file", file);
+      if (data.release_notes) body.append("release_notes", data.release_notes);
+      body.append("dry_run", data.dry_run ? "true" : "false");
+      return request<ClientDeliveryUpdatePreview>(`/clients/${clientId}/deliveries/${deliveryId}/publish-update-file`, { method: "POST", body });
+    },
     changeInvite: (clientId: string, deliveryId: string, action: "rotate" | "revoke") => request<ClientDeliveryReceipt>(`/clients/${clientId}/deliveries/${deliveryId}/${action}`, { method: "POST" }),
     invitation: (token: string) => request<ClientDeliveryReceipt>(`/client-deliveries/invites/${encodeURIComponent(token)}`),
     acceptDelivery: (token: string) => request<ClientDeliveryReceipt>(`/client-deliveries/invites/${encodeURIComponent(token)}/accept`, { method: "POST", body: JSON.stringify({}) }),
@@ -5921,16 +6330,22 @@ export const api = {
   },
 
   workspaces: {
-    list: () => request<Workspace[]>("/workspaces"),
+    // Summary items carry only the settings and operating model a list reads.
+    // Anything else in those two fields comes from get(id).
+    list: () => request<Workspace[]>("/workspaces?view=summary"),
     get: (id: string, signal?: AbortSignal) => request<Workspace>(`/workspaces/${id}`, { signal }),
-    appView: (id: string, options?: { includeCatalog?: boolean; signal?: AbortSignal }) => request<WorkspaceAppView>(
-      `/workspaces/${id}/app-view${options?.includeCatalog === false ? "?include_catalog=false" : ""}`,
-      { signal: options?.signal },
-    ),
-    appViewContexts: (id: string, componentKey: string, options?: { cursor?: string; limit?: number; signal?: AbortSignal }) => {
+    // ``draftId`` reads the page an open design draft stages instead of the saved one: its preview.
+    appView: (id: string, options?: { includeCatalog?: boolean; draftId?: string | null; signal?: AbortSignal }) => {
+      const params = new URLSearchParams();
+      if (options?.includeCatalog === false) params.set("include_catalog", "false");
+      if (options?.draftId) params.set("draft_id", options.draftId);
+      return request<WorkspaceAppView>(`/workspaces/${id}/app-view${params.size ? `?${params}` : ""}`, { signal: options?.signal });
+    },
+    appViewContexts: (id: string, componentKey: string, options?: { cursor?: string; limit?: number; draftId?: string | null; signal?: AbortSignal }) => {
       const params = new URLSearchParams();
       if (options?.cursor) params.set("cursor", options.cursor);
       if (options?.limit) params.set("limit", String(options.limit));
+      if (options?.draftId) params.set("draft_id", options.draftId);
       const suffix = params.size ? `?${params}` : "";
       return request<WorkspaceAppDataContextsResponse>(
         `/workspaces/${id}/app-view/components/${encodeURIComponent(componentKey)}/contexts${suffix}`,
@@ -5944,20 +6359,32 @@ export const api = {
       window?: string;
       cursor?: string;
       limit?: number;
+      draftId?: string | null;
+      /** One list block's chosen filter values (filter index -> value) and search text. */
+      filters?: Record<string, string>;
+      q?: string;
+      /** A tree block: the record whose projects to read, and how deep (1 its children, 2 theirs). */
+      parent?: string;
+      level?: number;
       signal?: AbortSignal;
     }) => {
       const params = new URLSearchParams({ context_kind: options.contextKind, context_id: options.contextId });
       if (options.block) params.set("block", options.block);
+      if (options.parent) params.set("parent", options.parent);
+      if (options.level) params.set("level", String(options.level));
+      if (options.filters && Object.keys(options.filters).length) params.set("filters", JSON.stringify(options.filters));
+      if (options.q) params.set("q", options.q);
       if (options.window) params.set("window", options.window);
       if (options.cursor) params.set("cursor", options.cursor);
       if (options.limit) params.set("limit", String(options.limit));
+      if (options.draftId) params.set("draft_id", options.draftId);
       return request<WorkspaceAppDataResponse>(
         `/workspaces/${id}/app-view/components/${encodeURIComponent(componentKey)}/data?${params}`,
         { signal: options.signal },
       );
     },
-    appViewSection: (id: string, sectionId: string, signal?: AbortSignal) => request<WorkspaceAppSectionData>(
-      `/workspaces/${id}/app-view/sections/${encodeURIComponent(sectionId)}`,
+    appViewSection: (id: string, sectionId: string, signal?: AbortSignal, draftId?: string | null) => request<WorkspaceAppSectionData>(
+      `/workspaces/${id}/app-view/sections/${encodeURIComponent(sectionId)}${draftId ? `?draft_id=${encodeURIComponent(draftId)}` : ""}`,
       { signal },
     ),
     saveAppView: async (id: string, config: WorkspaceAppViewConfig, previous: WorkspaceAppViewConfig) => {
@@ -6024,8 +6451,10 @@ export const api = {
         throw error;
       }
     },
-    setupStatus: (id: string, signal?: AbortSignal) =>
-      request<WorkspaceSetupStatus>(`/workspaces/${id}/setup-status`, { signal }),
+    /** With a Workflow, `ready` says whether that Workflow may start (setup it never reaches does not hold it up). */
+    setupStatus: (id: string, signal?: AbortSignal, workflowId?: string) =>
+      request<WorkspaceSetupStatus>(
+        `/workspaces/${id}/setup-status${workflowId ? `?workflow_id=${encodeURIComponent(workflowId)}` : ""}`, { signal }),
     submitSetupInput: (id: string, checkKey: string, text: string) =>
       request<{ accepted: boolean }>(`/workspaces/${id}/setup-input`, {
         method: "POST",
@@ -6145,10 +6574,32 @@ export const api = {
         method: "POST",
         body: JSON.stringify(data),
       }),
+    /** One-step update with the default choices; a 409 `upgrade_needs_review` means open the upgrade dialog.
+     *  `authToken` lets a provider apply it in a customer trial through that trial's scoped session. */
+    applyRecommendedBlueprintUpgrade: (id: string, data: { target_version?: string } = {}, authToken?: string) =>
+      request<{
+        updated: Array<{ kind: string; name: string }>;
+        kept_yours: Array<{ kind: string; name: string }>;
+        can_revert: boolean;
+        version: string | null;
+      }>(`/workspaces/${id}/blueprint/upgrade/v3/recommended`, {
+        method: "POST",
+        body: JSON.stringify(data),
+        headers: { "X-Silent-Error": "1" },
+      }, authToken),
     revertBlueprintUpgrade: (id: string) =>
       request<{ workspace_id: string; reverted: Array<{ kind: string; name: string }> }>(
         `/workspaces/${id}/blueprint/revert`, { method: "POST" },
       ),
+    // A Blueprint file built in any environment as the next release of this Workspace's own package.
+    publishPackageRelease: (id: string, file: File, data: { release_notes?: string; dry_run?: boolean; adopt?: boolean }) => {
+      const body = new FormData();
+      body.append("file", file);
+      if (data.release_notes) body.append("release_notes", data.release_notes);
+      body.append("dry_run", data.dry_run ? "true" : "false");
+      body.append("adopt", data.adopt ? "true" : "false");
+      return request<WorkspacePackageRelease>(`/workspaces/${id}/blueprint/releases`, { method: "POST", body });
+    },
     create: (data: Partial<Workspace>) => request<Workspace>("/workspaces", { method: "POST", body: JSON.stringify(data) }),
     sandbox: (data?: { kind?: string; name?: string; seed_task_title?: string }) =>
       request<{
@@ -6161,8 +6612,17 @@ export const api = {
       }>("/workspaces/sandbox", { method: "POST", body: JSON.stringify(data || {}) }),
     update: (id: string, data: Partial<Workspace>) => request<Workspace>(`/workspaces/${id}`, { method: "PUT", body: JSON.stringify(data) }),
     delete: (id: string) => request<void>(`/workspaces/${id}`, { method: "DELETE" }),
-    restore: (id: string) => request<Workspace>(`/workspaces/${id}/restore`, { method: "POST" }),
+    restore: (id: string) =>
+      request<Workspace & {
+        unmapped_agents: Array<{ agent_id: string; agent_name: string | null; service_key: string | null }>;
+      }>(`/workspaces/${id}/restore`, { method: "POST" }),
     trash: () => request<Workspace[]>("/workspaces/trash/list"),
+    purgeTrashed: (id: string) => request<void>(`/workspaces/trash/${id}`, { method: "DELETE" }),
+    purgeTrashedMany: (ids: string[]) =>
+      request<{ purged: string[]; failed: Array<{ workspace_id: string; reason: string }> }>(
+        "/workspaces/trash/purge",
+        { method: "POST", body: JSON.stringify({ workspace_ids: ids }) },
+      ),
     graceDays: () => request<{ grace_days: number }>("/workspaces/trash/grace-days"),
     dashboard: (id: string) => request<WorkspaceStats>(`/workspaces/${id}/dashboard`),
     ledgerOverview: (id: string) =>
@@ -6456,10 +6916,10 @@ export const api = {
       const match = /filename="([^"]+)"/.exec(res.headers.get("Content-Disposition") || "");
       return { blob: await res.blob(), filename: match?.[1] || "blueprint.manor" };
     },
-    promote: (wsId: string, force = false) =>
+    promote: (wsId: string, options: { force?: boolean; defer_connections?: boolean } = {}) =>
       request<PromoteResponse>(
         `/workspaces/${wsId}/promote`,
-        { method: "POST", body: JSON.stringify({ force }) },
+        { method: "POST", body: JSON.stringify(options) },
       ),
     promotePreflight: (wsId: string) =>
       request<UnmetRequirement[]>(`/workspaces/${wsId}/promote/preflight`),
@@ -6584,6 +7044,7 @@ export const api = {
   },
 
   workspaceDrafts: {
+    recommendations: () => request<WorkspaceRecommendations>("/workspace-drafts/recommendations"),
     list: (status?: "active" | "ready" | "finalized" | "abandoned") => {
       const q = new URLSearchParams();
       if (status) q.set("status", status);
@@ -6591,7 +7052,7 @@ export const api = {
         `/workspace-drafts${q.toString() ? "?" + q.toString() : ""}`,
       );
     },
-    get: (id: string) => request<WorkspaceDraft>(`/workspace-drafts/${id}`),
+    get: (id: string, signal?: AbortSignal) => request<WorkspaceDraft>(`/workspace-drafts/${id}`, { signal }),
     updateFields: (id: string, fields: Record<string, any>) =>
       request<WorkspaceDraft>(`/workspace-drafts/${id}/fields`, { method: "PATCH", body: JSON.stringify(fields) }),
     create: (data: { initial_brief?: string } = {}) =>
@@ -6807,12 +7268,12 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ channel_type }),
       }),
-    getChannelLinkStatus: (token: string) =>
+    getChannelLinkStatus: (token: string, signal?: AbortSignal) =>
       request<{
         status: "pending" | "claimed" | "expired" | "not_found";
         contact_id?: string | null;
         claimed_at?: string | null;
-      }>(`/notifications/preferences/link/${encodeURIComponent(token)}`),
+      }>(`/notifications/preferences/link/${encodeURIComponent(token)}`, { signal }),
   },
 
 
@@ -6870,206 +7331,6 @@ export const api = {
     },
   },
 
-  dashboard: {
-    layout: () =>
-      request<{
-        version: number;
-        widgets: Array<{ id: string; visible: boolean }>;
-        modules: Array<{
-          id: string;
-          title: string;
-          description?: string | null;
-          visible: boolean;
-          size: "compact" | "wide";
-          conversation_id?: string | null;
-          code: any;
-        }>;
-      }>("/dashboard/layout"),
-    updateLayout: (
-      widgets: Array<{ id: string; visible: boolean }>,
-      modules: Array<{
-        id: string;
-        title: string;
-        description?: string | null;
-        visible: boolean;
-        size: "compact" | "wide";
-        conversation_id?: string | null;
-        code: any;
-      }>,
-    ) =>
-      request<{
-        version: number;
-        widgets: Array<{ id: string; visible: boolean }>;
-        modules: any[];
-      }>("/dashboard/layout", {
-        method: "PUT",
-        body: JSON.stringify({ widgets, modules }),
-      }),
-    suggestLayout: (
-      prompt: string,
-      widgets: Array<{ id: string; visible: boolean }>,
-      modules: Array<{
-        id: string;
-        title: string;
-        description?: string | null;
-        visible: boolean;
-        size: "compact" | "wide";
-        conversation_id?: string | null;
-        code: any;
-      }>,
-      options?: {
-        targetModuleId?: string;
-        conversationId?: string;
-        signal?: AbortSignal;
-      },
-    ) =>
-      request<{
-        version: number;
-        widgets: Array<{ id: string; visible: boolean }>;
-        modules: any[];
-        assistant_message?: string | null;
-        changed_module_id?: string | null;
-        conversation_id?: string | null;
-        tool_calls: string[];
-        hitl_requests: Array<Record<string, unknown>>;
-        preview_created: boolean;
-      }>("/dashboard/layout/suggest", {
-        method: "POST",
-        body: JSON.stringify({
-          prompt,
-          widgets,
-          modules,
-          target_module_id: options?.targetModuleId,
-          conversation_id: options?.conversationId,
-        }),
-        signal: options?.signal,
-      }),
-    suggestLayoutJobStart: (
-      prompt: string,
-      widgets: Array<{ id: string; visible: boolean }>,
-      modules: Array<{
-        id: string;
-        title: string;
-        description?: string | null;
-        visible: boolean;
-        size: "compact" | "wide";
-        conversation_id?: string | null;
-        code: any;
-      }>,
-      options?: {
-        targetModuleId?: string;
-        conversationId?: string;
-        signal?: AbortSignal;
-      },
-    ) =>
-      request<DashboardSuggestJobResponse>("/dashboard/layout/suggest/jobs", {
-        method: "POST",
-        body: JSON.stringify({
-          prompt,
-          widgets,
-          modules,
-          target_module_id: options?.targetModuleId,
-          conversation_id: options?.conversationId,
-        }),
-        signal: options?.signal,
-      }),
-    suggestLayoutJobStatus: (jobId: string, signal?: AbortSignal) =>
-      request<DashboardSuggestJobResponse>(
-        `/dashboard/layout/suggest/jobs/${encodeURIComponent(jobId)}`,
-        { signal },
-      ),
-    suggestLayoutJobCancel: (jobId: string) =>
-      request<DashboardSuggestJobResponse>(
-        `/dashboard/layout/suggest/jobs/${encodeURIComponent(jobId)}/cancel`,
-        { method: "POST" },
-      ),
-    moduleConversation: (moduleId: string) =>
-      request<{
-        conversation_id?: string | null;
-        messages: Array<{
-          role: "user" | "assistant";
-          content: string;
-          tool_calls: string[];
-        }>;
-      }>(`/dashboard/modules/${encodeURIComponent(moduleId)}/conversation`),
-    httpData: (url: string, refreshSeconds = 300) =>
-      request<{
-        url: string;
-        result: unknown;
-        cached: boolean;
-      }>("/dashboard/http-data", {
-        method: "POST",
-        body: JSON.stringify({
-          url,
-          refresh_seconds: refreshSeconds,
-        }),
-      }),
-    toolData: (
-      toolName: string,
-      args: Record<string, unknown>,
-      conversationId?: string | null,
-      refreshSeconds = 300,
-    ) =>
-      request<{
-        tool_name: string;
-        result: unknown;
-        cached: boolean;
-      }>("/dashboard/tool-data", {
-        method: "POST",
-        body: JSON.stringify({
-          tool_name: toolName,
-          arguments: args,
-          conversation_id: conversationId,
-          refresh_seconds: refreshSeconds,
-        }),
-      }),
-    news: (query?: string, days = 1, limit = 8) => {
-      const params = new URLSearchParams({
-        days: String(days),
-        limit: String(limit),
-      });
-      if (query) params.set("query", query);
-      return request<Array<{
-        id: string;
-        title: string;
-        url: string;
-        source?: string | null;
-        published_at?: string | null;
-        language?: string | null;
-      }>>(`/dashboard/news?${params}`);
-    },
-    stocks: (symbols: string[]) => {
-      const params = new URLSearchParams({ symbols: symbols.join(",") });
-      return request<Array<{
-        symbol: string;
-        price?: number | null;
-        change?: number | null;
-        change_percent?: number | null;
-        open?: number | null;
-        high?: number | null;
-        low?: number | null;
-        previous_close?: number | null;
-        currency?: string | null;
-        updated_at?: string | null;
-        status: "ok" | "unavailable";
-        provider?: string | null;
-      }>>(`/dashboard/stocks?${params}`);
-    },
-    stats: (wsId?: string) => request<any>(`/dashboard/stats${wsId ? `?workspace_id=${wsId}` : ""}`),
-    taskTrends: (days = 30, wsId?: string) =>
-      request<any[]>(`/dashboard/task-trends?days=${days}${wsId ? `&workspace_id=${wsId}` : ""}`),
-    usageTrends: (days = 30) =>
-      request<any[]>(`/dashboard/usage-trends?days=${days}`),
-    recentActivity: (limit = 10, wsId?: string, since?: string | null) => {
-      const params = new URLSearchParams({ limit: String(limit) });
-      if (wsId) params.set("workspace_id", wsId);
-      if (since) params.set("since", since);
-      return request<any[]>(`/dashboard/recent-activity?${params.toString()}`);
-    },
-    activeGoals: (limit = 5, wsId?: string) =>
-      request<any[]>(`/dashboard/active-goals?limit=${limit}${wsId ? `&workspace_id=${wsId}` : ""}`),
-  },
-
   activity: {
     feed: (limit = 20) => request<any[]>(`/activity/feed?limit=${limit}`),
     events: (params?: {
@@ -7115,7 +7376,7 @@ export const api = {
     summary: (days?: number) =>
       request<UsageSummary>(`/usage/summary?days=${days || 30}`),
     daily: (days?: number, scope: "company" | "member" = "company") =>
-      request<{ date: string; input: number; output: number; total: number }[]>(`/usage/daily?days=${days || 30}&scope=${scope}`),
+      request<UsageDailyRow[]>(`/usage/daily?days=${days || 30}&scope=${scope}`),
     bySource: (days?: number, scope: "company" | "member" = "company") =>
       request<UsageBySourceRow[]>(`/usage/by-source?days=${days || 30}&scope=${scope}`),
     team: (params?: { days?: number; activity_limit?: number }) => {
@@ -7164,6 +7425,8 @@ export const api = {
     list: () => request<OAuthConnection[]>("/oauth/connections"),
     revoke: (id: string) =>
       request<void>(`/oauth/connections/${encodeURIComponent(id)}`, { method: "DELETE" }),
+    createAccessKey: (body: { name: string; scope: "mcp" | "mcp:read"; expires_in_days: number | null }) =>
+      request<PersonalAccessTokenCreated>("/oauth/personal-tokens", { method: "POST", body: JSON.stringify(body) }),
   },
 
   staff: {
@@ -7313,17 +7576,20 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ enabled }),
       }),
-    runs: (jobId: string) =>
-      request<any[]>(`/jobs/${jobId}/runs`),
-    runDetail: (jobId: string, runId: string) =>
+    runs: (jobId: string, signal?: AbortSignal) =>
+      request<any[]>(`/jobs/${jobId}/runs`, { signal }),
+    runDetail: (jobId: string, runId: string, signal?: AbortSignal) =>
       request<{ run: any; task: any | null; agent_execution: any | null }>(
         `/jobs/${jobId}/runs/${runId}`,
+        { signal },
       ),
-    runNow: (jobId: string, idempotencyKey = crypto.randomUUID()) =>
+    /** `responses` answers this run's own waits before they start, e.g. a late decision a person just confirmed. */
+    runNow: (jobId: string, idempotencyKey = crypto.randomUUID(), body?: { responses: Record<string, string> }) =>
       request<{ job_id: string; queued_at: string; idempotency_key: string }>(
         `/jobs/${jobId}/run_now`, {
           method: "POST",
           headers: { "Idempotency-Key": idempotencyKey },
+          ...(body ? { body: JSON.stringify(body) } : {}),
         },
       ),
   },
@@ -7336,6 +7602,8 @@ export const api = {
 
   workflows: {
     list: () => request<any[]>("/workflows"),
+    /** Without steps and variables: enough to name or pick a workflow. */
+    listSummaries: () => request<any[]>("/workflows?summary=true"),
     listProjectCandidates: (params: {
       workspace_id: string;
       project_type: string;
@@ -7385,7 +7653,7 @@ export const api = {
       onRun?: (runId: string) => void,
       data?: { variables?: Record<string, any>; trigger_data?: Record<string, any> },
     ) => streamWorkflowRun(`/workflows/${id}/run-stream`, onNode, onRun, data),
-    runs: (id: string) => request<any[]>(`/workflows/${id}/runs`),
+    runs: (id: string, signal?: AbortSignal) => request<any[]>(`/workflows/${id}/runs`, { signal }),
     listRuns: (params?: { workspace_id?: string; binding_id?: string; workflow_id?: string; include_unbound?: boolean; app_action?: string; include_unlabelled?: boolean; status?: string; limit?: number }, signal?: AbortSignal) => {
       const q = new URLSearchParams();
       if (params?.workspace_id) q.set("workspace_id", params.workspace_id);
@@ -7923,7 +8191,7 @@ export const api = {
         body: JSON.stringify({}),
       }),
     listSessions: () => request<BrowserSession[]>("/browser/sessions"),
-    getSession: (id: string) => request<BrowserSession>(`/browser/sessions/${id}`),
+    getSession: (id: string, signal?: AbortSignal) => request<BrowserSession>(`/browser/sessions/${id}`, { signal }),
     navigate: (id: string, url: string) =>
       request<any>(`/browser/sessions/${id}/navigate`, {
         method: "POST",
@@ -8309,8 +8577,8 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ domain }),
       }),
-    checkDomain: (id: string) =>
-      request<SiteInfo>(`/sites/${id}/domain/check`, { method: "POST" }),
+    checkDomain: (id: string, signal?: AbortSignal) =>
+      request<SiteInfo>(`/sites/${id}/domain/check`, { method: "POST", signal }),
     unbindDomain: (id: string) =>
       request<SiteInfo>(`/sites/${id}/domain`, { method: "DELETE" }),
     getConnections: (id: string) =>
@@ -8391,6 +8659,33 @@ export interface SitePublishResult extends SiteInfo {
 
 export interface ClientRecord { id: string; name: string; email?: string; phone?: string; address?: string; status: string; metadata?: { crm?: Partial<CrmProfile> }; }
 export interface ClientContactRecord extends Omit<ClientContactInput, "phone" | "job_title"> { id: string; user_id?: string | null; phone: string | null; job_title: string | null; }
+/** What a delivery update sends, or with ``dry_run`` would send. */
+export interface WorkspacePackageRelease {
+  dry_run: boolean;
+  package: { ref: string; name: string };
+  current_version?: string | null;
+  version?: string | null;
+  would_publish?: boolean;
+  published?: boolean;
+  level?: "patch" | "minor" | "major" | null;
+  reasons?: string[];
+  components?: { added: string[]; changed: string[]; removed: string[] } | null;
+  adoption?: {
+    matched: Array<{ component: string; id: string; name?: string | null }>;
+    unmatched: Array<{ component: string; reason: "ambiguous" | "not_found" }>;
+  } | null;
+}
+
+export type ClientDeliveryUpdatePreview = ClientDeliveryReceipt & {
+  published: boolean;
+  dry_run?: boolean;
+  would_publish?: boolean;
+  version?: string;
+  level?: "patch" | "minor" | "major";
+  reasons?: string[];
+  components?: { added: string[]; removed: string[]; changed: string[] };
+};
+
 export interface ClientDeliveryReceipt {
   id: string; client_id: string; contact_id: string; source_workspace_id: string; title: string;
   recipient_email: string; status: string; expires_at: string; invite_path?: string;

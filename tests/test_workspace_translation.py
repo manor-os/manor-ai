@@ -122,7 +122,10 @@ def test_flow_descriptions_and_data_view_headings_are_translated_too():
     workspace = SimpleNamespace(id="workspace", operating_model={"app_view": {"components": [{
         "key": "series", "type": "data_view", "title": "系列", "context": {"kind": "project", "source": "series", "label": "系列"},
         "blocks": [{"key": "progress", "type": "project_rollup", "source": "episodes", "title": "进度",
-                    "stage_labels": {"made": "已完成"}, "fields": [{"label": "内容", "field": ["premise"]}]}],
+                    "stage_labels": {"made": "已完成"}, "fields": [{"label": "内容", "field": ["premise"]}]},
+                   # A record's title names the field it reads from, below a text key.
+                   {"key": "published", "type": "records", "source": "episodes",
+                    "record_display": {"title": {"source": "series", "field": ["publication", "title"]}}}],
     }]}})
     workflow = SimpleNamespace(id="flow", name="flow", description="写一集短剧", variables={}, steps=[])
     binding = SimpleNamespace(id="binding", workspace_id="workspace", workflow_id="flow", name="单集生成",
@@ -131,6 +134,7 @@ def test_flow_descriptions_and_data_view_headings_are_translated_too():
 
     page = anchors["app_view"]
     assert {text for _, text in page.wanted()["en"]} == {"系列", "进度", "已完成", "内容"}
+    assert not [path for path, _ in page.leaves() if "record_display" in path]
     translated = page.with_translations("en", {path: f"EN:{text}" for path, text in page.wanted()["en"]})
     view = localized(translated, "en")["components"][0]
     assert (view["title"], view["blocks"][0]["stage_labels"]["made"]) == ("EN:系列", "EN:已完成")

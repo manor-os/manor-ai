@@ -62,22 +62,22 @@ function PortalLogin({ onLogin }: { onLogin: (token: string) => void }) {
             height: 56,
             margin: "0 auto 16px",
             borderRadius: 18,
-            background: "linear-gradient(135deg, #436b65, #4f7d75)",
+            background: "var(--surface-muted)",
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
           }}>
-            <svg style={{ width: 28, height: 28, color: "#fff" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <svg style={{ width: 28, height: 28, color: "var(--text-strong)" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z" />
             </svg>
           </div>
-          <h1 style={{ fontSize: 22, fontWeight: 900, color: "#292524", marginBottom: 4 }}>{t("page.client_portal.title")}</h1>
-          <p style={{ fontSize: 14, color: "#78716c" }}>{t("page.client_portal.login_subtitle")}</p>
+          <h1 style={{ fontSize: 22, fontWeight: 600, color: "var(--text-strong)", marginBottom: 4 }}>{t("page.client_portal.title")}</h1>
+          <p style={{ fontSize: 14, color: "var(--text-muted)" }}>{t("page.client_portal.login_subtitle")}</p>
         </div>
 
         <form onSubmit={handleSubmit}>
           <div style={{ marginBottom: 20 }}>
-            <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: "#57534e", marginBottom: 6 }}>
+            <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: "var(--text-muted)", marginBottom: 6 }}>
               {t("page.client_portal.portal_token")}
             </label>
             <input
@@ -147,8 +147,8 @@ function PortalTickets({ token }: { token: string }) {
       case "open": return { bg: "#f3f6fa", color: "#1e40af" };
       case "in_progress": return { bg: "#faf7ef", color: "#76502c" };
       case "resolved": return { bg: "#f1f6f3", color: "#065f46" };
-      case "closed": return { bg: "#f5f5f4", color: "#57534e" };
-      default: return { bg: "#f5f5f4", color: "#57534e" };
+      case "closed": return { bg: "#f5f5f7", color: "var(--text-muted)" };
+      default: return { bg: "#f5f5f7", color: "var(--text-muted)" };
     }
   };
 
@@ -168,8 +168,8 @@ function PortalTickets({ token }: { token: string }) {
 
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
           <div>
-            <h1 style={{ fontSize: 22, fontWeight: 900, color: "#292524" }}>{t("page.client_portal.my_tickets")}</h1>
-            <p style={{ fontSize: 13, color: "#a8a29e", marginTop: 4 }}>{t("page.client_portal.tickets_subtitle")}</p>
+            <h1 style={{ fontSize: 22, fontWeight: 900, color: "var(--text-strong)" }}>{t("page.client_portal.my_tickets")}</h1>
+            <p style={{ fontSize: 13, color: "var(--text-muted)", marginTop: 4 }}>{t("page.client_portal.tickets_subtitle")}</p>
           </div>
           <button onClick={() => setShowCreate(true)} className="btn-manor" style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
             <IconPlus size={16} />
@@ -187,7 +187,7 @@ function PortalTickets({ token }: { token: string }) {
             <div style={{ padding: 48 }}>
               <EmptyState
                 icon={
-                  <svg style={{ width: 32, height: 32, color: "#d6d3d1" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <svg style={{ width: 32, height: 32, color: "var(--text-faint)" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 6v.75m0 3v.75m0 3v.75m0 3V18m-9-5.25h5.25M7.5 15h3M3.375 5.25c-.621 0-1.125.504-1.125 1.125v3.026a2.999 2.999 0 010 5.198v3.026c0 .621.504 1.125 1.125 1.125h17.25c.621 0 1.125-.504 1.125-1.125v-3.026a2.999 2.999 0 010-5.198V6.375c0-.621-.504-1.125-1.125-1.125H3.375z" />
                   </svg>
                 }
@@ -227,11 +227,11 @@ function PortalTickets({ token }: { token: string }) {
                     onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = "transparent"; }}
                   >
                     <div style={{ minWidth: 0, flex: 1, marginRight: 12 }}>
-                      <p style={{ fontSize: 14, fontWeight: 600, color: "#292524", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      <p style={{ fontSize: 14, fontWeight: 600, color: "var(--text-strong)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                         {ticket.title}
                       </p>
                       {ticket.description && (
-                        <p style={{ fontSize: 12, color: "#a8a29e", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 2 }}>
+                        <p style={{ fontSize: 12, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 2 }}>
                           {ticket.description}
                         </p>
                       )}
@@ -247,7 +247,7 @@ function PortalTickets({ token }: { token: string }) {
                       }}>
                         {ticket.status?.replace("_", " ") || t("page.client_portal.open")}
                       </span>
-                      <span style={{ fontSize: 12, color: "#a8a29e" }}>
+                      <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
                         {ticket.created_at ? new Date(ticket.created_at).toLocaleDateString(undefined, { timeZone: getPreferredTimeZone() }) : ""}
                       </span>
                     </div>
@@ -267,18 +267,18 @@ function PortalTickets({ token }: { token: string }) {
           {selectedTicket && (
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               <div>
-                <span style={{ fontSize: 12, color: "#a8a29e", display: "block" }}>{t("page.client_portal.field_title")}</span>
-                <span style={{ fontSize: 14, fontWeight: 600, color: "#292524" }}>{selectedTicket.title}</span>
+                <span style={{ fontSize: 12, color: "var(--text-muted)", display: "block" }}>{t("page.client_portal.field_title")}</span>
+                <span style={{ fontSize: 14, fontWeight: 600, color: "var(--text-strong)" }}>{selectedTicket.title}</span>
               </div>
               {selectedTicket.description && (
                 <div>
-                  <span style={{ fontSize: 12, color: "#a8a29e", display: "block" }}>{t("page.client_portal.field_description")}</span>
-                  <p style={{ fontSize: 14, color: "#57534e", whiteSpace: "pre-wrap" }}>{selectedTicket.description}</p>
+                  <span style={{ fontSize: 12, color: "var(--text-muted)", display: "block" }}>{t("page.client_portal.field_description")}</span>
+                  <p style={{ fontSize: 14, color: "var(--text-muted)", whiteSpace: "pre-wrap" }}>{selectedTicket.description}</p>
                 </div>
               )}
               <div style={{ display: "flex", gap: 24 }}>
                 <div>
-                  <span style={{ fontSize: 12, color: "#a8a29e", display: "block" }}>{t("page.client_portal.field_status")}</span>
+                  <span style={{ fontSize: 12, color: "var(--text-muted)", display: "block" }}>{t("page.client_portal.field_status")}</span>
                   <span style={{
                     display: "inline-block",
                     marginTop: 4,
@@ -293,8 +293,8 @@ function PortalTickets({ token }: { token: string }) {
                   </span>
                 </div>
                 <div>
-                  <span style={{ fontSize: 12, color: "#a8a29e", display: "block" }}>{t("page.client_portal.field_created")}</span>
-                  <span style={{ fontSize: 14, color: "#57534e" }}>
+                  <span style={{ fontSize: 12, color: "var(--text-muted)", display: "block" }}>{t("page.client_portal.field_created")}</span>
+                  <span style={{ fontSize: 14, color: "var(--text-muted)" }}>
                     {selectedTicket.created_at ? new Date(selectedTicket.created_at).toLocaleString(undefined, { timeZone: getPreferredTimeZone() }) : t("page.client_portal.na")}
                   </span>
                 </div>

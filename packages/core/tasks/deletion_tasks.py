@@ -44,7 +44,7 @@ async def _async_purge_workspaces():
         list_workspaces_due_for_purge, purge_workspace,
     )
     from packages.core.services.workspace_artifact_purge import (
-        drain_workspace_artifact_purge_jobs,
+        drain_all_workspace_artifact_purge_jobs,
     )
 
     purged = 0
@@ -82,7 +82,7 @@ async def _async_purge_workspaces():
                 continue
 
         artifact_cleaned, artifact_failed = (
-            await drain_workspace_artifact_purge_jobs(db)
+            await drain_all_workspace_artifact_purge_jobs(db)
         )
 
     if purged or failed or artifact_cleaned or artifact_failed:

@@ -421,22 +421,6 @@ def test_documented_integration_skill_tools_are_declared_or_discoverable() -> No
     assert not problems, "integration Skill description/tool drift:\n" + "\n".join(problems)
 
 
-def test_integration_skill_tool_audit_rejects_fictional_provider_alias() -> None:
-    problems = _integration_skill_tool_reference_problems(
-        source=Path("mcp_stripe/SKILL.md"),
-        skill_name="mcp_stripe",
-        config={
-            "tools": ["mcp__stripe__list_payment_intents"],
-            "type": "runtime_guidance",
-        },
-        skill_text="Re-check with `stripe_api_read` before retrying.",
-        registered={"mcp__stripe__list_payment_intents"},
-    )
-
-    assert problems == [
-        "mcp_stripe/SKILL.md:1: documents unknown provider tool alias "
-        "'stripe_api_read'"
-    ]
 
 
 def test_fully_qualified_tool_names_in_skill_docs_are_registered() -> None:

@@ -2861,8 +2861,9 @@ _REVIEW_FINDING_GUIDANCE = {
         "with push_assets and declare @font-face { src: url('assets/references/<file>') }."
     ),
     "font_family_without_font_face": (
-        "Declare @font-face for that family with a font file staged under assets/ (push_assets), "
-        "or switch to a generic family such as sans-serif."
+        "Declare @font-face for that family: src: local('<font name>') for a font installed in the Sandbox "
+        "(no file needed), otherwise a font file staged under assets/ (push_assets). A generic family such "
+        "as sans-serif also passes."
     ),
     "contrast_aa_failure": (
         "Set the text color to the finding's suggestedColor, or darken/lighten the area behind the "

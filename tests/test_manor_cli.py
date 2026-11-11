@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import ast
 import json
+import os
+import subprocess
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -148,11 +151,33 @@ def test_ls_sends_entity_paths_and_prints_names(api, capsys):
     endpoint, body, auth = api.requests[-1]
     assert endpoint == "ls" and body["path"] == "Knowledge" and auth == "Bearer mcli_test-token"
 
-    import os
-
     os.chdir(api.workspace / "Knowledge")
     assert manor_cli.main(["ls", "sub"]) == 0
     assert api.requests[-1][1]["path"] == "Knowledge/sub", "relative to the cwd under /workspace"
+
+
+# A long listing fails while the handler prints; a short one only when the
+# buffered output is flushed at exit. Both must stay silent.
+@pytest.mark.parametrize("entries", [1, 20_000], ids=["flush-at-exit", "mid-output"])
+def test_reader_closing_the_pipe_exits_quietly(api, entries):
+    api.responses["ls"] = (200, {
+        "path": ".",
+        "entries": [{"path": f"f{i}.md", "type": "file"} for i in range(entries)],
+    }, {})
+    # `manor ls | head -1` with the reader already gone, so every write fails.
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    try:
+        result = subprocess.run(
+            [sys.executable, manor_cli.__file__, "ls"],
+            stdout=write_end,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+    finally:
+        os.close(write_end)
+    assert result.stderr == b""
+    assert result.returncode == manor_cli.EXIT_BROKEN_PIPE
 
 
 def test_server_refusal_and_expired_token_exit_codes(api, capsys):

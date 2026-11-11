@@ -45,7 +45,6 @@ async def test_workspace_delegation_uses_durable_per_call_billing_with_attempt_n
             task_id="task-1",
             tool_profile=None,
             llm_metadata=None,
-            byok=False,
         )
 
     prefixes: list[str] = []
@@ -127,5 +126,7 @@ async def test_workspace_delegation_uses_durable_per_call_billing_with_attempt_n
     assert len(prefixes) == 2
     assert all(prefix.startswith(stable_prefix) for prefix in prefixes)
     assert prefixes[0] != prefixes[1]
-    assert loop_contexts == [(True, True), (True, True)]
+    # (suppress, durable_per_call): rounds settle through the callbacks while
+    # calls outside a round keep their automatic record.
+    assert loop_contexts == [(False, True), (False, True)]
     assert billing_module.runtime_current_billing_context() is None

@@ -786,10 +786,10 @@ async def _run_child(
         workspace_id=workspace_id,
         conversation_id=conversation_id,
         fallback_model=ctx.model,
-        byok=bool(getattr(ctx, "byok", False)),
         payer_entity_id=await resolve_run_payer(
             None, entity_id=entity_id, workspace_id=workspace_id,
         ),
+        task_id=task_id,
     ) as (reserve_llm_call, settle_llm_call):
 
         async def _before_model(*args: Any, **kwargs: Any) -> Any:

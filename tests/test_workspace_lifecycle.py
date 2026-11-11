@@ -1,9 +1,11 @@
 """E2E tests: workspace soft-delete / restore / purge lifecycle."""
 
+import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 
 
 async def _register(
@@ -1820,15 +1822,16 @@ async def test_purge_workspace_cascades(client: AsyncClient, db_session):
     assert await db_session.get(NotificationOutboxEvent, legacy_outbox_id) is None
     assert await db_session.get(NotificationDelivery, notification_delivery_id) is None
     assert await db_session.get(Notification, unrelated_notification_id) is not None
+    # The credit ledger is never deleted: purging would refund the spend.
+    # Its rows stay, detached from the Workspace, and the hold is released.
+    kept_reservation = await db_session.get(CreditReservation, workspace_reservation_id)
+    kept_usage = await db_session.get(CreditUsageLog, workspace_usage_id)
+    assert kept_reservation is not None and kept_reservation.workspace_id is None
+    assert kept_reservation.status != "active"
+    assert kept_usage is not None and kept_usage.workspace_id is None
+    assert await db_session.get(CreditUsageAllocation, workspace_usage_allocation_id) is not None
     purged_runtime_rows = {
-        "credit_reservation": await db_session.get(
-            CreditReservation, workspace_reservation_id
-        ),
-        "credit_usage": await db_session.get(CreditUsageLog, workspace_usage_id),
-        "credit_usage_allocation": await db_session.get(
-            CreditUsageAllocation, workspace_usage_allocation_id
-        ),
-        "token_usage": await db_session.get(TokenUsageLog, workspace_token_usage_id),
+        "token_usage":await db_session.get(TokenUsageLog, workspace_token_usage_id),
         "tool_call_log": await db_session.get(ToolCallLog, workspace_tool_log_id),
         "runtime_event": await db_session.get(RuntimeEventLog, workspace_runtime_event_id),
         "review_run": await db_session.get(ReviewRun, workspace_review_run_id),
@@ -2800,3 +2803,195 @@ async def test_purge_workspace_preserves_resources_reused_elsewhere(
         ResourceType.SKILL,
         unrelated_user_id,
     ) is True
+
+
+async def _create_trashed_workspace(client: AsyncClient, headers: dict, name: str) -> str:
+    create = await client.post("/api/v1/workspaces", headers=headers, json={"name": name})
+    assert create.status_code == 201, create.text
+    ws_id = create.json()["id"]
+    deleted = await client.delete(f"/api/v1/workspaces/{ws_id}", headers=headers)
+    assert deleted.status_code == 204, deleted.text
+    return ws_id
+
+
+async def _workspace_row_exists(db_session, workspace_id: str) -> bool:
+    from packages.core.models.workspace import Workspace
+
+    db_session.expire_all()
+    return await db_session.get(Workspace, workspace_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_permanently_delete_trashed_workspace_now(client: AsyncClient, db_session):
+    """DELETE /trash/{id} purges one trashed Workspace before the grace window ends."""
+    _, headers = await _register(client, "lifecycle_trash_single")
+    ws_id = await _create_trashed_workspace(client, headers, "Single purge")
+    assert await _workspace_row_exists(db_session, ws_id)
+
+    resp = await client.delete(f"/api/v1/workspaces/trash/{ws_id}", headers=headers)
+    assert resp.status_code == 204, resp.text
+
+    assert not await _workspace_row_exists(db_session, ws_id)
+    trash = await client.get("/api/v1/workspaces/trash/list", headers=headers)
+    assert all(w["id"] != ws_id for w in trash.json())
+    again = await client.delete(f"/api/v1/workspaces/trash/{ws_id}", headers=headers)
+    assert again.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_permanent_delete_refuses_active_workspace(client: AsyncClient, db_session):
+    """Only trashed Workspaces can be permanently deleted from the trash."""
+    _, headers = await _register(client, "lifecycle_trash_active")
+    create = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Active"})
+    ws_id = create.json()["id"]
+
+    resp = await client.delete(f"/api/v1/workspaces/trash/{ws_id}", headers=headers)
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"] == "Workspace not found in trash"
+    assert await _workspace_row_exists(db_session, ws_id)
+
+
+@pytest.mark.asyncio
+async def test_permanent_delete_reports_pending_provider_work(
+    client: AsyncClient, db_session, monkeypatch,
+):
+    """A trashed Workspace whose provider work is still billable stays in the trash
+    and the refusal says why."""
+    from packages.core.services import apify_collections
+
+    async def pending_provider_work(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(apify_collections, "guard_collection_purge", pending_provider_work)
+    _, headers = await _register(client, "lifecycle_trash_pending")
+    ws_id = await _create_trashed_workspace(client, headers, "Pending provider work")
+
+    resp = await client.delete(f"/api/v1/workspaces/trash/{ws_id}", headers=headers)
+    assert resp.status_code == 409, resp.text
+    assert "provider work" in resp.json()["detail"]
+    assert await _workspace_row_exists(db_session, ws_id)
+    trash = await client.get("/api/v1/workspaces/trash/list", headers=headers)
+    assert ws_id in {w["id"] for w in trash.json()}
+
+
+@pytest.mark.asyncio
+async def test_batch_permanent_delete_reports_each_workspace(
+    client: AsyncClient, db_session,
+):
+    """POST /trash/purge purges every trashed id it can and reports the rest."""
+    _, headers = await _register(client, "lifecycle_trash_batch")
+    first = await _create_trashed_workspace(client, headers, "Batch one")
+    second = await _create_trashed_workspace(client, headers, "Batch two")
+    create_active = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Batch active"})
+    active = create_active.json()["id"]
+
+    resp = await client.post(
+        "/api/v1/workspaces/trash/purge",
+        headers=headers,
+        json={"workspace_ids": [first, active, second, first]},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["purged"] == [first, second]
+    assert [f["workspace_id"] for f in body["failed"]] == [active]
+    assert body["failed"][0]["reason"] == "Workspace not found in trash"
+    assert not await _workspace_row_exists(db_session, first)
+    assert not await _workspace_row_exists(db_session, second)
+    assert await _workspace_row_exists(db_session, active)
+
+
+@pytest.mark.asyncio
+async def test_trash_list_marks_workspaces_the_caller_can_delete(client: AsyncClient):
+    """The trash list tells the UI which rows may be permanently deleted."""
+    _, headers = await _register(client, "lifecycle_trash_flags")
+    ws_id = await _create_trashed_workspace(client, headers, "Flagged")
+
+    trash = await client.get("/api/v1/workspaces/trash/list", headers=headers)
+    row = next(w for w in trash.json() if w["id"] == ws_id)
+    assert row["can_delete"] is True
+
+
+async def _upload_text(client: AsyncClient, headers: dict, name: str, content: bytes, folder_id: str | None = None) -> dict:
+    params = {"folder_id": folder_id} if folder_id else None
+    uploaded = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        params=params,
+        files={"file": (name, content, "text/plain")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    return uploaded.json()
+
+
+@pytest.mark.asyncio
+async def test_permanent_delete_releases_workspace_file_storage(
+    client: AsyncClient, db_session, monkeypatch, tmp_path,
+):
+    """Permanently deleting a trashed Workspace removes its files, its documents and its folder."""
+    from packages.core.config import get_settings
+    from packages.core.models.document import DocumentFolder
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.document_service import storage_usage
+
+    from apps.api.routers import documents as document_routes
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(document_routes, "settings", settings)
+
+    from packages.core.models.document import Document
+    from packages.core.services.entity_fs import get_entity_root
+
+    _, headers = await _register(client, "lifecycle_storage_release")
+    create = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Storage release"})
+    assert create.status_code == 201, create.text
+    ws = create.json()
+    for name, content in (("first.txt", b"a" * 300), ("second.txt", b"b" * 500)):
+        await _upload_text(client, headers, name, content, folder_id=ws["artifact_folder_id"])
+
+    entity_id = ws["entity_id"]
+    db_session.expire_all()
+    before = await storage_usage(db_session, entity_id)
+    assert before == (800, 2)
+    stored_paths = (await db_session.execute(
+        select(Document.fs_path).where(Document.entity_id == entity_id)
+    )).scalars().all()
+    assert stored_paths and all(stored_paths)
+    entity_root = get_entity_root(entity_id)
+    assert all(os.path.isfile(os.path.join(entity_root, path)) for path in stored_paths)
+
+    deleted = await client.delete(f"/api/v1/workspaces/{ws['id']}", headers=headers)
+    assert deleted.status_code == 204, deleted.text
+    db_session.expire_all()
+    assert await storage_usage(db_session, entity_id) == before
+
+    purged = await client.delete(f"/api/v1/workspaces/trash/{ws['id']}", headers=headers)
+    assert purged.status_code == 204, purged.text
+    db_session.expire_all()
+    assert await storage_usage(db_session, entity_id) == (0, 0)
+    assert await db_session.get(Workspace, ws["id"]) is None
+    assert await db_session.get(DocumentFolder, ws["artifact_folder_id"]) is None
+    assert not any(os.path.exists(os.path.join(entity_root, path)) for path in stored_paths)
+
+
+@pytest.mark.asyncio
+async def test_permanent_delete_keeps_knowledge_filed_outside_workspace(client: AsyncClient, db_session):
+    """Knowledge filed outside the Workspace artifact tree survives its permanent delete."""
+    from packages.core.services.document_service import storage_usage
+
+    _, headers = await _register(client, "lifecycle_storage_keep")
+    create = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Keep outside"})
+    assert create.status_code == 201, create.text
+    ws = create.json()
+    await _upload_text(client, headers, "inside.txt", b"i" * 300, folder_id=ws["artifact_folder_id"])
+    outside = await _upload_text(client, headers, "outside.txt", b"o" * 200)
+
+    await client.delete(f"/api/v1/workspaces/{ws['id']}", headers=headers)
+    purged = await client.delete(f"/api/v1/workspaces/trash/{ws['id']}", headers=headers)
+    assert purged.status_code == 204, purged.text
+
+    db_session.expire_all()
+    assert await storage_usage(db_session, ws["entity_id"]) == (200, 1)
+    listed = await client.get(f"/api/v1/documents/{outside['id']}", headers=headers)
+    assert listed.status_code == 200, listed.text

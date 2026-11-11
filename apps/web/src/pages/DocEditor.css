@@ -1,0 +1,911 @@
+.presentation-editor-toolbar > .btn-manor-ghost,
+.presentation-editor-context-tools .btn-manor-ghost {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 30px;
+  flex: 0 0 auto;
+}
+
+.presentation-editor-toolbar {
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.presentation-editor-toolbar::-webkit-scrollbar,
+.presentation-editor-context-tools::-webkit-scrollbar {
+  display: none;
+}
+
+.presentation-editor-toolbar-side {
+  flex: 0 0 auto;
+}
+
+.presentation-editor-context-tools {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  margin-left: 2px;
+  padding-left: 10px;
+  border-left: 0.5px solid rgba(29, 29, 31, 0.08);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.presentation-editor-context-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  color: #6e6e73;
+}
+
+.presentation-editor-format-toggle {
+  padding: 4px 10px !important;
+}
+
+.presentation-editor-format-toggle[aria-pressed="true"] {
+  border-color: rgba(79, 125, 117, 0.34) !important;
+  background: rgba(79, 125, 117, 0.1) !important;
+  color: #315f58 !important;
+}
+
+.presentation-editor-danger-icon {
+  padding: 4px 8px !important;
+  color: #b7443f !important;
+}
+
+.presentation-editor-present-button {
+  padding: 4px 10px !important;
+}
+
+.presentation-editor-slide-strip {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  scrollbar-width: thin;
+}
+
+.presentation-editor-slide-strip::-webkit-scrollbar {
+  width: 7px;
+}
+
+.presentation-editor-slide-strip::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(87, 83, 78, 0.22);
+}
+
+.presentation-editor-thumb {
+  flex: 0 0 auto;
+}
+
+.presentation-editor-add-slide-controls {
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 68px;
+  gap: 4px;
+  padding: 10px 12px 12px;
+  border-top: 0.5px solid rgba(29, 29, 31, 0.06);
+  background: rgba(250, 250, 249, 0.92);
+}
+
+.presentation-editor-add-slide,
+.presentation-editor-add-slide-controls select {
+  min-width: 0;
+  min-height: 34px;
+  box-sizing: border-box;
+  border: 0.5px solid rgba(29, 29, 31, 0.1);
+  border-radius: 6px;
+  background: transparent;
+  color: #8e8e93;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.presentation-editor-add-slide:hover,
+.presentation-editor-add-slide-controls select:hover {
+  border-color: rgba(79, 125, 117, 0.35);
+  background: rgba(79, 125, 117, 0.06);
+  color: #315f58;
+}
+
+.presentation-editor-zoom-controls {
+  display: grid;
+  grid-template-columns: 28px 54px 28px;
+  height: 28px;
+  overflow: hidden;
+  border: 0.5px solid rgba(29, 29, 31, 0.1);
+  border-radius: 6px;
+}
+
+.presentation-editor-zoom-controls button {
+  border: 0;
+  border-right: 0.5px solid rgba(29, 29, 31, 0.08);
+  background: transparent;
+  color: #6e6e73;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.presentation-editor-zoom-controls button:last-child {
+  border-right: 0;
+}
+
+.presentation-editor-zoom-controls button:hover:not(:disabled) {
+  background: rgba(29, 29, 31, 0.05);
+}
+
+.presentation-editor-zoom-controls button:disabled {
+  cursor: default;
+  opacity: 0.35;
+}
+
+.presentation-editor-resize-handle {
+  position: absolute;
+  z-index: 30;
+  width: 10px;
+  height: 10px;
+  box-sizing: border-box;
+  border: 2px solid #4f7d75;
+  border-radius: 3px;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(29, 29, 31, 0.18);
+}
+
+.presentation-editor-edit-target:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.presentation-editor-inline-input {
+  width: 100%;
+  min-width: 0;
+  padding: 2px 4px;
+  border: 1px solid rgba(79, 125, 117, 0.5);
+  border-radius: 3px;
+  background: #ffffff;
+  color: #2c2c2e;
+  font: inherit;
+  outline: 2px solid rgba(79, 125, 117, 0.12);
+  resize: none;
+}
+
+.presentation-editor-workspace {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.presentation-editor-workspace .presentation-editor-canvas-viewport {
+  min-width: 0;
+  min-height: 0;
+}
+
+.presentation-editor-slide-frame {
+  container-type: size;
+}
+
+.presentation-editor-native-video {
+  position: absolute;
+  z-index: 20;
+  display: block;
+  border: 0;
+  border-radius: 6px;
+  background: #000000;
+  object-fit: fill;
+  box-shadow: 0 8px 24px rgba(29, 29, 31, 0.18);
+}
+
+.presentation-editor-native-video--shape {
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+}
+
+.presentation-editor-native-video:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.presentation-editor-format-panel {
+  position: relative;
+  z-index: 50;
+  flex: 0 0 280px;
+  width: 280px;
+  height: 100%;
+  box-sizing: border-box;
+  overflow-y: auto;
+  border-left: 0.5px solid rgba(29, 29, 31, 0.1);
+  background: #ffffff;
+  color: #2c2c2e;
+  box-shadow: -8px 0 24px rgba(29, 29, 31, 0.08);
+}
+
+.presentation-editor-format-panel-header {
+  position: sticky;
+  z-index: 1;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 56px;
+  padding: 10px 14px;
+  border-bottom: 0.5px solid rgba(29, 29, 31, 0.08);
+  background: rgba(255, 255, 255, 0.96);
+  backdrop-filter: blur(10px);
+}
+
+.presentation-editor-format-panel-header > div {
+  display: grid;
+  gap: 2px;
+}
+
+.presentation-editor-format-panel-header strong {
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.presentation-editor-format-panel-header span {
+  color: #8e8e93;
+  font-size: 11px;
+}
+
+.presentation-editor-format-panel-header button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #6e6e73;
+  cursor: pointer;
+}
+
+.presentation-editor-format-panel-header button:hover {
+  background: rgba(29, 29, 31, 0.05);
+}
+
+.presentation-editor-format-section {
+  display: grid;
+  gap: 12px;
+  padding: 16px 14px;
+  border-bottom: 0.5px solid rgba(29, 29, 31, 0.08);
+}
+
+.presentation-editor-format-section h3 {
+  margin: 0;
+  color: #48484a;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.presentation-editor-format-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.presentation-editor-format-grid label,
+.presentation-editor-format-row,
+.presentation-editor-format-slider {
+  display: grid;
+  gap: 5px;
+  color: #8e8e93;
+  font-size: 11px;
+}
+
+.presentation-editor-format-grid input,
+.presentation-editor-format-row input {
+  width: 100%;
+  height: 32px;
+  box-sizing: border-box;
+  border: 0.5px solid rgba(29, 29, 31, 0.12);
+  border-radius: 5px;
+  background: #ffffff;
+  color: #2c2c2e;
+  font-size: 12px;
+  padding: 4px 8px;
+}
+
+.presentation-editor-format-row {
+  grid-template-columns: 1fr 82px;
+  align-items: center;
+}
+
+.presentation-editor-format-slider > span {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.presentation-editor-format-slider output {
+  color: #6e6e73;
+  font-variant-numeric: tabular-nums;
+}
+
+.presentation-editor-format-slider input {
+  width: 100%;
+  accent-color: #4f7d75;
+}
+
+.presentation-editor-format-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.presentation-editor-format-actions button,
+.presentation-editor-format-actions-section button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 32px;
+  border: 0.5px solid rgba(29, 29, 31, 0.1);
+  border-radius: 6px;
+  background: #ffffff;
+  color: #48484a;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.presentation-editor-format-actions button:hover,
+.presentation-editor-format-actions-section button:hover {
+  background: rgba(29, 29, 31, 0.045);
+}
+
+.presentation-editor-format-actions-section {
+  grid-template-columns: 1fr;
+}
+
+.presentation-editor-format-actions-section .is-danger {
+  color: #b7443f;
+}
+
+.presentation-editor-format-row select {
+  width: 100%;
+  height: 32px;
+  box-sizing: border-box;
+  border: 0.5px solid rgba(29, 29, 31, 0.12);
+  border-radius: 5px;
+  background: #ffffff;
+  color: #2c2c2e;
+  font-size: 11px;
+  padding: 4px 6px;
+}
+
+.presentation-editor-format-command {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 32px;
+  border: 0.5px solid rgba(29, 29, 31, 0.1);
+  border-radius: 6px;
+  background: #ffffff;
+  color: #48484a;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.presentation-editor-speaker-notes {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  flex: 0 0 76px;
+  min-height: 0;
+  box-sizing: border-box;
+  padding: 10px 14px;
+  border-top: 0.5px solid rgba(29, 29, 31, 0.08);
+  background: rgba(255, 255, 255, 0.82);
+}
+
+.presentation-editor-speaker-notes label {
+  padding-top: 5px;
+  color: #8e8e93;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.presentation-editor-speaker-notes textarea {
+  width: 100%;
+  height: 54px;
+  box-sizing: border-box;
+  resize: none;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #48484a;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.45;
+  outline: none;
+  padding: 5px 7px;
+}
+
+.presentation-editor-speaker-notes textarea:focus {
+  background: #ffffff;
+  box-shadow: inset 0 0 0 1px rgba(79, 125, 117, 0.28);
+}
+
+.presentation-editor-context-menu {
+  position: fixed;
+  z-index: 500;
+  display: grid;
+  width: 212px;
+  box-sizing: border-box;
+  padding: 6px;
+  border: 0.5px solid rgba(29, 29, 31, 0.12);
+  border-radius: 7px;
+  background: #ffffff;
+  box-shadow: 0 14px 34px rgba(29, 29, 31, 0.18);
+}
+
+.presentation-editor-context-menu button {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 34px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #48484a;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 6px 9px;
+  text-align: left;
+}
+
+.presentation-editor-context-menu button:hover {
+  background: rgba(29, 29, 31, 0.055);
+}
+
+.presentation-editor-context-menu button.is-danger {
+  color: #b7443f;
+}
+
+.presentation-editor-context-menu-separator {
+  height: 1px;
+  margin: 5px 3px;
+  background: rgba(29, 29, 31, 0.08);
+}
+
+.presentation-editor-line-hit-area {
+  position: absolute;
+  inset: -7px;
+  z-index: 1;
+  background: transparent;
+}
+
+.presentation-editor-context-menu-note,
+.presentation-editor-locked-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  padding: 6px 8px;
+  max-width: 240px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
+.presentation-editor-locked-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--surface-muted);
+  cursor: help;
+}
+
+.presentation-editor-conflict-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+  padding: 8px 16px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--danger, #9f2d25);
+  background: color-mix(in srgb, var(--danger, #b42318) 7%, transparent);
+}
+
+.presentation-editor-conflict-banner > span {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.presentation-editor-conflict-banner > button {
+  flex: 0 0 auto;
+}
+
+.presentation-editor-present-overlay {
+  position: fixed;
+  z-index: 1200;
+  inset: 0;
+  display: grid;
+  grid-template-rows: 52px minmax(0, 1fr) 62px;
+  background: #111111;
+  color: #ffffff;
+}
+
+.presentation-editor-present-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 18px;
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 12px;
+}
+
+.presentation-editor-present-header button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 0;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #ffffff;
+  cursor: pointer;
+}
+
+.presentation-editor-present-stage {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  place-items: center;
+  overflow: hidden;
+  padding: 14px 28px;
+  cursor: pointer;
+}
+
+.presentation-editor-present-slide {
+  position: relative;
+  height: min(calc(100vh - 150px), 900px);
+  width: auto;
+  max-width: 92vw;
+  max-height: calc(100vh - 150px);
+  flex: 0 0 auto;
+  overflow: hidden;
+  container-type: size;
+  box-shadow: 0 22px 70px rgba(0, 0, 0, 0.48);
+}
+
+.presentation-editor-thumbnail-slide {
+  position: relative;
+  width: 100%;
+  overflow: hidden;
+  border-radius: 6px;
+  container-type: size;
+  pointer-events: none;
+}
+
+.presentation-editor-present-table {
+  width: 100%;
+  height: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 1.75cqh;
+}
+
+.presentation-editor-present-table td {
+  border: 0.5px solid rgba(29, 29, 31, 0.12);
+  padding: 0.4cqh 0.6cqw;
+}
+
+.presentation-editor-present-controls {
+  display: grid;
+  grid-template-columns: 160px 1fr 160px;
+  align-items: center;
+  gap: 18px;
+  padding: 0 18px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.56);
+  font-size: 11px;
+  text-align: center;
+}
+
+.presentation-editor-present-controls button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 34px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #ffffff;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.presentation-editor-present-controls button:disabled {
+  cursor: default;
+  opacity: 0.32;
+}
+
+html[data-theme="dark"] .presentation-editor {
+  background: #0f0f0f !important;
+  color: #ffffff !important;
+}
+
+html[data-theme="dark"] .presentation-editor-sidebar {
+  border-right-color: rgba(255, 255, 255, 0.12) !important;
+  background: #111111 !important;
+}
+
+html[data-theme="dark"] .presentation-editor-thumb {
+  border-color: transparent !important;
+  background: rgba(255, 255, 255, 0.035) !important;
+}
+
+html[data-theme="dark"] .presentation-editor-slide-strip::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18) !important;
+}
+
+html[data-theme="dark"] .presentation-editor-thumb.is-active {
+  border-color: rgba(139, 209, 199, 0.95) !important;
+  box-shadow: 0 0 0 1px rgba(139, 209, 199, 0.2) !important;
+}
+
+html[data-theme="dark"] .presentation-editor-thumb.is-drag-over {
+  border-color: rgba(160, 190, 230, 0.9) !important;
+}
+
+html[data-theme="dark"] .presentation-editor-thumb-label {
+  color: rgba(255, 255, 255, 0.72) !important;
+}
+
+html[data-theme="dark"] .presentation-editor-add-slide-controls {
+  border-top-color: rgba(255, 255, 255, 0.12) !important;
+  background: #111111 !important;
+}
+
+html[data-theme="dark"] .presentation-editor-add-slide {
+  border-color: rgba(255, 255, 255, 0.18) !important;
+  background: rgba(255, 255, 255, 0.045) !important;
+  color: rgba(255, 255, 255, 0.86) !important;
+}
+
+html[data-theme="dark"] .presentation-editor-add-slide:hover {
+  border-color: rgba(139, 209, 199, 0.42) !important;
+  background: rgba(139, 209, 199, 0.11) !important;
+  color: #ffffff !important;
+}
+
+html[data-theme="dark"] .presentation-editor-add-slide-controls select {
+  border-color: rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.045);
+  color: rgba(255, 255, 255, 0.82);
+}
+
+html[data-theme="dark"] .presentation-editor-main {
+  background: #0f0f0f !important;
+}
+
+html[data-theme="dark"] .presentation-editor-toolbar {
+  border-bottom-color: rgba(255, 255, 255, 0.13) !important;
+  background: rgba(17, 17, 17, 0.96) !important;
+  color: #ffffff !important;
+}
+
+html[data-theme="dark"] .presentation-editor-toolbar .btn-manor-ghost {
+  border-color: rgba(255, 255, 255, 0.12) !important;
+  background: rgba(255, 255, 255, 0.04) !important;
+  color: rgba(255, 255, 255, 0.88) !important;
+  box-shadow: none !important;
+}
+
+html[data-theme="dark"] .presentation-editor-toolbar .btn-manor-ghost:hover:not(:disabled) {
+  border-color: rgba(139, 209, 199, 0.42) !important;
+  background: rgba(139, 209, 199, 0.12) !important;
+  color: #ffffff !important;
+}
+
+html[data-theme="dark"] .presentation-editor-toolbar .btn-manor-ghost:disabled {
+  color: rgba(255, 255, 255, 0.32) !important;
+}
+
+html[data-theme="dark"] .presentation-editor-separator {
+  background: rgba(255, 255, 255, 0.14) !important;
+}
+
+html[data-theme="dark"] .presentation-editor-field-label,
+html[data-theme="dark"] .presentation-editor-page-count {
+  color: rgba(255, 255, 255, 0.68) !important;
+}
+
+html[data-theme="dark"] .presentation-editor-toolbar input:not([type="color"]),
+html[data-theme="dark"] .presentation-editor-toolbar select {
+  border-color: rgba(255, 255, 255, 0.16) !important;
+  background: rgba(255, 255, 255, 0.055) !important;
+  color: #ffffff !important;
+}
+
+html[data-theme="dark"] .presentation-editor-toolbar input[type="color"] {
+  border-color: rgba(255, 255, 255, 0.18) !important;
+  background: rgba(255, 255, 255, 0.08) !important;
+}
+
+html[data-theme="dark"] .presentation-editor-context-tools {
+  border-left-color: rgba(255, 255, 255, 0.11);
+}
+
+html[data-theme="dark"] .presentation-editor-context-title {
+  color: rgba(255, 255, 255, 0.78);
+}
+
+html[data-theme="dark"] .presentation-editor-zoom-controls {
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
+html[data-theme="dark"] .presentation-editor-zoom-controls button {
+  border-right-color: rgba(255, 255, 255, 0.12);
+  color: rgba(255, 255, 255, 0.82);
+}
+
+html[data-theme="dark"] .presentation-editor-zoom-controls button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+html[data-theme="dark"] .presentation-editor-format-toggle[aria-pressed="true"] {
+  border-color: rgba(139, 209, 199, 0.36) !important;
+  background: rgba(139, 209, 199, 0.13) !important;
+  color: #b9eee7 !important;
+}
+
+html[data-theme="dark"] .presentation-editor-format-panel {
+  border-left-color: rgba(255, 255, 255, 0.12);
+  background: #151515;
+  color: rgba(255, 255, 255, 0.9);
+  box-shadow: -10px 0 28px rgba(0, 0, 0, 0.32);
+}
+
+html[data-theme="dark"] .presentation-editor-format-panel-header {
+  border-bottom-color: rgba(255, 255, 255, 0.1);
+  background: rgba(21, 21, 21, 0.96);
+}
+
+html[data-theme="dark"] .presentation-editor-format-panel-header span,
+html[data-theme="dark"] .presentation-editor-format-grid label,
+html[data-theme="dark"] .presentation-editor-format-row,
+html[data-theme="dark"] .presentation-editor-format-slider {
+  color: rgba(255, 255, 255, 0.62);
+}
+
+html[data-theme="dark"] .presentation-editor-format-panel-header button,
+html[data-theme="dark"] .presentation-editor-format-section h3,
+html[data-theme="dark"] .presentation-editor-format-slider output {
+  color: rgba(255, 255, 255, 0.84);
+}
+
+html[data-theme="dark"] .presentation-editor-format-section {
+  border-bottom-color: rgba(255, 255, 255, 0.1);
+}
+
+html[data-theme="dark"] .presentation-editor-format-grid input,
+html[data-theme="dark"] .presentation-editor-format-row input,
+html[data-theme="dark"] .presentation-editor-format-row select,
+html[data-theme="dark"] .presentation-editor-format-command,
+html[data-theme="dark"] .presentation-editor-format-actions button,
+html[data-theme="dark"] .presentation-editor-format-actions-section button {
+  border-color: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.055);
+  color: rgba(255, 255, 255, 0.86);
+}
+
+html[data-theme="dark"] .presentation-editor-format-panel-header button:hover,
+html[data-theme="dark"] .presentation-editor-format-actions button:hover,
+html[data-theme="dark"] .presentation-editor-format-actions-section button:hover {
+  background: rgba(255, 255, 255, 0.09);
+}
+
+html[data-theme="dark"] .presentation-editor-speaker-notes {
+  border-top-color: rgba(255, 255, 255, 0.11);
+  background: #111111;
+}
+
+html[data-theme="dark"] .presentation-editor-speaker-notes label {
+  color: rgba(255, 255, 255, 0.58);
+}
+
+html[data-theme="dark"] .presentation-editor-speaker-notes textarea {
+  color: rgba(255, 255, 255, 0.86);
+}
+
+html[data-theme="dark"] .presentation-editor-speaker-notes textarea:focus {
+  background: rgba(255, 255, 255, 0.055);
+  box-shadow: inset 0 0 0 1px rgba(139, 209, 199, 0.28);
+}
+
+html[data-theme="dark"] .presentation-editor-context-menu {
+  border-color: rgba(255, 255, 255, 0.14);
+  background: #1b1b1b;
+  box-shadow: 0 16px 38px rgba(0, 0, 0, 0.44);
+}
+
+html[data-theme="dark"] .presentation-editor-context-menu button {
+  color: rgba(255, 255, 255, 0.86);
+}
+
+html[data-theme="dark"] .presentation-editor-context-menu button:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+html[data-theme="dark"] .presentation-editor-context-menu-separator {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+@media (max-width: 1280px) {
+.presentation-editor-format-toggle span,
+  .presentation-editor-present-button span {
+    display: none;
+  }
+}
+
+@media (max-width: 760px) {
+.presentation-editor-sidebar {
+    width: 108px !important;
+  }
+.presentation-editor-slide-strip {
+    padding: 8px;
+  }
+.presentation-editor-add-slide-controls {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 8px;
+  }
+.presentation-editor-present-controls {
+    grid-template-columns: 96px 1fr 96px;
+  }
+.presentation-editor-present-controls span {
+    display: none;
+  }
+}
+
+html[data-theme="dark"] .presentation-editor-canvas-viewport {
+  background:
+    radial-gradient(circle at 1px 1px, rgba(255, 255, 255, 0.055) 1px, transparent 1.25px),
+    #0b0b0b !important;
+  background-size: 28px 28px, 100% 100% !important;
+}
+
+html[data-theme="dark"] .presentation-editor-slide-frame {
+  box-shadow:
+    0 18px 48px rgba(0, 0, 0, 0.52),
+    0 0 0 1px rgba(255, 255, 255, 0.12) !important;
+}
+
+.presentation-editor-sidebar {
+  background: var(--surface-panel);
+}
+
+html[data-theme="dark"] .presentation-editor-canvas-viewport {
+  background: var(--file-stage) !important;
+  background-size: auto !important;
+}

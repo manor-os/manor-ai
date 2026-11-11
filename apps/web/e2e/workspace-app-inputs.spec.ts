@@ -34,6 +34,16 @@ for (const width of [1440, 390]) {
     await expect(source).toBeHidden();
   });
 }
+test("a run that changes a project reads as its end message, not the project's stored data", async ({ page }) => {
+  await page.goto(`${fixture}?project-end`);
+  await page.getByRole("textbox", { name: "Source caption" }).fill("Synthetic caption.");
+  for (let step = 0; step < 2; step += 1) await page.getByRole("button", { name: "Next", exact: true }).click();
+  await page.getByRole("button", { name: "Run", exact: true }).click();
+  await expect(page.getByText("This post is cancelled: it will not be made or published.", { exact: true })).toBeVisible();
+  await expect(page.getByText("slot:campaign-1:3", { exact: true })).toBeHidden();
+  await expect(page.getByText("Queue Key")).toBeHidden();
+});
+
 test("chat is optional and setup/read-only gates remain effective", async ({ page }) => {
   await page.goto(fixture);
   await page.getByRole("button", { name: "Write in chat", exact: true }).click();
@@ -174,4 +184,16 @@ test("Chat workflow starter waits for sibling schema roots before enabling Run",
   await expect(run).toBeDisabled();
   await page.evaluate(() => window.workspaceAppUploadFixture.finishLinking());
   await expect(run).toBeEnabled();
+});
+test("failed setup keeps a slow recovery read and discovers a retried setup", async ({ page }) => {
+  await page.clock.install();
+  await page.goto(`${fixture}?setup&failed-setup`);
+  await expect.poll(() => page.evaluate(() => (window as any).setupPolling.reads())).toBeGreaterThan(0);
+  await page.clock.runFor(30_000);
+  expect(await page.evaluate(() => (window as any).setupPolling.reads())).toBe(1);
+  await page.evaluate(() => (window as any).setupPolling.retry());
+  await page.clock.runFor(30_000);
+  await expect.poll(() => page.evaluate(() => (window as any).setupPolling.reads())).toBe(2);
+  await page.clock.runFor(5_000);
+  await expect.poll(() => page.evaluate(() => (window as any).setupPolling.reads())).toBe(3);
 });

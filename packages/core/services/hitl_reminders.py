@@ -5,6 +5,10 @@ after the first). Requests older than the window are never reminded, so a
 deploy does not flood people with old cards. State lives on the request
 (``context["reminders"]``). Each sweep sends one message per person and
 Workspace, through their own notification settings.
+
+With the ``attention_delivery`` flag on, attention delivery reminds about
+pending requests instead (``needs_input``, and ``decision_pending`` for a
+Strategist cohort's card), and writes the same state.
 """
 from __future__ import annotations
 
@@ -17,7 +21,8 @@ from typing import Any
 
 from sqlalchemy import DateTime, and_, bindparam, func, or_, select, text
 
-from packages.core.constants.approvals import APPROVAL_OPEN_STATUSES
+from packages.core.attention.delivery import delivery_enabled
+from packages.core.constants.approvals import APPROVAL_OPEN_STATUSES, ApprovalStatus
 from packages.core.database import async_session
 from packages.core.database_values import dumps_storable_json
 from packages.core.models.hitl_request import HitlRequest
@@ -59,12 +64,29 @@ def due_stage(*, created_at: datetime, state: dict[str, Any], now: datetime) -> 
 
 
 def summary(request: HitlRequest) -> str:
+    """What the request asks, in words: its question, else action + target.
+
+    A value can be a code such as ``approval.mode`` or carry a record id; never show those.
+    """
+    from packages.core.ai.workflow_failure import names_record_id, strip_record_ids
+    from packages.core.workers.task_agent_loop_completion import effect_label
+
     payload = request.payload if isinstance(request.payload, dict) else {}
-    for key in ("question", "action_description", "what_happened", "why"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return " ".join(value.split())[:160]
-    return " ".join(str(request.reason or "A decision").split())[:160]
+    for value in (*(payload.get(key) for key in ("question", "action_description", "what_happened", "why")),
+                  request.reason):
+        text = " ".join(strip_record_ids(value).split())[:160] if isinstance(value, str) else ""
+        if text and (" " in text or "." not in text):
+            return text
+    label = effect_label(request.action_key, locale="en") if request.action_key else "A decision"
+    return f"{label}: {request.resource_id}" if request.resource_id and not names_record_id(request.resource_id) else label
+
+
+def attention_tells(request: HitlRequest) -> bool:
+    """Whether attention delivery reminds about this request instead.
+
+    A Strategist cohort's card is told as its cohort (decision_pending).
+    """
+    return request.status == ApprovalStatus.PENDING.value
 
 
 async def reminder_recipients(db, request: HitlRequest) -> list[str]:
@@ -138,7 +160,7 @@ _CLAIM_SQL = text(
 ).bindparams(bindparam("open", expanding=True))
 
 
-async def _claim(db, request_id: str, *, prev_sent: int, state: dict[str, Any]) -> bool:
+async def claim_reminder_stage(db, request_id: str, *, prev_sent: int, state: dict[str, Any]) -> bool:
     """Record reminder state only if the request is still open and at the stage read.
 
     Answer paths lock the row and write into ``context``; this touches only
@@ -152,7 +174,7 @@ async def _claim(db, request_id: str, *, prev_sent: int, state: dict[str, Any]) 
     return claimed is not None
 
 
-async def _log_on_task(db, item: dict[str, Any], *, now: datetime) -> None:
+async def log_reminder_on_task(db, item: dict[str, Any], *, now: datetime) -> None:
     """Show the reminder on the Task's timeline, in the claim's transaction."""
     from packages.core.constants.task import TaskLogType
     from packages.core.constants.task_actors import TaskActor
@@ -167,6 +189,118 @@ async def _log_on_task(db, item: dict[str, Any], *, now: datetime) -> None:
             "wait_minutes": item["wait_minutes"], "prompt": item["summary"], "reminded_at": now.isoformat(),
         },
     )
+
+
+#: An authorization nobody answered stops waiting after this long: the one
+#: action it held is skipped (it never runs) and the card records why. Past the
+#: final reminder by default, so a person is reminded twice before it lapses.
+UNANSWERED_AUTHORIZATION_HOURS = int(os.getenv("APPROVAL_UNANSWERED_EXPIRE_HOURS", "120"))
+UNANSWERED_REASON = "unanswered"
+
+
+async def expire_unanswered_authorizations(
+    db, *, now: datetime | None = None, limit: int = 200,
+) -> list[str]:
+    """Skip authorizations nobody answered in time; returns the closed ids.
+
+    Only the one action waits on a question, so only it is skipped: the
+    request expires, a Task run parked on it resumes knowing the action did
+    not run, and its card resolves as ``expired`` (the chat shows it was
+    skipped). External-reply cards, which have no request row, lapse the same
+    way and their reply is never sent. The caller commits.
+    """
+    from packages.core.constants.approvals import ApprovalStatus, HitlType
+    from packages.core.constants.pending_actions import PendingActionKind
+    from packages.core.ledger import adapters as ledger_adapters
+    from packages.core.ledger import event_types as ledger_et
+    from packages.core.services.hitl_requests import mark_hitl_request_resolved
+    from packages.core.services.task_agent_loop_hitl import wake_run_for_closed_request
+
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=UNANSWERED_AUTHORIZATION_HOURS)
+    resolution = {"choice": "expired", "reason": UNANSWERED_REASON}
+    requests = (await db.execute(
+        select(HitlRequest).where(
+            HitlRequest.status == ApprovalStatus.PENDING.value,
+            HitlRequest.hitl_type == HitlType.AUTHORIZE.value,
+            HitlRequest.created_at < cutoff,
+        ).order_by(HitlRequest.created_at.asc()).limit(limit)
+        .with_for_update(skip_locked=True)
+    )).scalars().all()
+    closed: list[str] = []
+    for request in requests:
+        request.status = ApprovalStatus.EXPIRED.value
+        request.resolved_reason = UNANSWERED_REASON
+        request.decided_at = now
+        await wake_run_for_closed_request(db, request)
+        await ledger_adapters.record_approval_event(db, request, ledger_et.APPROVAL_EXPIRED)
+        if request.origin_conversation_id:
+            await mark_hitl_request_resolved(
+                db, conversation_id=request.origin_conversation_id, hitl_id=request.id, choice="expired",
+            )
+        closed.append(request.id)
+    await _expire_strategist_proposals(db, [
+        request for request in requests
+        if request.resource_kind == "proposal" and request.resource_id
+    ])
+    card_filter = or_(
+        Message.pending_action["approval_request_id"].as_string().in_(closed or [""]),
+        and_(
+            Message.pending_action["kind"].as_string() == PendingActionKind.EXTERNAL_MESSAGE_APPROVAL.value,
+            Message.created_at < cutoff,
+        ),
+    )
+    cards = (await db.execute(
+        select(Message).where(Message.resolved_at.is_(None), card_filter).limit(limit)
+        .with_for_update(skip_locked=True)
+    )).scalars().all()
+    for card in cards:
+        card.resolved_at = now
+        card.resolution = dict(resolution)
+        if not card.pending_action or not card.pending_action.get("approval_request_id"):
+            closed.append(card.id)
+    return closed
+
+
+async def _expire_strategist_proposals(db, requests: list[HitlRequest]) -> None:
+    """A Strategist cohort whose card lapsed is closed as EXPIRED with it.
+
+    Otherwise its Tasks stay ``proposed`` behind a card nobody can answer, and
+    the Strategist keeps treating the cohort as undecided.
+    """
+    if not requests:
+        return
+    from packages.core.constants.proposal import ProposalStatus
+    from packages.core.models.proposal import ProposalRecord
+    from packages.core.strategist.service import (
+        EXPIRE_REASON,
+        EXPIRE_REASON_CODE,
+        close_open_proposals,
+    )
+
+    records = (await db.execute(
+        select(ProposalRecord).where(
+            ProposalRecord.id.in_([request.resource_id for request in requests]),
+            ProposalRecord.status == ProposalStatus.OPEN.value,
+        )
+    )).scalars().all()
+    for record in records:
+        await close_open_proposals(
+            db,
+            entity_id=record.entity_id,
+            open_tasks=[],
+            open_items=[{"review_id": record.review_id}],
+            reason=EXPIRE_REASON,
+            reason_code=EXPIRE_REASON_CODE,
+            actor_kind="system",
+        )
+
+
+async def run_unanswered_authorization_expiry(*, now: datetime | None = None) -> int:
+    async with async_session() as db:
+        closed = await expire_unanswered_authorizations(db, now=now)
+        await db.commit()
+    return len(closed)
 
 
 async def run_hitl_reminder_sweep(*, now: datetime | None = None, limit: int = 200) -> int:
@@ -189,7 +323,12 @@ async def run_hitl_reminder_sweep(*, now: datetime | None = None, limit: int = 2
             ).order_by(HitlRequest.created_at.asc()).limit(limit)
         )).scalars().all()
         names: dict[str, str] = {}
+        told_by_attention: dict[str, bool] = {}
         for request in requests:
+            if request.entity_id not in told_by_attention:
+                told_by_attention[request.entity_id] = await delivery_enabled(db, request.entity_id)
+            if told_by_attention[request.entity_id] and attention_tells(request):
+                continue
             state = (request.context or {}).get(STATE_KEY) or {}
             # The SQL predicate picks candidates; this check decides, so a
             # mismatch between the two can only skip a reminder, never add one.
@@ -213,15 +352,15 @@ async def run_hitl_reminder_sweep(*, now: datetime | None = None, limit: int = 2
 
         for request_id, prev_sent in unreachable:
             # Nobody can answer it: finish its reminders so it is not rescanned every tick.
-            await _claim(db, request_id, prev_sent=prev_sent, state={
+            await claim_reminder_stage(db, request_id, prev_sent=prev_sent, state={
                 "sent": len(_STAGE_HOURS), "skipped": "no_recipients", "last_at": now.isoformat(),
             })
         for item, prev_sent, users in prepared:
             state = {"sent": item["stage"], "last_at": now.isoformat()}
-            if not await _claim(db, item["id"], prev_sent=prev_sent, state=state):
+            if not await claim_reminder_stage(db, item["id"], prev_sent=prev_sent, state=state):
                 continue
             if item["task_id"]:
-                await _log_on_task(db, item, now=now)
+                await log_reminder_on_task(db, item, now=now)
             for user_id in users:
                 batches[(item["entity_id"], user_id, item["workspace_id"])].append(item)
         await db.commit()

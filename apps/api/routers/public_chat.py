@@ -26,7 +26,7 @@ from typing import Any
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response
 from fastapi.routing import APIRoute
 from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -80,7 +80,7 @@ from apps.api.chat_audio import (
     enforce_public_audio_budget,
     transcribe_chat_upload,
 )
-from apps.api.streaming_concurrency import acquire_chat_stream_lease
+from apps.api.streaming_concurrency import LeasedStreamingResponse, acquire_chat_stream_lease
 
 logger = logging.getLogger(__name__)
 
@@ -1280,7 +1280,7 @@ async def stream_message(
                 notice = "Thanks, your message was sent. The team will follow up here shortly."
             else:
                 notice = str(result.get("reply") or "Message sent. Waiting for a reply...")
-            return StreamingResponse(
+            return LeasedStreamingResponse(
                 lease.wrap(_single_message_stream(
                     conversation_id=result.get("conversation_id"),
                     content=notice,
@@ -1391,7 +1391,7 @@ async def stream_message(
             channel_config_id=cc.id,
             conversation_id=conv.id,
         )
-        return StreamingResponse(
+        return LeasedStreamingResponse(
             lease.wrap(site_content.guard_stream(site_scope, webchat_resident.guard_stream(
                 getattr(request.state, "resident_scope", None), runtime_stream_chat_turn(
                 llm_message,

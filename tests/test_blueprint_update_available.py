@@ -239,7 +239,7 @@ def test_marketplace_installs_are_resolved_by_id_not_slug():
     from apps.api.routers import workspaces
 
     body = inspect.getsource(workspaces._blueprint_payloads_for)
-    assert "resolve_blueprint_rows(db, references)" in body
+    assert "resolve_blueprint_rows(db, references" in body
     assert "BlueprintRowReference(" in body
     assert "prefer_platform" not in body, (
         "an exact Marketplace id must not be redirected by a matching slug"
@@ -256,7 +256,7 @@ def test_the_workspace_list_looks_payloads_up_once():
     from apps.api.routers import workspaces
 
     body = inspect.getsource(workspaces.list_my_workspaces)
-    assert "_blueprint_payloads_for(db, workspaces)" in body
+    assert "_blueprint_payloads_for(db, workspaces, digests=True)" in body
 
 
 # ── Identity is the id; the version is what moves ─────────────────────
@@ -390,9 +390,11 @@ def test_a_payload_install_adopts_the_published_row_it_matches():
 
     body = inspect.getsource(blueprints.install_from_payload)
     assert "_published_platform_blueprint_matching_payload" in body
-    assert "blueprint_id=matched.id if matched else None" in body
+    assert "blueprint_id=matched.id if matched else team_release[0] if team_release else None" in body
     assert "paid_source[2]" in body
-    assert "matched.content_version if matched else None" in body
+    assert "matched.content_version if matched" in body
+    # Anything else is the team's own package, never a listing it resembles.
+    assert "_record_team_package_release" in body
 
 
 def test_a_marketplace_install_records_the_version_it_took():

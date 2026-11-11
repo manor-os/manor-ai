@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useId, useMemo, useRef, useState } from "react";
 import { IconChevronDown, IconError, IconList, IconPause } from "../icons";
 import { t } from "../../lib/i18n";
+import { recommendationOf, recommendationReason, type RecommendedQuestion } from "../../lib/recommendedOptions";
 import { formatUserFacingLabel } from "../../lib/taskDisplay";
 import Button from "../ui/Button";
 import LoadingSpinner from "../ui/LoadingSpinner";
@@ -14,6 +15,7 @@ import TikTokPublishReview, { isTikTokPublishApproval } from "./TikTokPublishRev
 import WorkflowApprovalReview, {
   EditableWorkflowApprovalReview,
   workflowReviewIsEditable,
+  workflowReviewIsRevisionChoice,
 } from "./WorkflowApprovalReview";
 import {
   WorkflowSchemaFields,
@@ -35,6 +37,7 @@ import {
   type WorkflowRunAction,
   type WorkflowRunActionInput,
   type WorkflowRunView,
+  workflowRetrySuppliedValues,
 } from "./workflowRunDisplay";
 
 function schemaForStarterInput(input: WorkflowRunActionInput): WorkflowInputSchema {
@@ -73,21 +76,6 @@ function actionSchema(action: WorkflowRunAction): WorkflowInputSchema {
   };
 }
 
-function suppliedActionValues(
-  action: WorkflowRunAction,
-  schema: WorkflowInputSchema,
-): Record<string, unknown> {
-  const values = { ...(action.values || {}) };
-  if (
-    action.kind === "workflow_retry"
-    && schema.properties?.retry_segment_ids
-    && action.retry_segment_ids
-  ) {
-    values.retry_segment_ids = action.retry_segment_ids;
-  }
-  return values;
-}
-
 function actionOptionLabel(run: WorkflowRunView, option: string): string {
   const key = workflowRunActionLabelKey(run, option);
   return key ? t(key) : formatUserFacingLabel(option);
@@ -109,9 +97,6 @@ function compactReasonPreview(value: unknown, fallback: string, truncationText: 
   const fallbackLines = fallback.split(/\r?\n/).map((part) => part.trim()).filter(Boolean);
   return fallbackLines.find((line) => !isPreviewScaffold(line)) || fallbackLines[0] || "";
 }
-
-/** Approval choices that send the work back and therefore need instructions. */
-const WORKFLOW_REVISION_CHOICES = new Set(["revise", "request_changes", "changes_requested"]);
 
 export interface WorkflowRunInterventionProps {
   run: WorkflowRunView;
@@ -151,7 +136,7 @@ export default function WorkflowRunIntervention({
   const stableActionIdentity = JSON.stringify([actionIdentity(action), action.runtime_approval_id]);
   const schema = useMemo(() => actionSchema(action), [stableActionIdentity]);
   const initialValues = useMemo(
-    () => suppliedActionValues(action, schema),
+    () => workflowRetrySuppliedValues(action, schema),
     [stableActionIdentity],
   );
   const [values, setValues] = useState<unknown>(() => workflowSchemaDraft(schema, initialValues));
@@ -225,11 +210,14 @@ export default function WorkflowRunIntervention({
   const editableReview = action.kind === "workflow_approval"
     && action.review_read_only !== true
     && workflowReviewIsEditable(displayedReview);
+  const reviewRevisionField = typeof action.review_revision_field === "string"
+    ? action.review_revision_field
+    : "";
   const allowedOptions = (action.options || [])
     .map((option) => `${option}`.trim())
     .filter((option) => (
       Boolean(option)
-      && !(editableReview && option.toLowerCase().replace(/[-\s]+/g, "_") === "revise")
+      && !(editableReview && !reviewRevisionField && option.toLowerCase().replace(/[-\s]+/g, "_") === "revise")
     ));
   const preservedCount = Array.isArray(action.preserved_receipts)
     ? action.preserved_receipts.length
@@ -280,12 +268,20 @@ export default function WorkflowRunIntervention({
   const hasReview = action.kind === "workflow_approval" && displayedReview != null;
   const reviewInHistory = reviewFromHistory && Boolean(historyHref);
   const busy = loading || Boolean(submittingOption) || fileBusy;
-  const primaryOption = allowedOptions.find((option) => {
+  // The recommended answer is the primary button when it is one of the
+  // choices this surface shows; otherwise the first non-cancel choice.
+  const recommendation = recommendationOf(action as RecommendedQuestion);
+  const recommendedOption = recommendation && allowedOptions.includes(recommendation.option)
+    && !workflowReviewIsRevisionChoice(recommendation.option)
+    ? recommendation.option
+    : undefined;
+  const primaryOption = recommendedOption || allowedOptions.find((option) => {
     const normalized = option.toLowerCase().replace(/[-\s]+/g, "_");
     return normalized !== "cancel" && normalized !== "revise";
   });
+  const recommendationLine = recommendedOption && !needsInput ? recommendationReason(recommendation) : "";
   const secondaryOptions = allowedOptions.filter((option) => option !== primaryOption);
-  const isRevisionOption = (option: string) => WORKFLOW_REVISION_CHOICES.has(option.toLowerCase().replace(/[-\s]+/g, "_"));
+  const isRevisionOption = workflowReviewIsRevisionChoice;
   const reviewChangeOptions = action.kind === "workflow_approval" && !dialogReview
     ? secondaryOptions.filter(isRevisionOption)
     : [];
@@ -345,7 +341,7 @@ export default function WorkflowRunIntervention({
   );
 
   const optionLabel = (option: string) => (
-    action.kind === "workflow_approval" && WORKFLOW_REVISION_CHOICES.has(option.toLowerCase().replace(/[-\s]+/g, "_"))
+    action.kind === "workflow_approval" && workflowReviewIsRevisionChoice(option)
       ? t("component.workflow_review.request_changes")
       : actionOptionLabel(run, option)
   );
@@ -403,10 +399,12 @@ export default function WorkflowRunIntervention({
   const resolve = async (option: string, note?: string) => {
     if (disabled || busy) return;
     const normalized = option.toLowerCase().replace(/[-\s]+/g, "_");
+    const revising = workflowReviewIsRevisionChoice(normalized);
     if (
       action.kind === "workflow_approval"
-      && WORKFLOW_REVISION_CHOICES.has(normalized)
+      && revising
       && note === undefined
+      && !reviewRevisionField
     ) {
       setRevisionOption(option);
       setRevisionNoteError("");
@@ -440,13 +438,31 @@ export default function WorkflowRunIntervention({
     } else if (
       action.kind === "workflow_approval"
       && editableReview
-      && !["cancel", "reject", "revise"].includes(normalized)
+      && !["cancel", "reject"].includes(normalized)
+      && (!revising || reviewRevisionField)
     ) {
       if (!reviewDraftIsValid) {
         setExpanded(true);
         return;
       }
-      payload = { review: reviewDraft ?? displayedReview };
+      const review = reviewDraft ?? displayedReview;
+      const request = review && typeof review === "object"
+        ? String((review as Record<string, unknown>)[reviewRevisionField] ?? "").trim()
+        : "";
+      if (normalized === "approve" && reviewRevisionField && request) {
+        setSubmissionError("Submit the video change request or clear it before approving.");
+        setExpanded(true);
+        return;
+      }
+      if (revising) {
+        if (!request) {
+          setSubmissionError(t("component.workflow_review.change_required"));
+          setExpanded(true);
+          return;
+        }
+        note = request;
+      }
+      payload = { review };
     }
     setSubmittingOption(option);
     setSubmissionError(undefined);
@@ -518,6 +534,8 @@ export default function WorkflowRunIntervention({
               review={displayedReview}
               reviewTitle={displayedReviewTitle}
               disabled={disabled || busy}
+              editableFields={action.review_editable_fields}
+              revisionField={reviewRevisionField || undefined}
               onDraftState={(draft, valid) => {
                 setReviewDraft(draft);
                 setReviewDraftIsValid(valid);
@@ -536,7 +554,7 @@ export default function WorkflowRunIntervention({
           {!hasReview && historyReviewLoading && (
             <div className="workspace-workflow-run-query-state" role="status">
               <LoadingSpinner size={13} />
-              <span>{t("component.workflow_run.loading_review")}</span>
+              <span className="sr-only">{t("component.workflow_run.loading_review")}</span>
             </div>
           )}
 
@@ -656,6 +674,9 @@ export default function WorkflowRunIntervention({
             </div>
           )}
 
+          {recommendationLine && !dialogReview && (
+            <p className="chat-hitl-recommendation-reason">{t("recommendation.reason_prefix", { reason: recommendationLine })}</p>
+          )}
           {shownError && (
             <p className="workflow-run-intervention-error" role="alert">{shownError}</p>
           )}
@@ -670,6 +691,9 @@ export default function WorkflowRunIntervention({
       {(dialogReview || dialogInput) && <div className="workflow-run-intervention-dialog-actions">
         {!revisionOption && secondaryActions.length > 0 && <div className="workflow-run-intervention-actions">{secondaryActions}</div>}
         {primaryActions}
+        {recommendationLine && (
+          <p className="chat-hitl-recommendation-reason">{t("recommendation.reason_prefix", { reason: recommendationLine })}</p>
+        )}
       </div>}
       {needsInput && presentation === "inline" && <Modal
         open={inputDialogOpen}

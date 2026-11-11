@@ -50,6 +50,20 @@ RUNTIME_INPUT_ACTION_KEY = "chat.request_input"
 RUNTIME_INPUT_DECIDED_VIA = "chat_input"
 
 
+def is_runtime_input_request(request: HitlRequest | None) -> bool:
+    """Whether ``request`` is a question a run asked (``request_input``).
+
+    A run also parks on approvals (a capability change, for example). Those
+    are authorizations, never questions: they are not shown as a free-text
+    question and an answer typed into chat must never grant them.
+    """
+    return (
+        request is not None
+        and request.action_key == RUNTIME_INPUT_ACTION_KEY
+        and request.hitl_type == HitlType.INPUT.value
+    )
+
+
 class RuntimeHumanInputError(ValueError):
     """The run is not parked on a question, or the answer cannot be applied."""
 
@@ -85,7 +99,7 @@ def _hitl_payload(question: dict[str, Any], *, conversation_id: str | None) -> d
         ),
         "action_to_take": "Reply in the chat; the assistant continues with your answer.",
     }
-    for key in ("options", "fields", "context", "justification", "review_files", "action_link", "action_to_take"):
+    for key in ("options", "recommendation", "fields", "context", "justification", "review_files", "action_link", "action_to_take"):
         if question.get(key):
             payload[key] = question[key]
     if conversation_id:
@@ -159,7 +173,7 @@ async def human_input_projection(
     if not run.human_input_request_id:
         return None
     request = await db.get(HitlRequest, run.human_input_request_id)
-    if request is None:
+    if not is_runtime_input_request(request):
         return None
     context = request.context if isinstance(request.context, dict) else {}
     question = context.get("question") if isinstance(context.get("question"), dict) else {}
@@ -169,7 +183,7 @@ async def human_input_projection(
         "question": str(question.get("question") or request.reason or ""),
         "deadline_at": context.get("deadline_at"),
     }
-    for key in ("options", "fields", "context", "justification", "review_files", "action_link", "action_to_take"):
+    for key in ("options", "recommendation", "fields", "context", "justification", "review_files", "action_link", "action_to_take"):
         if question.get(key):
             projection[key] = question[key]
     answer = context.get("answer")
@@ -247,8 +261,21 @@ async def answer_runtime_human_input(
     ).scalar_one_or_none()
     if request is None:
         raise RuntimeHumanInputError("request_missing", "The question is no longer open")
+    if not is_runtime_input_request(request):
+        # Parked on an approval: it is decided on its own card, never by a
+        # chat answer (which would grant it without the approval's checks).
+        raise RuntimeHumanInputError("not_waiting", "This run is waiting for an approval, not an answer")
     if request.status != ApprovalStatus.PENDING.value:
         raise RuntimeHumanInputError("request_closed", "The question is no longer open")
+    if clean_fields:
+        from packages.core.ai.runtime.human_input import input_field_answer_errors
+
+        asked = (request.context or {}).get("question") if isinstance(request.context, dict) else None
+        refused = input_field_answer_errors((asked or {}).get("fields") if isinstance(asked, dict) else None, clean_fields)
+        if refused:
+            raise RuntimeHumanInputError(
+                "answer_invalid", "; ".join(f"{key}: {message}" for key, message in refused.items()),
+            )
 
     try:
         checkpoint = RuntimeAgentCheckpoint.from_dict(dict(run.checkpoint or {}))
@@ -297,6 +324,123 @@ async def answer_runtime_human_input(
     return run
 
 
+async def decide_runtime_parked_approval(
+    db: AsyncSession,
+    *,
+    run_id: str,
+    entity_id: str,
+    user_id: str,
+    request_id: str,
+    approve: bool,
+) -> RuntimeRun:
+    """Approve or reject the approval a run is parked on.
+
+    The approval keeps its own checks (``grant_approval`` verifies who may
+    decide); granting or denying it resumes the run through the request's
+    own continuation. Questions are answered with
+    :func:`answer_runtime_human_input` instead.
+    """
+    from packages.core.governance.approvals import (
+        ApprovalAuthorityError,
+        deny_approval,
+        grant_approval,
+    )
+
+    run = (
+        await db.execute(
+            select(RuntimeRun)
+            .where(
+                RuntimeRun.id == run_id,
+                RuntimeRun.entity_id == entity_id,
+                RuntimeRun.user_id == user_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if run is None:
+        raise RuntimeHumanInputError("run_not_found", "Chat run not found")
+    if run.status != RuntimeRunStatus.WAITING_RESOURCE.value or run.human_input_request_id != request_id:
+        raise RuntimeHumanInputError("not_waiting", "This run is not waiting for this approval")
+    request = (
+        await db.execute(
+            select(HitlRequest).where(HitlRequest.id == request_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if request is None or is_runtime_input_request(request):
+        raise RuntimeHumanInputError("not_waiting", "This run is not waiting for an approval")
+    if request.status != ApprovalStatus.PENDING.value:
+        raise RuntimeHumanInputError("request_closed", "This approval was already decided")
+    try:
+        if approve:
+            await grant_approval(db, request, by_user_id=user_id, via="chat_card")
+        else:
+            await deny_approval(db, request, by_user_id=user_id, via="chat_card")
+    except ApprovalAuthorityError as exc:
+        raise RuntimeHumanInputError("not_allowed", str(exc)) from exc
+    await _settle_parked_approval_card(db, run=run, request=request, choice="approve" if approve else "reject")
+    return run
+
+
+async def _settle_parked_approval_card(
+    db: AsyncSession, *, run: RuntimeRun, request: HitlRequest, choice: str,
+) -> None:
+    """Close the persisted card of a parked approval with what happened."""
+    if not run.conversation_id or is_runtime_input_request(request):
+        return
+    from packages.core.services.hitl_requests import mark_hitl_request_resolved
+
+    await mark_hitl_request_resolved(
+        db, conversation_id=run.conversation_id, hitl_id=request.id, choice=choice,
+    )
+
+
+async def supersede_parked_approval_run(
+    db: AsyncSession,
+    *,
+    conversation_id: str,
+    entity_id: str,
+    user_id: str,
+    message: str = "",
+) -> RuntimeRun | None:
+    """Let a new message through while the sender's run waits on an approval.
+
+    A conversation holds one active run, and a run parked on an approval
+    stays active until someone decides it; a new message would otherwise be
+    refused ("the previous request is still running") for as long as the
+    approval stays open, or for good once it expired. The new message moves
+    the conversation on: the parked run is cancelled, its approval closed and
+    its card settled. A message that is itself the decision for that approval
+    leaves it alone, and a question (``request_input``) is answered instead.
+    """
+    from packages.core.services.chat_approvals import parse_hitl_action
+    from packages.core.services.runtime_run_service import request_runtime_run_cancel
+
+    run = (
+        await db.execute(
+            select(RuntimeRun).where(
+                RuntimeRun.conversation_id == conversation_id,
+                RuntimeRun.entity_id == entity_id,
+                RuntimeRun.user_id == user_id,
+                RuntimeRun.parent_run_id.is_(None),
+                RuntimeRun.status == RuntimeRunStatus.WAITING_RESOURCE.value,
+                RuntimeRun.human_input_request_id.isnot(None),
+            )
+        )
+    ).scalars().first()
+    if run is None:
+        return None
+    request = await db.get(HitlRequest, run.human_input_request_id)
+    if request is None or is_runtime_input_request(request):
+        return None
+    decision = parse_hitl_action(message) if message else None
+    if decision is not None and decision[0] == request.id:
+        return None
+    return await request_runtime_run_cancel(
+        db, run_id=run.id, entity_id=entity_id, user_id=user_id, reason="superseded",
+    )
+
+
 async def close_runtime_human_input_request(
     db: AsyncSession,
     *,
@@ -316,6 +460,8 @@ async def close_runtime_human_input_request(
         db, request, by_user_id=user_id, via=RUNTIME_INPUT_DECIDED_VIA, reason=reason,
         authority_prechecked=True,
     )
+    # A parked approval's card no longer waits for anyone.
+    await _settle_parked_approval_card(db, run=run, request=request, choice="expired")
 
 
 def _request_deadline(request: HitlRequest) -> datetime | None:
@@ -424,7 +570,7 @@ async def record_human_input_question_message(
     if not run.conversation_id or not run.human_input_request_id:
         return None
     request = await db.get(HitlRequest, run.human_input_request_id)
-    if request is None:
+    if not is_runtime_input_request(request):
         return None
     context = request.context if isinstance(request.context, dict) else {}
     question = context.get("question") if isinstance(context.get("question"), dict) else {}
@@ -447,6 +593,48 @@ async def record_human_input_question_message(
             "runtime_run_id": run.id,
             "runtime_input_role": "question",
         },
+    )
+    message.created_at = datetime.now(timezone.utc)
+    return message
+
+
+async def record_parked_approval_message(
+    db: AsyncSession,
+    *,
+    run: RuntimeRun,
+    hitl_requests: list[dict[str, Any]] | None,
+) -> Any:
+    """Persist the approval a run parked on as an authorization card.
+
+    The counterpart of :func:`record_human_input_question_message` for a run
+    that waits on an approval rather than a question: after a reload only
+    messages exist, so the card must be one. It is an approval card (decided
+    on its own buttons), never a question answered in chat.
+    """
+    if not run.conversation_id or not run.human_input_request_id or not hitl_requests:
+        return None
+    request = await db.get(HitlRequest, run.human_input_request_id)
+    if request is None or is_runtime_input_request(request):
+        return None
+    # The card is decided against its parked run (``/chat/runs/{id}/approval``).
+    cards = [
+        {**item, "runtime_run_id": run.id}
+        for item in hitl_requests if str(item.get("id") or "") == request.id
+    ]
+    if not cards:
+        return None
+    from packages.core.models.task import Message
+    from packages.core.services.conversation_messages import add_message
+
+    turn = await db.get(Message, run.assistant_message_id) if run.assistant_message_id else None
+    message = await add_message(
+        db,
+        run.conversation_id,
+        role="assistant",
+        content="",
+        author_subscription_id=getattr(turn, "author_subscription_id", None),
+        meta={"hitl_requests": cards, "runtime_run_id": run.id},
+        message_kind="hitl_request",
     )
     message.created_at = datetime.now(timezone.utc)
     return message
@@ -517,12 +705,16 @@ __all__ = [
     "RUNTIME_INPUT_ACTION_KEY",
     "RuntimeHumanInputError",
     "answer_runtime_human_input",
+    "decide_runtime_parked_approval",
     "close_runtime_human_input_request",
     "expire_runtime_human_input_requests",
     "human_input_projection",
     "human_input_question_text",
     "is_awaiting_human_input",
+    "is_runtime_input_request",
     "record_human_input_answer_message",
     "record_human_input_question_message",
+    "record_parked_approval_message",
+    "supersede_parked_approval_run",
     "mint_runtime_human_input_request",
 ]

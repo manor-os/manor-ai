@@ -1105,7 +1105,38 @@ async def test_agentic_loop_deduplicates_identical_tool_results(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_agentic_loop_keeps_repeated_successful_validation_diagnostics(monkeypatch):
+async def test_agentic_loop_tells_a_run_repeating_known_results_once(monkeypatch):
+    """Rounds that only re-read what the run already had are a loop; after
+    three in a row the run is told so, once, and a new result ends the streak."""
+    seen: list[list[dict]] = []
+
+    async def fake_chat_completion_with_tools(messages, tools, **kwargs):
+        seen.append(list(messages))
+        if len(seen) <= 6:
+            return "", [{"id": f"call_{len(seen)}", "name": "read_file", "arguments": {"path": "same.md"}}], {}
+        return "done", None, {}
+
+    async def fake_executor(name, args):
+        return json.dumps({"path": args["path"], "content": "same result"})
+
+    loop_module = importlib.import_module("packages.core.ai.agentic_loop")
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_tool_completion", fake_chat_completion_with_tools)
+
+    result = await loop_module.agentic_loop(
+        system_prompt="test",
+        user_message="read",
+        tools=[{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}],
+        tool_executor=fake_executor,
+        max_rounds=10,
+    )
+
+    def notices(messages):
+        return [m for m in messages if m.get("role") == "user" and '"no_progress"' in str(m.get("content"))]
+
+    assert result.content == "done"
+    # Round 1 is new; rounds 2-4 repeat it, so the notice precedes the 5th call.
+    assert not notices(seen[3]) and len(notices(seen[4])) == 1
+    assert len(notices(seen[-1])) == 1
     calls = 0
     observed_tool_messages: list[dict] = []
 

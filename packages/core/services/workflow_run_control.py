@@ -15,6 +15,7 @@ from sqlalchemy import select
 from packages.core.constants.task import CancelSource
 from packages.core.constants.workflow import WORKFLOW_RUN_OPEN_STATUSES
 from packages.core.models.workflow import WorkflowRun
+from packages.core.services.workflow_contracts import workflow_step_label
 
 
 CONTROL_KEY = "_workflow_run_control"
@@ -82,12 +83,22 @@ def run_resume_action(run: Any, *, locale: str | None = None) -> dict[str, Any] 
         "kind": "workflow_resume",
         "workflow_run_id": run.id,
         "step_id": run.current_step_id,
-        "title": step.get("name") or run.current_step_id,
+        "title": workflow_step_label(step) or run.current_step_id,
         "options": ["resume"],
     }
     if is_manually_paused(run):
         return action
     result = (run.step_results or {}).get(run.current_step_id) or {}
+    from packages.core.services.workflow_connection_wait import is_connection_wait
+
+    if is_connection_wait(result):
+        # Connecting is the answer; continuing rechecks it and runs the step.
+        return {
+            **action,
+            "connection_provider": result["connection_provider"],
+            "connection_label": result.get("connection_label") or result["connection_provider"],
+            "prompt": result.get("prompt"),
+        }
     if step.get("type") != "wait" or result.get("resume_strategy") == "blocked":
         return None
     config = step.get("config") or {}
@@ -130,15 +141,39 @@ def run_resume_action(run: Any, *, locale: str | None = None) -> dict[str, Any] 
     if workflow_chat_context(run) is not None:
         # Chat-origin approvals must resolve their existing message/card.
         return None
+    from packages.core.services.workflow_chat_projection import workflow_step_recommendation
+
+    from packages.core.services.workflow_contracts import workflow_wait_options
+
+    options = workflow_wait_options(config) or ["approve", "reject"]
+    step_recommendation = workflow_step_recommendation(result, config, options=options)
+    from packages.core.services.workflow_chat_approvals import workflow_review_is_editable
+
     return {
         **action,
+        **({"recommendation": step_recommendation} if step_recommendation else {}),
         "kind": "workflow_approval",
-        "options": config.get("options") or ["approve", "reject"],
+        "options": options,
         "response_variable": config.get("response_variable") or "decision",
         "prompt": result.get("output"),
         "review": result.get("review"),
         "review_title": result.get("review_title"),
-        "review_read_only": True,
+        # Native run pages only expose the constrained editable-review contract.
+        # Legacy variable-backed packets remain read-only here.
+        "review_read_only": not (
+            workflow_review_is_editable(config)
+            and isinstance(config.get("review_editable_fields"), list)
+        ),
+        **(
+            {"review_editable_fields": config["review_editable_fields"]}
+            if isinstance(config.get("review_editable_fields"), list)
+            else {}
+        ),
+        **(
+            {"review_revision_field": config["review_revision_field"]}
+            if isinstance(config.get("review_revision_field"), str)
+            else {}
+        ),
     }
 
 

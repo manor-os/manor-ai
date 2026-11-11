@@ -71,7 +71,7 @@ for (const width of [2560, 390]) {
     expect(Math.abs(bounds.x - (width - bounds.x - bounds.width))).toBeLessThan(2);
     const titleBounds = (await title.boundingBox())!;
     expect(Math.abs(titleBounds.x - bounds.x)).toBeLessThan(2);
-    await page.getByRole("button", { name: "Install…", exact: true }).click();
+    await page.getByRole("button", { name: "Get for free", exact: true }).click();
     const dialog = page.getByRole("dialog");
     await expect(dialog.getByRole("radio", { name: "Live", exact: true })).toBeChecked();
     await expect(dialog.getByRole("button", { name: "Install Live", exact: true })).toBeEnabled();
@@ -96,7 +96,7 @@ for (const width of [2560, 390]) {
 test("keyboard selection and reopening return to live with advanced settings closed", async ({ page }) => {
   const state = await mockInstall(page);
   await page.goto(fixtureUrl);
-  await page.getByRole("button", { name: "Install…", exact: true }).click();
+  await page.getByRole("button", { name: "Get for free", exact: true }).click();
   const dialog = page.getByRole("dialog");
   await dialog.getByRole("radio", { name: "Live", exact: true }).focus();
   await page.keyboard.press("ArrowRight");
@@ -111,8 +111,8 @@ test("keyboard selection and reopening return to live with advanced settings clo
   await page.getByRole("option", { name: /^Safe,/ }).click();
   await page.keyboard.press("Escape");
   await expect(dialog).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Install…", exact: true })).toBeFocused();
-  await page.getByRole("button", { name: "Install…", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Get for free", exact: true })).toBeFocused();
+  await page.getByRole("button", { name: "Get for free", exact: true }).click();
   await expect(dialog.getByRole("radio", { name: "Live", exact: true })).toBeChecked();
   await expect(dialog.getByText("Governance preset", { exact: true })).toHaveCount(0);
 });
@@ -125,7 +125,7 @@ test("required settings and connections remain visible and block live installati
   state.requirements = [{ kind: "browser_session", provider: "chrome", label: "Publishing browser",
     required: true, blocking: true, ready: false, purpose: "Connect the publishing account" }];
   await page.goto(fixtureUrl);
-  await page.getByRole("button", { name: "Install…", exact: true }).click();
+  await page.getByRole("button", { name: "Get for free", exact: true }).click();
   const dialog = page.getByRole("dialog");
   const install = dialog.getByRole("button", { name: "Install Live", exact: true });
   await expect(install).toBeDisabled();
@@ -144,7 +144,7 @@ test("failed live preflight can be refreshed without allowing installation", asy
   const state = await mockInstall(page);
   state.preflightStatus = 503;
   await page.goto(fixtureUrl);
-  await page.getByRole("button", { name: "Install…", exact: true }).click();
+  await page.getByRole("button", { name: "Get for free", exact: true }).click();
   const dialog = page.getByRole("dialog");
   await expect(dialog.getByRole("alert")).toContainText("Could not verify Integration readiness");
   await expect(dialog.getByRole("button", { name: "Install Live", exact: true })).toBeDisabled();

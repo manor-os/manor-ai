@@ -14,7 +14,7 @@ from packages.core.services.workspace_artifacts import (
     workspace_artifact_storage_base,
 )
 from packages.core.services.workspace_layout import (
-    TASK_ARTIFACT_SEGMENT, WORKFLOW_ARTIFACT_SEGMENT, WORKSPACE_RESERVED_DIRECTORIES,
+    TASK_ARTIFACT_SEGMENT, WORKFLOW_ARTIFACT_SEGMENT, WORKSPACE_RESERVED_DIRECTORIES, project_production_root,
 )
 
 
@@ -32,6 +32,7 @@ class WorkspaceArtifactScope:
     workflow_run_id: str | None = None
     workflow_lineage_root_run_id: str | None = None
     workspace_shared: bool = False
+    workflow_project_root: str | None = None
 
 
 _artifact_scope: ContextVar[WorkspaceArtifactScope | None] = ContextVar("workspace_artifact_owner", default=None)
@@ -106,6 +107,23 @@ def workspace_task_artifact_dir(
     return _clean_rel_dir(f"{base}/{TASK_ARTIFACT_SEGMENT}/{task_segment}")
 
 
+def workflow_run_project_folder(
+    workspace_base_dir: str | None,
+    *,
+    workflow_run_id: str | None,
+    workflow_project_root: str | None,
+) -> str | None:
+    """The folder of the WorkflowProject a Workflow run works on, if any.
+
+    Every writer that picks a folder for something new in a run (an output,
+    a code project) starts here, so the project's App view and reviews see
+    what the run made.
+    """
+    base = _clean_rel_dir(workspace_base_dir or "")
+    project_root = project_production_root(workflow_project_root) if str(workflow_run_id or "").strip() else None
+    return _clean_rel_dir(f"{base}/{project_root}") if base and project_root else None
+
+
 def workspace_execution_artifact_dir(
     workspace_base_dir: str | None,
     *,
@@ -113,13 +131,23 @@ def workspace_execution_artifact_dir(
     workflow_run_id: str | None = None,
     workflow_lineage_root_run_id: str | None = None,
     entity_root: str | None = None,
+    workflow_project_root: str | None = None,
 ) -> str:
-    """Select the producing runtime's archive, with stable Workflow retries."""
+    """Select the producing runtime's archive, with stable Workflow retries.
+
+    A run that works on a WorkflowProject keeps what it makes in that
+    project's folder, where the project's App view and reviews find it.
+    """
     base = _clean_rel_dir(workspace_base_dir or "")
     if not base:
         return ""
     run_id = str(workflow_run_id or "").strip()
     lineage = str(workflow_lineage_root_run_id or run_id).strip()
+    project_folder = workflow_run_project_folder(
+        base, workflow_run_id=run_id, workflow_project_root=workflow_project_root,
+    )
+    if project_folder:
+        return project_folder
     if run_id:
         if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id) or not re.fullmatch(r"[A-Za-z0-9_-]+", lineage):
             raise ValueError("Workflow artifact identity must be a single identifier")
@@ -162,7 +190,7 @@ class GeneratedMediaTarget:
 
 
 MEDIA_OUTPUT_EXTENSIONS = {
-    "image": (".png", ".jpg", ".webp"),
+    "image": (".png", ".jpg", ".webp", ".gif"),
     "audio": (".mp3", ".wav", ".flac", ".opus", ".aac", ".ogg"),
     "video": (".mp4", ".webm"),
 }
@@ -294,6 +322,7 @@ async def resolve_workspace_artifact_base_dir(
     task_id: str | None = None,
     workflow_run_id: str | None = None,
     workflow_lineage_root_run_id: str | None = None,
+    workflow_project_root: str | None = None,
 ) -> str:
     """Resolve the artifact base dir for generated output.
 
@@ -308,10 +337,11 @@ async def resolve_workspace_artifact_base_dir(
     scope = current_workspace_artifact_scope(entity_id, workspace_id)
     if scope is not None:
         if scope.workspace_shared:
-            task_id = workflow_run_id = workflow_lineage_root_run_id = None
+            task_id = workflow_run_id = workflow_lineage_root_run_id = workflow_project_root = None
         else:
             workflow_run_id = workflow_run_id or scope.workflow_run_id
             workflow_lineage_root_run_id = workflow_lineage_root_run_id or scope.workflow_lineage_root_run_id
+            workflow_project_root = workflow_project_root or scope.workflow_project_root
 
     from sqlalchemy import select
 
@@ -326,7 +356,7 @@ async def resolve_workspace_artifact_base_dir(
         )
         if entity_id:
             stmt = stmt.where(Workspace.entity_id == entity_id)
-        workspace = (await db.execute(stmt.with_for_update().limit(1))).scalar_one_or_none()
+        workspace = (await db.execute(stmt.with_for_update(key_share=True).limit(1))).scalar_one_or_none()
         if workspace is None:
             raise RuntimeError(f"Workspace artifact scope could not resolve workspace {workspace_id}")
         folder = await ensure_workspace_artifact_folder(db, workspace)
@@ -337,6 +367,7 @@ async def resolve_workspace_artifact_base_dir(
             base, task_id=task_id, workflow_run_id=workflow_run_id,
             workflow_lineage_root_run_id=workflow_lineage_root_run_id,
             entity_root=get_entity_root(workspace.entity_id),
+            workflow_project_root=workflow_project_root,
         )
 
 

@@ -142,6 +142,31 @@ async def test_stats_tools_enforce_actor_workspace_and_lifecycle_at_entry(db_ses
         **context, **{**manual, "collector_config": {"subject": {"kind": "web_page", "id": "pricing"}}},
     )).get("error")
 
+    # A Workflow records its own measurements on manual Stats, configuring a missing one on first use.
+    recorded = json.loads(await handlers["record_workspace_stat_observations"](**context, observations=[
+        {"key": "newsletter.signups", "value": 4, "idempotency_key": "batch-1:signups"},
+        {"key": "newsletter.unsubscribes", "value": None, "gaps": ["hidden"], "idempotency_key": "batch-1:unsub",
+         "definition": {"name": "Unsubscribes", "collector_config": {"subject": {"kind": "web_page", "id": "newsletter"}}}},
+    ]))
+    assert [(row["key"], row["value"]) for row in recorded["observations"]] == [
+        ("newsletter.signups", 4.0), ("newsletter.unsubscribes", None)]
+    replay = json.loads(await handlers["record_workspace_stat_observations"](**context, observations=[
+        {"key": "newsletter.signups", "value": 4, "idempotency_key": "batch-1:signups"}]))
+    assert replay["observations"][0]["observation_id"] == recorded["observations"][0]["observation_id"]
+    for bad in ([{"key": "newsletter.bounces", "value": 1, "idempotency_key": "x"}],
+                [{"key": str(definition["key"]), "value": 1, "idempotency_key": "x"}]):
+        assert json.loads(await handlers["record_workspace_stat_observations"](**context, observations=bad)).get("error")
+    # Deleting takes one family; a selector that could sweep the Workspace is refused.
+    assert json.loads(await handlers["delete_workspace_stats"](**context, key_prefix="news")).get("error")
+    assert json.loads(await handlers["delete_workspace_stats"](**context)).get("error")
+    for literal_prefix in ("ne%.", "newsletter._"):
+        selected, cursor = await _selected_stats(
+            db_session, entity_id=entity_id, workspace_id=workspace.id, params={"key_prefix": literal_prefix},
+        )
+        assert selected == [] and cursor is None
+        assert json.loads(await handlers["delete_workspace_stats"](**context, key_prefix=literal_prefix))["deleted"] == 0
+    assert json.loads(await handlers["delete_workspace_stats"](**context, key_prefix="newsletter."))["deleted"] == 2
+
     public_fetches = 0
 
     async def public_snapshot(**_kwargs):

@@ -30,7 +30,12 @@ def cancelled_runtime_message_snapshot(message: Message, run: RuntimeRun):
     partial = message.content
     if partial == assistant_stream_started_content():
         partial = None
-    content = runtime_assistant_stream_interrupted_content(partial)
+    # The person moved on past a run waiting on their approval: nothing broke,
+    # so the turn keeps what it said and carries no interruption notice.
+    content = (
+        (partial or "").strip() if run.status_reason == "superseded"
+        else runtime_assistant_stream_interrupted_content(partial)
+    )
     terminal_meta = assistant_stream_interrupted_meta(meta)
     terminal_meta["stop_reason"] = "cancelled"
     blocks = project_failed_assistant_blocks(

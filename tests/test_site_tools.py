@@ -84,6 +84,7 @@ async def test_publish_site_handler(entity_fs, tool_db):
     )
     assert out["published"] is True
     assert out["url"] == f"https://{out['slug']}.sites.test.local"
+    assert out["name"] == "Demo"
     assert out["revision"] == 1
     assert out["excluded_files"] == ["notes.py"]
 

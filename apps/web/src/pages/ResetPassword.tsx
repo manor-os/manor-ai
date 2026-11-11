@@ -86,7 +86,7 @@ export default function ResetPassword() {
             >
               <IconCheckCircle size={24} />
             </div>
-            <h1 style={{ fontSize: 30, fontWeight: 900, color: "var(--text-strong)", marginBottom: 8 }}>
+            <h1 style={{ fontSize: 26, fontWeight: 600, letterSpacing: "-0.02em", color: "var(--text-strong)", marginBottom: 8 }}>
               {t("page.reset_password.title")}
             </h1>
             <p style={{ fontSize: 14, color: "var(--text-muted)", lineHeight: 1.6, marginBottom: 28 }}>
@@ -115,7 +115,7 @@ export default function ResetPassword() {
             >
               <IconWarning size={24} />
             </div>
-            <h1 style={{ fontSize: 30, fontWeight: 900, color: "var(--text-strong)", marginBottom: 8 }}>
+            <h1 style={{ fontSize: 26, fontWeight: 600, letterSpacing: "-0.02em", color: "var(--text-strong)", marginBottom: 8 }}>
               {t("page.reset_password.link_invalid_title")}
             </h1>
             <p style={{ fontSize: 14, color: "var(--text-muted)", lineHeight: 1.6, marginBottom: 28 }}>
@@ -139,7 +139,7 @@ export default function ResetPassword() {
           </div>
         ) : (
           <>
-            <h1 style={{ fontSize: 30, fontWeight: 900, color: "var(--text-strong)", marginBottom: 8 }}>
+            <h1 style={{ fontSize: 26, fontWeight: 600, letterSpacing: "-0.02em", color: "var(--text-strong)", marginBottom: 8 }}>
               {t("page.reset_password.set_new")}
             </h1>
             <p style={{ fontSize: 14, color: "var(--text-muted)", lineHeight: 1.6, marginBottom: 28 }}>

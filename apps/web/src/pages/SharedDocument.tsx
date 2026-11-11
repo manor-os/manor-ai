@@ -102,7 +102,7 @@ export default function SharedDocument() {
       style={{
         minHeight: "100vh",
         padding: "32px 16px",
-        background: "linear-gradient(180deg, #fafaf9 0%, #ffffff 100%)",
+        background: "linear-gradient(180deg, #fafafa 0%, #ffffff 100%)",
       }}
     >
       <div
@@ -111,16 +111,16 @@ export default function SharedDocument() {
           margin: "0 auto",
           background: "#ffffff",
           borderRadius: 12,
-          boxShadow: "0 1px 3px rgba(28,25,23,0.06)",
+          boxShadow: "0 1px 3px rgba(29, 29, 31,0.06)",
           padding: 24,
         }}
       >
-        <h1 style={{ fontSize: 14, fontWeight: 700, color: "#78716c", margin: "0 0 4px", letterSpacing: 0.5 }}>
+        <h1 style={{ fontSize: 14, fontWeight: 700, color: "var(--text-muted)", margin: "0 0 4px", }}>
           {t("page.shared_doc.brand_header")}
         </h1>
 
         {state.kind === "loading" && (
-          <p style={{ fontSize: 14, color: "#a8a29e", padding: "32px 0", textAlign: "center" }}>
+          <p style={{ fontSize: 14, color: "var(--text-muted)", padding: "32px 0", textAlign: "center" }}>
             {t("page.shared_doc.loading")}
           </p>
         )}
@@ -137,10 +137,10 @@ export default function SharedDocument() {
 
         {state.kind === "error" && (
           <div style={{ padding: "32px 0", textAlign: "center" }}>
-            <p style={{ fontSize: 18, fontWeight: 600, color: "#292524", margin: "0 0 4px" }}>
+            <p style={{ fontSize: 18, fontWeight: 600, color: "var(--text-strong)", margin: "0 0 4px" }}>
               {state.status === 404 ? "Locked" : "Expired"} {state.message}
             </p>
-            <p style={{ fontSize: 12, color: "#a8a29e", margin: "12px 0 0" }}>
+            <p style={{ fontSize: 12, color: "var(--text-muted)", margin: "12px 0 0" }}>
               {t("page.shared_doc.contact_owner")}
             </p>
           </div>
@@ -153,17 +153,17 @@ export default function SharedDocument() {
             <>
               <div style={{ display: "flex", alignItems: "center", gap: 12, margin: "12px 0 4px" }}>
                 <IconDocument size={20} />
-                <h2 style={{ fontSize: 22, fontWeight: 700, color: "#1c1917", margin: 0, wordBreak: "break-word" }}>
+                <h2 style={{ fontSize: 22, fontWeight: 700, color: "var(--text-strong)", margin: 0, wordBreak: "break-word" }}>
                   {data.name}
                 </h2>
               </div>
               <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 18, flexWrap: "wrap" }}>
                 <ClassificationBadge level={data.classification} size="sm" />
-                <span style={{ fontSize: 12, color: "#a8a29e" }}>
+                <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
                   {t("page.shared_doc.permission_prefix")} {data.capabilities.join(" / ")}
                 </span>
                 {data.expires_at && (
-                  <span style={{ fontSize: 12, color: "#a8a29e" }}>
+                  <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
                     · {t("page.shared_doc.expires_on", { date: new Date(data.expires_at).toLocaleDateString(undefined, { timeZone: getPreferredTimeZone() }) })}
                   </span>
                 )}
@@ -177,7 +177,7 @@ export default function SharedDocument() {
                       alignItems: "center",
                       gap: 6,
                       padding: "6px 12px",
-                      background: "#1c1917",
+                      background: "#1d1d1f",
                       color: "#ffffff",
                       borderRadius: 8,
                       fontSize: 13,
@@ -191,7 +191,7 @@ export default function SharedDocument() {
                 )}
               </div>
 
-              <div style={{ borderTop: "1px solid rgba(28,25,23,0.06)", paddingTop: 18 }}>
+              <div style={{ borderTop: "0.5px solid rgba(29, 29, 31,0.06)", paddingTop: 18 }}>
                 <ReadOnlyFilePreview file={data} source={source} canDownload={canDownload} />
               </div>
 
@@ -199,9 +199,9 @@ export default function SharedDocument() {
                 style={{
                   marginTop: 20,
                   paddingTop: 12,
-                  borderTop: "1px solid rgba(28,25,23,0.06)",
+                  borderTop: "0.5px solid rgba(29, 29, 31,0.06)",
                   fontSize: 11,
-                  color: "#a8a29e",
+                  color: "#aeaeb2",
                 }}
               >
                 {t("page.shared_doc.footer_logged")}

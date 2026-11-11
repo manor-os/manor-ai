@@ -1,16 +1,27 @@
 import { useRef, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, translateApiError } from "../../lib/api";
 import { t } from "../../lib/i18n";
+import { integrationCatalogQueryOptions } from "../../lib/integrationCatalog";
+import IntegrationConnectRow from "../integrations/IntegrationConnectRow";
 import Button from "../ui/Button";
 import Modal from "../ui/Modal";
 import { WORKFLOW_REVIEW_FRAMES_DIALOG_WIDTH, workflowReviewHasFrames } from "./WorkflowApprovalReview";
 import WorkflowRunIntervention from "./WorkflowRunIntervention";
-import type { WorkflowHistoryRun } from "./workflowRunDisplay";
+import type { WorkflowHistoryRun, WorkflowRunAction } from "./workflowRunDisplay";
+import { PageLoading } from "../ui/Skeleton";
+import { loadWaitingRun } from "./workflowWaitingRun";
 
-/** Review the current frozen wait before sending a decision to normal resume. */
-export default function WorkflowRunResumeControl({ runId, disabled, onResumed, label, variant = "outline" }: {
+const RESUMED_RUN_QUERY_KEYS = ["workflow-run", "workflow-runs", "workspace-workflow-runs", "workflow-run-history-detail", "workflow-run-history-family", "workflow-run-history-control", "workflow-run-review", "workspace-chat-workflow-run-family", "workspace-chat", "workspace-chat-messages", "chat-messages", "workspace-app-data", "workspace-app-data-contexts", "workspace-app-section", "workspace-app-recent-run"];
+
+/** Review the current frozen wait before sending a decision to normal resume.
+ *
+ * A run waiting for an integration (``action.connection_provider``) is
+ * answered by connecting it over this page; the run then continues from its
+ * step. */
+export default function WorkflowRunResumeControl({ runId, action: waitAction, disabled, onResumed, label, variant = "outline" }: {
   runId: string;
+  action?: WorkflowRunAction | null;
   disabled?: boolean;
   /** The button's words where the wait is known ("Review"); defaults to the generic request. */
   label?: string;
@@ -24,6 +35,56 @@ export default function WorkflowRunResumeControl({ runId, disabled, onResumed, l
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
 
+  const connectionProvider = String(waitAction?.connection_provider || "");
+  const connectionLabel = String(waitAction?.connection_label || connectionProvider);
+  const catalog = useQuery(integrationCatalogQueryOptions(Boolean(connectionProvider)));
+  const connectionReady = Boolean(catalog.data?.find((server) => server.server_key === connectionProvider)?.agent_can_use);
+  const continueRun = async () => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    setError("");
+    try {
+      const waitingRunId = typeof waitAction?.workflow_run_id === "string" && waitAction.workflow_run_id.trim()
+        ? waitAction.workflow_run_id.trim()
+        : runId;
+      let resumed = await api.workflows.resumeRun(waitingRunId, undefined, waitAction?.step_id);
+      if (waitingRunId !== runId) resumed = await api.workflows.getRun(runId);
+      for (const key of RESUMED_RUN_QUERY_KEYS) void queryClient.invalidateQueries({ queryKey: [key] });
+      onResumed?.(resumed);
+    } catch (cause) {
+      setError(translateApiError(cause, t("component.workflow_run_history.control_load_error")));
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  };
+
+  if (connectionProvider && !connectionReady) {
+    // Connected with the same row as everywhere; the run then continues from its waiting step.
+    return <>
+      {error && <span role="alert">{error}</span>}
+      <IntegrationConnectRow as="div" requirement={{ kind: "integration", provider: connectionProvider, label: connectionLabel }}
+        hint={t("component.integration_connect.run_waiting", { provider: connectionLabel, step: String(waitAction?.title || waitAction?.step_id || "") })}
+        onConnected={() => void continueRun()} />
+    </>;
+  }
+  if (connectionProvider) {
+    return <>
+      {error && <span role="alert">{error}</span>}
+      <Button
+        size="sm"
+        variant="primary"
+        disabled={disabled || busy}
+        loading={busy}
+        title={t("component.integration_connect.run_waiting", { provider: connectionLabel, step: String(waitAction?.title || waitAction?.step_id || "") })}
+        onClick={() => void continueRun()}
+      >
+        {t("recommendation.label.integration.continue")}
+      </Button>
+    </>;
+  }
+
   const openReview = async () => {
     if (disabled || busyRef.current) return;
     busyRef.current = true;
@@ -32,7 +93,8 @@ export default function WorkflowRunResumeControl({ runId, disabled, onResumed, l
     setDetail(null);
     setError("");
     try {
-      const current = await api.workflows.getRun(runId);
+      // A retried result's first run id still answers its latest attempt's request.
+      const current = await loadWaitingRun<WorkflowHistoryRun>(runId, (id, full = true) => api.workflows.getRun(id, full));
       if (current.status !== "paused" || !current.capabilities?.can_control || !current.resume_action) {
         throw new Error(current.status === "paused"
           ? "Nothing needs your response right now. This run is waiting on background work and continues on its own."
@@ -71,12 +133,23 @@ export default function WorkflowRunResumeControl({ runId, disabled, onResumed, l
       } else {
         // A note (revision instructions) travels with the choice; the runner
         // reads `.choice` from either shape.
+        const approvalResponse = note || payload?.review ? {
+          choice,
+          ...(note ? { note } : {}),
+          ...(payload?.review ? { review: payload.review } : {}),
+        } : choice;
         const variables = action.kind === "workflow_approval"
-          ? { [String(action.response_variable)]: note ? { choice, note } : choice }
+          ? { [String(action.response_variable)]: approvalResponse }
           : action.kind === "workflow_input"
             ? payload
           : undefined;
-        resumed = await api.workflows.resumeRun(detail.id, variables, action.step_id);
+        // A run paused on a nested Flow shows the decision its descendant waits on;
+        // that descendant is the run answered, and this run is read again after.
+        const waitingRunId = typeof action.workflow_run_id === "string" && action.workflow_run_id.trim()
+          ? action.workflow_run_id.trim()
+          : detail.id;
+        resumed = await api.workflows.resumeRun(waitingRunId, variables, action.step_id);
+        if (waitingRunId !== detail.id) resumed = await api.workflows.getRun(detail.id);
       }
       for (const key of ["workflow-run", "workflow-runs", "workspace-workflow-runs", "workflow-run-history-detail", "workflow-run-history-family", "workflow-run-history-control", "workflow-run-review", "workspace-chat-workflow-run-family", "workspace-chat", "workspace-chat-messages", "chat-messages", "workspace-app-data", "workspace-app-data-contexts", "workspace-app-section", "workspace-app-recent-run"]) {
         void queryClient.invalidateQueries({ queryKey: [key] });
@@ -99,7 +172,7 @@ export default function WorkflowRunResumeControl({ runId, disabled, onResumed, l
       className="workflow-response-dialog"
     >
       {error && <p role="alert">{error}</p>}
-      {busy && !detail && <p role="status">Loading current request…</p>}
+      {busy && !detail && <PageLoading label={t("ui.loading_current_request")} minHeight={96} />}
       {detail?.resume_action && <WorkflowRunIntervention
         run={{ id: detail.id, title: detail.workflow_name || "Workflow", status: "paused", currentNodeId: detail.current_step_id, nodes: [{ id: detail.current_step_id || "", name: String(detail.resume_action.title || "Wait"), status: "paused" }] }}
         action={detail.resume_action}

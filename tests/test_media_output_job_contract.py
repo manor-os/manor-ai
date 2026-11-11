@@ -162,11 +162,16 @@ async def test_audio_saver_uses_prepared_name_and_actual_format(media_storage):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("base", [BASE, TASK_BASE, f"{BASE}/workflow/runmediaoutput"])
+@pytest.mark.parametrize("base", [
+    BASE, TASK_BASE, f"{BASE}/workflow/runmediaoutput",
+    # A run working on a WorkflowProject makes its clips in the project's folder.
+    f"{BASE}/projects/launch-film", f"{BASE}/projects/launch-film/takes/runmediaoutput",
+])
 async def test_video_worker_preserves_frozen_target_without_runtime_lease(media_storage, base):
     contract = _contract(media_storage, base=base)
     result = await _save_video(contract)
-    path = f"{base}/ep03-test.mp4" if base == BASE else f"{base}/videos/ep03-test.mp4"
+    archive = base in {TASK_BASE, f"{BASE}/workflow/runmediaoutput"}
+    path = f"{base}/videos/ep03-test.mp4" if archive else f"{base}/ep03-test.mp4"
     assert result["result_url"] == f"/api/v1/fs/{ENTITY}/{path}"
     assert (media_storage / path).read_bytes() == VIDEO
     assert result["document_id"] == "docmediaoutput"

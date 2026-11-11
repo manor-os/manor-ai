@@ -152,7 +152,7 @@ export default function Reports() {
       {/* Date range */}
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
         <div>
-          <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "#78716c", marginBottom: 4 }}>{t("page.reports.from")}</label>
+          <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "var(--text-muted)", marginBottom: 4 }}>{t("page.reports.from")}</label>
           <input
             type="date"
             value={dateFrom}
@@ -162,7 +162,7 @@ export default function Reports() {
           />
         </div>
         <div>
-          <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "#78716c", marginBottom: 4 }}>{t("page.reports.to")}</label>
+          <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "var(--text-muted)", marginBottom: 4 }}>{t("page.reports.to")}</label>
           <input
             type="date"
             value={dateTo}
@@ -184,7 +184,7 @@ export default function Reports() {
       {!isLoading && !currentReport && (
         <EmptyState
           icon={
-            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#d6d3d1" strokeWidth={1.5}>
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#d1d1d6" strokeWidth={1.5}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M3 13.125C3 12.504 3.504 12 4.125 12h2.25c.621 0 1.125.504 1.125 1.125v6.75C7.5 20.496 6.996 21 6.375 21h-2.25A1.125 1.125 0 013 19.875v-6.75zM9.75 8.625c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125v11.25c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V8.625zM16.5 4.125c0-.621.504-1.125 1.125-1.125h2.25C20.496 3 21 3.504 21 4.125v15.75c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V4.125z" />
             </svg>
           }
@@ -195,12 +195,12 @@ export default function Reports() {
 
       {/* Report content */}
       {!isLoading && currentReport && (
-        <div className="glass-card" style={{ padding: 24 }}>
+        <div>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }}>
-            <h3 style={{ fontSize: 16, fontWeight: 700, color: "#1c1917", margin: 0 }}>
-              {(currentReport as Report).title || `${tab.charAt(0).toUpperCase() + tab.slice(1)} Report`}
+            <h3 style={{ fontSize: 16, fontWeight: 600, color: "var(--text-strong)", margin: 0 }}>
+              {t(`ui.report_title_${tab}`)}
             </h3>
-            <span style={{ fontSize: 11, color: "#a8a29e" }}>
+            <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
               {t("page.reports.generated")} {(currentReport as Report).generated_at ? new Date((currentReport as Report).generated_at).toLocaleString(undefined, { timeZone: getPreferredTimeZone() }) : "N/A"}
             </span>
           </div>
@@ -235,7 +235,7 @@ export default function Reports() {
             onChange={(e) => setEmailRecipients(e.target.value)}
             placeholder={t("page.reports.user_example_com_admin_example_com")}
           />
-          <p style={{ fontSize: 11, color: "#a8a29e", marginTop: 8 }}>
+          <p style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 8 }}>
             {t("page.reports.the")} {tab} {t("page.reports.report_for")} {dateFrom} {t("page.reports.to_2")} {dateTo} {t("page.reports.will_be_sent_to_these_email_addresses")}
           </p>
         </div>
@@ -248,7 +248,7 @@ export default function Reports() {
 
 function renderReportData(data: Record<string, any> | undefined) {
   if (!data || Object.keys(data).length === 0) {
-    return <p style={{ fontSize: 13, color: "#a8a29e" }}>{t("page.reports.no_data_available")}</p>;
+    return <p style={{ fontSize: 13, color: "var(--text-muted)" }}>{t("page.reports.no_data_available")}</p>;
   }
 
   return (
@@ -259,15 +259,15 @@ function renderReportData(data: Record<string, any> | undefined) {
           const cols = Object.keys(value[0]);
           return (
             <div key={key}>
-              <h4 style={{ fontSize: 13, fontWeight: 700, color: "#44403c", textTransform: "capitalize", marginBottom: 8 }}>
-                {key.replace(/_/g, " ")}
+              <h4 style={{ fontSize: 13, fontWeight: 600, color: "var(--text-default)", textTransform: "none", marginBottom: 8 }}>
+                {formatReportLabel(key)}
               </h4>
               <div style={{ overflowX: "auto" }}>
                 <table className="glass-table" style={{ width: "100%", fontSize: 12 }}>
                   <thead>
                     <tr>
                       {cols.map((col) => (
-                        <th key={col} style={{ textTransform: "capitalize" }}>{col.replace(/_/g, " ")}</th>
+                        <th key={col} style={{ textTransform: "none" }}>{formatReportLabel(col)}</th>
                       ))}
                     </tr>
                   </thead>
@@ -275,7 +275,7 @@ function renderReportData(data: Record<string, any> | undefined) {
                     {value.map((row: any, i: number) => (
                       <tr key={i}>
                         {cols.map((col) => (
-                          <td key={col} style={{ padding: "8px 12px", color: "#57534e" }}>
+                          <td key={col} style={{ padding: "8px 12px", color: "var(--text-muted)" }}>
                             {formatReportValue(row[col])}
                           </td>
                         ))}
@@ -292,16 +292,16 @@ function renderReportData(data: Record<string, any> | undefined) {
         if (typeof value === "object" && value !== null && !Array.isArray(value)) {
           return (
             <div key={key}>
-              <h4 style={{ fontSize: 13, fontWeight: 700, color: "#44403c", textTransform: "capitalize", marginBottom: 8 }}>
-                {key.replace(/_/g, " ")}
+              <h4 style={{ fontSize: 13, fontWeight: 600, color: "var(--text-default)", textTransform: "none", marginBottom: 8 }}>
+                {formatReportLabel(key)}
               </h4>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 200px), 1fr))", gap: 12 }}>
                 {Object.entries(value).map(([k, v]) => (
-                  <div key={k} style={{ background: "#fafaf9", borderRadius: 12, padding: "12px 16px" }}>
-                    <div style={{ fontSize: 11, fontWeight: 600, color: "#a8a29e", textTransform: "capitalize", marginBottom: 4 }}>
-                      {k.replace(/_/g, " ")}
+                  <div key={k} style={{ background: "var(--surface-muted)", borderRadius: 10, padding: "12px 16px" }}>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "none", marginBottom: 4 }}>
+                      {formatReportLabel(k)}
                     </div>
-                    <div style={{ fontSize: 18, fontWeight: 700, color: "#1c1917" }}>
+                    <div style={{ fontSize: 18, fontWeight: 600, color: "var(--text-strong)" }}>
                       {renderReportValue(v)}
                     </div>
                   </div>
@@ -313,11 +313,11 @@ function renderReportData(data: Record<string, any> | undefined) {
 
         // Simple value
         return (
-          <div key={key} style={{ display: "flex", alignItems: "center", gap: 12, padding: "8px 0", borderBottom: "1px solid #f5f5f4" }}>
-            <span style={{ fontSize: 13, fontWeight: 600, color: "#57534e", textTransform: "capitalize", minWidth: 140 }}>
-              {key.replace(/_/g, " ")}
+          <div key={key} style={{ display: "flex", alignItems: "center", gap: 12, padding: "8px 0", borderBottom: "1px solid #f5f5f7" }}>
+            <span style={{ fontSize: 13, fontWeight: 600, color: "var(--text-muted)", textTransform: "none", minWidth: 140 }}>
+              {formatReportLabel(key)}
             </span>
-            <span style={{ fontSize: 13, color: "#292524" }}>
+            <span style={{ fontSize: 13, color: "var(--text-strong)" }}>
               {formatReportValue(value)}
             </span>
           </div>
@@ -327,27 +327,29 @@ function renderReportData(data: Record<string, any> | undefined) {
   );
 }
 
+/** Report sections and fields arrive as server keys; known ones have a name in every language. */
 function formatReportLabel(key: string) {
-  return key.replace(/_/g, " ");
+  const label = t(`ui.report_label_${key}`);
+  return label === `ui.report_label_${key}` ? key.replace(/_/g, " ") : label;
 }
 
 function formatReportValue(value: any): string {
   if (value === null || value === undefined || value === "") return "--";
   if (typeof value === "number") return value.toLocaleString();
-  if (typeof value === "boolean") return value ? "Yes" : "No";
+  if (typeof value === "boolean") return value ? t("ui.yes") : t("ui.no");
   if (typeof value === "string") return value;
   if (Array.isArray(value)) {
-    if (value.length === 0) return "None";
+    if (value.length === 0) return t("ui.none");
     if (value.every((item) => item === null || typeof item !== "object")) {
       return value.map(formatReportValue).join(", ");
     }
-    return `${value.length.toLocaleString()} ${value.length === 1 ? "item" : "items"}`;
+    return t("ui.items_count", { count: value.length.toLocaleString() });
   }
   if (typeof value === "object") {
     const entries = Object.entries(value);
     if (entries.length === 0) return "--";
     const visible = entries.slice(0, 4).map(([k, v]) => `${formatReportLabel(k)}: ${formatReportValue(v)}`);
-    if (entries.length > visible.length) visible.push(`+${entries.length - visible.length} more`);
+    if (entries.length > visible.length) visible.push(t("ui.more_count", { count: entries.length - visible.length }));
     return visible.join(" · ");
   }
   return String(value);
@@ -362,12 +364,12 @@ function renderReportValue(value: any) {
     <div style={{ display: "flex", flexDirection: "column", gap: 2, fontSize: 12, lineHeight: 1.45 }}>
       {Object.entries(value).slice(0, 5).map(([k, v]) => (
         <div key={k} style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-          <span style={{ color: "#78716c", fontWeight: 600, textTransform: "capitalize" }}>{formatReportLabel(k)}</span>
-          <span style={{ color: "#1c1917", fontWeight: 700, textAlign: "right" }}>{formatReportValue(v)}</span>
+          <span style={{ color: "var(--text-muted)", fontWeight: 600, textTransform: "none" }}>{formatReportLabel(k)}</span>
+          <span style={{ color: "var(--text-strong)", fontWeight: 600, textAlign: "right" }}>{formatReportValue(v)}</span>
         </div>
       ))}
       {Object.keys(value).length > 5 && (
-        <span style={{ color: "#a8a29e", fontWeight: 600 }}>+{Object.keys(value).length - 5} more</span>
+        <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>+{Object.keys(value).length - 5} more</span>
       )}
     </div>
   );

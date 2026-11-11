@@ -24,6 +24,34 @@ const calendarError = params.has("calendar-error");
 const metricsPending = params.has("metrics-pending");
 const narrow = params.has("narrow");
 const demo = params.has("demo");
+// A refresh icon beside a published post's counts runs its entry in place.
+const refresh = params.has("refresh");
+const deletePost = params.has("delete-post");
+let deletedPostId: string | undefined;
+const deletionRun = {
+  id: "delete-post-run", workspace_id: workspaceId, workflow_id: "cancel-post", binding_id: "cancel-post",
+  status: "completed", current_step_id: "deleted", variables: { __result: { deleted: 0 } },
+  step_results: { deleted: { completion_message: "The post is deleted." } },
+};
+if (deletePost) {
+  api.workspaces.setupStatus = async () => ({ ready: true, incomplete_checks: [] } as any);
+  api.workflows.listRuns = async () => [];
+  api.workflows.runBinding = async (_bindingId, data) => {
+    deletedPostId = String(data?.variables?.slot_project_id);
+    for (const campaign of campaigns) campaign.items = campaign.items.filter((item) => item.id !== deletedPostId);
+    return deletionRun as any;
+  };
+}
+const refreshAction = "action:refresh-post-metrics";
+const refreshStarts: Array<Record<string, unknown>> = [];
+(window as unknown as { refreshStarts: typeof refreshStarts }).refreshStarts = refreshStarts;
+let refreshChecks = 0;
+if (refresh) {
+  api.workflows.runBinding = async (_bindingId: string, data?: any) => {
+    refreshStarts.push(data);
+    return { id: "refresh-run", status: "running" };
+  };
+}
 useConfigStore.setState({ loaded: true });
 
 const calendarItems: WorkspaceAppDataItem[] = [
@@ -150,10 +178,13 @@ const component: WorkspaceAppDataComponent = {
     },
     {
       key: "calendar_slots", type: "progress" as const, source: "slots", title: "Publishing calendar", limit: 100,
+      item_action: { action: "workflow:cancel-post", input: "slot_project_id", label: "Cancel this post", stages: ["scheduled", "preparation_blocked", "ready"] },
+      ...(refresh ? { result_action: { action: refreshAction, input: "slot_project_id", label: "Refresh data", stages: ["published"] } } : {}),
       stage_labels: { published: "Published", ready: "Ready to publish", scheduled: "Awaiting production", leased: "Processing", awaiting_review: "Waiting for your review", preparation_blocked: "Production needs attention", publication_blocked: "Publishing needs attention", verification_required: "Needs review" },
     },
     { key: "published", type: "records" as const, source: "publications", title: "Published content", metrics_source: "results" },
-    { key: "tracking", type: "summary" as const, source: "campaigns", title: "Plan & reporting" },
+    { key: "tracking", type: "summary" as const, source: "campaigns", title: "Plan & reporting",
+      item_action: { action: "workflow:end-campaign", input: "campaign_project_id", label: "End campaign", stages: ["ready"] } },
     { key: "proposal", type: "documents" as const, source: "proposals", title: "Original proposal", limit: 1 },
     { key: "reports", type: "documents" as const, source: "reports", title: "Weekly reports", empty_message: "No weekly report yet. Reports will appear here when generated." },
     { key: "schedule", type: "progress" as const, source: "schedule", title: "Automatic schedule" },
@@ -176,6 +207,7 @@ const component: WorkspaceAppDataComponent = {
 
 api.workspaces.appViewContexts = async (_id, componentKey): Promise<WorkspaceAppDataContextsResponse> => {
   if (componentKey !== component.key) throw new Error("Unexpected component");
+  if (deletedPostId) (window as any).__collectionReadAfterDelete = true;
   return {
     component: { key: component.key, title: component.title, context: component.context },
     status: "ready",
@@ -196,7 +228,10 @@ const reviewRun = {
 };
 let reviewAnswered = false;
 api.workflows.getRun = async (runId) => {
+  if (deletePost && runId === deletionRun.id) return deletionRun as any;
   if (runId === reviewRun.id) return (reviewAnswered ? { ...reviewRun, status: "running", intervention: null, resume_action: null } : reviewRun) as any;
+  // The refresh run reports running once, then finished.
+  if (refresh && runId === "refresh-run") return { id: runId, status: ++refreshChecks > 1 ? "completed" : "running" } as any;
   if (runId !== "publish-lyric") throw new Error("Unexpected fixture run");
   return { id: runId, workspace_id: workspaceId, workflow_id: "jr-music", status: "failed", capabilities: { can_control: false } } as any;
 };
@@ -272,6 +307,8 @@ api.workspaces.appViewSection = async (_id, sectionId): Promise<WorkspaceAppSect
   throw new Error("Unexpected App section");
 };
 
+const launch = { key: "workflow:launch", kind: "workflow", binding_id: "launch", workflow_id: "launch", title: "Launch a Music Marketing Campaign", description: "Create a campaign", inputs: [] };
+
 const view = {
   workspace_id: workspaceId,
   title: "JR Music Studio",
@@ -285,7 +322,12 @@ const view = {
   blocks: [
     { block: "actions", zone: "functions" }, { block: "metrics", zone: "data" }, { block: "outputs", zone: "outputs" },
   ],
-  actions: [{ key: "workflow:launch", kind: "workflow", binding_id: "launch", workflow_id: "launch", title: "Launch a Music Marketing Campaign", description: "Create a campaign", inputs: [] }],
+  actions: [launch],
+  // Ending a campaign, cancelling a post and refreshing its counts open from the calendar, not as tiles.
+  available_actions: [launch,
+    { key: "workflow:end-campaign", kind: "workflow", binding_id: "end-campaign", workflow_id: "end-campaign", title: "End a Campaign", description: "", inputs: [{ key: "campaign_project_id", label: "Campaign to end", type: "string", required: true }] },
+    { key: "workflow:cancel-post", kind: "workflow", binding_id: "cancel-post", workflow_id: "cancel-post", title: "Cancel a Post", description: "", inputs: [{ key: "slot_project_id", label: "Post to cancel", type: "string", required: true }] },
+    { key: refreshAction, kind: "workflow", binding_id: "refresh", workflow_id: "refresh", title: "Refresh post data", description: "", inputs: [] }],
 };
 
 function Fixture() {

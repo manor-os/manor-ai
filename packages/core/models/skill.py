@@ -71,6 +71,11 @@ class Skill(Base, TimestampMixin):
     revision: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default="1", default=1,
     )
+    # Moves on every saved change, cosmetic ones included. Editors send the
+    # value they loaded so a save made since then is never silently overwritten.
+    edit_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="1", default=1,
+    )
 
 
 class AgentSkillBinding(Base, TimestampMixin):

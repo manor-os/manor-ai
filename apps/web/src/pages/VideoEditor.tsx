@@ -22,9 +22,9 @@ import EmptyState from "../components/ui/EmptyState";
 import InfoPopover from "../components/ui/InfoPopover";
 import Modal from "../components/ui/Modal";
 import Select from "../components/ui/Select";
-import AiEditButton from "../components/ui/AiEditButton";
 import AiEditPreviewControls, { AiEditPreviewInteractionShield } from "../components/ui/AiEditPreviewControls";
-import { PageHeaderSubtitle, PageHeaderTitle } from "../components/ui/PageHeader";
+import { PageHeaderTitle } from "../components/ui/PageHeader";
+import Dropdown from "../components/ui/Dropdown";
 import {
   IconArrowLeft,
   IconCheck,
@@ -917,8 +917,8 @@ function parseSrtCaptions(content: string, duration: number): CaptionCue[] {
         keyframes: [],
         size: 32,
         color: "#ffffff",
-        background: "rgba(28,25,23,0.72)",
-        backgroundColor: "#1c1917",
+        background: "rgba(29, 29, 31,0.72)",
+        backgroundColor: "#1d1d1f",
         backgroundOpacity: 0.72,
         align: "center" as CanvasTextAlign,
       };
@@ -943,14 +943,14 @@ function captionDisplay(caption: CaptionCue): { color: string; background: strin
   const opacity = Number.isFinite(caption.backgroundOpacity) ? clamp(caption.backgroundOpacity, 0, 1) : null;
   if (caption.style === "speechBubble") {
     return {
-      color: caption.color === "#ffffff" ? "#1c1917" : caption.color,
+      color: caption.color === "#ffffff" ? "#1d1d1f" : caption.color,
       background: hexToRgba(caption.backgroundColor || "#ffffff", opacity ?? 0.94),
     };
   }
   if (caption.style === "narrationBox") {
     return {
       color: caption.color,
-      background: hexToRgba(caption.backgroundColor || "#1c1917", opacity ?? 0.86),
+      background: hexToRgba(caption.backgroundColor || "#1d1d1f", opacity ?? 0.86),
     };
   }
   if (caption.style === "titleCard") {
@@ -1652,7 +1652,7 @@ async function captureTimelineFilmstrip(
     // Waiting for a video-frame callback prevents the previous thumbnail from
     // being copied repeatedly across the filmstrip on keyframe-heavy codecs.
     await waitForDecodedVideoFrame(video);
-    context.fillStyle = "#1c1917";
+    context.fillStyle = "#1d1d1f";
     context.fillRect(0, 0, width, height);
     if (video.videoWidth && video.videoHeight) {
       const sourceAspect = video.videoWidth / video.videoHeight;
@@ -2650,14 +2650,14 @@ function normalizeVideoEditRecipe(recipe: VideoEditRecipe, sourceDuration: numbe
       }, Math.max(0, end - start)),
       size: clamp(numberOr(caption.size, 32), 10, 480),
       color: typeof caption.color === "string" ? caption.color : "#ffffff",
-      background: typeof caption.background === "string" ? caption.background : "rgba(28,25,23,0.72)",
+      background: typeof caption.background === "string" ? caption.background : "rgba(29, 29, 31,0.72)",
       backgroundColor: typeof caption.backgroundColor === "string"
         ? caption.backgroundColor
         : style === "speechBubble"
           ? "#ffffff"
           : style === "titleCard" || style === "lowerThird"
             ? "#0f172a"
-            : "#1c1917",
+            : "#1d1d1f",
       backgroundOpacity: clamp(numberOr(
         caption.backgroundOpacity,
         style === "speechBubble" ? 0.94 : style === "narrationBox" ? 0.86 : style === "titleCard" ? 0.56 : style === "lowerThird" ? 0.9 : 0.72,
@@ -4703,7 +4703,7 @@ export default function VideoEditor() {
     height: 30,
     minHeight: 30,
     borderRadius: 8,
-    borderColor: "#e7e5e4",
+    borderColor: "#e5e5ea",
     background: "#ffffff",
     boxShadow: "none",
     padding: "0 9px",
@@ -7244,7 +7244,7 @@ export default function VideoEditor() {
       opacity: 1,
       keyframes: [],
       size: isTitle ? 64 : isLowerThird ? 38 : 32,
-      color: isTitle || isLowerThird ? "#ffffff" : "#1c1917",
+      color: isTitle || isLowerThird ? "#ffffff" : "#1d1d1f",
       background: isTitle ? "rgba(15,23,42,0.56)" : isLowerThird ? "rgba(15,23,42,0.9)" : "rgba(255,255,255,0.94)",
       backgroundColor: isTitle || isLowerThird ? "#0f172a" : "#ffffff",
       backgroundOpacity: isTitle ? 0.56 : isLowerThird ? 0.9 : 0.94,
@@ -8974,7 +8974,7 @@ export default function VideoEditor() {
       drawRoundedRect(ctx, boxX, boxY, blockWidth, blockHeight, fontSize * visualStyle.cornerRadius);
       ctx.fill();
       if (caption.style === "speechBubble") {
-        ctx.strokeStyle = "rgba(28,25,23,0.2)";
+        ctx.strokeStyle = "rgba(29, 29, 31,0.2)";
         ctx.lineWidth = Math.max(2, fontSize * 0.05);
         ctx.stroke();
       }
@@ -10157,33 +10157,17 @@ export default function VideoEditor() {
         {...aiEditInteractionLockProps(Boolean(videoAiPreview))}
       >
         <div className="ve-topbar-left">
-          <button className="ve-icon-button" type="button" title={veText("back")} onClick={() => navigate(backTarget)}>
-            <IconArrowLeft size={18} />
+          <button className="page-header-back" type="button" aria-label={veText("back")} title={veText("back")} onClick={() => navigate(backTarget)}>
+            <IconArrowLeft size={16} />
           </button>
-          <div className="ve-title-block">
-            <div className="ve-title-row">
-              <PageHeaderTitle variant="editor" title={doc.name}>{doc.name}</PageHeaderTitle>
-              <VideoEditorHelp
-                titleKey="help.editor.title"
-                bodyKey="help.editor.body"
-                itemKeys={["help.editor.item1", "help.editor.item2", "help.editor.item3", "help.editor.item4"]}
-              />
-            </div>
-            <PageHeaderSubtitle>{veText("title")}</PageHeaderSubtitle>
-          </div>
+          <PageHeaderTitle variant="editor" title={doc.name}>{doc.name}</PageHeaderTitle>
+          <VideoEditorHelp
+            titleKey="help.editor.title"
+            bodyKey="help.editor.body"
+            itemKeys={["help.editor.item1", "help.editor.item2", "help.editor.item3", "help.editor.item4"]}
+          />
         </div>
         <div className="ve-topbar-actions">
-          <AiEditButton
-            onClick={() => {
-              if (videoEditorAiEditDetail) openEditorLiveChat(videoEditorAiEditDetail);
-            }}
-          />
-          {lastExportDoc && (
-            <Link className="ve-link-button ve-open-export" to={`/viewer/${lastExportDoc.id}`} state={location.state} title={veText("open_export")}>
-              <IconDocument size={15} />
-              <span className="ve-action-label">{veText("open_export")}</span>
-            </Link>
-          )}
           <button className="ve-icon-button" type="button" title={veText("shortcut.undo")} onClick={undoHistory} disabled={!canUndo}>
             <IconUndo size={15} />
           </button>
@@ -10212,20 +10196,33 @@ export default function VideoEditor() {
               <span>{veText("inspector")}</span>
             </button>
           </div>
-          {(recipeDoc || recipeQuery.data) && (
-            <button className="ve-icon-button" type="button" title={veText("reload_recipe")} onClick={() => loadSavedRecipe(true)} disabled={loadingRecipe}>
-              <IconDocument size={15} />
-            </button>
-          )}
           <div className="ve-save-actions">
-            <button className="ve-button ve-save-plan" type="button" title={veText("shortcut.save_recipe")} onClick={() => { void saveRecipe(); }} disabled={saving || timelineDuration <= 0}>
-              <IconEdit size={15} />
-              <span className="ve-action-label">{saving ? veText("saving") : veText("save_recipe")}</span>
-            </button>
             <button className="ve-button ve-button-primary ve-save-video" type="button" title={veText("shortcut.export_preview")} onClick={exportPreview} disabled={exporting || exportRangeDuration <= 0}>
               <IconDownload size={15} />
               <span className="ve-action-label">{exporting ? veText("exporting", { progress: exportProgress }) : veText("export_preview")}</span>
             </button>
+            <Dropdown
+              align="right"
+              trigger={(
+                <button className="manor-editor-tool-button manor-editor-icon-button" type="button" aria-label={t("nav.more")} title={t("nav.more")}>
+                  <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                    <circle cx="3.5" cy="8" r="1.3" /><circle cx="8" cy="8" r="1.3" /><circle cx="12.5" cy="8" r="1.3" />
+                  </svg>
+                </button>
+              )}
+              items={[
+                { key: "ai", label: t("ui.ai_edit"), icon: <IconSparkles size={15} />, disabled: !videoEditorAiEditDetail },
+                { key: "recipe", label: saving ? veText("saving") : veText("save_recipe"), icon: <IconEdit size={15} />, disabled: saving || timelineDuration <= 0 },
+                ...(lastExportDoc ? [{ key: "export", label: veText("open_export"), icon: <IconDocument size={15} /> }] : []),
+                ...(recipeDoc || recipeQuery.data ? [{ key: "reload", label: veText("reload_recipe"), icon: <IconDocument size={15} />, disabled: loadingRecipe }] : []),
+              ]}
+              onSelect={(key) => {
+                if (key === "ai" && videoEditorAiEditDetail) openEditorLiveChat(videoEditorAiEditDetail);
+                if (key === "recipe") void saveRecipe();
+                if (key === "export" && lastExportDoc) navigate(`/viewer/${lastExportDoc.id}`, { state: location.state });
+                if (key === "reload") loadSavedRecipe(true);
+              }}
+            />
           </div>
         </div>
       </header>
@@ -13024,7 +13021,7 @@ const VIDEO_EDITOR_STYLES = `
 }
 .ve-shell {
   --ve-border: rgba(214, 211, 209, 0.68);
-  --ve-border-soft: rgba(28, 25, 23, 0.07);
+  --ve-border-soft: rgba(29, 29, 31, 0.07);
   --ve-surface: var(--glass-panel);
   --ve-surface-solid: var(--surface-panel);
   --ve-muted-surface: var(--surface-muted);
@@ -13041,7 +13038,7 @@ const VIDEO_EDITOR_STYLES = `
   overflow: hidden;
   padding: 12px 14px 14px;
   background: var(--surface-muted);
-  color: #1c1917;
+  color: #1d1d1f;
 }
 .ve-loading {
   min-height: 320px;
@@ -13111,7 +13108,7 @@ const VIDEO_EDITOR_STYLES = `
   border: 0;
   border-radius: 7px;
   background: transparent;
-  color: #78716c;
+  color: #8e8e93;
   font-size: 11px;
   font-weight: 800;
   cursor: pointer;
@@ -13119,8 +13116,8 @@ const VIDEO_EDITOR_STYLES = `
 .ve-view-toggle:hover,
 .ve-view-toggle.is-active {
   background: var(--ve-surface-solid);
-  color: #292524;
-  box-shadow: 0 1px 4px rgba(28,25,23,.08);
+  color: #2c2c2e;
+  box-shadow: 0 1px 4px rgba(29, 29, 31,.08);
 }
 .ve-view-toggle:focus-visible {
   outline: none;
@@ -13161,17 +13158,17 @@ const VIDEO_EDITOR_STYLES = `
   gap: 7px;
 }
 .ve-help-popover strong {
-  color: #1c1917;
+  color: #1d1d1f;
   font-size: 12px;
 }
 .ve-help-popover p {
   margin: 0;
-  color: #57534e;
+  color: #6e6e73;
 }
 .ve-help-popover ul {
   margin: 0;
   padding-left: 17px;
-  color: #44403c;
+  color: #48484a;
 }
 .ve-help-popover li + li {
   margin-top: 4px;
@@ -13179,9 +13176,9 @@ const VIDEO_EDITOR_STYLES = `
 .ve-kicker {
   display: block;
   font-size: 11px;
-  text-transform: uppercase;
+  text-transform: none;
   letter-spacing: 0;
-  color: #78716c;
+  color: #8e8e93;
   font-weight: 800;
 }
 .ve-title-block .page-header-title {
@@ -13236,17 +13233,17 @@ const VIDEO_EDITOR_STYLES = `
   margin: 0;
   font-size: 13px;
   font-weight: 800;
-  color: #292524;
+  color: #2c2c2e;
 }
 .ve-panel-subtitle {
   display: block;
   margin-top: 2px;
-  color: #a8a29e;
+  color: #aeaeb2;
   font-size: 11px;
   font-weight: 800;
 }
 .ve-panel-header span {
-  color: #78716c;
+  color: #8e8e93;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
@@ -13257,17 +13254,17 @@ const VIDEO_EDITOR_STYLES = `
   align-items: center;
   padding: 8px;
   border-radius: 12px;
-  background: rgba(28, 25, 23, .035);
+  background: rgba(29, 29, 31, .035);
 }
 .ve-source-thumb {
   height: 52px;
   overflow: hidden;
   border-radius: 8px;
-  background: #e7e5e4;
+  background: #e5e5ea;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #78716c;
+  color: #8e8e93;
 }
 .ve-source-thumb video {
   width: 100%;
@@ -13293,14 +13290,14 @@ const VIDEO_EDITOR_STYLES = `
 }
 .ve-source-meta span {
   font-size: 12px;
-  color: #78716c;
+  color: #8e8e93;
 }
 .ve-recipe-strip {
   margin-top: 10px;
   padding: 8px 10px;
   border: 0;
   border-radius: 10px;
-  background: rgba(28, 25, 23, .035);
+  background: rgba(29, 29, 31, .035);
   display: flex;
   flex-direction: column;
   gap: 3px;
@@ -13312,7 +13309,7 @@ const VIDEO_EDITOR_STYLES = `
 }
 .ve-recipe-strip span {
   font-size: 12px;
-  color: #78716c;
+  color: #8e8e93;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -13348,17 +13345,17 @@ const VIDEO_EDITOR_STYLES = `
 }
 .ve-import-dropzone strong {
   font-size: 12px;
-  color: #1c1917;
+  color: #1d1d1f;
 }
 .ve-import-dropzone span {
   font-size: 11px;
-  color: #78716c;
+  color: #8e8e93;
 }
 .ve-open-media-picker {
   min-height: 44px;
   border: 0;
   border-radius: 12px;
-  background: rgba(28, 25, 23, .035);
+  background: rgba(29, 29, 31, .035);
   color: #436b65;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
@@ -13370,7 +13367,7 @@ const VIDEO_EDITOR_STYLES = `
   transition: border-color .12s ease, box-shadow .12s ease, transform .12s ease;
 }
 .ve-open-media-picker:hover {
-  background: rgba(28, 25, 23, .06);
+  background: rgba(29, 29, 31, .06);
   box-shadow: 0 0 0 3px var(--accent-ring);
 }
 .ve-open-media-picker span {
@@ -13380,11 +13377,11 @@ const VIDEO_EDITOR_STYLES = `
   gap: 1px;
 }
 .ve-open-media-picker strong {
-  color: #1c1917;
+  color: #1d1d1f;
   font-size: 12px;
 }
 .ve-open-media-picker small {
-  color: #78716c;
+  color: #8e8e93;
   font-size: 11px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -13418,8 +13415,8 @@ const VIDEO_EDITOR_STYLES = `
 .ve-media-tabs button, .ve-media-filter-row button {
   min-width: 0;
   border: 0;
-  background: rgba(28, 25, 23, .035);
-  color: #57534e;
+  background: rgba(29, 29, 31, .035);
+  color: #6e6e73;
   border-radius: 8px;
   min-height: 30px;
   font-size: 11px;
@@ -13437,11 +13434,11 @@ const VIDEO_EDITOR_STYLES = `
   padding: 0 9px;
 }
 .ve-media-tabs button span {
-  color: #a8a29e;
+  color: #aeaeb2;
 }
 .ve-media-tabs button.is-active, .ve-media-filter-row button.is-active {
   background: var(--ve-surface-solid);
-  color: #292524;
+  color: #2c2c2e;
   box-shadow: var(--shadow-sm);
 }
 .ve-media-search {
@@ -13452,7 +13449,7 @@ const VIDEO_EDITOR_STYLES = `
 .ve-media-search svg {
   position: absolute;
   left: 10px;
-  color: #a8a29e;
+  color: #aeaeb2;
   pointer-events: none;
 }
 .ve-media-search .ve-input {
@@ -13471,7 +13468,7 @@ const VIDEO_EDITOR_STYLES = `
   padding: 0 8px;
 }
 .ve-media-filter-row button span {
-  color: #a8a29e;
+  color: #aeaeb2;
   font-size: 10px;
   font-weight: 900;
 }
@@ -13479,8 +13476,8 @@ const VIDEO_EDITOR_STYLES = `
   color: inherit;
 }
 .ve-media-filter-row button:disabled {
-  background: #fafaf9;
-  color: #a8a29e;
+  background: #fafafa;
+  color: #aeaeb2;
   cursor: not-allowed;
   opacity: 0.72;
 }
@@ -13510,7 +13507,7 @@ const VIDEO_EDITOR_STYLES = `
   transition: border-color .12s ease, box-shadow .12s ease, transform .12s ease;
 }
 .ve-media-card:hover {
-  box-shadow: 0 9px 18px rgba(28,25,23,.06);
+  box-shadow: 0 9px 18px rgba(29, 29, 31,.06);
   outline: 2px solid var(--accent-ring);
 }
 .ve-media-card.is-project {
@@ -13525,13 +13522,13 @@ const VIDEO_EDITOR_STYLES = `
   height: 22px;
   border-radius: 999px;
   border: 1px solid rgba(255,255,255,.86);
-  background: rgba(28,25,23,.62);
+  background: rgba(29, 29, 31,.62);
   color: #ffffff;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  box-shadow: 0 4px 10px rgba(28,25,23,.18);
+  box-shadow: 0 4px 10px rgba(29, 29, 31,.18);
 }
 .ve-media-select.is-selected {
   border-color: #436b65;
@@ -13589,11 +13586,11 @@ const VIDEO_EDITOR_STYLES = `
   max-width: calc(100% - 12px);
   padding: 3px 6px;
   border-radius: 6px;
-  background: rgba(28,25,23,.74);
+  background: rgba(29, 29, 31,.74);
   color: #ffffff;
   font-size: 9px;
   font-weight: 900;
-  text-transform: uppercase;
+  text-transform: none;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -13641,7 +13638,7 @@ const VIDEO_EDITOR_STYLES = `
 }
 .ve-media-card-body strong {
   min-width: 0;
-  color: #1c1917;
+  color: #1d1d1f;
   font-size: 12px;
   line-height: 1.22;
   overflow: hidden;
@@ -13649,7 +13646,7 @@ const VIDEO_EDITOR_STYLES = `
   white-space: nowrap;
 }
 .ve-media-card-body span, .ve-media-card-body small {
-  color: #78716c;
+  color: #8e8e93;
   font-size: 10px;
   font-weight: 750;
   overflow: hidden;
@@ -13693,8 +13690,8 @@ const VIDEO_EDITOR_STYLES = `
 }
 .ve-media-preview-pill:disabled {
   border-color: #dbe7e4;
-  background: #fafaf9;
-  color: #a8a29e;
+  background: #fafafa;
+  color: #aeaeb2;
   cursor: wait;
 }
 .ve-media-preview-pill .ve-audio-preview-spinner {
@@ -13716,8 +13713,8 @@ const VIDEO_EDITOR_STYLES = `
   height: 26px;
   border-radius: 7px;
   border: 0;
-  background: rgba(28, 25, 23, .04);
-  color: #57534e;
+  background: rgba(29, 29, 31, .04);
+  color: #6e6e73;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -13727,13 +13724,13 @@ const VIDEO_EDITOR_STYLES = `
   cursor: pointer;
 }
 .ve-media-action:hover:not(:disabled), .ve-media-action.is-active {
-  background: rgba(28, 25, 23, .09);
-  color: #1c1917;
+  background: rgba(29, 29, 31, .09);
+  color: #1d1d1f;
 }
 .ve-media-action:disabled {
-  color: #a8a29e;
+  color: #aeaeb2;
   cursor: not-allowed;
-  background: #fafaf9;
+  background: #fafafa;
 }
 .ve-audio-preview-spinner {
   width: 13px;
@@ -14124,8 +14121,8 @@ const VIDEO_EDITOR_STYLES = `
   padding: 9px 10px;
   border: 1px solid #dbe7e4;
   border-radius: 10px;
-  background: #fafaf9;
-  color: #78716c;
+  background: #fafafa;
+  color: #8e8e93;
   font-size: 12px;
 }
 .ve-picker-hint button {
@@ -14172,16 +14169,16 @@ const VIDEO_EDITOR_STYLES = `
 }
 .ve-picker-footer span {
   margin-right: auto;
-  color: #78716c;
+  color: #8e8e93;
   font-size: 12px;
   font-weight: 800;
 }
 .ve-bin-empty {
   padding: 9px 10px;
-  border: 1px dashed #d6d3d1;
+  border: 1px dashed #d1d1d6;
   border-radius: 8px;
-  background: #fafaf9;
-  color: #78716c;
+  background: #fafafa;
+  color: #8e8e93;
   font-size: 12px;
   line-height: 1.35;
 }
@@ -14210,8 +14207,8 @@ const VIDEO_EDITOR_STYLES = `
   content: "";
   width: 7px;
   height: 7px;
-  border-right: 2px solid #a8a29e;
-  border-bottom: 2px solid #a8a29e;
+  border-right: 2px solid #aeaeb2;
+  border-bottom: 2px solid #aeaeb2;
   transform: rotate(45deg);
   margin-left: auto;
   transition: transform .12s ease;
@@ -14231,7 +14228,7 @@ const VIDEO_EDITOR_STYLES = `
 }
 .ve-render-status summary span {
   font-size: 12px;
-  color: #78716c;
+  color: #8e8e93;
   white-space: nowrap;
 }
 .ve-render-status .ve-help-anchor {
@@ -14246,17 +14243,17 @@ const VIDEO_EDITOR_STYLES = `
 .ve-render-issue {
   padding: 7px 8px;
   border-radius: 7px;
-  background: #fafaf9;
+  background: #fafafa;
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
 .ve-render-issue b {
   font-size: 11px;
-  color: #44403c;
+  color: #48484a;
 }
 .ve-render-issue small {
-  color: #78716c;
+  color: #8e8e93;
   font-size: 11px;
   line-height: 1.25;
 }
@@ -14278,7 +14275,7 @@ const VIDEO_EDITOR_STYLES = `
   border: 1px solid transparent;
   border-radius: 8px;
   background: transparent;
-  color: #44403c;
+  color: #48484a;
   font-size: 12px;
   font-weight: 800;
   cursor: pointer;
@@ -14289,11 +14286,11 @@ const VIDEO_EDITOR_STYLES = `
   width: 100%;
   justify-content: flex-start;
   padding: 6px 9px;
-  background: rgba(28, 25, 23, .035);
+  background: rgba(29, 29, 31, .035);
   border-color: transparent;
 }
 .ve-track-action:hover:not(:disabled), .ve-button:hover:not(:disabled), .ve-link-button:hover {
-  background: rgba(28, 25, 23, .065);
+  background: rgba(29, 29, 31, .065);
   border-color: transparent;
 }
 .ve-track-action:disabled {
@@ -14303,22 +14300,22 @@ const VIDEO_EDITOR_STYLES = `
 .ve-button, .ve-link-button {
   padding: 6px 11px;
   border-color: transparent;
-  background: rgba(28, 25, 23, .035);
+  background: rgba(29, 29, 31, .035);
 }
 .ve-action-group {
   margin-top: 8px;
   padding: 8px;
   border: 1px solid #dbe7e4;
   border-radius: 10px;
-  background: #fafaf9;
+  background: #fafafa;
 }
 .ve-action-group-title {
   margin-bottom: 7px;
-  color: #78716c;
+  color: #8e8e93;
   font-size: 10px;
   font-weight: 900;
   letter-spacing: 0;
-  text-transform: uppercase;
+  text-transform: none;
 }
 .ve-action-row {
   display: grid;
@@ -14362,7 +14359,7 @@ const VIDEO_EDITOR_STYLES = `
   align-items: center;
   justify-content: center;
   gap: 7px;
-  color: #44403c;
+  color: #48484a;
   font-size: 12px;
   font-weight: 850;
   cursor: pointer;
@@ -14375,8 +14372,8 @@ const VIDEO_EDITOR_STYLES = `
   content: "";
   width: 7px;
   height: 7px;
-  border-right: 2px solid #a8a29e;
-  border-bottom: 2px solid #a8a29e;
+  border-right: 2px solid #aeaeb2;
+  border-bottom: 2px solid #aeaeb2;
   transform: rotate(45deg);
   margin-left: auto;
   transition: transform .12s ease;
@@ -14392,7 +14389,7 @@ const VIDEO_EDITOR_STYLES = `
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 6px;
   padding: 8px;
-  background: #fafaf9;
+  background: #fafafa;
 }
 .ve-more-actions-grid .ve-track-action {
   min-height: 31px;
@@ -14443,7 +14440,7 @@ const VIDEO_EDITOR_STYLES = `
   border: 1px solid transparent;
   border-radius: 8px;
   background: transparent;
-  color: #44403c;
+  color: #48484a;
   cursor: pointer;
   transition: background .12s ease, border-color .12s ease, color .12s ease;
 }
@@ -14497,11 +14494,11 @@ const VIDEO_EDITOR_STYLES = `
   right: 12px;
   z-index: 5;
   border-radius: 999px;
-  background: rgba(28,25,23,.72);
+  background: rgba(29, 29, 31,.72);
   box-shadow: 0 8px 20px rgba(2,6,23,.22);
 }
 .ve-preview-help .ve-help-anchor button {
-  color: #e7e5e4;
+  color: #e5e5ea;
 }
 .ve-preview-media-stage {
   position: relative;
@@ -14556,7 +14553,7 @@ const VIDEO_EDITOR_STYLES = `
   border: 1px solid rgba(125,211,252,.38);
   border-radius: 10px;
   background: rgba(8,13,29,.78);
-  color: #fafaf9;
+  color: #fafafa;
   box-shadow: 0 12px 28px rgba(2,6,23,.24), 0 0 0 1px rgba(255,255,255,.06) inset;
   backdrop-filter: blur(14px);
   pointer-events: none;
@@ -14653,7 +14650,7 @@ const VIDEO_EDITOR_STYLES = `
   height: 100%;
   display: grid;
   place-items: center;
-  background: rgba(28,25,23,.34);
+  background: rgba(29, 29, 31,.34);
 }
 .ve-caption-overlay {
   position: absolute;
@@ -14684,12 +14681,12 @@ const VIDEO_EDITOR_STYLES = `
   opacity: 1;
 }
 .ve-caption-speechBubble {
-  border: 1px solid rgba(28,25,23,.16);
-  box-shadow: 0 10px 24px rgba(28,25,23,.18);
+  border: 1px solid rgba(29, 29, 31,.16);
+  box-shadow: 0 10px 24px rgba(29, 29, 31,.18);
 }
 .ve-caption-narrationBox {
   border: 1px solid rgba(250,250,249,.22);
-  box-shadow: 0 10px 24px rgba(28,25,23,.24);
+  box-shadow: 0 10px 24px rgba(29, 29, 31,.24);
 }
 .ve-caption-titleCard {
   max-width: 86%;
@@ -14710,20 +14707,20 @@ const VIDEO_EDITOR_STYLES = `
   max-width: 42%;
   padding: 8px 10px;
   border-radius: 8px;
-  background: rgba(28,25,23,.78);
-  color: #fafaf9;
+  background: rgba(29, 29, 31,.78);
+  color: #fafafa;
   pointer-events: none;
   display: flex;
   flex-direction: column;
   gap: 2px;
-  box-shadow: 0 10px 24px rgba(28,25,23,.24);
+  box-shadow: 0 10px 24px rgba(29, 29, 31,.24);
 }
 .ve-shot-overlay strong {
   font-size: 11px;
 }
 .ve-shot-overlay span {
   font-size: 12px;
-  color: #d6d3d1;
+  color: #d1d1d6;
 }
 .ve-preview-audio-chip {
   position: absolute;
@@ -14756,7 +14753,7 @@ const VIDEO_EDITOR_STYLES = `
   color: #ccded9;
   font-size: 10px;
   font-weight: 900;
-  text-transform: uppercase;
+  text-transform: none;
   letter-spacing: 0;
 }
 .ve-preview-audio-chip.is-ai-highlighted {
@@ -14813,7 +14810,7 @@ const VIDEO_EDITOR_STYLES = `
   display: none;
 }
 .ve-timecode {
-  color: #44403c;
+  color: #48484a;
   font-size: 12px;
   font-weight: 800;
   font-variant-numeric: tabular-nums;
@@ -14847,14 +14844,14 @@ const VIDEO_EDITOR_STYLES = `
   border: 0;
   border-radius: 7px;
   background: transparent;
-  color: #44403c;
+  color: #48484a;
   font: inherit;
   font-size: 11px;
   font-weight: 850;
   cursor: pointer;
 }
 .ve-workarea-controls > span {
-  color: #78716c;
+  color: #8e8e93;
   font-size: 10px;
   font-weight: 800;
   font-variant-numeric: tabular-nums;
@@ -14874,7 +14871,7 @@ const VIDEO_EDITOR_STYLES = `
   padding: 10px;
   border: 1px solid var(--ve-border-soft);
   border-radius: 10px;
-  background: #fafaf9;
+  background: #fafafa;
   display: flex;
   flex-direction: column;
   gap: 3px;
@@ -14890,7 +14887,7 @@ const VIDEO_EDITOR_STYLES = `
   color: #a23e38;
 }
 .ve-overview-status span {
-  color: #78716c;
+  color: #8e8e93;
   font-size: 12px;
 }
 .ve-overview-grid {
@@ -14904,7 +14901,7 @@ const VIDEO_EDITOR_STYLES = `
   border: 1px solid var(--ve-border-soft);
   border-radius: 10px;
   background: #ffffff;
-  color: #78716c;
+  color: #8e8e93;
   font-size: 11px;
   font-weight: 850;
   display: flex;
@@ -14913,7 +14910,7 @@ const VIDEO_EDITOR_STYLES = `
   gap: 4px;
 }
 .ve-overview-grid b {
-  color: #1c1917;
+  color: #1d1d1f;
   font-size: 20px;
   line-height: 1;
 }
@@ -14933,14 +14930,14 @@ const VIDEO_EDITOR_STYLES = `
 }
 .ve-asset-pill span {
   font-size: 12px;
-  color: #1c1917;
+  color: #1d1d1f;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .ve-field-note {
   margin: -4px 0 0;
-  color: #78716c;
+  color: #8e8e93;
   font-size: 12px;
   line-height: 1.45;
 }
@@ -14977,15 +14974,15 @@ const VIDEO_EDITOR_STYLES = `
 .ve-field-label {
   font-size: 11px;
   font-weight: 800;
-  color: #78716c;
+  color: #8e8e93;
 }
 .ve-input, .ve-textarea, .ve-color {
   width: 100%;
   min-width: 0;
   border: 0;
   border-radius: var(--radius-control);
-  background: rgba(28, 25, 23, .045);
-  color: #1c1917;
+  background: rgba(29, 29, 31, .045);
+  color: #1d1d1f;
   font-size: 13px;
   transition: background .12s ease, box-shadow .12s ease;
 }
@@ -15014,7 +15011,7 @@ const VIDEO_EDITOR_STYLES = `
   display: flex;
   gap: 8px;
   align-items: center;
-  color: #44403c;
+  color: #48484a;
   font-size: 13px;
 }
 .ve-particle-editor {
@@ -15037,11 +15034,11 @@ const VIDEO_EDITOR_STYLES = `
   gap: 2px;
 }
 .ve-particle-editor-heading strong {
-  color: #292524;
+  color: #2c2c2e;
   font-size: 12px;
 }
 .ve-particle-editor-heading span:not(.ve-feature-badge) {
-  color: #78716c;
+  color: #8e8e93;
   font-size: 10px;
   line-height: 1.35;
 }
@@ -15056,7 +15053,7 @@ const VIDEO_EDITOR_STYLES = `
   gap: 10px;
   padding: 9px;
   border-radius: 12px;
-  background: rgba(28, 25, 23, .035);
+  background: rgba(29, 29, 31, .035);
   box-shadow: none;
 }
 .ve-motion-header {
@@ -15072,11 +15069,11 @@ const VIDEO_EDITOR_STYLES = `
   gap: 2px;
 }
 .ve-motion-header strong {
-  color: #292524;
+  color: #2c2c2e;
   font-size: 12px;
 }
 .ve-motion-header span {
-  color: #78716c;
+  color: #8e8e93;
   font-size: 10px;
   line-height: 1.35;
 }
@@ -15093,7 +15090,7 @@ const VIDEO_EDITOR_STYLES = `
 }
 .ve-motion-presets > span {
   margin-right: 2px;
-  color: #78716c;
+  color: #8e8e93;
   font-size: 10px;
   font-weight: 900;
 }
@@ -15103,14 +15100,14 @@ const VIDEO_EDITOR_STYLES = `
   border: 0;
   border-radius: 7px;
   background: rgba(255, 255, 255, .78);
-  color: #57534e;
+  color: #6e6e73;
   font-size: 10px;
   font-weight: 850;
   cursor: pointer;
   box-shadow: var(--shadow-sm);
 }
 .ve-motion-presets button:hover:not(:disabled) {
-  color: #1c1917;
+  color: #1d1d1f;
   box-shadow: 0 0 0 2px var(--accent-ring);
 }
 .ve-motion-presets button:focus-visible {
@@ -15191,16 +15188,16 @@ const VIDEO_EDITOR_STYLES = `
   gap: 2px;
 }
 .ve-motion-curve strong {
-  color: #292524;
+  color: #2c2c2e;
   font-size: 10px;
 }
 .ve-motion-curve span {
-  color: #78716c;
+  color: #8e8e93;
   font-size: 9px;
   line-height: 1.35;
 }
 .ve-motion-curve small {
-  color: #57534e;
+  color: #6e6e73;
   font: 600 9px/1.35 "JetBrains Mono", ui-monospace, monospace;
 }
 .ve-motion-bezier-fields {
@@ -15225,7 +15222,7 @@ const VIDEO_EDITOR_STYLES = `
   border: 0;
   border-radius: 7px;
   background: rgba(255, 255, 255, .78);
-  color: #57534e;
+  color: #6e6e73;
   font-size: 10px;
   font-weight: 900;
   cursor: pointer;
@@ -15236,16 +15233,16 @@ const VIDEO_EDITOR_STYLES = `
   height: 7px;
   transform: rotate(45deg);
   border-radius: 1px;
-  background: #a8a29e;
+  background: #aeaeb2;
 }
 .ve-motion-keyframe-list button small {
-  color: #a8a29e;
+  color: #aeaeb2;
   font: 500 9px/1 "JetBrains Mono", ui-monospace, monospace;
 }
 .ve-motion-keyframe-list button:hover,
 .ve-motion-keyframe-list button.is-active {
-  color: #1c1917;
-  box-shadow: 0 0 0 2px var(--accent-ring), 0 3px 8px rgba(28,25,23,.08);
+  color: #1d1d1f;
+  box-shadow: 0 0 0 2px var(--accent-ring), 0 3px 8px rgba(29, 29, 31,.08);
 }
 .ve-motion-keyframe-list button.is-active > span {
   background: var(--ve-teal);
@@ -15281,7 +15278,7 @@ const VIDEO_EDITOR_STYLES = `
 }
 .ve-timeline-header span {
   font-size: 12px;
-  color: #78716c;
+  color: #8e8e93;
   font-variant-numeric: tabular-nums;
 }
 .ve-timeline-summary {
@@ -15302,8 +15299,8 @@ const VIDEO_EDITOR_STYLES = `
   flex: 0 0 auto;
   border: 0;
   border-radius: 999px;
-  background: rgba(28, 25, 23, .04);
-  color: #78716c;
+  background: rgba(29, 29, 31, .04);
+  color: #8e8e93;
   font-size: 11px;
   font-weight: 850;
 }
@@ -15344,7 +15341,7 @@ const VIDEO_EDITOR_STYLES = `
   border: 0;
   border-radius: 6px;
   background: transparent;
-  color: #78716c;
+  color: #8e8e93;
   font-size: 11px;
   font-weight: 850;
   cursor: pointer;
@@ -15352,8 +15349,8 @@ const VIDEO_EDITOR_STYLES = `
 .ve-tool-switcher button:hover,
 .ve-tool-switcher button.is-active {
   background: var(--ve-surface-solid);
-  color: #292524;
-  box-shadow: 0 1px 4px rgba(28,25,23,.08);
+  color: #2c2c2e;
+  box-shadow: 0 1px 4px rgba(29, 29, 31,.08);
 }
 .ve-tool-switcher button:focus-visible {
   outline: 2px solid rgba(67,107,101,.42);
@@ -15371,7 +15368,7 @@ const VIDEO_EDITOR_STYLES = `
 }
 .ve-zoom-control span {
   font-size: 12px;
-  color: #78716c;
+  color: #8e8e93;
   font-weight: 800;
 }
 .ve-zoom-slider {
@@ -15405,7 +15402,7 @@ const VIDEO_EDITOR_STYLES = `
   border: 1px solid transparent;
   border-radius: 8px;
   background: transparent;
-  color: #1c1917;
+  color: #1d1d1f;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -15413,7 +15410,7 @@ const VIDEO_EDITOR_STYLES = `
 }
 .ve-mini-button:hover:not(:disabled) {
   border-color: transparent;
-  background: rgba(28, 25, 23, .06);
+  background: rgba(29, 29, 31, .06);
 }
 .ve-mini-button:disabled {
   opacity: .45;
@@ -15466,7 +15463,7 @@ const VIDEO_EDITOR_STYLES = `
 }
 .ve-shortcut-group h3 {
   margin: 0 0 10px;
-  color: #292524;
+  color: #2c2c2e;
   font-size: 12px;
 }
 .ve-shortcut-row {
@@ -15475,7 +15472,7 @@ const VIDEO_EDITOR_STYLES = `
   justify-content: space-between;
   gap: 12px;
   min-height: 32px;
-  color: #57534e;
+  color: #6e6e73;
   font-size: 12px;
 }
 .ve-shortcut-row + .ve-shortcut-row {
@@ -15487,11 +15484,11 @@ const VIDEO_EDITOR_STYLES = `
   border: 1px solid var(--ve-border);
   border-radius: 6px;
   background: var(--ve-surface-solid);
-  color: #292524;
+  color: #2c2c2e;
   font-family: inherit;
   font-size: 10px;
   font-weight: 850;
-  box-shadow: 0 1px 2px rgba(28,25,23,.08);
+  box-shadow: 0 1px 2px rgba(29, 29, 31,.08);
 }
 .ve-timeline-scroll {
   flex: 1 1 auto;
@@ -15518,14 +15515,14 @@ const VIDEO_EDITOR_STYLES = `
   display: flex;
   align-items: center;
   padding-left: 6px;
-  color: #78716c;
+  color: #8e8e93;
   font-size: 11px;
   font-weight: 850;
 }
 .ve-time-ruler-lane {
   position: relative;
   min-height: 32px;
-  border-bottom: 1px solid #d6d3d1;
+  border-bottom: 1px solid #d1d1d6;
   background-image: linear-gradient(90deg, rgba(168,162,158,0.26) 1px, transparent 1px);
   background-size: var(--ve-second-width, 48px) 100%;
   cursor: crosshair;
@@ -15537,18 +15534,18 @@ const VIDEO_EDITOR_STYLES = `
   top: 13px;
   bottom: 0;
   width: 1px;
-  background: #d6d3d1;
+  background: #d1d1d6;
   pointer-events: none;
 }
 .ve-ruler-tick.is-major {
   top: 7px;
-  background: #a8a29e;
+  background: #aeaeb2;
 }
 .ve-ruler-tick b {
   position: absolute;
   top: -7px;
   left: 5px;
-  color: #78716c;
+  color: #8e8e93;
   font-size: 10px;
   font-weight: 850;
   font-variant-numeric: tabular-nums;
@@ -15580,7 +15577,7 @@ const VIDEO_EDITOR_STYLES = `
   justify-content: space-between;
   gap: 6px;
   padding-left: 6px;
-  color: #57534e;
+  color: #6e6e73;
   font-size: 12px;
   font-weight: 850;
   min-width: 0;
@@ -15607,10 +15604,10 @@ const VIDEO_EDITOR_STYLES = `
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid #d6d3d1;
+  border: 1px solid #d1d1d6;
   border-radius: 6px;
   background: #ffffff;
-  color: #a8a29e;
+  color: #aeaeb2;
   cursor: pointer;
   font-size: 10px;
   font-weight: 900;
@@ -15651,7 +15648,7 @@ const VIDEO_EDITOR_STYLES = `
   left: 12px;
   top: 50%;
   transform: translateY(-50%);
-  color: #a8a29e;
+  color: #aeaeb2;
   font-size: 12px;
   font-weight: 700;
   pointer-events: none;
@@ -15661,7 +15658,7 @@ const VIDEO_EDITOR_STYLES = `
   left: 12px;
   top: 50%;
   transform: translateY(-50%);
-  color: #a8a29e;
+  color: #aeaeb2;
   font-size: 12px;
   font-weight: 800;
   pointer-events: none;
@@ -15685,7 +15682,7 @@ const VIDEO_EDITOR_STYLES = `
   cursor: grab;
   touch-action: none;
   overflow: hidden;
-  box-shadow: 0 6px 14px rgba(28,25,23,.08);
+  box-shadow: 0 6px 14px rgba(29, 29, 31,.08);
 }
 .ve-marker-pin span:last-child {
   min-width: 0;
@@ -15754,7 +15751,7 @@ const VIDEO_EDITOR_STYLES = `
   z-index: 5;
   transform: translateY(-2px);
   filter: saturate(1.08);
-  box-shadow: 0 11px 22px rgba(28,25,23,.22), inset 0 0 0 2px rgba(255,255,255,.78);
+  box-shadow: 0 11px 22px rgba(29, 29, 31,.22), inset 0 0 0 2px rgba(255,255,255,.78);
 }
 .ve-clip-block.is-selected {
   box-shadow: 0 0 0 2px rgba(95,146,138,.4), inset 0 0 0 2px rgba(255,255,255,.6);
@@ -15773,16 +15770,16 @@ const VIDEO_EDITOR_STYLES = `
   max-width: none !important;
   border-radius: inherit;
   pointer-events: none;
-  background: rgba(28,25,23,.16);
+  background: rgba(29, 29, 31,.16);
 }
 .ve-clip-filmstrip::after {
   content: "";
   position: absolute;
   inset: 0;
-  background: linear-gradient(180deg, rgba(28,25,23,.02) 30%, rgba(28,25,23,.76) 100%);
+  background: linear-gradient(180deg, rgba(29, 29, 31,.02) 30%, rgba(29, 29, 31,.76) 100%);
 }
 .ve-clip-filmstrip.is-loading {
-  background-image: repeating-linear-gradient(90deg, rgba(255,255,255,.10) 0 18%, rgba(28,25,23,.10) 18% 20%);
+  background-image: repeating-linear-gradient(90deg, rgba(255,255,255,.10) 0 18%, rgba(29, 29, 31,.10) 18% 20%);
 }
 .ve-clip-filmstrip img {
   min-width: 0;
@@ -15820,7 +15817,7 @@ const VIDEO_EDITOR_STYLES = `
   transform: translateX(-1px);
   overflow: visible !important;
   background: #ffffff;
-  box-shadow: 0 0 0 1px rgba(28,25,23,.48), 0 0 0 4px rgba(255,255,255,.18);
+  box-shadow: 0 0 0 1px rgba(29, 29, 31,.48), 0 0 0 4px rgba(255,255,255,.18);
   pointer-events: none;
 }
 .ve-razor-preview::before,
@@ -15832,7 +15829,7 @@ const VIDEO_EDITOR_STYLES = `
   height: 7px;
   transform: translateX(-50%) rotate(45deg);
   background: #ffffff;
-  box-shadow: 0 0 0 1px rgba(28,25,23,.42);
+  box-shadow: 0 0 0 1px rgba(29, 29, 31,.42);
 }
 .ve-razor-preview::before {
   top: -3px;
@@ -15845,21 +15842,21 @@ const VIDEO_EDITOR_STYLES = `
 .ve-clip-grip {
   position: relative;
   z-index: 2;
-  text-shadow: 0 1px 3px rgba(28,25,23,.72);
+  text-shadow: 0 1px 3px rgba(29, 29, 31,.72);
 }
 .ve-clip-block small {
   opacity: .82;
   font-size: 11px;
 }
 .ve-clip-block.is-manual {
-  box-shadow: inset 0 0 0 2px rgba(255,255,255,.72), inset 0 -4px 0 rgba(28,25,23,.24);
+  box-shadow: inset 0 0 0 2px rgba(255,255,255,.72), inset 0 -4px 0 rgba(29, 29, 31,.24);
 }
 .ve-clip-block.is-manual.is-selected {
-  box-shadow: 0 0 0 2px rgba(95,146,138,.42), inset 0 0 0 2px rgba(255,255,255,.72), inset 0 -4px 0 rgba(28,25,23,.24);
+  box-shadow: 0 0 0 2px rgba(95,146,138,.42), inset 0 0 0 2px rgba(255,255,255,.72), inset 0 -4px 0 rgba(29, 29, 31,.24);
 }
 .ve-clip-block.is-dragging,
 .ve-clip-block.is-manual.is-dragging {
-  box-shadow: 0 11px 22px rgba(28,25,23,.22), inset 0 0 0 2px rgba(255,255,255,.78);
+  box-shadow: 0 11px 22px rgba(29, 29, 31,.22), inset 0 0 0 2px rgba(255,255,255,.78);
 }
 .ve-clip-grip {
   position: absolute;
@@ -15904,7 +15901,7 @@ const VIDEO_EDITOR_STYLES = `
   font-size: 10px;
   font-weight: 900;
   white-space: nowrap;
-  box-shadow: 0 6px 14px rgba(28,25,23,.18);
+  box-shadow: 0 6px 14px rgba(29, 29, 31,.18);
 }
 .ve-clip-block .ve-resize-handle {
   opacity: .82;
@@ -15961,7 +15958,7 @@ const VIDEO_EDITOR_STYLES = `
   right: 2px;
 }
 .ve-caption-block {
-  background: #1c1917;
+  background: #1d1d1f;
 }
 .ve-graphic-block {
   background: #5f928a;
@@ -15981,7 +15978,7 @@ const VIDEO_EDITOR_STYLES = `
   inset: 0;
   content: "";
   pointer-events: none;
-  background: linear-gradient(90deg, rgba(28,25,23,.42), transparent 32%, rgba(28,25,23,.18));
+  background: linear-gradient(90deg, rgba(29, 29, 31,.42), transparent 32%, rgba(29, 29, 31,.18));
 }
 .ve-graphic-block-ellipse {
   background: #a97935;
@@ -16018,7 +16015,7 @@ const VIDEO_EDITOR_STYLES = `
   height: 12px;
   padding: 0;
   transform: translate(-50%, -50%) rotate(45deg);
-  border: 2px solid rgba(28,25,23,.68);
+  border: 2px solid rgba(29, 29, 31,.68);
   border-radius: 2px;
   background: #ffffff;
   cursor: pointer;
@@ -16039,7 +16036,7 @@ const VIDEO_EDITOR_STYLES = `
   opacity: .58;
 }
 .ve-shot-block {
-  background: #57534e;
+  background: #6e6e73;
 }
 .ve-audio-block {
   background: #4f7e87;
@@ -16072,9 +16069,9 @@ const VIDEO_EDITOR_STYLES = `
   padding: 2px 5px;
   overflow: hidden;
   border-radius: 5px;
-  background: rgba(28,25,23,.36);
+  background: rgba(29, 29, 31,.36);
   text-overflow: ellipsis;
-  text-shadow: 0 1px 2px rgba(28,25,23,.5);
+  text-shadow: 0 1px 2px rgba(29, 29, 31,.5);
 }
 .ve-clip-block.is-ai-highlighted,
 .ve-shot-block.is-ai-highlighted,
@@ -16127,7 +16124,7 @@ const VIDEO_EDITOR_STYLES = `
   transform: translate(-50%, -35%);
   border-radius: 999px;
   background: #d65f59;
-  box-shadow: 0 0 0 2px rgba(255,255,255,.92), 0 6px 12px rgba(28,25,23,.18);
+  box-shadow: 0 0 0 2px rgba(255,255,255,.92), 0 6px 12px rgba(29, 29, 31,.18);
   pointer-events: none;
 }
 .ve-playhead:hover::before,

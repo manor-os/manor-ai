@@ -2,12 +2,16 @@
 
 from datetime import datetime, timedelta, timezone
 from inspect import getsource
+from pathlib import Path
 
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.ai.runtime.editor_document import create_editor_document_snapshot
+from packages.core.ai.runtime.file_actions import runtime_entity_file_root
+from packages.core.config import get_settings
 from packages.core.constants.conversation import AiEditTargetKind, ConversationSurfaceKind
 from packages.core.models.base import generate_ulid
 from packages.core.models.conversation_share import ConversationShare
@@ -143,6 +147,38 @@ async def test_public_webchat_stream_update_preserves_session_metadata(db_sessio
         session_id=session_id,
     )
     assert [m["content"] for m in messages] == ["Final streamed public reply."]
+
+
+@pytest.mark.asyncio
+async def test_channel_history_applies_workspace_and_channel_before_limit(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers = await _auth(client, "scoped_history")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    workspace = Workspace(entity_id=me["entity_id"], name="Support")
+    other_workspace = Workspace(entity_id=me["entity_id"], name="Other support")
+    db_session.add_all([workspace, other_workspace])
+    await db_session.flush()
+    older = datetime.now(timezone.utc) - timedelta(days=1)
+    target = Conversation(
+        entity_id=me["entity_id"], workspace_id=workspace.id,
+        channel="webchat", title="Older customer", created_at=older,
+    )
+    db_session.add(target)
+    for workspace_id, channel in [(workspace.id, "email"), (other_workspace.id, "webchat")]:
+        db_session.add_all([
+            Conversation(entity_id=me["entity_id"], workspace_id=workspace_id, channel=channel)
+            for _ in range(50)
+        ])
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/v1/chat/conversations", headers=headers,
+        params={"workspace_id": workspace.id, "channel": "webchat"},
+    )
+    assert response.status_code == 200, response.text
+    assert [row["id"] for row in response.json()] == [target.id]
 
 
 @pytest.mark.asyncio
@@ -491,6 +527,8 @@ async def test_chat_stream_rejects_conversation_surface_mismatch_before_runtime(
 @pytest.mark.asyncio
 async def test_expired_ai_edit_cleanup_uses_conversation_lifecycle(
     db_session: AsyncSession,
+    monkeypatch,
+    tmp_path,
 ):
     now = datetime.now(timezone.utc)
     entity_id = generate_ulid()
@@ -549,6 +587,16 @@ async def test_expired_ai_edit_cleanup_uses_conversation_lifecycle(
     ])
     await db_session.commit()
 
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    snapshot = create_editor_document_snapshot(runtime_entity_file_root(entity_id), "secret draft")
+    expired_run = await db_session.get(RuntimeRun, expired_run_id)
+    expired_run.execution_payload = {"editor_context": {"document_snapshot": snapshot.to_context()}}
+    await db_session.commit()
+    snapshot_file = Path(runtime_entity_file_root(entity_id)) / snapshot.path
+    assert snapshot_file.exists()
+
     cancelled_runs: list[RuntimeRun] = []
     assert await cleanup_expired_ai_edit_conversations(
         db_session,
@@ -556,6 +604,7 @@ async def test_expired_ai_edit_cleanup_uses_conversation_lifecycle(
         cancelled_runtime_runs=cancelled_runs,
     ) == 1
     await db_session.commit()
+    assert not snapshot_file.exists()
 
     assert await db_session.get(Conversation, expired_id) is None
     assert await db_session.get(Conversation, active_id) is not None

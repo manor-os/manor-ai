@@ -21,6 +21,7 @@ from time import perf_counter
 from typing import Any
 
 from packages.core.database import async_session
+from packages.core.revisions import StaleRevisionError
 from packages.core.services.workflow_run_trace import visible_workflow_tags
 
 
@@ -374,6 +375,30 @@ RESUME_RUN_SCHEMA = _schema(
     },
     ["run_id"],
 )
+RETRY_RUN_SCHEMA = _schema(
+    "retry_workflow_run",
+    "Start a new attempt of a failed or cancelled workflow run from its checkpoint. "
+    "When its deliverable was already made elsewhere (for example a video made in this chat and "
+    "saved as a Document), pass supplied_output to accept that work as the producing step's result: "
+    "the step does not run again and every step after it, its QA and reviews included, runs as usual.",
+    {
+        "run_id": {"type": "string", "description": "The failed run (for a nested Flow, the child run that failed)."},
+        "from_step_id": {"type": "string", "description": "Optional checkpoint step; defaults to the run's own retry point."},
+        "supplied_output": {
+            "type": "object",
+            "description": "Finished work that stands in for one step's result.",
+            "properties": {
+                "step_id": {"type": "string", "description": "The step that produces this work; it must declare an output_schema."},
+                "output": {"type": "object", "description": "The step's result, matching its output_schema and naming each document id."},
+                "document_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 20,
+                                 "description": "Knowledge Documents in the run's Workspace that hold the work."},
+                "note": {"type": "string", "description": "How the work was made, for the run's audit."},
+            },
+            "required": ["step_id", "output", "document_ids"],
+        },
+    },
+    ["run_id"],
+)
 IMPORT_WORKFLOW_SCHEMA = _schema(
     "import_workflow",
     "Import an n8n, Dify, or ComfyUI workflow export into Manor. Use dry_run first to inspect mapping coverage.",
@@ -587,9 +612,27 @@ def _requested_workspace_id(kwargs: dict[str, Any]) -> str | None:
     ).strip() or None
 
 
+async def _unknown_workspace_error(db, entity_id: str, workspace_id: str | None, kwargs: dict[str, Any]) -> str | None:
+    """An id that names no Workspace (a folder id from a file path, say) is an error, not an empty catalog."""
+    if workspace_id is None:
+        return None
+    from sqlalchemy import select
+
+    from packages.core.models.workspace import Workspace
+
+    if await db.scalar(select(Workspace.id).where(Workspace.id == workspace_id, Workspace.entity_id == entity_id)):
+        return None
+    return _error(
+        f"{workspace_id} is not a Workspace id; omit target_workspace_id to use the current Workspace",
+        current_workspace_id=_run_workspace_id(kwargs),
+    )
+
+
 async def _list_workflows(entity_id: str = "", **kwargs: Any) -> str:
     workspace_id = _requested_workspace_id(kwargs)
     async with async_session() as db:
+        if error := await _unknown_workspace_error(db, entity_id, workspace_id, kwargs):
+            return error
         pairs = await _exposed_workflows(db, entity_id, workspace_id=workspace_id)
         return _dump({
             "ok": True,
@@ -1096,6 +1139,7 @@ async def _ai_edit_workflow(entity_id: str = "", **kwargs: Any) -> str:
         expected = kwargs.get("expected_version")
         if expected is not None and int(expected) != int(wf.version or 1):
             return _error("Workflow version conflict", expected_version=int(expected), current_version=int(wf.version or 1))
+        base_version = int(wf.version or 1)
         try:
             generated = await generate_workflow(
                 prompt, list(wf.steps or []), entity_id,
@@ -1123,7 +1167,12 @@ async def _ai_edit_workflow(entity_id: str = "", **kwargs: Any) -> str:
         }
         if bool(kwargs.get("update_name")) and generated.get("name"):
             changes["name"] = str(generated["name"])[:255]
-        wf = await svc.update_workflow(db, wf.id, entity_id, **changes)
+        # The graph was generated from this version; a save made while the
+        # model was working must not be overwritten.
+        try:
+            wf = await svc.update_workflow(db, wf.id, entity_id, expected_version=base_version, **changes)
+        except StaleRevisionError as exc:
+            return _error("Workflow version conflict", expected_version=exc.expected, current_version=exc.actual)
         await db.commit()
         return _dump({"ok": True, "saved": True, "workflow": _workflow_dict(wf), "validation": validation})
 
@@ -1154,7 +1203,13 @@ async def _update_workflow(entity_id: str = "", **kwargs: Any) -> str:
             return _error("Workflow graph is invalid", validation=validation)
         if "steps" in changes and (refused := await _collaborator_steps_refused(db, entity_id, kwargs, changes["steps"])):
             return refused
-        wf = await svc.update_workflow(db, wf.id, entity_id, **changes)
+        try:
+            wf = await svc.update_workflow(
+                db, wf.id, entity_id,
+                expected_version=int(expected) if expected is not None else None, **changes,
+            )
+        except StaleRevisionError as exc:
+            return _error("Workflow version conflict", expected_version=exc.expected, current_version=exc.actual)
         await db.commit()
         return _dump({"ok": True, "updated": True, "workflow": _workflow_dict(wf), "validation": validation})
 
@@ -1300,6 +1355,8 @@ async def _run_workflow(entity_id: str = "", user_id: str = "", **kwargs: Any) -
     if not target:
         return _error("run_workflow requires a workflow")
     async with async_session() as db:
+        if error := await _unknown_workspace_error(db, entity_id, workspace_id, kwargs):
+            return error
         pairs = await _exposed_workflows(db, entity_id, workspace_id=workspace_id)
         match = next(((binding, wf) for binding, wf in pairs if wf.id == target or wf.name.lower() == target.lower()), None)
         if match is None:
@@ -1704,6 +1761,62 @@ async def _resume_workflow_run(entity_id: str = "", user_id: str = "", **kwargs:
         return _dump({"ok": True, "run": _run_dict(run) if run else None})
 
 
+async def _retry_workflow_run(entity_id: str = "", user_id: str = "", **kwargs: Any) -> str:
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.services import workflow_service as svc
+
+    supplied = kwargs.get("supplied_output")
+    if supplied is not None and not isinstance(supplied, dict):
+        return _error("supplied_output must be an object")
+    async with async_session() as db:
+        run = await svc.get_run(db, str(kwargs.get("run_id") or ""), entity_id)
+        if run is None or not await _user_can_control_workflow_run(
+            db,
+            run=run,
+            entity_id=entity_id,
+            user_id=user_id,
+        ):
+            return _error("Workflow run not found")
+        latest = await svc.latest_workflow_run_family_attempt(db, run)
+        try:
+            retry = await svc.retry_workflow_run(
+                db,
+                run_id=run.id,
+                entity_id=entity_id,
+                started_by=user_id,
+                from_step_id=str(kwargs.get("from_step_id") or "").strip() or None,
+                owner_run_id=run.id,
+                expected_owner_run_id=latest.id,
+                expected_owner_status=latest.status,
+                definition="current",
+                supplied_output=supplied,
+            )
+        except ValueError as exc:
+            await db.rollback()
+            return _error(f"Could not retry workflow run: {exc}")
+        await db.commit()
+        retry_id = retry.id
+    queued = WorkflowRunner.enqueue(retry_id) is not False
+    async with async_session() as db:
+        retry = await svc.get_run(db, retry_id, entity_id)
+        if not queued and retry is not None:
+            from datetime import datetime, timezone
+
+            from packages.core.ai.workflow_runner import mark_workflow_terminal_effects_pending
+            from packages.core.services.workflow_chat_projection import project_workflow_run_status
+            from packages.core.services.workflow_run_trace import update_workflow_history_summary
+
+            # As the run page's retry does: never leave an attempt running with no worker.
+            retry.status = "failed"
+            retry.error = "Workflow could not be queued. Please retry this run."
+            retry.completed_at = datetime.now(timezone.utc)
+            mark_workflow_terminal_effects_pending(retry)
+            update_workflow_history_summary(retry)
+            await project_workflow_run_status(db, run=retry)
+            await db.commit()
+        return _dump({"ok": queued, "queued": queued, "run": _run_dict(retry, detailed=False) if retry else None})
+
+
 async def _import_workflow(entity_id: str = "", **kwargs: Any) -> str:
     from packages.core.ai.workflow_import import UnknownWorkflowFormat, import_workflow
     from packages.core.services import workflow_service as svc
@@ -1896,5 +2009,6 @@ def get_tools() -> list[tuple[dict, Any]]:
         (GET_RUN_SCHEMA, _get_workflow_run),
         (CANCEL_RUN_SCHEMA, _cancel_workflow_run),
         (RESUME_RUN_SCHEMA, _resume_workflow_run),
+        (RETRY_RUN_SCHEMA, _retry_workflow_run),
         (IMPORT_WORKFLOW_SCHEMA, _import_workflow),
     ]

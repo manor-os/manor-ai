@@ -151,7 +151,8 @@ async def accumulate_step_cost(
         }
 
     workspace = (await db.execute(
-        select(Workspace).where(Workspace.id == step.workspace_id).with_for_update()
+        # No key update: rows that reference this Workspace may be inserted meanwhile.
+        select(Workspace).where(Workspace.id == step.workspace_id).with_for_update(key_share=True)
     )).scalar_one_or_none()
     if workspace is None:
         await db.flush()
@@ -235,7 +236,7 @@ async def accumulate_workspace_ai_cost(
         return {"usd": 0, "workspace_total": None, "workspace_pct": None, "alert_emitted": None}
 
     workspace = (await db.execute(
-        select(Workspace).where(Workspace.id == workspace_id).with_for_update()
+        select(Workspace).where(Workspace.id == workspace_id).with_for_update(key_share=True)
     )).scalar_one_or_none()
     if workspace is None:
         await db.flush()

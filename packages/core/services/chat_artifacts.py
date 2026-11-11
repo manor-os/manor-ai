@@ -4,11 +4,14 @@ import json
 import mimetypes
 import os
 from typing import Any
+from urllib.parse import quote
 
 from packages.core.ai.runtime.composite_tools import RuntimeCompositeToolCallFactory
 from packages.core.services.file_type_detection import mime_for_extension
 from packages.core.services.file_refs import parse_file_reference
 from packages.core.services.generated_file_refs import (
+    canonical_document_id,
+    canonical_file_markdown_link,
     canonical_generated_file_ref,
     dedupe_generated_file_refs,
     entity_fs_open_url,
@@ -78,6 +81,9 @@ _EXPLICIT_ARTIFACT_TOOL_NAMES = {
     # Retired tool; kept so persisted transcripts keep their artifact cards.
     "save_sandbox_file",
 }
+# Tools whose successful result is a published website, shown in chat as a
+# live site card (attachment type "site") rather than as a file.
+_SITE_PUBLISHING_TOOL_NAMES = {"publish_site"}
 _DISPLAY_FLAG_KEYS = (
     "display_as_artifact",
     "show_as_artifact",
@@ -254,8 +260,33 @@ def _canonical_url(url: str, fs_path: str, entity_id: str) -> str:
     return ""
 
 
+def _site_attachment(payload: Any) -> dict[str, Any] | None:
+    """A published site: ``{"type": "site", name, url, site_id, revision}``."""
+    if not isinstance(payload, dict) or payload.get("published") is not True:
+        return None
+    url = _text(payload.get("url"))
+    site_id = _text(payload.get("site_id"))
+    if not site_id or not url.lower().startswith(("http://", "https://")):
+        return None
+    attachment: dict[str, Any] = {
+        "type": "site",
+        "name": _text(payload.get("name")) or _text(payload.get("slug")) or url,
+        "url": url,
+        "site_id": site_id,
+    }
+    revision = payload.get("revision")
+    if isinstance(revision, int) and not isinstance(revision, bool):
+        attachment["revision"] = revision
+    return attachment
+
+
 def chat_attachments_from_tool_results(tool_results: list[dict] | None) -> list[dict]:
-    """Extract generated files with an exact address from chat tool results."""
+    """Extract generated files with an exact address, and published sites, from chat tool results.
+
+    Files keep the FileRef contract (``type`` knowledge|file with ``open_url``).
+    A published site is one ``type: "site"`` attachment per site; a later
+    publish of the same site replaces the earlier one.
+    """
 
     if not tool_results:
         return []
@@ -368,6 +399,7 @@ def chat_attachments_from_tool_results(tool_results: list[dict] | None) -> list[
             return
         canonical_refs.append(canonical)
 
+    sites: dict[str, dict[str, Any]] = {}
     for item in tool_results:
         if not isinstance(item, dict):
             continue
@@ -378,6 +410,12 @@ def chat_attachments_from_tool_results(tool_results: list[dict] | None) -> list[
                 _text(item.get("name")),
                 arguments if isinstance(arguments, dict) else {},
             )
+            if canonical_call.tool_name.lower() in _SITE_PUBLISHING_TOOL_NAMES:
+                site = _site_attachment(payload)
+                if site is not None:
+                    sites.pop(site["site_id"], None)
+                    sites[site["site_id"]] = site
+                continue
             add_from_obj(
                 payload,
                 tool_name=canonical_call.tool_name,
@@ -407,4 +445,81 @@ def chat_attachments_from_tool_results(tool_results: list[dict] | None) -> list[
         if preview_url:
             attachment["previewUrl"] = preview_url
         attachments.append(attachment)
+    attachments.extend(sites.values())
     return attachments
+
+
+async def resolve_attachment_documents(
+    attachments: list[dict],
+    *,
+    entity_id: str | None,
+    db: Any = None,
+) -> list[dict]:
+    """Give each path-only attachment the Knowledge Document id of its file.
+
+    Media producers (images, audio, video) register a Document but report only
+    the file's path, while the reply links the same file by ``/viewer/<id>``.
+    One key per file lets the chat show it once. A file without a Document, or
+    a failed lookup, keeps its path-only attachment.
+    """
+
+    paths = {
+        str(item["fs_path"])
+        for item in attachments
+        if item.get("fs_path") and not item.get("document_id")
+    }
+    if not paths or not entity_id:
+        return attachments
+    from sqlalchemy import select
+
+    from packages.core.models.document import Document
+
+    statement = select(Document.fs_path, Document.id).where(
+        Document.entity_id == entity_id,
+        Document.fs_path.in_(paths),
+        Document.is_trashed == False,  # noqa: E712
+    )
+    try:
+        if db is not None:
+            rows = (await db.execute(statement)).all()
+        else:
+            from packages.core.database import async_session
+
+            async with async_session() as session:
+                rows = (await session.execute(statement)).all()
+    except Exception:
+        return attachments
+    documents = {fs_path: document_id for fs_path, document_id in rows}
+    resolved: list[dict] = []
+    seen_documents: set[str] = set()
+    for item in attachments:
+        attachment = dict(item)
+        document_id = canonical_document_id(attachment.get("document_id")) or canonical_document_id(
+            documents.get(attachment.get("fs_path"))
+        )
+        if document_id and not attachment.get("document_id"):
+            open_url = f"/viewer/{quote(document_id, safe='')}"
+            attachment["document_id"] = document_id
+            attachment["open_url"] = open_url
+            markdown_link = canonical_file_markdown_link(attachment.get("name"), open_url)
+            if markdown_link:
+                attachment["markdown_link"] = markdown_link
+        if document_id:
+            if document_id in seen_documents:
+                continue
+            seen_documents.add(document_id)
+        resolved.append(attachment)
+    return resolved
+
+
+async def chat_turn_attachments(
+    tool_results: list[dict] | None,
+    *,
+    entity_id: str | None,
+    db: Any = None,
+) -> list[dict]:
+    """The attachments a chat turn's reply carries, keyed by Document when one exists."""
+
+    return await resolve_attachment_documents(
+        chat_attachments_from_tool_results(tool_results), entity_id=entity_id, db=db,
+    )

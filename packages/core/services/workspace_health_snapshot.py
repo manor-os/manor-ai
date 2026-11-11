@@ -33,7 +33,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Collection, Optional, TypeVar
 
 from sqlalchemy import (
-    ARRAY, String, all_, and_, any_, case, delete, exists, func, literal, or_, select,
+    ARRAY, String, all_, and_, case, delete, exists, func, literal, or_, select,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -53,6 +53,7 @@ from packages.core.services.workspace_health_metrics import (
     TASK_OUTCOMES,
     HealthInputs,
     derive_status,
+    ids_param,
     judged_rate,
     stalled_task_clause,
     stalled_workflow_run_clause,
@@ -202,7 +203,7 @@ async def refresh_workspace_health(
     # into scope starts a fresh row, and with it a new status_since.
     stale = WorkspaceHealthSnapshot.workspace_id != all_(literal(ids, type_=ARRAY(String)))
     if limit is not None:
-        stale = and_(stale, WorkspaceHealthSnapshot.workspace_id == _ids_param(limit))
+        stale = and_(stale, WorkspaceHealthSnapshot.workspace_id == ids_param(limit))
     await db.execute(delete(WorkspaceHealthSnapshot).where(stale))
     return {
         "workspaces": len(rows), "by_status": dict(by_status), "unknown_parts": sorted(failed),
@@ -224,14 +225,8 @@ async def _previous_snapshots(db: AsyncSession, ids: list[str]) -> dict[str, dic
         for r in (await db.execute(select(
             S.workspace_id, S.status, S.reasons, S.quality, S.readiness_gaps,
             S.missed_schedules, S.pending_approvals_over_24h, S.service_coverage,
-        ).where(S.workspace_id == _ids_param(ids)))).mappings()
+        ).where(S.workspace_id == ids_param(ids)))).mappings()
     }
-
-
-def _ids_param(ids: list[str]):
-    # One array parameter instead of an expanding IN: the scope can hold
-    # more Workspaces than asyncpg accepts bind parameters.
-    return any_(literal(ids, type_=ARRAY(String)))
 
 
 # ── Scope ────────────────────────────────────────────────────────────
@@ -244,7 +239,7 @@ async def _scoped_workspaces(
     Readiness alone does not bring a Workspace into scope: finding those
     would mean evaluating the setup gate of every Workspace every hour."""
     since = now - timedelta(days=SCOPE_ACTIVITY_DAYS)
-    limited = [Workspace.id == _ids_param(limit)] if limit is not None else []
+    limited = [Workspace.id == ids_param(limit)] if limit is not None else []
     return list((await db.execute(select(Workspace).where(
         *limited,
         Workspace.status == "active",
@@ -279,7 +274,7 @@ async def _daily_sums(db: AsyncSession, ids: list[str], now: datetime) -> Sums:
     ]
     sums: Sums = defaultdict(dict)
     for r in (await db.execute(select(D.workspace_id, D.surface, *columns).where(
-        D.workspace_id == _ids_param(ids), D.day >= week_start,
+        D.workspace_id == ids_param(ids), D.day >= week_start,
     ).group_by(D.workspace_id, D.surface))).mappings():
         sums[r["workspace_id"]][r["surface"]] = Counter({
             key: int(value or 0) for key, value in r.items()
@@ -348,7 +343,7 @@ async def _stalled_tasks(db: AsyncSession, ids: list[str], now: datetime) -> dic
     if not ids:
         return {}
     return await _grouped_count(
-        db, Task.workspace_id, Task.workspace_id == _ids_param(ids), stalled_task_clause(now),
+        db, Task.workspace_id, Task.workspace_id == ids_param(ids), stalled_task_clause(now),
     )
 
 
@@ -358,7 +353,7 @@ async def _stalled_workflow_runs(
     if not ids:
         return {}
     return await _grouped_count(
-        db, WorkflowRun.workspace_id, WorkflowRun.workspace_id == _ids_param(ids),
+        db, WorkflowRun.workspace_id, WorkflowRun.workspace_id == ids_param(ids),
         stalled_workflow_run_clause(now),
     )
 
@@ -369,7 +364,7 @@ async def _missed_schedules(db: AsyncSession, ids: list[str], now: datetime) -> 
     if not ids:
         return {}
     return await _grouped_count(
-        db, ScheduledJob.workspace_id, ScheduledJob.workspace_id == _ids_param(ids),
+        db, ScheduledJob.workspace_id, ScheduledJob.workspace_id == ids_param(ids),
         ScheduledJob.enabled.is_(True), ScheduledJob.next_run_at < now - MISSED_FIRE_AFTER,
     )
 
@@ -378,7 +373,7 @@ async def _approval_backlog(db: AsyncSession, ids: list[str], now: datetime) -> 
     if not ids:
         return {}
     return await _grouped_count(
-        db, HitlRequest.workspace_id, HitlRequest.workspace_id == _ids_param(ids),
+        db, HitlRequest.workspace_id, HitlRequest.workspace_id == ids_param(ids),
         HitlRequest.status == ApprovalStatus.PENDING.value,
         HitlRequest.created_at < now - APPROVAL_BACKLOG_AFTER,
     )
@@ -392,7 +387,7 @@ async def _covered_services(
         return {}
     covered: dict[str, set[str]] = defaultdict(set)
     for r in (await db.execute(select(Task.workspace_id, Task.owner_service_key).where(
-        Task.workspace_id == _ids_param(ids),
+        Task.workspace_id == ids_param(ids),
         Task.owner_service_key.is_not(None),
         Task.status.in_(statuses_with(TASK_OUTCOMES, SUCCEEDED)),
         Task.completed_at >= now - COVERAGE_WINDOW,

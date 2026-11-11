@@ -24,7 +24,21 @@ RUN npm config set registry https://registry.npmjs.org/ \
 COPY apps/web/ .
 RUN npm run build
 
+# brotli_static only sends files compressed at build time, so it links no
+# compression library. The module is built against this exact nginx version.
+FROM nginx:alpine AS brotli-module
+ARG NGX_BROTLI_COMMIT=53e0fb55f250f48fe80c0ddbf6c0f7103cdbaae1
+RUN apk add --no-cache curl gcc linux-headers make musl-dev pcre2-dev zlib-dev \
+    && curl -fsSL "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" | tar xz -C /tmp \
+    && curl -fsSL "https://github.com/google/ngx_brotli/archive/${NGX_BROTLI_COMMIT}.tar.gz" | tar xz -C /tmp \
+    && cd "/tmp/nginx-${NGINX_VERSION}" \
+    && ./configure --with-compat "--add-dynamic-module=/tmp/ngx_brotli-${NGX_BROTLI_COMMIT}/static" \
+    && make modules \
+    && cp objs/ngx_http_brotli_static_module.so /ngx_http_brotli_static_module.so
+
 FROM nginx:alpine
+COPY --from=brotli-module /ngx_http_brotli_static_module.so /usr/lib/nginx/modules/ngx_http_brotli_static_module.so
+RUN sed -i '1i load_module modules/ngx_http_brotli_static_module.so;' /etc/nginx/nginx.conf
 ENV NGINX_ENTRYPOINT_LOCAL_RESOLVERS=1
 ENV MANOR_API_UPSTREAM=manor-api:8000
 ENV MANOR_CHAT_UPSTREAM=manor-chat:8000

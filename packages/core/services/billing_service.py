@@ -4,13 +4,13 @@
 from __future__ import annotations
 
 import os
+from decimal import ROUND_CEILING, Decimal
 from typing import Any
 
 from packages.core.constants.plans import is_cloud
 
 
-CREDITS_PER_USD = int(os.getenv("MANOR_OSS_CREDITS_PER_USD", "1000"))
-AI_MARGIN = 0.0
+_OSS_CREDITS_PER_USD = int(os.getenv("MANOR_OSS_CREDITS_PER_USD", "1000"))
 
 
 def _cloud_impl():
@@ -26,17 +26,50 @@ def _cloud_attr(name: str):
     return getattr(impl, name)
 
 
+def credit_rate() -> tuple[int, float]:
+    """(credits per USD, AI margin) that every USD-to-credit conversion uses.
+
+    The cloud values are the only real ones. A module-level copy here would
+    shadow them, so ``CREDITS_PER_USD`` and ``AI_MARGIN`` resolve through this
+    function instead.
+    """
+    impl = _cloud_impl()
+    if impl is None:
+        return _OSS_CREDITS_PER_USD, 0.0
+    return int(impl.CREDITS_PER_USD), float(impl.AI_MARGIN)
+
+
+def usd_to_credits(cost_usd: float | Decimal | None) -> int:
+    """Credits for a USD cost: ceil(cost × (1 + margin) × credits per USD).
+
+    Exact decimal arithmetic, so a float product never rounds one credit up.
+    A zero or missing cost is zero credits; any positive cost is at least one.
+    """
+    cost = Decimal(str(float(cost_usd or 0)))
+    if cost <= 0:
+        return 0
+    credits_per_usd, ai_margin = credit_rate()
+    exact = cost * (1 + Decimal(str(ai_margin))) * credits_per_usd
+    return int(exact.to_integral_value(rounding=ROUND_CEILING))
+
+
 def __getattr__(name: str) -> Any:
     if name.startswith("__"):
         raise AttributeError(name)
+    if name == "CREDITS_PER_USD":
+        return credit_rate()[0]
+    if name == "AI_MARGIN":
+        return credit_rate()[1]
     return _cloud_attr(name)
 
 
-def estimate_provider_cost(*args: Any, **kwargs: Any) -> float:
+def estimate_provider_cost(*args: Any, **kwargs: Any) -> float | None:
     impl = _cloud_impl()
     if impl is None:
         return 0.0
-    return float(impl.estimate_provider_cost(*args, **kwargs))
+    cost = impl.estimate_provider_cost(*args, **kwargs)
+    # None only with require_price: the model has no price to bill on.
+    return None if cost is None else float(cost)
 
 
 def tokens_to_credits(*args: Any, **kwargs: Any) -> int:

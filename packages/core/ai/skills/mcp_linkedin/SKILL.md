@@ -30,7 +30,7 @@ Company pages (admin only):
 Manage & measure:
 - `get_my_posts` (req `author_urn`), `delete_post` (req `post_urn`).
 - `get_post_stats` (req `author_urn`) — engagement on the user's posts.
-- `create_comment` (req `post_urn`,`actor_urn`,`text`), `react_to_post` (req `post_urn`,`actor_urn`), `get_post_comments`, `get_post_reactions`.
+- `create_comment` (req `post_urn`,`actor_urn`,`text`), `react_to_post` (req `post_urn`,`actor_urn`), `list_recent_post_comments` (latest posts of the person and their pages, no ids needed), `get_post_comments`, `get_post_reactions`.
 
 ## Common Recipes
 

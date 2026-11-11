@@ -6,6 +6,7 @@ Primary API for callers:
 """
 from __future__ import annotations
 
+import json
 import os
 import logging
 from hashlib import sha256
@@ -100,6 +101,15 @@ async def _ledger_payer_or_uncharged(
         return None
 
 
+def _billing_task_id(entity_id: str | None, task_id: str | None) -> str | None:
+    """``task_id``, else the Task the bound billing context bills ``entity_id``'s calls to."""
+    if task_id:
+        return task_id
+    from packages.core.ai.runtime.billing import runtime_current_billing_task_id
+
+    return runtime_current_billing_task_id(entity_id)
+
+
 def chat_llm_usage_is_byok(usage: dict | None = None) -> bool:
     """Return whether the active chat call or its normalized usage is BYOK."""
     from packages.core.ai.runtime import runtime_is_byok_call_active
@@ -107,32 +117,36 @@ def chat_llm_usage_is_byok(usage: dict | None = None) -> bool:
     return runtime_is_byok_call_active() or _usage_is_byok(usage or {})
 
 
-def chat_llm_usage_to_credits(usage: dict) -> int:
-    """Convert normalized chat usage with the same pricing path as the ledger."""
-    if not usage or not is_cloud():
-        return 0
-
+def _usd(value: Any) -> float | None:
     try:
-        reported_cost = float(usage.get("cost_usd") or 0)
+        return float(value) if value is not None else None
     except (TypeError, ValueError):
-        reported_cost = 0.0
-    if reported_cost > 0:
-        try:
-            import math
+        return None
 
-            from packages.core.services.billing_service import AI_MARGIN, CREDITS_PER_USD
 
-            return max(1, math.ceil(reported_cost * (1 + AI_MARGIN) * CREDITS_PER_USD))
-        except Exception:
-            logger.debug("Failed to convert chat LLM cost to credits", exc_info=True)
+def llm_call_cost_usd(usage: dict, model: str | None = None) -> tuple[float | None, str]:
+    """A finished LLM call's provider cost in USD, and what it was priced on.
 
+    1. ``cost_usd`` already worked out from official tokens by the caller.
+    2. The call's tokens at the model's price (official registry, else a
+       gateway's synced catalog): ``official_tokens``.
+    3. Only when nothing prices the model, the gateway's own reported cost:
+       ``gateway_cost_fallback``.
+    4. Otherwise ``unpriced``: no cost, so no charge, and a warning.
+    A gateway's reported cost is never billed while the tokens can be priced.
+    """
+    usage = usage or {}
+    given = _usd(usage.get("cost_usd"))
+    if given is not None and given > 0:
+        return given, "official_tokens"
+    model_name = str(model or usage.get("model") or "") or None
     try:
-        from packages.core.services.billing_service import tokens_to_credits
+        from packages.core.services.billing_service import estimate_provider_cost
 
-        return int(tokens_to_credits(
+        cost = estimate_provider_cost(
             int(usage.get("prompt") or usage.get("prompt_tokens") or 0),
             int(usage.get("completion") or usage.get("completion_tokens") or 0),
-            str(usage.get("model") or "") or None,
+            model_name,
             pricing_source=str(usage.get("pricing_source") or usage.get("llm_pricing_source") or ""),
             provider=str(usage.get("provider") or ""),
             cache_read_tokens=int(usage.get("cache_read") or usage.get("cache_read_input_tokens") or 0),
@@ -141,10 +155,30 @@ def chat_llm_usage_to_credits(usage: dict) -> int:
             ),
             audio_input_tokens=int(usage.get("audio_in") or usage.get("audio_input_tokens") or 0),
             audio_output_tokens=int(usage.get("audio_out") or usage.get("audio_output_tokens") or 0),
-        ))
+            cached_audio_input_tokens=int(usage.get("cached_audio_input_tokens") or 0),
+            require_price=True,
+        )
     except Exception:
-        logger.debug("Failed to estimate chat LLM usage credits", exc_info=True)
+        logger.warning("llm_call_cost_usd: pricing failed for %s", model_name, exc_info=True)
+        cost = None
+    if cost is not None:
+        return float(cost), "official_tokens"
+    gateway = _usd(usage.get("gateway_cost_usd"))
+    if gateway is not None and gateway > 0:
+        logger.warning("LLM model %s has no price; billing the gateway's reported cost", model_name)
+        return gateway, "gateway_cost_fallback"
+    logger.warning("LLM model %s has no price and no reported cost; nothing billed", model_name)
+    return None, "unpriced"
+
+
+def chat_llm_usage_to_credits(usage: dict) -> int:
+    """Credits a finished chat LLM call costs, on the same price as the ledger."""
+    if not usage or not is_cloud():
         return 0
+    from packages.core.services.billing_service import usd_to_credits
+
+    cost, _basis = llm_call_cost_usd(usage)
+    return usd_to_credits(cost)
 
 
 def durable_llm_call_source_id(source_prefix: str, round_num: int) -> str:
@@ -176,18 +210,29 @@ def build_durable_llm_billing_callbacks(
     workspace_id: str | None,
     conversation_id: str | None,
     fallback_model: str | None,
-    byok: bool = False,
     payer_entity_id: str | None = None,
+    source: str | None = None,
+    operation_id: str | None = None,
+    task_id: str | None = None,
 ):
     """Build per-provider-call reserve/settle callbacks for an agentic loop.
+
+    Whether a call is BYOK is read from the route the call actually took (the
+    loop marks it from its metadata, and the call's usage carries it). A saved
+    key whose provider cannot serve the model routes to the platform, so the
+    caller's view of its keys never makes a platform call free.
 
     ``payer_entity_id`` pins who pays. Without it the first reservation
     resolves the Workspace's payer and every later round reuses it, so a
     delivery phase change mid-loop cannot split one loop across two payers.
 
+    ``source`` labels each usage row (the caller's billing source; chat when
+    omitted). ``operation_id`` ties each row to the run that made the call;
+    when omitted the row is tied to its own call.
+
     Reservations are committed before provider I/O. Settlement, ledger and
     reservation consumption share a later transaction. The reservation row is
-    the idempotency fence for duplicate settlement callbacks. ``byok`` calls do
+    the idempotency fence for duplicate settlement callbacks. BYOK calls do
     not reserve Manor credits; without a reservation their analytics remain
     best-effort and cannot use this fence.
 
@@ -212,7 +257,7 @@ def build_durable_llm_billing_callbacks(
     ) -> None:
         call_source_id = source_id(round_num)
         source_ids[round_num] = call_source_id
-        if not entity_id or not is_cloud() or byok or chat_llm_usage_is_byok():
+        if not entity_id or not is_cloud() or chat_llm_usage_is_byok():
             return
 
         from packages.core.ai.agentic_loop import _estimate_tokens
@@ -268,7 +313,10 @@ def build_durable_llm_billing_callbacks(
                     agent_id=agent_id,
                     conversation_id=conversation_id,
                     user_id=user_id,
-                    metadata={"round": round_num, "model": model or ""},
+                    metadata={
+                        "round": round_num, "model": model or "",
+                        "task_id": _billing_task_id(entity_id, task_id), "operation_id": operation_id,
+                    },
                 )
                 await db.commit()
         except CreditReservationError as exc:
@@ -294,7 +342,7 @@ def build_durable_llm_billing_callbacks(
         call_source_id = source_ids.pop(round_num, source_id(round_num))
         billed_usage = dict(usage or {})
         billed_usage.setdefault("model", fallback_model or "")
-        usage_is_byok = byok or chat_llm_usage_is_byok(billed_usage)
+        usage_is_byok = chat_llm_usage_is_byok(billed_usage)
         if usage_is_byok:
             billed_usage.setdefault("byok", True)
             billed_usage.setdefault("billing_mode", "byok")
@@ -328,6 +376,8 @@ def build_durable_llm_billing_callbacks(
                     duration_ms=int(duration_ms),
                     consumed_credits=actual_credits,
                     payer_entity_id=pinned_payer["entity_id"],
+                    source=source,
+                    operation_id=operation_id,
                 )
                 await db.commit()
             except Exception:
@@ -404,6 +454,9 @@ async def log_token_usage(
     billing_mode: Optional[str] = None,
     api_key_source: Optional[str] = None,
     pricing_source: Optional[str] = None,
+    operation_id: Optional[str] = None,
+    media_job_id: Optional[str] = None,
+    task_id: Optional[str] = None,
 ) -> TokenUsageLog:
     """Insert a new token usage log entry."""
     entry_id = generate_ulid()
@@ -412,12 +465,18 @@ async def log_token_usage(
     has_api_key_source = await _token_usage_has_column(db, "api_key_source")
     has_pricing_source = await _token_usage_has_column(db, "pricing_source")
     has_rounds = await _token_usage_has_column(db, "rounds")
+    has_operation_id = await _token_usage_has_column(db, "operation_id")
+    has_media_job_id = await _token_usage_has_column(db, "media_job_id")
+    has_task_id = await _token_usage_has_column(db, "task_id")
     if not (
         has_context_breakdown
         and has_billing_mode
         and has_api_key_source
         and has_pricing_source
         and has_rounds
+        and has_operation_id
+        and has_media_job_id
+        and has_task_id
     ):
         columns = [
             "id", "entity_id", "workspace_id", "agent_id", "user_id", "conversation_id",
@@ -462,11 +521,26 @@ async def log_token_usage(
         if has_context_breakdown:
             columns.append("context_breakdown")
             values.append(":context_breakdown")
-            params["context_breakdown"] = context_breakdown
+            # A raw-SQL JSON column takes the encoded text; a dict is refused by the driver.
+            params["context_breakdown"] = (
+                json.dumps(context_breakdown, default=str) if context_breakdown is not None else None
+            )
         if has_rounds:
             columns.append("rounds")
             values.append(":rounds")
             params["rounds"] = rounds
+        if has_operation_id:
+            columns.append("operation_id")
+            values.append(":operation_id")
+            params["operation_id"] = operation_id
+        if has_media_job_id:
+            columns.append("media_job_id")
+            values.append(":media_job_id")
+            params["media_job_id"] = media_job_id
+        if has_task_id:
+            columns.append("task_id")
+            values.append(":task_id")
+            params["task_id"] = task_id
         # Column and placeholder names come only from the fixed lists above.
         await db.execute(
             text(
@@ -496,6 +570,9 @@ async def log_token_usage(
             api_key_source=api_key_source if has_api_key_source else None,
             pricing_source=pricing_source if has_pricing_source else None,
             rounds=rounds if has_rounds else None,
+            operation_id=operation_id if has_operation_id else None,
+            media_job_id=media_job_id if has_media_job_id else None,
+            task_id=task_id if has_task_id else None,
         )
 
     entry_kwargs = {
@@ -525,6 +602,12 @@ async def log_token_usage(
         entry_kwargs["pricing_source"] = pricing_source
     if has_rounds:
         entry_kwargs["rounds"] = rounds
+    if has_operation_id:
+        entry_kwargs["operation_id"] = operation_id
+    if has_media_job_id:
+        entry_kwargs["media_job_id"] = media_job_id
+    if has_task_id:
+        entry_kwargs["task_id"] = task_id
     entry = TokenUsageLog(**entry_kwargs)
     db.add(entry)
     await db.flush()
@@ -645,6 +728,7 @@ async def record_llm_usage(
     operation_id: str | None = None,
     strict: bool = False,
     payer_entity_id: str | None = None,
+    task_id: str | None = None,
 ) -> None:
     """Record LLM usage in one call: token log + billing + AI budget.
 
@@ -657,10 +741,14 @@ async def record_llm_usage(
     and (optionally) ``provider`` — captured at auto-record time so
     fallback routing is visible in slice-by-provider reports.
 
+    ``task_id`` names the Task whose execution made the call; the bound
+    billing context's Task when omitted.
+
     Best-effort by default — failures are logged, never raised. Callers that
     need a durable provider settlement can use ``strict=True`` and commit the
     resulting transaction themselves.
     """
+    task_id = _billing_task_id(entity_id, task_id)
     prompt_tokens = int(usage.get("prompt_tokens") or usage.get("prompt") or 0)
     completion_tokens = int(usage.get("completion_tokens") or usage.get("completion") or 0)
     total_tokens = int(usage.get("total_tokens") or usage.get("total") or 0)
@@ -691,12 +779,6 @@ async def record_llm_usage(
         or usage.get("llm_api_key_source")
         or None
     )
-    reported_cost = None
-    try:
-        reported_cost = float(usage["cost_usd"]) if usage.get("cost_usd") else None
-    except Exception:
-        reported_cost = None
-    estimated_cost = reported_cost
     is_byok = _usage_is_byok(usage)
     billing_mode = str(
         usage.get("billing_mode")
@@ -708,25 +790,24 @@ async def record_llm_usage(
         or usage.get("llm_api_key_source")
         or ("byok" if is_byok else "platform")
     ).lower()
-    if estimated_cost is None and not is_byok:
-        try:
-            from packages.core.services.billing_service import estimate_provider_cost
-
-            estimated_cost = estimate_provider_cost(
-                prompt_tokens,
-                completion_tokens,
-                model_name,
-                pricing_source=str(pricing_source or ""),
-                provider=str(provider or ""),
-                cache_read_tokens=cache_read,
-                cache_creation_tokens=cache_creation,
-                audio_input_tokens=audio_in,
-                audio_output_tokens=audio_out,
-                cached_audio_input_tokens=cached_audio_in,
-            )
-        except Exception:
-            logger.debug("record_llm_usage: cost estimate failed", exc_info=True)
-            estimated_cost = None
+    # The provider cost this call is billed on (official tokens; see
+    # llm_call_cost_usd). BYOK rows keep the same figure as an estimate.
+    estimated_cost, _cost_basis = llm_call_cost_usd(
+        {
+            **usage,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "cache_read": cache_read,
+            "cache_creation": cache_creation,
+            "audio_in": audio_in,
+            "audio_out": audio_out,
+            "cached_audio_input_tokens": cached_audio_in,
+            "pricing_source": str(pricing_source or ""),
+            "provider": str(provider or ""),
+        },
+        model_name,
+    )
+    reported_cost = estimated_cost
 
     # 1. Token usage log row
     try:
@@ -746,7 +827,13 @@ async def record_llm_usage(
             duration_ms=duration_ms, rounds=rounds, source=source,
             billing_mode=billing_mode,
             api_key_source=api_key_source,
-            pricing_source=str(pricing_source or ""),
+            # A BYOK call no price source knows keeps no made-up estimate: its
+            # row says so, rather than carrying a default rate.
+            pricing_source=(
+                "byok_unpriced" if is_byok and estimated_cost is None else str(pricing_source or "")
+            ),
+            operation_id=operation_id,
+            task_id=task_id,
         )
     except Exception:
         logger.warning("record_llm_usage: token log failed", exc_info=True)
@@ -757,11 +844,11 @@ async def record_llm_usage(
     # 2. Credit billing (model-aware pricing)
     # BYOK (Bring Your Own Key): log usage for analytics but charge 0 credits
     try:
-        from packages.core.services.billing_service import (
-            record_token_usage as record_billing,
-            estimate_provider_cost,
-        )
-        payer = None if is_byok else await _ledger_payer_or_uncharged(
+        from packages.core.services.billing_service import record_token_usage as record_billing
+
+        # An unpriced call (no price and no reported cost) is logged above and
+        # warned about in llm_call_cost_usd; it is never charged a guessed rate.
+        payer = None if is_byok or reported_cost is None else await _ledger_payer_or_uncharged(
             db, writer="record_llm_usage", entity_id=entity_id, workspace_id=workspace_id,
             payer_entity_id=payer_entity_id, strict=strict, operation_id=operation_id,
         )
@@ -775,6 +862,7 @@ async def record_llm_usage(
                 agent_id=agent_id, user_id=user_id,
                 conversation_id=conversation_id,
                 operation_id=operation_id,
+                task_id=task_id,
                 cache_read_tokens=cache_read,
                 cache_creation_tokens=cache_creation,
                 audio_input_tokens=audio_in,
@@ -784,20 +872,7 @@ async def record_llm_usage(
                 business_type=source, duration_ms=duration_ms,
             )
             # 4. AI budget tracking (dollar-based metering for plan limits)
-            provider_cost = (
-                reported_cost
-                if reported_cost is not None
-                else estimate_provider_cost(
-                    prompt_tokens, completion_tokens, model_name,
-                    pricing_source=str(pricing_source or ""),
-                    provider=str(provider or ""),
-                    cache_read_tokens=cache_read,
-                    cache_creation_tokens=cache_creation,
-                    audio_input_tokens=audio_in,
-                    audio_output_tokens=audio_out,
-                    cached_audio_input_tokens=cached_audio_in,
-                )
-            )
+            provider_cost = reported_cost
             if workspace_id:
                 try:
                     from packages.core.budget import accumulate_workspace_ai_cost
@@ -853,8 +928,12 @@ async def record_chat_llm_usage(
     operation_id: str | None = None,
     strict: bool = False,
     payer_entity_id: str | None = None,
+    source: str | None = None,
 ) -> None:
-    """Best-effort chat LLM usage persistence with chat-specific metadata."""
+    """Best-effort chat LLM usage persistence with chat-specific metadata.
+
+    ``source`` labels the row; chat when omitted.
+    """
 
     if not db or not entity_id:
         return
@@ -890,7 +969,7 @@ async def record_chat_llm_usage(
             usage=usage,
             duration_ms=duration_ms or 0,
             rounds=rounds,
-            source=RUNTIME_CHAT_SOURCE,
+            source=source or RUNTIME_CHAT_SOURCE,
             operation_id=operation_id,
             strict=strict,
             payer_entity_id=payer_entity_id,
@@ -914,8 +993,13 @@ async def settle_chat_llm_call_usage(
     duration_ms: int,
     consumed_credits: int | None = None,
     payer_entity_id: str | None = None,
+    source: str | None = None,
+    operation_id: str | None = None,
 ) -> bool:
     """Write one completed chat LLM call and consume its durable reservation.
+
+    ``source`` and ``operation_id`` label the row; chat and the call's own
+    source id when omitted.
 
     The charge goes to the reservation's entity, the payer pinned when the
     call was reserved, even if the Workspace's payer changed since.
@@ -946,7 +1030,8 @@ async def settle_chat_llm_call_usage(
             conversation_id=conversation_id,
             usage={**usage, "byok": True, "billing_mode": "byok", "api_key_source": "byok"},
             duration_ms=duration_ms,
-            operation_id=source_id,
+            operation_id=operation_id or source_id,
+            source=source,
             strict=True,
             payer_entity_id=entity_id,
         )
@@ -1034,7 +1119,8 @@ async def settle_chat_llm_call_usage(
         conversation_id=conversation_id,
         usage=usage,
         duration_ms=duration_ms,
-        operation_id=source_id,
+        operation_id=operation_id or source_id,
+        source=source,
         strict=True,
         payer_entity_id=reservation.entity_id if reservation is not None else payer_entity_id,
     )
@@ -1103,13 +1189,155 @@ async def record_tool_call(
 
 # ── Media usage (image / video / audio / embedding) ─────────────────
 
+async def _record_byok_media_usage(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    kind: str,
+    model: str,
+    source: str,
+    workspace_id: Optional[str],
+    user_id: Optional[str],
+    agent_id: Optional[str],
+    conversation_id: Optional[str],
+    duration_ms: Optional[int],
+    operation_id: Optional[str],
+    prompt_tokens: int,
+    completion_tokens: int,
+    strict: bool,
+    media_job_id: Optional[str] = None,
+    pricing_source: Optional[str] = None,
+    estimate_usd: Optional[float] = None,
+    task_id: Optional[str] = None,
+) -> None:
+    """Write the ``token_usage_logs`` row for a media call on the user's key.
+
+    No credit row and no budget movement: the provider bills the user. The
+    row keeps the call's model, source, run and any provider token counts so
+    BYOK work stays visible next to platform work. ``estimate_usd`` is the
+    approximate cost of those tokens, stored on the row only.
+    """
+    prompt = int(prompt_tokens or 0)
+    completion = int(completion_tokens or 0)
+    try:
+        await log_token_usage(
+            db,
+            entity_id,
+            model=model,
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            total_tokens=prompt + completion,
+            cost_usd=estimate_usd,
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            duration_ms=int(duration_ms) if duration_ms else None,
+            source=source,
+            billing_mode="byok",
+            api_key_source="byok",
+            operation_id=operation_id,
+            media_job_id=media_job_id,
+            pricing_source=pricing_source,
+            task_id=task_id,
+        )
+    except Exception:
+        logger.warning("record_media_usage: byok token log failed kind=%s", kind, exc_info=True)
+        if strict:
+            raise
+
+
+def media_cost_credits(cost_usd: float) -> int:
+    """Credits a platform media call costs; at least one credit for a call with cost."""
+    from packages.core.services.billing_service import AI_MARGIN, CREDITS_PER_USD
+    from packages.core.services.model_pricing_gateway import cost_to_credits
+
+    return max(
+        1,
+        cost_to_credits(
+            float(cost_usd),
+            credits_per_usd=CREDITS_PER_USD,
+            ai_margin=AI_MARGIN,
+        ),
+    )
+
+
+async def record_media_call_unknown_cost(
+    db: AsyncSession,
+    entity_id: str,
+    *,
+    kind: str,
+    model: str,
+    media_job_id: Optional[str] = None,
+    operation_id: Optional[str] = None,
+    workspace_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    units: Optional[int] = None,
+    payer_entity_id: Optional[str] = None,
+    pricing_source: str = "unknown",
+    strict: bool = False,
+    task_id: Optional[str] = None,
+) -> bool:
+    """Log a platform media call that has no known cost, and charge nothing.
+
+    ``pricing_source`` says why: ``unknown`` for a failed gateway request with no
+    reported cost, ``unpriced`` for a completed call whose model has no price.
+    The row keeps the call's run, media job and model with ``cost_usd`` NULL and
+    no credits, and no budget moves. The media job holds the generation id to
+    reconcile against the gateway's billing later. Like ``record_media_usage``,
+    an omitted ``operation_id`` is the bound billing context's run.
+    """
+    if operation_id is None:
+        from packages.core.ai.runtime.billing import runtime_current_billing_operation_id
+
+        operation_id = runtime_current_billing_operation_id(entity_id)
+    task_id = _billing_task_id(entity_id, task_id)
+    try:
+        from packages.core.models.billing import CreditUsageLog
+        payer = await _ledger_payer_or_uncharged(
+            db, writer="record_media_call_unknown_cost", entity_id=entity_id, workspace_id=workspace_id,
+            payer_entity_id=payer_entity_id, strict=strict,
+        )
+        if payer is None:
+            return False
+        db.add(CreditUsageLog(
+            id=generate_ulid(),
+            entity_id=payer,
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            operation_id=operation_id,
+            input_tokens=0, output_tokens=0,
+            total_tokens=int(units or 0),
+            input_credit=0, output_credit=0,
+            direct_credit=0, total_credit=0,
+            model=model,
+            cost_usd=None,
+            business_type=kind,
+            duration_ms=0,
+            media_job_id=media_job_id,
+            pricing_source=pricing_source,
+            task_id=task_id,
+        ))
+        await db.flush()
+        return True
+    except Exception:
+        logger.warning("record_media_call_unknown_cost: log failed kind=%s", kind, exc_info=True)
+        if strict:
+            raise
+        return False
+
+
 async def record_media_usage(
     db: AsyncSession,
     entity_id: str,
     *,
     kind: str,
     model: str,
-    cost_usd: float,
+    cost_usd: Optional[float],
     units: Optional[int] = None,
     workspace_id: Optional[str] = None,
     user_id: Optional[str] = None,
@@ -1120,6 +1348,13 @@ async def record_media_usage(
     byok: bool = False,
     strict: bool = False,
     payer_entity_id: Optional[str] = None,
+    operation_id: Optional[str] = None,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    media_job_id: Optional[str] = None,
+    pricing_source: Optional[str] = None,
+    byok_estimate_usd: Optional[float] = None,
+    task_id: Optional[str] = None,
 ) -> bool:
     """Record a non-token-based LLM-style call (image / video / TTS /
     Whisper / embedding).
@@ -1136,6 +1371,25 @@ async def record_media_usage(
     count) — written into the log row for analytics but not billed
     again here.
 
+    ``operation_id`` names the run that made the call. When omitted, the
+    bound billing context's run id is used if it belongs to ``entity_id``,
+    so a tool call inside a Workflow run is tied to that run. A media job
+    passes its owning run here and its own id as ``media_job_id``.
+
+    ``prompt_tokens`` / ``completion_tokens`` are the provider's token counts
+    when it reported them (or the estimate's), stored on the log row.
+    ``pricing_source`` says where ``cost_usd`` came from: ``official_tokens``
+    (the provider's output tokens at the model's token price), ``estimated``
+    (the list price for the clip's duration), or ``unknown``.
+
+    BYOK calls (the user's own key) charge nothing. They still get one
+    ``token_usage_logs`` row with ``billing_mode='byok'`` and any
+    provider-reported ``prompt_tokens`` / ``completion_tokens``, so every
+    provider call leaves a record. ``byok_estimate_usd`` is the approximate
+    cost of those tokens, kept on that row for reporting; it is never charged,
+    since the user pays the provider directly. A BYOK caller that passes no
+    estimate writes no cost.
+
     Caller MUST commit. Failure is logged but not raised by default. Durable
     reservation settlement can pass ``strict=True`` so a caller-owned rollback
     keeps the ledger, workspace budget state, and threshold alert atomic.
@@ -1143,24 +1397,39 @@ async def record_media_usage(
     The charge, counters and AI budget go to the payer (``payer_entity_id``,
     or the Workspace's current payer when omitted).
     """
+    if operation_id is None:
+        from packages.core.ai.runtime.billing import runtime_current_billing_operation_id
+
+        operation_id = runtime_current_billing_operation_id(entity_id)
+    task_id = _billing_task_id(entity_id, task_id)
+
+    if byok:
+        await _record_byok_media_usage(
+            db,
+            entity_id=entity_id,
+            kind=kind,
+            model=model,
+            source=source,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            duration_ms=duration_ms,
+            operation_id=operation_id,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            strict=strict,
+            media_job_id=media_job_id,
+            pricing_source=pricing_source,
+            estimate_usd=byok_estimate_usd,
+            task_id=task_id,
+        )
+        return False
+
     if cost_usd is None or cost_usd <= 0:
         return False
 
-    # BYOK: log for analytics but skip credit billing and budget tracking
-    if byok:
-        return False
-
-    from packages.core.services.billing_service import AI_MARGIN, CREDITS_PER_USD
-    from packages.core.services.model_pricing_gateway import cost_to_credits
-
-    credits = max(
-        1,
-        cost_to_credits(
-            float(cost_usd),
-            credits_per_usd=CREDITS_PER_USD,
-            ai_margin=AI_MARGIN,
-        ),
-    )
+    credits = media_cost_credits(float(cost_usd))
 
     # 1. credit_usage_logs row (analytics + audit)
     try:
@@ -1178,7 +1447,8 @@ async def record_media_usage(
             agent_id=agent_id,
             conversation_id=conversation_id,
             user_id=user_id,
-            input_tokens=0, output_tokens=0,
+            operation_id=operation_id,
+            input_tokens=int(prompt_tokens or 0), output_tokens=int(completion_tokens or 0),
             total_tokens=int(units or 0),  # repurpose for unit count
             input_credit=0, output_credit=0,
             direct_credit=int(credits),
@@ -1187,6 +1457,9 @@ async def record_media_usage(
             cost_usd=float(cost_usd),
             business_type=kind,
             duration_ms=int(duration_ms or 0),
+            media_job_id=media_job_id,
+            pricing_source=pricing_source,
+            task_id=task_id,
         )
         db.add(row)
         await db.flush()

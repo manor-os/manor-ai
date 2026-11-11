@@ -272,7 +272,7 @@ def _driver_fields(
     initiative: AgentInitiative,
     subscription: AgentSubscription,
 ) -> dict[str, Any]:
-    trigger, condition, decision, delivery, interruption = initiative_contracts(initiative)
+    trigger, _condition, _decision, delivery, _interruption = initiative_contracts(initiative)
     schedule_kind = {
         "cron": "cron",
         "interval": "every",
@@ -311,12 +311,9 @@ def _driver_fields(
                 "notify_user",
             ],
         },
-        "execution_script": initiative_execution_script(
-            initiative,
-            condition=condition,
-            decision=decision,
-            interruption=interruption,
-        ),
+        # The scheduler renders the prompt from the admitted Initiative on
+        # every run; a stored copy goes stale when the template changes.
+        "execution_script": None,
         "workspace_id": subscription.workspace_id,
         "conversation_id": delivery.surface.conversation_id,
         "default_delivery_mode": None,
@@ -410,6 +407,8 @@ async def _sync_driver(
         )
         job.agent_initiative_id = initiative.id
         job.enabled = fields["enabled"]
+        # The Initiative owns this driver's switch, not Workspace activation.
+        job.workspace_hold = False
         job.delete_after_run = fields["delete_after_run"]
         from packages.core.schedule_clock import refresh_scheduled_job_next_run_at
 

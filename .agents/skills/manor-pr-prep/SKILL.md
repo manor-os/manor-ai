@@ -36,6 +36,7 @@ obsolete coverage retired. Test count is not a completion criterion.
 
 If a check cannot run because dependencies are absent, say that directly and provide the blocker.
 
+
 ## PR body guidance
 
 Use the template:

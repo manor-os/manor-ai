@@ -412,39 +412,66 @@ type MarkdownNode = {
   type: string;
   url?: string;
   identifier?: string;
+  alt?: string | null;
+  value?: string;
   children?: MarkdownNode[];
 };
 
-/** Collect only links the same CommonMark/GFM syntax used by ChatMarkdown renders. */
-function renderedMarkdownLinkDestinations(source: string): string[] {
+type MarkdownDestination = { url: string; label: string };
+
+function markdownNodeText(node: MarkdownNode): string {
+  if (node.type === "text" || node.type === "inlineCode") return node.value || "";
+  if (node.type === "image" || node.type === "imageReference") return node.alt || "";
+  return (node.children || []).map(markdownNodeText).join("");
+}
+
+/**
+ * Collect only links (and images: ``![name](/viewer/<id>)`` names a file just
+ * the same) the same CommonMark/GFM syntax used by ChatMarkdown renders.
+ */
+function renderedMarkdownLinkDestinations(source: string): MarkdownDestination[] {
   const root = fromMarkdown(source, {
     extensions: [gfm()],
     mdastExtensions: [gfmFromMarkdown()],
   }) as MarkdownNode;
   const definitions = new Map<string, string>();
-  const referenceIdentifiers: string[] = [];
-  const destinations: string[] = [];
+  const references: Array<{ identifier: string; label: string }> = [];
+  const destinations: MarkdownDestination[] = [];
 
   const visit = (node: MarkdownNode) => {
     if (node.type === "definition" && node.identifier && node.url) {
       if (!definitions.has(node.identifier)) definitions.set(node.identifier, node.url);
-    } else if (node.type === "link" && node.url) {
-      destinations.push(node.url);
+    } else if ((node.type === "link" || node.type === "image") && node.url) {
+      destinations.push({ url: node.url, label: markdownNodeText(node) });
     } else if (
-      node.type === "linkReference"
+      (node.type === "linkReference" || node.type === "imageReference")
       && node.identifier
     ) {
-      referenceIdentifiers.push(node.identifier);
+      references.push({ identifier: node.identifier, label: markdownNodeText(node) });
     }
     node.children?.forEach(visit);
   };
 
   visit(root);
-  referenceIdentifiers.forEach((identifier) => {
-    const destination = definitions.get(identifier);
-    if (destination) destinations.push(destination);
+  references.forEach(({ identifier, label }) => {
+    const url = definitions.get(identifier);
+    if (url) destinations.push({ url, label });
   });
   return destinations;
+}
+
+const FILE_NAME_WITH_EXTENSION = /\.[a-z0-9]{1,8}$/i;
+
+/**
+ * The file name a Markdown link to a Manor file stands for: its text when that
+ * is a file name, else the last segment of a storage path. Empty for anything
+ * that is not a Manor file (another site's page, a route).
+ */
+function linkedDocumentFileName(destination: MarkdownDestination, aliases: string[]): string {
+  // Only a document link lacks a path to compare; a path link is matched exactly by its path.
+  if (!aliases.some((alias) => alias.startsWith("document:")) || aliases.some((alias) => alias.startsWith("fs:"))) return "";
+  const label = destination.label.trim();
+  return FILE_NAME_WITH_EXTENSION.test(label) ? label : "";
 }
 
 function normalizedLinkedDestination(value: string): string {
@@ -519,6 +546,8 @@ export function filterGeneratedFileRecordsAlreadyLinkedInMarkdown<T>(
 ): T[] {
   if (!records.length) return records;
   const linkedAliases = new Set<string>();
+  // File names the Markdown links by document id only (no path to compare).
+  const linkedNames = new Set<string>();
   const source = typeof content === "string" ? content : "";
   if (!source) return records;
   const linkedSource = linkifyFileReferencesInMarkdown(
@@ -526,13 +555,31 @@ export function filterGeneratedFileRecordsAlreadyLinkedInMarkdown<T>(
   );
   const destinations = renderedMarkdownLinkDestinations(linkedSource);
   for (const destination of destinations) {
-    linkedDestinationAliases(destination).forEach((alias) => linkedAliases.add(alias));
+    const aliases = linkedDestinationAliases(destination.url);
+    aliases.forEach((alias) => linkedAliases.add(alias));
+    const name = linkedDocumentFileName(destination, aliases);
+    if (name) linkedNames.add(name);
   }
   if (!linkedAliases.size) return records;
 
-  return records.filter((record) => {
-    const aliases = generatedFileLinkAliases(record);
-    return !aliases.some((alias) => linkedAliases.has(alias));
+  const recordAliases = records.map((record) => generatedFileLinkAliases(record));
+  // The same file under another address: the reply links /viewer/<document id>
+  // while the attachment carries only its storage path. Within one message the
+  // file name joins them, when exactly one path-only record has that name.
+  const pathOnlyName = (index: number) => {
+    if (recordAliases[index].some((alias) => alias.startsWith("document:"))) return "";
+    const record = records[index] as GeneratedFileRecord;
+    return String(record.name || record.title || "").trim();
+  };
+  const nameCounts = new Map<string, number>();
+  records.forEach((_, index) => {
+    const name = pathOnlyName(index);
+    if (name && linkedNames.has(name)) nameCounts.set(name, (nameCounts.get(name) || 0) + 1);
+  });
+  return records.filter((_, index) => {
+    if (recordAliases[index].some((alias) => linkedAliases.has(alias))) return false;
+    const name = pathOnlyName(index);
+    return !(name && nameCounts.get(name) === 1);
   });
 }
 

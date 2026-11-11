@@ -84,7 +84,11 @@ function detailItem(
 // like a soft preference but is a hard block: the agent never publishes.
 function ruleEnforcementCopy(rule: any): string {
   const ruleType = String(rule?.rule_type || "").trim().toLowerCase();
-  const enforceable = asList(rule?.approval_selectors).length > 0;
+  // Same source the server compiles: typed selectors, or else the rule's
+  // action patterns (approval_projection.py).
+  const enforceable = asList(
+    rule?.approval_selectors != null ? rule.approval_selectors : rule?.action_patterns,
+  ).length > 0;
   if (!ruleType || ruleType === "notice" || !enforceable) {
     return t("page.workspace_draft_chat.value.enforcement_guidance");
   }
@@ -575,19 +579,7 @@ export default function WorkspaceDraftConfigurationPanel({
   }
 
   const finalized = draft.status === "finalized";
-  const statusLabel = draft.status === "ready"
-    ? t("page.workspace_draft_chat.value.ready")
-    : draft.status === "finalized"
-      ? t("page.workspace_draft_chat.value.created")
-      : draft.status === "abandoned"
-        ? t("page.workspace_draft_chat.value.abandoned")
-        : t("page.workspace_draft_chat.value.drafting");
   const editable = draft.status === "active" || draft.status === "ready";
-  const statusDescription = draft.status === "abandoned"
-    ? t("page.workspace_draft_chat.draft_saved")
-    : draft.ready
-      ? t("page.workspace_draft_chat.workspace_ready")
-      : t("page.workspace_draft_chat.keep_chatting_until_ready");
   const busy = creating || updating || settledRefreshRequired || query.isFetching || operation !== null || applyMutation.isPending || autonomyMutation.isPending || personalizationMutation.isPending || channelMutation.isPending || finalizeMutation.isPending;
   const applyBlueprint = async (blueprintId: string) => {
     if (!editable || busy || operationRef.current) return;
@@ -630,8 +622,14 @@ export default function WorkspaceDraftConfigurationPanel({
       <div className="workspace-draft-panel__body" ref={panelBodyRef}>
         <header className="workspace-draft-panel__header">
           <div>
-            <span className="workspace-draft-eyebrow">{statusLabel}</span>
             <h2>{view.fields.name || t("page.workspace_draft_chat.identity")}</h2>
+            {draft.status === "abandoned" && (
+              <p className="workspace-draft-abandoned">
+                <span>{t("page.workspace_draft_chat.value.abandoned")}</span>
+                {" · "}
+                <span>{t("page.workspace_draft_chat.draft_saved")}</span>
+              </p>
+            )}
             <p>{view.fields.operating_context || view.fields.initial_brief || t("page.workspace_draft_chat.tell_me_what_you_re_building_i_ll_fill_these_in")}</p>
           </div>
           <div
@@ -647,45 +645,19 @@ export default function WorkspaceDraftConfigurationPanel({
           </div>
         </header>
 
-        <div className="workspace-draft-statusline">
-          <span
-            className={`workspace-draft-statusdot workspace-draft-statusdot--${draft.status}`}
-            aria-hidden="true"
-          />
-          <span>{statusLabel}</span>
-          <span>·</span>
-          <span>{statusDescription}</span>
-        </div>
 
         <div className="workspace-draft-details">
           <section>
             <span>{t("page.workspace_draft_chat.field.workspace_type")}</span>
-            <strong>{humanize(view.fields.kind) || "—"}</strong>
+            {(humanize(view.fields.kind)) ? <strong>{humanize(view.fields.kind)}</strong> : <span className="workspace-draft-empty">—</span>}
           </section>
           <section>
             <span>{t("page.workspace_draft_chat.field.how_it_will_be_used")}</span>
-            <strong>{view.fields.operating_context || "—"}</strong>
+            {(view.fields.operating_context) ? <strong>{view.fields.operating_context}</strong> : <span className="workspace-draft-empty">—</span>}
           </section>
           <section>
             <span>{t("page.workspace_draft_chat.field.main_work")}</span>
-            <strong>{view.fields.primary_work || "—"}</strong>
-          </section>
-          <section className="workspace-draft-runtime">
-            <div className="workspace-draft-runtime__copy">
-              <span>{t("page.workspace_draft_chat.runtime_mode")}</span>
-              <strong>
-                {view.autonomousEnabled
-                  ? t("page.workspace_draft_chat.runtime_automatic")
-                  : t("page.workspace_draft_chat.runtime_manual")}
-              </strong>
-              <small>{t("page.workspace_draft_chat.runtime_mode_desc")}</small>
-            </div>
-            <Toggle
-              checked={view.autonomousEnabled}
-              disabled={!editable || busy}
-              aria-label={t("page.workspace_draft_chat.runtime_mode")}
-              onChange={() => autonomyMutation.mutate(!view.autonomousEnabled)}
-            />
+            {(view.fields.primary_work) ? <strong>{view.fields.primary_work}</strong> : <span className="workspace-draft-empty">—</span>}
           </section>
           <section>
             <span>{t("page.workspace_draft_chat.field.services_to_run")}</span>
@@ -716,14 +688,6 @@ export default function WorkspaceDraftConfigurationPanel({
                 />
               </div>
             ))}
-          </section>
-          <section>
-            <span>{t("page.workspace_draft_chat.field.budget")}</span>
-            <DetailList values={view.budgetDetails} />
-          </section>
-          <section>
-            <span>{t("page.workspace_draft_chat.field.evaluation")}</span>
-            <DetailList values={view.evaluationDetails} />
           </section>
           {view.goals.length > 0 && <section>
             <span>{t("page.workspace_draft_chat.field.goals")}</span>
@@ -799,13 +763,37 @@ export default function WorkspaceDraftConfigurationPanel({
               </Button>
             </div>
           </section>}
+          <details className="workspace-draft-more">
+            <summary>{t("page.workspace_draft_chat.more_settings")}</summary>
+          <section className="workspace-draft-runtime">
+            <div className="workspace-draft-runtime__copy">
+              <span>{t("page.workspace_draft_chat.runtime_mode")}</span>
+              <strong>
+                {view.autonomousEnabled
+                  ? t("page.workspace_draft_chat.runtime_automatic")
+                  : t("page.workspace_draft_chat.runtime_manual")}
+              </strong>
+              <small>{t("page.workspace_draft_chat.runtime_mode_desc")}</small>
+            </div>
+            <Toggle
+              checked={view.autonomousEnabled}
+              disabled={!editable || busy}
+              aria-label={t("page.workspace_draft_chat.runtime_mode")}
+              onChange={() => autonomyMutation.mutate(!view.autonomousEnabled)}
+            />
+          </section>
+          <section>
+            <span>{t("page.workspace_draft_chat.field.budget")}</span>
+            <DetailList values={view.budgetDetails} />
+          </section>
+          <section>
+            <span>{t("page.workspace_draft_chat.field.evaluation")}</span>
+            <DetailList values={view.evaluationDetails} />
+          </section>
+          </details>
           {view.notes && <section>
             <span>{t("page.workspace_draft_chat.field.notes")}</span>
             <strong>{view.notes}</strong>
-          </section>}
-          {!finalized && draft.missing.length > 0 && <section>
-            <span>{t("page.workspace_draft_chat.still_needed")}</span>
-            <Tags values={draft.missing.map(humanize)} />
           </section>}
         </div>
 
@@ -829,7 +817,8 @@ export default function WorkspaceDraftConfigurationPanel({
         )}
       </div>
 
-      {(finalized || editable) && <footer className="workspace-draft-panel__footer">
+      {/* The action appears once there is something to create; until then, Manor is asking. */}
+      {(finalized || (editable && draft.ready)) && <footer className="workspace-draft-panel__footer">
         {finalized ? (
           <Button size="lg" variant="primary" onClick={() => navigate(`/workspaces/${draft.finalized_workspace_id}`)}>
             {t("page.blueprint_detail.open_workspace")}
@@ -843,10 +832,9 @@ export default function WorkspaceDraftConfigurationPanel({
             ariaBusy={busy}
             onClick={createWorkspace}
           >
-            {draft.ready ? t("page.workspaces.create_workspace") : t("page.workspace_draft_chat.keep_chatting_until_ready")}
+            {t("page.workspaces.create_workspace")}
           </Button>
         )}
-        {editable && <p>{t("page.workspace_draft_chat.resume_from_workspaces_page_anytime")}</p>}
       </footer>}
     </section>
   );

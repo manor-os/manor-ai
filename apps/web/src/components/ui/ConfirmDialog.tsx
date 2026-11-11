@@ -1,3 +1,4 @@
+import { t } from "../../lib/i18n";
 import Modal from "./Modal";
 import Button from "./Button";
 
@@ -22,8 +23,8 @@ export default function ConfirmDialog({
   onConfirm,
   title,
   message,
-  confirmLabel = "Confirm",
-  cancelLabel = "Cancel",
+  confirmLabel = t("action.confirm"),
+  cancelLabel = t("action.cancel"),
   danger = false,
   loading = false,
   closeOnConfirm = true,

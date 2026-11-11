@@ -93,14 +93,16 @@ def _summary(payload: dict) -> dict:
 
 async def export_blueprint(ctx: ToolContext, args: dict) -> Any:
     ws_id = require(args, "workspace_id")
-    if args.get("format") == "package":
+    source = args.get("format") == "source"
+    if args.get("format") == "package" or source:
         data, _content_type = await ctx.api.download(
             f"{_WS}/{ws_id}/export-blueprint-package", method="POST", json_body=args.get("export_options") or {},
+            layout="source" if source else "package",
         )
         if len(data) > transfers.MAX_TRANSFER_BYTES:
             raise ToolError("the package is larger than a transfer slot; export it from the Workspace page instead")
         payload, assets = _package_payload(data)
-        filename = args.get("filename") or "blueprint.manor"
+        filename = args.get("filename") or ("blueprint" if source else "blueprint.manor")
         content_type = "application/gzip"
     else:
         payload, assets = await _export(ctx, ws_id, args.get("export_options")), []
@@ -112,16 +114,31 @@ async def export_blueprint(ctx: ToolContext, args: dict) -> Any:
         filename=filename, content_type=content_type, data=data,
     )
     url = ctx.transfer_url(slot.id)
+    command = f"curl -sS --fail -o {_shell_quote(filename)} {_shell_quote(url)}"
+    if source:
+        # Replace the directory only once the download succeeded, so removed
+        # components leave no stale files; git shows what changed.
+        folder, archive = _shell_quote(filename), _shell_quote(f"{filename}.manor.tmp")
+        command = (
+            f"curl -sS --fail -o {archive} {_shell_quote(url)} && rm -rf {folder} && mkdir -p {folder} "
+            f"&& tar -xzf {archive} -C {folder} && rm {archive}"
+        )
     return {
         "download_url": url,
-        "command": f"curl -sS --fail -o {_shell_quote(filename)} {_shell_quote(url)}",
+        "command": command,
         "bytes": len(data),
         "sha256": hashlib.sha256(data).hexdigest(),
         "expires_in_seconds": transfers.TRANSFER_TTL_SECONDS,
         "summary": _summary(payload),
         "assets": [{"name": asset.name, "size": len(asset.data), "mime_type": asset.mime_type} for asset in assets],
-        "note": "The export already passed the portable payload validator. Commit the file; "
-                "re-export after every live change rather than hand-editing behaviour.",
+        "note": (
+            "A source tree: one file per component, long text as .md. Commit the folder; to install, "
+            f"validate or publish it, pack it with `tar -czf blueprint.manor -C {filename} .` and send that "
+            "with create_upload."
+            if source else
+            "The export already passed the portable payload validator. Commit the file; "
+            "re-export after every live change rather than hand-editing behaviour."
+        ),
     }
 
 
@@ -242,6 +259,9 @@ async def preview_workspace_upgrade(ctx: ToolContext, args: dict) -> Any:
 
 async def apply_workspace_upgrade(ctx: ToolContext, args: dict) -> Any:
     ws_id = require(args, "workspace_id")
+    if args.get("recommended"):
+        body = {key: args[key] for key in ("target_version",) if args.get(key)}
+        return await ctx.api.post(f"{_WS}/{ws_id}/blueprint/upgrade/v3/recommended", body)
     body = {
         "expected_blueprint_fingerprint": require(args, "expected_blueprint_fingerprint"),
         "expected_plan_fingerprint": require(args, "expected_plan_fingerprint"),
@@ -255,10 +275,25 @@ async def revert_workspace_upgrade(ctx: ToolContext, args: dict) -> Any:
     return await ctx.api.post(f"{_WS}/{require(args, 'workspace_id')}/blueprint/revert", {})
 
 
+async def publish_workspace_release(ctx: ToolContext, args: dict) -> Any:
+    ws_id = require(args, "workspace_id")
+    data = await _uploaded_bytes(ctx, require(args, "upload_id"))
+    form = {key: (None, "true" if args.get(key) else "false") for key in ("dry_run", "adopt")}
+    if args.get("release_notes"):
+        form["release_notes"] = (None, args["release_notes"])
+    return await ctx.api.request(
+        "POST", f"{_WS}/{ws_id}/blueprint/releases",
+        files={"file": ("blueprint", data, "application/octet-stream"), **form},
+    )
+
+
 _EXPORT_OPTIONS = obj(
     "ExportBlueprintPayloadRequest options: title, summary, description, usage_guide, tags, "
     "install_variables, include_* toggles (all default true), knowledge_pack_mode "
-    "(skeleton | inline_text), knowledge_document_ids.",
+    "(skeleton | inline_text), knowledge_document_ids, align_to_installed_release (default true: "
+    "a Workspace installed from a release exports in that release's order, keeps its listing copy "
+    "and channel requirements it never connected, and takes its title unless one is given, so a "
+    "file in git changes only where the Workspace did).",
 )
 _UPLOAD_ID = string("upload_id of a payload (.json) or package (.manor) sent with create_upload.")
 _SIDE = {
@@ -293,8 +328,13 @@ _UPGRADE_TOOLS = [
          "configuration_resolutions entry {key, resolution: keep_yours | use_blueprint} for every item "
          "whose action is not unchanged or customized (customized defaults to keep_yours). Changes the "
          "Workspace's agents, Skills, Flows and configuration; refused if anything changed since the "
-         "preview or a run is open. Get the user's decision on each conflict first. One step can be "
-         "undone with revert_workspace_upgrade.",
+         "preview or a run is open. Get the user's decision on each conflict first. "
+         "recommended=true is the one-step update instead (no fingerprints or resolutions): every "
+         "author change is taken and every edit the Workspace made itself is kept; a 409 "
+         "upgrade_needs_review names what needs a person (active_runs, setup, variables). It also "
+         "closes the update card the Workspace chat shows. One step can be undone with "
+         "revert_workspace_upgrade. A reviewed update also refreshes the installed usage "
+         "guide; undo restores the prior guide and refuses to overwrite later guide edits.",
          apply_workspace_upgrade,
          properties={"workspace_id": string("Installed Workspace."), "target_version": _TARGET_VERSION,
                      "expected_blueprint_fingerprint": string("blueprint_fingerprint from the preview."),
@@ -304,15 +344,33 @@ _UPGRADE_TOOLS = [
                          "items": {"type": "object", "required": ["key", "resolution"], "properties": {
                              "key": string("Item key from the preview."),
                              "resolution": {"enum": ["keep_yours", "use_blueprint"]}}}},
+                     "recommended": boolean("Update in one step with the default choices; ignores the "
+                                            "fingerprints and resolutions.", False),
                      **_UPGRADE_INPUTS},
-         required=("workspace_id", "expected_blueprint_fingerprint", "expected_plan_fingerprint"),
-         destructive=True),
+         required=("workspace_id",), destructive=True),
     Tool("revert_workspace_upgrade", "Undo Workspace upgrade",
          "Put back what the most recent upgrade changed. Refused once the Workspace has been changed "
          "since that upgrade. To return to an older release later, preview it with target_version instead.",
          revert_workspace_upgrade,
          properties={"workspace_id": string("Installed Workspace.")},
          required=("workspace_id",), destructive=True),
+    Tool("publish_workspace_release", "Publish Workspace release",
+         "Make a Blueprint file built in any environment (a .manor package or payload exported from "
+         "local, staging or git) the next release of this Workspace's own package. Nothing in the "
+         "Workspace changes: it then shows the update, which preview_workspace_upgrade / "
+         "apply_workspace_upgrade take through the normal review. The version moves only when "
+         "installable content changed. A Workspace with no package yet (built by hand or installed "
+         "before packages) needs adopt=true: its components are matched to the file's and its current "
+         "content becomes the merge base. dry_run=true returns the version step, reasons and, for an "
+         "adoption, which components matched; run it first and show the user. A Workspace installed "
+         "from a Marketplace listing or client delivery updates from there instead.",
+         publish_workspace_release,
+         properties={"workspace_id": string("Workspace to receive the release."), "upload_id": _UPLOAD_ID,
+                     "release_notes": string("What changed, shown with the update."),
+                     "dry_run": boolean("Report the release and matches; write nothing.", False),
+                     "adopt": boolean("Give a Workspace with no package this one.", False)},
+         # Records a release and, with adopt, links the Workspace; its content is unchanged.
+         required=("workspace_id", "upload_id"), destructive=True, idempotent=True),
 ]
 
 TOOLS = [
@@ -333,14 +391,18 @@ TOOLS = [
          "format=package exports a .manor file that also carries the Workspace's own files its App "
          "and Skills point at (uploaded covers, motion covers, choice pictures and samples, Skill "
          "scripts and templates), so another account sees the same App; Knowledge files and run "
-         "data never travel.",
+         "data never travel. format=source is the same package as a folder for git — one file per "
+         "Workflow, Skill and Agent, prompts and other long text as .md — so people editing different "
+         "components or paragraphs merge cleanly; the command replaces the folder. Every tool that takes "
+         "an upload reads a packed folder (tar -czf blueprint.manor -C <folder> .).",
          export_blueprint,
          properties={"workspace_id": string("Workspace to export."),
                      "export_options": _EXPORT_OPTIONS,
-                     "format": {"enum": ["json", "package"], "default": "json",
-                                "description": "json (a payload) or package (.manor with its files)."},
-                     "filename": string("Local file name for the curl command; default blueprint.json "
-                                        "or blueprint.manor.")},
+                     "format": {"enum": ["json", "package", "source"], "default": "json",
+                                "description": "json (a payload), package (.manor with its files) or "
+                                               "source (that package as a folder for git)."},
+                     "filename": string("Local file or, for source, folder name for the command; default "
+                                        "blueprint.json, blueprint.manor or blueprint.")},
          required=("workspace_id",), read_only=True),
     Tool("validate_blueprint", "Validate Blueprint",
          "Validate an uploaded Blueprint payload or .manor package: portable-payload rules, cross-section invariants, "
@@ -356,7 +418,7 @@ TOOLS = [
          "package (its files are stored in this team first), or from "
          "source_workspace_id (a verified same-account round trip). mode=simulate (default) "
          "builds a sandboxed simulation Workspace; live creates a working one and may start "
-         "configured automations that modify data, send messages, or call external services. "
+         "configured automations that modify data, send messages, or call external services. Missing integrations stay declared and the Workspace asks its installer to connect them before that work runs. "
          "preflight_only=true reports setup requirements without installing.",
          install_blueprint,
          properties={"upload_id": _UPLOAD_ID,

@@ -179,16 +179,16 @@ export function formatInitiativeSchedule(trigger?: AgentInitiativeTrigger | null
 
 export function initiativeStatusPresentation(status: string): { label: string; color: string; alert: boolean } {
   const presentations: Record<string, { key: string; color: string; alert?: boolean }> = {
-    draft: { key: "page.agent_initiative.status_draft", color: "#78716c" },
+    draft: { key: "page.agent_initiative.status_draft", color: "#8e8e93" },
     active: { key: "page.agent_initiative.status_active", color: "#437f6b" },
     muted: { key: "page.agent_initiative.status_muted", color: "#b27c34" },
-    paused: { key: "page.agent_initiative.status_paused", color: "#78716c" },
+    paused: { key: "page.agent_initiative.status_paused", color: "#8e8e93" },
     needs_setup: { key: "page.agent_initiative.status_needs_setup", color: "#b27c34", alert: true },
     error: { key: "page.agent_initiative.status_error", color: "#c14a44", alert: true },
     completed: { key: "page.agent_initiative.status_completed", color: "#437f6b" },
-    deleted: { key: "page.agent_initiative.status_deleted", color: "#78716c" },
+    deleted: { key: "page.agent_initiative.status_deleted", color: "#8e8e93" },
   };
-  const value = presentations[status] || { key: status, color: "#78716c" };
+  const value = presentations[status] || { key: status, color: "#8e8e93" };
   const translated = t(value.key);
   return {
     label: translated === value.key ? status.replaceAll("_", " ") : translated,

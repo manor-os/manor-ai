@@ -53,7 +53,7 @@ async def test_browse_page_cursor_counts_raw_rows_after_permission_filter(monkey
     async def folders(_db, _user, **_kwargs):
         return [], {}, SimpleNamespace()
 
-    async def response(_db, document, _user, _access_context):
+    async def response(_db, document, _user, _access_context, **_kwargs):
         return routes.DocumentResponse(
             id=document.id, entity_id=document.entity_id, name=document.name,
         )

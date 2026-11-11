@@ -13,6 +13,7 @@ from typing import Any
 from packages.core.models.workflow import WorkflowRun
 from packages.core.services.sensitive_data import sanitize_sensitive_payload
 from packages.core.services.viewer_language import run_display_translations, without_i18n
+from packages.core.services.workflow_contracts import workflow_step_label
 
 
 TRACE_SUMMARY_BYTES = 8 * 1024
@@ -30,6 +31,7 @@ _ARTIFACT_KEYS = {
     "images",
     "image_urls",
     "knowledge_artifacts",
+    "saved_files",
 }
 _CHILD_RUN_ID_KEYS = {"child_run_id", "subrun_id"}
 _CHILD_RUN_IDS_KEYS = {"child_run_ids", "subrun_ids"}
@@ -212,7 +214,7 @@ def build_definition_snapshot(
 
         node = {
             "id": str(step.get("id") or ""),
-            "name": str(step.get("name") or step.get("id") or ""),
+            "name": workflow_step_label(step),
             "type": str(step.get("type") or ""),
             "order": order,
             "targets": list(dict.fromkeys(targets)),
@@ -834,11 +836,13 @@ def workflow_run_current_stage(run_status: str, stages: list[dict[str, Any]]) ->
     return None
 
 
-def workflow_run_deliverables(variables: Any, *, entity_id: str = "") -> list[dict[str, Any]]:
+def workflow_run_deliverables(variables: Any, *, entity_id: str = "", run: Any = None) -> list[dict[str, Any]]:
     """The files the run's final result delivered, as bounded references.
 
     Found the way Chat finds them (``workflow_result_files``), so a result that
     nests its files (a delivery package, a project) lists them in the App too.
+    A result that names no file (a project record) delivered what the run's
+    steps made, newest first.
     """
     from packages.core.services.workflow_chat_projection import workflow_result_files
 
@@ -857,7 +861,9 @@ def workflow_run_deliverables(variables: Any, *, entity_id: str = "") -> list[di
         delivered.append(item)
         if len(delivered) >= _SUMMARY_LIST_LIMIT * 2:
             return delivered
-    if delivered:
+    if delivered or declared == []:
+        # A result that lists no files says it delivered none: what its steps
+        # read or cited along the way is not its output.
         return delivered
     for ref in workflow_result_files(result, entity_id=entity_id) if result is not None else []:
         document_id = str(ref.get("document_id") or "").strip()[:64]
@@ -872,6 +878,15 @@ def workflow_run_deliverables(variables: Any, *, entity_id: str = "") -> list[di
         delivered.append(item)
         if len(delivered) >= _SUMMARY_LIST_LIMIT * 2:
             break
+    if not delivered and run is not None:
+        from packages.core.services.workflow_review_files import workflow_run_made_files
+
+        for ref in workflow_run_made_files(run)[:_SUMMARY_LIST_LIMIT * 2]:
+            item = {"document_id": ref["document_id"][:64]} if ref.get("document_id") else {"fs_path": ref["fs_path"][:512]}
+            name = _short_text(ref.get("name"))
+            if name:
+                item["name"] = name
+            delivered.append(item)
     return delivered
 
 
@@ -940,7 +955,7 @@ def update_workflow_history_summary(run: WorkflowRun) -> None:
         "blocker": summarize_trace_value(blocker) if blocker not in (None, "") else None,
         "stages": stages,
         "current_stage": workflow_run_current_stage(str(run.status or "").lower(), stages),
-        "deliverables": workflow_run_deliverables(variables, entity_id=str(run.entity_id or "")),
+        "deliverables": workflow_run_deliverables(variables, entity_id=str(run.entity_id or ""), run=run),
         "publications": workflow_run_publications(step_results),
         # What the result is called and says.
         **workflow_run_result_headline(variables),
@@ -1012,7 +1027,7 @@ def append_execution_trace(
         "sequence": len(current) + 1,
         "attempt_number": attempt_number,
         "node_id": node_id,
-        "node_name": str(node.get("name") or node_id),
+        "node_name": workflow_step_label(node) or node_id,
         "node_type": str(node.get("type") or ""),
         "status": normalized_status,
         "input_summary": summarize_trace_value(payload.get("inputs")),

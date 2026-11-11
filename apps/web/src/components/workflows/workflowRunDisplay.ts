@@ -202,10 +202,15 @@ export interface WorkflowRunAction {
   step_id?: string;
   retry_from_step_id?: string;
   retry_from_step_name?: string;
+  /** The integration the failed step was waiting for; connect it, then continue. */
+  connection_provider?: string;
+  connection_label?: string;
   observed_problem?: unknown;
   required_change?: unknown;
   preserved_receipts?: unknown[];
   retry_segment_ids?: string[];
+  review_editable_fields?: string[];
+  review_revision_field?: string;
   [key: string]: unknown;
 }
 
@@ -516,14 +521,20 @@ function editableSchemaUiIsCompatible(
   if (ui.control === "documents" && schemaType !== "array") return false;
   if (ui.control === "textarea" && !["string", "array"].includes(schemaType)) return false;
   if (ui.control === "workflow_project_select") {
-    if (schemaType !== "string") return false;
+    // One record (a string) or several (an array of strings).
+    const items = asRecord(schema.items);
+    const multiple = schemaType === "array" && Boolean(items) && editableSchemaType(items!) === "string";
+    if (!multiple && schemaType !== "string") return false;
     if (typeof ui.project_type !== "string" || !ui.project_type.trim()) return false;
+    // Without allowed_stages the picker offers every stage.
     if (
-      !Array.isArray(ui.allowed_stages)
-      || ui.allowed_stages.length === 0
-      || ui.allowed_stages.length > 20
-      || ui.allowed_stages.some((stage) => typeof stage !== "string" || !stage.trim())
-      || new Set(ui.allowed_stages).size !== ui.allowed_stages.length
+      ui.allowed_stages !== undefined && (
+        !Array.isArray(ui.allowed_stages)
+        || ui.allowed_stages.length === 0
+        || ui.allowed_stages.length > 20
+        || ui.allowed_stages.some((stage) => typeof stage !== "string" || !stage.trim())
+        || new Set(ui.allowed_stages).size !== ui.allowed_stages.length
+      )
     ) return false;
   } else if (ui.project_type !== undefined || ui.allowed_stages !== undefined) {
     return false;
@@ -653,6 +664,24 @@ function editableSchemaFieldIsCompatible(value: unknown, depth: number): boolean
   return Object.entries(properties).every(([key, field]) => (
     Boolean(key.trim()) && editableSchemaFieldIsCompatible(field, depth + 1)
   ));
+}
+
+/** The values a retry form starts from. Segment ids go back only when the
+ *  retry schema declares them: the server rejects a variable the Workflow does
+ *  not declare. The run page and the chat bubble both start from this. */
+export function workflowRetrySuppliedValues(
+  action: Pick<WorkflowRunAction, "kind" | "values" | "retry_segment_ids">,
+  schema: WorkflowInputSchema | null | undefined,
+): Record<string, unknown> {
+  const values: Record<string, unknown> = { ...(asRecord(action.values) || {}) };
+  if (
+    action.kind === "workflow_retry"
+    && asRecord(schema?.properties)?.retry_segment_ids
+    && action.retry_segment_ids
+  ) {
+    values.retry_segment_ids = action.retry_segment_ids;
+  }
+  return values;
 }
 
 export function workflowRetrySchemaIsCompatible(value: unknown): value is WorkflowInputSchema {
@@ -1652,6 +1681,15 @@ export function workflowRunStageCounts(
   };
 }
 
+/** "Step N of M" among a run's stages, counted as the run page and App count them. */
+export function workflowStagePosition(
+  steps: Array<{ type?: string | null; status?: string | null }>,
+): { current: number; total: number } {
+  const stages = steps.filter((step) => isStageType(step.type || undefined));
+  const processed = stages.filter((step) => PROCESSED_STATUSES.has(String(step.status || "") as WorkflowRunStatus)).length;
+  return { current: Math.min(stages.length, processed + 1), total: stages.length };
+}
+
 export function processedNodeCount(nodes: WorkflowRunNode[]): number {
   return nodes.reduce(
     (count, node) => count + (PROCESSED_STATUSES.has(node.status) ? 1 : 0),
@@ -1722,6 +1760,8 @@ export function workflowRunActionLabelKey(
     pause: "component.workflow_run.action.pause",
     resume: "component.workflow_run.action.resume",
     accept: "component.workflow_run.action.accept",
+    confirm: "component.workflow_run.action.confirm",
+    done: "component.workflow_run.action.done",
     revise: "component.workflow_run.action.revise",
     cancel: "component.workflow_run.action.cancel",
   };

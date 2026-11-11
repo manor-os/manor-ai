@@ -1,0 +1,50 @@
+/* The App's timeline, gantt, places and tree views: rows that open a record's card; hairlines, no outlines. */
+.workspace-app-views__row { display: flex; flex: 1 1 auto; align-items: center; gap: 10px; min-width: 0; min-height: 36px; padding: 6px 8px; border: 0; border-radius: 8px; background: none; color: var(--text-default); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.workspace-app-views__row:hover { background: var(--surface-muted); color: var(--text-strong); }
+.workspace-app-views__row:focus-visible, .workspace-app-views__twisty:focus-visible, .workspace-app-views__place a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.workspace-app-views__row-name { flex: 1 1 auto; min-width: 0; overflow: hidden; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-views__row-status { flex: 0 0 auto; padding: 1px 8px; border-radius: 999px; background: var(--chip-neutral-bg); color: var(--chip-neutral-fg); font-size: 11px; white-space: nowrap; }
+.workspace-app-views__count { flex: 0 0 auto; color: var(--text-muted); font-size: 11px; }
+/* Timeline: a heading per day, each event at its time. */
+.workspace-app-views__timeline { display: grid; gap: 16px; min-width: 0; }
+.workspace-app-views__day { display: grid; gap: 4px; min-width: 0; }
+.workspace-app-views__day h5 { margin: 0; color: var(--text-muted); font-size: 12px; font-weight: 600; }
+.workspace-app-views__day ol { display: grid; gap: 0; margin: 0; padding: 0 0 0 12px; border-inline-start: 2px solid var(--glass-hairline); list-style: none; }
+.workspace-app-views__day li { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.workspace-app-views__time { flex: 0 0 auto; min-width: 44px; color: var(--text-muted); font-size: 11px; white-space: nowrap; }
+/* Gantt: a name column and a lane per record on one time axis. */
+.workspace-app-views__gantt { display: grid; gap: 2px; min-width: 0; }
+.workspace-app-views__gantt-axis, .workspace-app-views__gantt-row { display: grid; grid-template-columns: minmax(96px, 32%) minmax(0, 1fr); align-items: center; gap: 8px; min-width: 0; }
+.workspace-app-views__gantt-ticks { position: relative; height: 18px; color: var(--text-muted); font-size: 11px; }
+.workspace-app-views__gantt-ticks span { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; }
+.workspace-app-views__gantt-ticks span:first-child { transform: none; }
+.workspace-app-views__gantt-ticks span:last-child { transform: translateX(-100%); }
+.workspace-app-views__gantt-name { min-width: 0; }
+.workspace-app-views__gantt-lane { position: relative; height: 36px; border-radius: 6px; background: var(--surface-muted); }
+.workspace-app-views__gantt-bar { position: absolute; top: 10px; height: 12px; min-width: 6px; border-radius: 4px; background: var(--text-strong); }
+.workspace-app-views__gantt-today { position: absolute; top: 2px; bottom: 2px; width: 1px; background: var(--accent); }
+.workspace-app-views__gantt-waits { position: absolute; top: 23px; max-width: 100%; overflow: hidden; color: var(--text-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-views__unplaced { display: grid; gap: 2px; margin-top: 12px; }
+.workspace-app-views__unplaced h5 { margin: 0; color: var(--text-muted); font-size: 12px; font-weight: 600; }
+/* Places: a heading per place with its maps link, its records under it. */
+.workspace-app-views__places { display: grid; gap: 14px; min-width: 0; }
+.workspace-app-views__place { display: grid; gap: 4px; min-width: 0; }
+.workspace-app-views__place + .workspace-app-views__place { padding-top: 14px; border-top: 0.5px solid var(--border-subtle); }
+.workspace-app-views__place header { display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--text-muted); }
+.workspace-app-views__place-name { flex: 1 1 auto; min-width: 0; overflow: hidden; color: var(--text-strong); font-size: 13px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-views__place header a { flex: 0 0 auto; color: var(--text-muted); font-size: 12px; text-decoration: none; }
+.workspace-app-views__place header a:hover { color: var(--text-strong); }
+.workspace-app-views__place-address { color: var(--text-muted); font-size: 11px; }
+.workspace-app-views__place-rows { display: grid; gap: 0; }
+/* Tree: each level indented, opened on demand. */
+.workspace-app-views__tree, .workspace-app-views__tree ul { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; min-width: 0; }
+.workspace-app-views__node-row { display: flex; align-items: center; gap: 2px; min-width: 0; }
+.workspace-app-views__twisty { display: inline-grid; flex: 0 0 24px; place-items: center; width: 24px; height: 24px; padding: 0; border: 0; border-radius: 6px; background: none; color: var(--text-muted); cursor: pointer; }
+button.workspace-app-views__twisty:hover { background: var(--surface-muted); color: var(--text-strong); }
+.workspace-app-views__tree-note { padding: 6px 0; color: var(--text-muted); font-size: 12px; }
+.workspace-app-views__tree-note.is-error { color: var(--chip-danger-fg); }
+.workspace-app-views__columns { display: grid; gap: 8px; padding: 4px; font-size: 13px; }
+@media (max-width: 480px) {
+  .workspace-app-views__gantt-axis, .workspace-app-views__gantt-row { grid-template-columns: minmax(84px, 38%) minmax(0, 1fr); }
+  .workspace-app-views__time { min-width: 38px; }
+}

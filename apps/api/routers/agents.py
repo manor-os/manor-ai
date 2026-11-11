@@ -24,6 +24,7 @@ from packages.core.services.resource_access import (
 from packages.core.services.workspace_access import (
     user_can_write_workspace_id,
     user_readable_workspace_ids,
+    user_writable_workspace_ids,
 )
 from packages.core.services.agent_service import (
     AgentMCPActionToolIdFactory,
@@ -54,7 +55,7 @@ from apps.api.routers.workspaces import (
     _learning_candidate_response,
     _runtime_evidence_response,
 )
-from apps.api.streaming_concurrency import acquire_chat_stream_lease
+from apps.api.streaming_concurrency import LeasedStreamingResponse, acquire_chat_stream_lease
 from packages.core.constants.execution import WorkerStatus
 
 router = APIRouter(prefix="/api/v1/agents", tags=["agents"])
@@ -436,20 +437,33 @@ async def _subscription_is_visible(
     return str(subscription.workspace_id) in readable_workspace_ids
 
 
-async def _subscription_can_manage(
+async def _manageable_subscription_ids(
     db: AsyncSession,
-    subscription: AgentSubscription,
+    subscriptions: list[AgentSubscription],
     user: User,
-) -> bool:
-    if not subscription.workspace_id:
-        return bool(subscription.owner_user_id == user.id)
-    return await user_can_write_workspace_id(
+) -> set[str]:
+    """Subscriptions the user may manage: own personal ones, and those of
+    Workspaces the user may write, decided once per Workspace."""
+    writable_workspace_ids = await user_writable_workspace_ids(
         db,
-        workspace_id=subscription.workspace_id,
         entity_id=user.entity_id,
+        workspace_ids={
+            str(subscription.workspace_id)
+            for subscription in subscriptions
+            if subscription.workspace_id
+        },
         user_id=user.id,
         role=user.role,
     )
+    return {
+        subscription.id
+        for subscription in subscriptions
+        if (
+            str(subscription.workspace_id) in writable_workspace_ids
+            if subscription.workspace_id
+            else subscription.owner_user_id == user.id
+        )
+    }
 
 
 async def _visible_subscriptions(
@@ -782,8 +796,6 @@ async def generate_new_agent_stream(
     past Cloudflare's 100s 524 timeout and narrates the build. Emits ``step``
     events, then a terminal ``done`` (the agent) or ``error`` frame.
     """
-    from fastapi.responses import StreamingResponse
-
     from packages.core.services.agent_generator import generate_agent_streaming
     from packages.core.services.sse_events import format_sse
 
@@ -808,7 +820,7 @@ async def generate_new_agent_stream(
             yield format_sse("error", {"message": str(exc)})
 
     lease = await acquire_chat_stream_lease(scope="agent-generate")
-    return StreamingResponse(
+    return LeasedStreamingResponse(
         lease.wrap(event_stream()),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -822,8 +834,6 @@ async def generate_agent_draft_stream(
     db: AsyncSession = Depends(get_db),
 ):
     """AI-generate an agent draft, streaming progress without persisting it."""
-    from fastapi.responses import StreamingResponse
-
     from packages.core.services.agent_generator import generate_agent_draft_streaming
     from packages.core.services.sse_events import format_sse
 
@@ -848,7 +858,7 @@ async def generate_agent_draft_stream(
             yield format_sse("error", {"message": str(exc)})
 
     lease = await acquire_chat_stream_lease(scope="agent-draft")
-    return StreamingResponse(
+    return LeasedStreamingResponse(
         lease.wrap(event_stream()),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -1034,12 +1044,13 @@ async def my_subscriptions(
 ):
     subs = await list_subscriptions(db, user.entity_id)
     subs = await _visible_subscriptions(db, subs, user)
+    manageable = await _manageable_subscription_ids(db, subs, user)
     return [SubscriptionResponse(
         id=s.id, entity_id=s.entity_id, agent_id=s.agent_id,
         workspace_id=s.workspace_id, owner_user_id=s.owner_user_id,
         name=s.name,
         scope_kind="workspace" if s.workspace_id else "personal",
-        can_manage=await _subscription_can_manage(db, s, user),
+        can_manage=s.id in manageable,
         custom_prompt=s.custom_prompt, status=s.status,
     ) for s in subs]
 
@@ -1198,9 +1209,11 @@ async def _agent_deployments_for_ids(
     if not agent_ids:
         return []
 
+    # Only the Workspace's name and status are shown; its full row (settings,
+    # operating model) repeated per deployment dominated this read.
     rows = (
         await db.execute(
-            select(AgentSubscription, Workspace)
+            select(AgentSubscription, Workspace.name, Workspace.status)
             .join(Workspace, Workspace.id == AgentSubscription.workspace_id, isouter=True)
             .where(
                 AgentSubscription.entity_id == user.entity_id,
@@ -1212,17 +1225,16 @@ async def _agent_deployments_for_ids(
     ).all()
     visible_subscriptions = await _visible_subscriptions(
         db,
-        [sub for sub, _workspace in rows],
+        [sub for sub, _name, _status in rows],
         user,
     )
     visible_subscription_ids = {sub.id for sub in visible_subscriptions}
-    rows = [
-        (sub, workspace)
-        for sub, workspace in rows
-        if sub.id in visible_subscription_ids
-    ]
-    sub_ids = [sub.id for sub, _workspace in rows]
+    rows = [row for row in rows if row[0].id in visible_subscription_ids]
+    sub_ids = [sub.id for sub, _name, _status in rows]
     workers_by_sub = await _subscription_workers(db, sub_ids, user=user)
+    manageable = await _manageable_subscription_ids(
+        db, [sub for sub, _name, _status in rows], user,
+    )
 
     return [
         AgentDeploymentResponse(
@@ -1233,9 +1245,9 @@ async def _agent_deployments_for_ids(
             owner_user_id=sub.owner_user_id,
             name=sub.name,
             scope_kind="workspace" if sub.workspace_id else "personal",
-            can_manage=await _subscription_can_manage(db, sub, user),
-            workspace_name=workspace.name if workspace else None,
-            workspace_status=workspace.status if workspace else None,
+            can_manage=sub.id in manageable,
+            workspace_name=workspace_name,
+            workspace_status=workspace_status,
             service_key=sub.service_key,
             custom_prompt=sub.custom_prompt,
             config=sub.config or {},
@@ -1244,7 +1256,7 @@ async def _agent_deployments_for_ids(
             created_at=sub.created_at,
             updated_at=sub.updated_at,
         )
-        for sub, workspace in rows
+        for sub, workspace_name, workspace_status in rows
     ]
 
 

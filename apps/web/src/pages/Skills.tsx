@@ -37,6 +37,9 @@ import {
   getSkillTheme,
 } from "./skills/skillTypes";
 import { SkillCard, SectionHeader, SkillIcon } from "./skills/SkillCard";
+import Input from "../components/ui/Input";
+import { useNavigate } from "react-router-dom";
+import { SkillPane } from "./skills/SkillPane";
 import { SkillDetailsModal } from "./skills/SkillDetailsModal";
 import { CredentialModal } from "./skills/CredentialModal";
 import { InvokeModal } from "./skills/InvokeModal";
@@ -56,8 +59,12 @@ function skillDisplayName(skill: any): string {
 /*  Main component                                                      */
 /* ------------------------------------------------------------------ */
 
-export default function Skills() {
+type SkillLibrarySource = "all" | "company" | "market" | "manor" | "agent";
+
+/** `embedded`: shown inside Settings › AI, so the header stays in the panel. */
+export default function Skills({ embedded = false }: { embedded?: boolean } = {}) {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const catalogScope = useCatalogScope();
   const toast = useToastStore();
   const authToken = useAuthStore((s) => s.token);
@@ -65,7 +72,10 @@ export default function Skills() {
   const privateApiEnabled = !authLoading && Boolean(authToken);
 
   const [tab, setTab] = useState<MainTab>("my");
-  const [scope, setScope] = useState<MyScope>("entity");
+  const [librarySource, setLibrarySource] = useState<SkillLibrarySource>("all");
+  const scope: MyScope = librarySource === "agent" ? "agent" : "entity";
+  const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null);
+  const [teachDraft, setTeachDraft] = useState("");
   const [selectedAgentId, setSelectedAgentId] = useState("");
   const [search, setSearch] = useState("");
 
@@ -161,7 +171,14 @@ export default function Skills() {
     s.name?.toLowerCase().includes(search.toLowerCase()) ||
     getSkillDescription(s).toLowerCase().includes(search.toLowerCase());
 
-  const filteredEntitySkills = entitySkills.filter(filterSkill);
+  const skillsBySource: Record<Exclude<SkillLibrarySource, "agent">, any[]> = {
+    all: allSkills as any[],
+    company: entitySkills.filter((skill: any) => !skill?.config?.marketplace_id),
+    market: entitySkills.filter((skill: any) => !!skill?.config?.marketplace_id),
+    manor: (allSkills as any[]).filter((skill: any) => !skill.entity_id),
+  };
+  const filteredLibrarySkills = (skillsBySource[librarySource === "agent" ? "all" : librarySource]).filter(filterSkill);
+  const selectedSkill = filteredLibrarySkills.find((skill: any) => skill.id === selectedSkillId) ?? filteredLibrarySkills[0] ?? null;
 
   const selectedAgent = (agents as any[]).find(
     (a: any) => (a.id || a.agent_id) === selectedAgentId,
@@ -210,7 +227,7 @@ export default function Skills() {
       {/* ── Header ── */}
       <PageHeader
         title={t("nav.skills")}
-        subtitle={
+        subtitle={embedded ? undefined :
           tab === "my"
             ? scope === "entity"
               ? t("page.skills.subtitle_entity")
@@ -266,125 +283,36 @@ export default function Skills() {
             minHeight: 0,
           }}
         >
-          {/* Info banner */}
-          <div
-            style={{
-              marginBottom: 14,
-              flexShrink: 0,
-              padding: "14px 18px",
-              background:
-                "linear-gradient(135deg, rgba(28,25,23,0.06), rgba(28,25,23,0.02))",
-              border: "1px solid rgba(28,25,23,0.18)",
-              borderRadius: 14,
-              display: "flex",
-              alignItems: "flex-start",
-              gap: 12,
+          <form
+            className="skills-teach"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const ask = teachDraft.trim();
+              if (ask) navigate(`/chat?new=chat&ask=${encodeURIComponent(t("page.skills.teach_prompt", { ask }))}`);
             }}
           >
-            <svg
-              style={{
-                width: 18,
-                height: 18,
-                color: "#57534e",
-                flexShrink: 0,
-                marginTop: 1,
-              }}
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-              strokeWidth={2}
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-              />
-            </svg>
-            <div>
-              <p
-                style={{
-                  margin: 0,
-                  fontSize: 13,
-                  fontWeight: 700,
-                  color: "#292524",
-                }}
-              >
-                {t("page.skills.entity_subagent_binding")}
-              </p>
-              <p style={{ margin: "3px 0 0", fontSize: 12, color: "#78716c" }}>
-                {t("page.skills.entity_subagent_desc")}
-              </p>
-            </div>
-          </div>
-
-          {/* Scope switcher */}
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 10,
-              marginBottom: 16,
-              flexShrink: 0,
-            }}
-          >
-            <span style={{ fontSize: 13, fontWeight: 600, color: "#78716c" }}>
-              {t("page.skills.manage_by")}:
-            </span>
-            {(["entity", "agent"] as MyScope[]).map((s) => (
-              <button
-                key={s}
-                onClick={() => setScope(s)}
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: 6,
-                  padding: "8px 18px",
-                  borderRadius: 11,
-                  border: "1px solid transparent",
-                  background: scope === s ? "#1c1917" : "rgba(255,255,255,0.7)",
-                  color: scope === s ? "#fff" : "#57534e",
-                  fontSize: 12,
-                  fontWeight: 700,
-                  cursor: "pointer",
-                  transition: "all 0.2s",
-                  boxShadow:
-                    scope === s ? "0 4px 12px rgba(28,25,23,0.3)" : "none",
-                }}
-              >
-                {s === "entity" ? (
-                  <svg
-                    style={{ width: 13, height: 13 }}
-                    fill="none"
-                    viewBox="0 0 24 24"
-                    stroke="currentColor"
-                    strokeWidth={2}
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"
-                    />
-                  </svg>
-                ) : (
-                  <svg
-                    style={{ width: 13, height: 13 }}
-                    fill="none"
-                    viewBox="0 0 24 24"
-                    stroke="currentColor"
-                    strokeWidth={2}
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"
-                    />
-                  </svg>
-                )}
-                {s === "entity"
-                  ? t("page.skills.entity_skills")
-                  : t("page.skills.agent_skills")}
-              </button>
-            ))}
+            <Input
+              value={teachDraft}
+              onChange={(event) => setTeachDraft(event.target.value)}
+              placeholder={t("page.skills.teach_placeholder")}
+              ariaLabel={t("page.skills.teach_placeholder")}
+            />
+          </form>
+          <div style={{ marginBottom: 16, flexShrink: 0 }}>
+            <TabSwitcher
+              appearance="minimal"
+              size="sm"
+              ariaLabel={t("page.skills.manage_by")}
+              tabs={[
+                { key: "all", label: t("page.skills.source_all") },
+                { key: "company", label: t("page.skills.source_company") },
+                ...(skillsBySource.market.length > 0 ? [{ key: "market", label: t("page.skills.source_market") }] : []),
+                ...(skillsBySource.manor.length > 0 ? [{ key: "manor", label: t("page.skills.source_manor") }] : []),
+                { key: "agent", label: t("page.skills.agent_skills") },
+              ]}
+              value={librarySource}
+              onChange={(key) => setLibrarySource(key as SkillLibrarySource)}
+            />
           </div>
 
           {/* ── ENTITY SCOPE ── */}
@@ -404,66 +332,64 @@ export default function Skills() {
                       display: "flex",
                       alignItems: "center",
                       gap: 12,
-                      color: "#a8a29e",
+                      color: "var(--text-faint)",
                     }}
                   >
                     <LoadingSpinner size={20} />
                     <span style={{ fontSize: 14 }}>
-                      {t("page.skills.loading_skills")}
+                      <span className="sr-only">{t("page.skills.loading_skills")}</span>
                     </span>
                   </div>
                 </div>
               ) : (
-                <div>
-                  <SectionHeader
-                    title={t("page.skills.entity_skills")}
-                    count={entitySkills.length}
-                    accent="#6d6fb2"
-                  />
-                  <div
-                    style={{
-                      display: "grid",
-                      gridTemplateColumns:
-                        "repeat(auto-fill, minmax(min(100%, 240px), 1fr))",
-                      gap: 18,
-                    }}
-                  >
-                    {filteredEntitySkills.map((skill: any) => (
-                      <SkillCard
-                        key={skill.id}
-                        skill={skill}
-                        {...skillCardProps}
-                      />
-                    ))}
-
-                    {filteredEntitySkills.length === 0 && (
-                      <div
-                        style={{
-                          gridColumn: "1 / -1",
-                          minHeight: 220,
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                          padding: 24,
-                        }}
-                      >
-                        <EmptyState
-                          icon={<IconSkill size={32} style={{ color: "#d6d3d1" }} />}
-                          title={
-                            entitySkills.length === 0
-                              ? t("page.skills.no_entity_skills")
-                              : t("page.skills.no_matching_entity_skills")
-                          }
-                          description={
-                            entitySkills.length === 0
-                              ? t("page.skills.no_entity_skills_desc")
-                              : t("page.skills.no_matching_entity_skills_desc")
-                          }
-                        />
-                      </div>
-                    )}
+                filteredLibrarySkills.length === 0 ? (
+                  <div style={{ minHeight: 220, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
+                    <EmptyState
+                      icon={<IconSkill size={32} style={{ color: "var(--text-faint)" }} />}
+                      title={
+                        entitySkills.length === 0
+                          ? t("page.skills.no_entity_skills")
+                          : t("page.skills.no_matching_entity_skills")
+                      }
+                      description={
+                        entitySkills.length === 0
+                          ? t("page.skills.no_entity_skills_desc")
+                          : t("page.skills.no_matching_entity_skills_desc")
+                      }
+                    />
                   </div>
-                </div>
+                ) : (
+                  <div className="agents-master-detail">
+                    <nav className="agents-master-list" aria-label={t("nav.skills")}>
+                      {filteredLibrarySkills.map((skill: any) => (
+                        <button
+                          key={skill.id}
+                          type="button"
+                          className={`agents-master-row${selectedSkill?.id === skill.id ? " is-active" : ""}`}
+                          aria-current={selectedSkill?.id === skill.id ? "true" : undefined}
+                          onClick={() => setSelectedSkillId(skill.id)}
+                        >
+                          <SkillIcon skill={skill} size={22} />
+                          <span>{skill.name}</span>
+                        </button>
+                      ))}
+                    </nav>
+                    <div className="agents-master-detail-pane" style={{ overflowY: "auto" }}>
+                      {selectedSkill && (
+                        <SkillPane
+                          key={selectedSkill.id}
+                          skill={selectedSkill}
+                          editable={!!selectedSkill.entity_id}
+                          onInvoke={skillCardProps.onInvoke}
+                          onEdit={skillCardProps.onEdit}
+                          onDetails={skillCardProps.onDetails}
+                          onCredential={skillCardProps.onCredential}
+                          onDelete={skillCardProps.onDelete}
+                        />
+                      )}
+                    </div>
+                  </div>
+                )
               )}
             </div>
           )}
@@ -485,13 +411,13 @@ export default function Skills() {
                   flexShrink: 0,
                   padding: "14px 16px",
                   background: "rgba(255,255,255,0.72)",
-                  border: "1px solid rgba(28,25,23,0.06)",
+                  border: "0.5px solid rgba(29, 29, 31,0.06)",
                   borderRadius: 16,
                   display: "grid",
                   gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
                   gap: 14,
                   alignItems: "end",
-                  boxShadow: "0 1px 2px rgba(28,25,23,0.02)",
+                  boxShadow: "0 1px 2px rgba(29, 29, 31,0.02)",
                 }}
               >
                 <div style={{ minWidth: 0 }}>
@@ -499,7 +425,7 @@ export default function Skills() {
                     style={{
                       fontSize: 12,
                       fontWeight: 600,
-                      color: "#78716c",
+                      color: "var(--text-muted)",
                       display: "block",
                       marginBottom: 6,
                     }}
@@ -525,8 +451,8 @@ export default function Skills() {
                     dropdownMinWidth={320}
                     buttonStyle={{
                       minHeight: 40,
-                      background: "#fff",
-                      borderColor: "rgba(28,25,23,0.08)",
+                      background: "var(--surface-panel)",
+                      borderColor: "rgba(29, 29, 31,0.08)",
                     }}
                     openButtonStyle={{
                       borderColor: "#4f7d75",
@@ -540,7 +466,7 @@ export default function Skills() {
                       minHeight: 40,
                       display: "flex",
                       alignItems: "center",
-                      color: "#a8a29e",
+                      color: "var(--text-faint)",
                       fontSize: 13,
                       lineHeight: 1.5,
                     }}
@@ -555,7 +481,7 @@ export default function Skills() {
                       style={{
                         fontSize: 12,
                         fontWeight: 600,
-                        color: "#78716c",
+                        color: "var(--text-muted)",
                         display: "block",
                         marginBottom: 6,
                       }}
@@ -586,8 +512,8 @@ export default function Skills() {
                         dropdownMinWidth={320}
                         buttonStyle={{
                           minHeight: 40,
-                          background: "#fff",
-                          borderColor: "rgba(28,25,23,0.08)",
+                          background: "var(--surface-panel)",
+                          borderColor: "rgba(29, 29, 31,0.08)",
                         }}
                         openButtonStyle={{
                           borderColor: "#4f7d75",
@@ -617,12 +543,12 @@ export default function Skills() {
                       display: "flex",
                       alignItems: "center",
                       gap: 8,
-                      color: "#a8a29e",
+                      color: "var(--text-faint)",
                     }}
                   >
                     <LoadingSpinner size={14} />
                     <span style={{ fontSize: 12 }}>
-                      {t("page.skills.loading_agents")}
+                      <span className="sr-only">{t("page.skills.loading_agents")}</span>
                     </span>
                   </div>
                 )}
@@ -634,7 +560,7 @@ export default function Skills() {
                   <EmptyState
                     icon={
                       <svg
-                        style={{ width: 32, height: 32, color: "#d6d3d1" }}
+                        style={{ width: 32, height: 32, color: "var(--text-faint)" }}
                         fill="none"
                         viewBox="0 0 24 24"
                         stroke="currentColor"
@@ -664,12 +590,12 @@ export default function Skills() {
                         display: "flex",
                         alignItems: "center",
                         gap: 12,
-                        color: "#a8a29e",
+                        color: "var(--text-faint)",
                       }}
                     >
                       <LoadingSpinner size={20} />
                       <span style={{ fontSize: 14 }}>
-                        {t("page.skills.loading_agent_skills")}
+                        <span className="sr-only">{t("page.skills.loading_agent_skills")}</span>
                       </span>
                     </div>
                   </div>
@@ -677,7 +603,7 @@ export default function Skills() {
                   <EmptyState
                     icon={
                       <svg
-                        style={{ width: 32, height: 32, color: "#d6d3d1" }}
+                        style={{ width: 32, height: 32, color: "var(--text-faint)" }}
                         fill="none"
                         viewBox="0 0 24 24"
                         stroke="currentColor"

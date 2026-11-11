@@ -1,4 +1,6 @@
-import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import { displayReadInterval } from "../lib/readRefreshPolicy";
+import { usePageVisible } from "../lib/usePageVisible";
+import { useState, useRef, useCallback, useEffect, useMemo, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useQuery, useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -17,6 +19,7 @@ import { relativeTime, formatFileSize, VectorStatus, getPreferredTimeZone } from
 import PageHeader, { PageHeaderAddButton } from "../components/ui/PageHeader";
 import StatusBadge from "../components/ui/StatusBadge";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
+import { SignedMediaRefreshContext, useSignedMediaRefresh, useSignedMediaUrl } from "../components/ui/useSignedMediaUrl";
 import { SkeletonTable } from "../components/ui/Skeleton";
 import EmptyState from "../components/ui/EmptyState";
 import Modal from "../components/ui/Modal";
@@ -63,6 +66,7 @@ import {
   usePermission,
 } from "../lib/permissions";
 import { isCodeLikeFile } from "../lib/codeFiles";
+import { createConcurrencyLimit } from "../lib/concurrencyLimit";
 import { capabilitiesToShareRole, shareRoleCapabilities, type ShareRole } from "../lib/shareRoles";
 
 import { t } from "../lib/i18n";
@@ -117,7 +121,7 @@ const STYLES = `
   font-weight: 400;
   transition: all 0.15s;
   background: transparent;
-  color: #44403c;
+  color: #48484a;
   text-align: left;
 }
 .kb-sidebar-link:hover {
@@ -128,7 +132,7 @@ const STYLES = `
   color: #436b65;
 }
 .kb-sidebar-link.disabled {
-  color: #d6d3d1;
+  color: #d1d1d6;
   cursor: not-allowed;
 }
 .kb-sidebar-link.disabled:hover {
@@ -146,9 +150,9 @@ const STYLES = `
   cursor: pointer;
   font-size: 12px;
   font-weight: 800;
-  text-transform: uppercase;
+  text-transform: none;
   letter-spacing: 0.05em;
-  color: #a8a29e;
+  color: #aeaeb2;
 }
 
 .kb-collapse-btn {
@@ -161,12 +165,12 @@ const STYLES = `
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #a8a29e;
+  color: #aeaeb2;
   transition: all 0.2s;
 }
 .kb-collapse-btn:hover {
-  background: #f5f5f4;
-  color: #57534e;
+  background: #f5f5f7;
+  color: #6e6e73;
 }
 
 .kb-tree-node {
@@ -177,7 +181,7 @@ const STYLES = `
   border-radius: 8px;
   cursor: pointer;
   font-weight: 500;
-  color: #57534e;
+  color: #6e6e73;
   transition: all 0.12s;
   min-height: 30px;
 }
@@ -203,7 +207,7 @@ const STYLES = `
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #a8a29e;
+  color: #aeaeb2;
   padding: 0;
   flex-shrink: 0;
 }
@@ -238,11 +242,11 @@ const STYLES = `
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #78716c;
+  color: #8e8e93;
   transition: all 0.2s;
 }
 .kb-expand-sidebar:hover {
-  background: #f5f5f4;
+  background: #f5f5f7;
 }
 
 .wiki-linked-text {
@@ -270,12 +274,12 @@ const STYLES = `
 .wiki-inline-link-missing {
   border-color: rgba(168, 162, 158, 0.34);
   background: rgba(250, 250, 249, 0.78);
-  color: #78716c;
+  color: #8e8e93;
   border-style: dashed;
 }
 .wiki-inline-link-missing:hover {
   background: rgba(245, 245, 244, 0.95);
-  color: #57534e;
+  color: #6e6e73;
 }
 
 .kb-breadcrumb-item {
@@ -285,7 +289,7 @@ const STYLES = `
   cursor: pointer;
 }
 .kb-breadcrumb-item:hover {
-  background: #f5f5f4;
+  background: #f5f5f7;
 }
 
 .kb-view-btn {
@@ -303,7 +307,7 @@ const STYLES = `
 .kb-doc-name-link {
   font-size: 14px;
   font-weight: 600;
-  color: #292524;
+  color: #2c2c2e;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -340,7 +344,7 @@ const STYLES = `
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #d6d3d1;
+  color: #d1d1d6;
   transition: all 0.2s;
 }
 .kb-delete-btn:hover {
@@ -388,23 +392,23 @@ const STYLES = `
   align-items: center;
   gap: 8px;
   margin: 0;
-  color: #292524;
+  color: #2c2c2e;
   font-size: 13px;
   font-weight: 800;
   line-height: 1.3;
 }
 .kb-section-title svg {
-  color: #a8a29e;
+  color: #aeaeb2;
 }
 .kb-section-count {
-  color: #a8a29e;
+  color: #aeaeb2;
   font-size: 11px;
   font-weight: 700;
   line-height: 1.3;
 }
 .kb-section-empty {
   margin: 0;
-  color: #a8a29e;
+  color: #aeaeb2;
   font-size: 12px;
   font-weight: 600;
 }
@@ -441,7 +445,25 @@ const STYLES = `
 .kb-video-preview {
   width: 100%;
   height: 100%;
-  background: linear-gradient(135deg, #fdf2f8 0%, #fafaf9 100%);
+  background: linear-gradient(135deg, #fdf2f8 0%, #fafafa 100%);
+}
+.kb-text-preview {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 10px 12px;
+  overflow: hidden;
+  background: var(--surface-muted);
+  color: var(--text-muted);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 9px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.kb-file-type-label {
+  font-size: 20px;
+  font-weight: 600;
 }
 .kb-video-placeholder {
   width: 100%;
@@ -451,13 +473,13 @@ const STYLES = `
   align-items: center;
   justify-content: center;
   gap: 7px;
-  color: #c96a98;
+  color: var(--text-faint);
 }
 .kb-video-placeholder svg {
   opacity: .78;
 }
 .kb-video-placeholder span {
-  color: #78716c;
+  color: #8e8e93;
   font-size: 11px;
   font-weight: 800;
 }
@@ -465,7 +487,7 @@ const STYLES = `
 .kb-inline-folder-input {
   font-size: 13px;
   font-weight: 600;
-  color: #292524;
+  color: #2c2c2e;
   border: 1.5px solid #4f7d75;
   border-radius: 8px;
   padding: 4px 8px;
@@ -507,7 +529,7 @@ const STYLES = `
   cursor: pointer;
   font-size: 13px;
   font-weight: 600;
-  color: #44403c;
+  color: #48484a;
   transition: all 0.12s;
   text-align: left;
 }
@@ -516,12 +538,12 @@ const STYLES = `
   color: #436b65;
 }
 .kb-new-dropdown-item.disabled {
-  color: #a8a29e;
+  color: #aeaeb2;
   cursor: not-allowed;
 }
 .kb-new-dropdown-item.disabled:hover {
   background: transparent;
-  color: #a8a29e;
+  color: #aeaeb2;
 }
 .kb-new-dropdown-divider {
   height: 1px;
@@ -890,7 +912,7 @@ tr.dragging {
 }
 .kb-empty-folder-title {
   margin: 0;
-  color: #292524;
+  color: #2c2c2e;
   font-size: 18px;
   font-weight: 820;
   letter-spacing: 0;
@@ -898,7 +920,7 @@ tr.dragging {
 .kb-empty-folder-copy {
   max-width: 420px;
   margin: 8px 0 0;
-  color: #78716c;
+  color: #8e8e93;
   font-size: 13px;
   line-height: 1.55;
 }
@@ -914,7 +936,7 @@ tr.dragging {
   border-radius: 9px;
   border: 1px solid rgba(231,229,228,0.84);
   background: rgba(255,255,255,0.82);
-  color: #44403c;
+  color: #48484a;
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -1000,7 +1022,7 @@ html[data-theme="dark"] .kb-empty-folder-action.primary {
   max-width: min(calc(100vw - 32px), 760px);
   padding: 12px 20px;
   border-radius: 16px;
-  background: rgba(28,25,23,0.92);
+  background: rgba(29, 29, 31,0.92);
   backdrop-filter: blur(12px);
   box-shadow: 0 8px 32px rgba(0,0,0,0.2);
   z-index: 120;
@@ -1026,14 +1048,14 @@ html[data-theme="dark"] .kb-empty-folder-action.primary {
 }
 .kb-batch-btn-primary {
   background: rgba(79,125,117,0.25);
-  color: #d6d3d1;
+  color: #d1d1d6;
 }
 .kb-batch-btn-primary:hover {
   background: rgba(79,125,117,0.4);
 }
 .kb-batch-btn-ghost {
   background: rgba(255,255,255,0.1);
-  color: #a8a29e;
+  color: #aeaeb2;
 }
 .kb-batch-btn-ghost:hover {
   background: rgba(255,255,255,0.2);
@@ -1087,45 +1109,46 @@ const VIEWABLE_EXTENSIONS = new Set([
   "mp3", "wav", "aac", "flac", "m4a",
 ]);
 
+// Type tiles are monochrome: the extension reads, colour would only compete.
 const FILE_TYPE_ICONS: Record<string, { icon: string; color: string; bg: string }> = {
-  pdf: { icon: "PDF", color: "#c14a44", bg: "#f8f0ef" },
-  docx: { icon: "DOC", color: "#4869ac", bg: "#f3f6fa" },
-  doc: { icon: "DOC", color: "#4869ac", bg: "#f3f6fa" },
-  xlsx: { icon: "XLS", color: "#437f6b", bg: "#f1f6f3" },
-  xls: { icon: "XLS", color: "#437f6b", bg: "#f1f6f3" },
-  txt: { icon: "TXT", color: "#57534e", bg: "#f5f5f4" },
-  csv: { icon: "CSV", color: "#b27c34", bg: "#faf7ef" },
-  pptx: { icon: "PPT", color: "#b66a3c", bg: "#f9f4ec" },
-  ppt: { icon: "PPT", color: "#b66a3c", bg: "#f9f4ec" },
-  wps: { icon: "WPS", color: "#4869ac", bg: "#f3f6fa" },
-  et: { icon: "ET", color: "#437f6b", bg: "#f1f6f3" },
-  dps: { icon: "DPS", color: "#b66a3c", bg: "#f9f4ec" },
-  md: { icon: "MD", color: "#6f4ba8", bg: "#f7f4fa" },
-  diagram: { icon: "DIA", color: "#57534e", bg: "#f5f5f4" },
-  "diagram.json": { icon: "DIA", color: "#57534e", bg: "#f5f5f4" },
-  json: { icon: "JSON", color: "#a16207", bg: "#fefce8" },
-  html: { icon: "HTML", color: "#b66a3c", bg: "#f9f4ec" },
-  png: { icon: "PNG", color: "#a07fc0", bg: "#f7f4fa" },
-  jpg: { icon: "JPG", color: "#a07fc0", bg: "#f7f4fa" },
-  jpeg: { icon: "JPG", color: "#a07fc0", bg: "#f7f4fa" },
-  gif: { icon: "GIF", color: "#a07fc0", bg: "#f7f4fa" },
-  webp: { icon: "WEBP", color: "#a07fc0", bg: "#f7f4fa" },
-  svg: { icon: "SVG", color: "#6f4ba8", bg: "#f7f4fa" },
-  mp4: { icon: "MP4", color: "#c96a98", bg: "#fdf2f8" },
-  webm: { icon: "WEBM", color: "#c96a98", bg: "#fdf2f8" },
-  mov: { icon: "MOV", color: "#c96a98", bg: "#fdf2f8" },
-  mp3: { icon: "MP3", color: "#5e9098", bg: "#f1f6f5" },
-  wav: { icon: "WAV", color: "#5e9098", bg: "#f1f6f5" },
-  aac: { icon: "AAC", color: "#5e9098", bg: "#f1f6f5" },
-  flac: { icon: "FLAC", color: "#5e9098", bg: "#f1f6f5" },
-  m4a: { icon: "M4A", color: "#5e9098", bg: "#f1f6f5" },
-  py: { icon: "PY", color: "#4869ac", bg: "#f3f6fa" },
-  js: { icon: "JS", color: "#ca8a04", bg: "#fefce8" },
-  ts: { icon: "TS", color: "#4869ac", bg: "#f3f6fa" },
-  sql: { icon: "SQL", color: "#4f7e87", bg: "#f1f6f5" },
-  yaml: { icon: "YML", color: "#65a30d", bg: "#f7fee7" },
-  yml: { icon: "YML", color: "#65a30d", bg: "#f7fee7" },
-  zip: { icon: "ZIP", color: "#78716c", bg: "#f5f5f4" },
+  pdf: { icon: "PDF", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  docx: { icon: "DOC", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  doc: { icon: "DOC", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  xlsx: { icon: "XLS", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  xls: { icon: "XLS", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  txt: { icon: "TXT", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  csv: { icon: "CSV", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  pptx: { icon: "PPT", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  ppt: { icon: "PPT", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  wps: { icon: "WPS", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  et: { icon: "ET", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  dps: { icon: "DPS", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  md: { icon: "MD", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  diagram: { icon: "DIA", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  "diagram.json": { icon: "DIA", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  json: { icon: "JSON", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  html: { icon: "HTML", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  png: { icon: "PNG", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  jpg: { icon: "JPG", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  jpeg: { icon: "JPG", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  gif: { icon: "GIF", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  webp: { icon: "WEBP", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  svg: { icon: "SVG", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  mp4: { icon: "MP4", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  webm: { icon: "WEBM", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  mov: { icon: "MOV", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  mp3: { icon: "MP3", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  wav: { icon: "WAV", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  aac: { icon: "AAC", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  flac: { icon: "FLAC", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  m4a: { icon: "M4A", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  py: { icon: "PY", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  js: { icon: "JS", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  ts: { icon: "TS", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  sql: { icon: "SQL", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  yaml: { icon: "YML", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  yml: { icon: "YML", color: "var(--text-faint)", bg: "var(--surface-muted)" },
+  zip: { icon: "ZIP", color: "var(--text-faint)", bg: "var(--surface-muted)" },
 };
 
 type LibrarySection = KnowledgeLibrarySection;
@@ -1164,7 +1187,7 @@ const FILE_TYPE_FILTERS: { key: FileTypeFilter; label: string; badge?: string; c
   { key: "sql", label: t("page.knowledge.sql"), badge: "SQL", color: "#4f7e87", bg: "#f1f6f5" },
   { key: "yaml", label: t("page.knowledge.yaml"), badge: "YML", color: "#65a30d", bg: "#f7fee7" },
   { key: "xlsx", label: t("page.knowledge.excel"), badge: "XLS", color: "#437f6b", bg: "#f1f6f3" },
-  { key: "txt", label: t("page.skill_form.text"), badge: "TXT", color: "#57534e", bg: "#f5f5f4" },
+  { key: "txt", label: t("page.skill_form.text"), badge: "TXT", color: "var(--text-muted)", bg: "#f5f5f7" },
   { key: "csv", label: t("page.knowledge.csv"), badge: "CSV", color: "#b27c34", bg: "#faf7ef" },
 ];
 
@@ -1173,7 +1196,7 @@ function getFileTypeInfo(name: string, fileType?: string) {
     return FILE_TYPE_ICONS["diagram.json"];
   }
   const ext = (fileType || name?.split(".").pop() || "").toLowerCase();
-  return FILE_TYPE_ICONS[ext] || { icon: ext.toUpperCase().slice(0, 4) || "?", color: "#57534e", bg: "#f5f5f4" };
+  return FILE_TYPE_ICONS[ext] || { icon: ext.toUpperCase().slice(0, 4) || "?", color: "var(--text-faint)", bg: "var(--surface-muted)" };
 }
 
 const IMAGE_EXTENSIONS = new Set(["image", "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico"]);
@@ -1181,7 +1204,15 @@ const VIDEO_EXTENSIONS = new Set(["video", "mp4", "webm", "ogg", "mov", "avi", "
 const AUDIO_EXTENSIONS = new Set(["audio", "mp3", "wav", "ogg", "aac", "flac", "m4a", "wma"]);
 const PRESENTATION_EXTENSIONS = new Set(["presentation", "ppt", "pptx"]);
 const MEDIA_EXTENSIONS = new Set([...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS, ...AUDIO_EXTENSIONS]);
-type KnowledgePreviewType = "image" | "video" | "audio" | "presentation";
+// First-page thumbnails come from the same render the viewer uses.
+const PAGE_PREVIEW_EXTENSIONS = new Set(["pdf", "doc", "docx", "xls", "xlsx"]);
+const TEXT_PREVIEW_EXTENSIONS = new Set([
+  "txt", "md", "markdown", "csv", "tsv", "log", "json", "yaml", "yml", "xml", "html", "htm", "css",
+  "py", "js", "jsx", "ts", "tsx", "sql", "sh", "go", "rs", "java", "c", "cpp", "rb",
+]);
+const TEXT_PREVIEW_MAX_FILE_BYTES = 256 * 1024;
+const TEXT_PREVIEW_MAX_CHARS = 900;
+type KnowledgePreviewType = "image" | "video" | "audio" | "presentation" | "page" | "text";
 
 function isVideoFile(name: string, fileType?: string | null): boolean {
   const ext = (fileType || name?.split(".").pop() || "").toLowerCase();
@@ -1216,6 +1247,9 @@ function documentThumbnailCacheVersion(doc: {
   ].join(":");
 }
 
+// Unsigned thumbnails come through the API: a full grid must not crowd out the rest of the page.
+const apiThumbnailSlot = createConcurrencyLimit(4);
+
 async function loadKnowledgePreviewThumbnail(
   doc: {
     created_at?: string | null;
@@ -1231,6 +1265,7 @@ async function loadKnowledgePreviewThumbnail(
   if (type === "image") return api.documents.imageThumbnail(doc.id, { cache: true, version });
   if (type === "video") return api.documents.videoThumbnail(doc.id, { cache: true, version });
   if (type === "presentation") return api.documents.presentationThumbnail(doc.id, { cache: true, version });
+  if (type === "page") return api.documents.documentThumbnail(doc.id, { cache: true, version });
   throw new Error("Preview thumbnail unavailable");
 }
 
@@ -1243,16 +1278,14 @@ function getMediaPreviewUrl(doc: { entity_id: string; fs_path?: string | null; n
   if (VIDEO_EXTENSIONS.has(ext)) return { type: "video", url };
   if (PRESENTATION_EXTENSIONS.has(ext) || mime.includes("presentation")) return { type: "presentation", url };
   if (AUDIO_EXTENSIONS.has(ext)) return { type: "audio", url };
+  if (PAGE_PREVIEW_EXTENSIONS.has(ext)) return { type: "page", url };
+  if (TEXT_PREVIEW_EXTENSIONS.has(ext) && !doc.name?.toLowerCase().endsWith(".diagram.json")) return { type: "text", url };
   return null;
 }
 
-function DocumentMediaPreview({ doc, media }: { doc: any; media: { type: KnowledgePreviewType; url: string } }) {
+function useNearViewport() {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [isVisible, setIsVisible] = useState(false);
-  const [previewRequested, setPreviewRequested] = useState(false);
-  const [thumbnailUrl, setThumbnailUrl] = useState<string | null>(null);
-  const [displayUrl, setDisplayUrl] = useState<string | null>(null);
-  const [previewFailed, setPreviewFailed] = useState(() => brokenMediaPreviewDocIds.has(doc.id));
 
   useEffect(() => {
     const node = containerRef.current;
@@ -1274,6 +1307,64 @@ function DocumentMediaPreview({ doc, media }: { doc: any; media: { type: Knowled
     return () => observer.disconnect();
   }, []);
 
+  return { containerRef, isVisible };
+}
+
+const textPreviewExcerpts = new Map<string, string>();
+
+function DocumentTextPreview({ doc, fallback }: { doc: any; fallback: ReactNode }) {
+  const { containerRef, isVisible } = useNearViewport();
+  const cacheKey = `${doc.id}:${documentThumbnailCacheVersion(doc)}`;
+  const [excerpt, setExcerpt] = useState(() => textPreviewExcerpts.get(cacheKey) ?? "");
+  const tooLarge = typeof doc.file_size === "number" && doc.file_size > TEXT_PREVIEW_MAX_FILE_BYTES;
+
+  useEffect(() => {
+    if (!isVisible || tooLarge) return undefined;
+    const cached = textPreviewExcerpts.get(cacheKey);
+    if (cached !== undefined) {
+      setExcerpt(cached);
+      return undefined;
+    }
+    const controller = new AbortController();
+    api.documents.getContent(doc.id, controller.signal)
+      .then(({ content }) => {
+        const next = (content || "").slice(0, TEXT_PREVIEW_MAX_CHARS).trim();
+        textPreviewExcerpts.set(cacheKey, next);
+        setExcerpt(next);
+      })
+      .catch(() => {});
+    return () => controller.abort();
+  }, [cacheKey, doc.id, isVisible, tooLarge]);
+
+  return (
+    <div ref={containerRef} className="w-full h-full">
+      {excerpt ? <pre className="kb-text-preview" aria-hidden="true">{excerpt}</pre> : fallback}
+    </div>
+  );
+}
+
+function FileTypeTile({ typeInfo }: { typeInfo: { icon: string; color: string; bg: string } }) {
+  return (
+    <div className="w-full h-full flex items-center justify-center" style={{ background: typeInfo.bg }}>
+      <span className="kb-file-type-label" style={{ color: typeInfo.color }}>{typeInfo.icon}</span>
+    </div>
+  );
+}
+
+function DocumentMediaPreview({ doc, media, fallback }: {
+  doc: any;
+  media: { type: KnowledgePreviewType; url: string };
+  fallback: ReactNode;
+}) {
+  const { containerRef, isVisible } = useNearViewport();
+  const [previewRequested, setPreviewRequested] = useState(false);
+  const [thumbnailUrl, setThumbnailUrl] = useState<string | null>(null);
+  const [displayUrl, setDisplayUrl] = useState<string | null>(null);
+  const [previewFailed, setPreviewFailed] = useState(() => brokenMediaPreviewDocIds.has(doc.id));
+  // The list signed this card's thumbnail: the browser loads it, lazily and cached, without the API.
+  const signed = useSignedMediaUrl(doc.thumbnail_url);
+  const viaApi = !signed.src && !signed.waiting;
+
   useEffect(() => {
     setDisplayUrl(null);
     setThumbnailUrl(null);
@@ -1282,12 +1373,14 @@ function DocumentMediaPreview({ doc, media }: { doc: any; media: { type: Knowled
   }, [doc.id, media.type]);
 
   useEffect(() => {
-    if (!isVisible || media.type === "audio") return undefined;
+    if (!isVisible || media.type === "audio" || !viaApi) return undefined;
     if (media.type === "video" && !shouldRequestVideoThumbnail(doc)) return undefined;
     let cancelled = false;
     let objectUrl: string | null = null;
-    loadKnowledgePreviewThumbnail(doc, media.type)
+    // A card that left the page while waiting for a slot asks for nothing.
+    apiThumbnailSlot(() => (cancelled ? Promise.resolve(null) : loadKnowledgePreviewThumbnail(doc, media.type)))
       .then((url) => {
+        if (url === null) return;
         if (cancelled) {
           if (url.startsWith("blob:")) URL.revokeObjectURL(url);
           return;
@@ -1303,7 +1396,7 @@ function DocumentMediaPreview({ doc, media }: { doc: any; media: { type: Knowled
       cancelled = true;
       if (objectUrl?.startsWith("blob:")) URL.revokeObjectURL(objectUrl);
     };
-  }, [doc, doc.id, doc.file_size, isVisible, media.type]);
+  }, [doc, doc.id, doc.file_size, isVisible, media.type, viaApi]);
 
   useEffect(() => {
     if (media.type !== "video" || !isVisible || !previewRequested || previewFailed) return undefined;
@@ -1331,18 +1424,19 @@ function DocumentMediaPreview({ doc, media }: { doc: any; media: { type: Knowled
     };
   }, [doc.id, isVisible, media.type, previewFailed, previewRequested]);
 
-  if (media.type === "image" || media.type === "presentation") {
+  if (media.type === "image" || media.type === "presentation" || media.type === "page") {
     return (
-      <div ref={containerRef} className="w-full h-full bg-stone-100">
-        {thumbnailUrl ? (
-          <img src={thumbnailUrl} alt={doc.name} loading="lazy" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-        ) : media.type === "presentation" ? (
-          <div className="kb-video-placeholder">
-            <span>Presentation preview</span>
-          </div>
-        ) : (
-          null
-        )}
+      <div ref={containerRef} className="w-full h-full">
+        {signed.src ? (
+          <img src={signed.src} alt={doc.name} loading="lazy" decoding="async" onError={signed.onError} style={{ width: "100%", height: "100%", objectFit: "cover", objectPosition: media.type === "page" ? "top" : "center" }} />
+        ) : thumbnailUrl ? (
+          <img
+            src={thumbnailUrl}
+            alt={doc.name}
+            loading="lazy"
+            style={{ width: "100%", height: "100%", objectFit: "cover", objectPosition: media.type === "page" ? "top" : "center" }}
+          />
+        ) : fallback}
       </div>
     );
   }
@@ -1356,6 +1450,8 @@ function DocumentMediaPreview({ doc, media }: { doc: any; media: { type: Knowled
       >
         {displayUrl ? (
           <video src={`${displayUrl}#t=0.5`} muted preload="metadata" playsInline style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+        ) : signed.src ? (
+          <img src={signed.src} alt={doc.name} loading="lazy" decoding="async" onError={signed.onError} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
         ) : thumbnailUrl ? (
           <img src={thumbnailUrl} alt={doc.name} loading="lazy" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
         ) : (
@@ -1363,16 +1459,14 @@ function DocumentMediaPreview({ doc, media }: { doc: any; media: { type: Knowled
             <svg width="30" height="30" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
               <path d="M8 5.14v13.72a1 1 0 0 0 1.52.85l10.96-6.86a1 1 0 0 0 0-1.7L9.52 4.29A1 1 0 0 0 8 5.14Z" />
             </svg>
-            <span>{previewRequested ? "Loading preview" : "Video preview"}</span>
           </div>
         )}
       </div>
     );
   }
   return (
-    <div ref={containerRef} className="w-full h-full flex flex-col items-center justify-center gap-2 bg-gradient-to-br from-violet-50 to-indigo-50">
-      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-violet-400"><path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" /></svg>
-      <span className="text-[11px] font-bold text-violet-400">Audio</span>
+    <div ref={containerRef} className="w-full h-full flex flex-col items-center justify-center bg-[color:var(--surface-muted)]">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-[color:var(--text-muted)]"><path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" /></svg>
     </div>
   );
 }
@@ -1601,7 +1695,7 @@ function FileTypeFilterList({ fileTypeFilter, setFileTypeFilter }: {
         >
           {ft.badge ? (
             <span
-              className="flex-shrink-0 w-[28px] h-[18px] rounded-[4px] flex items-center justify-center text-[9px] font-extrabold tracking-wide"
+              className="flex-shrink-0 w-[28px] h-[18px] rounded-[4px] flex items-center justify-center text-[9px] font-extrabold"
               style={{ background: ft.bg, color: ft.color }}
             >
               {ft.badge}
@@ -1623,7 +1717,7 @@ function FileTypeFilterList({ fileTypeFilter, setFileTypeFilter }: {
           onClick={() => setExpanded(!expanded)}
           className="kb-sidebar-link text-stone-400 hover:text-stone-600"
         >
-          <span className="flex-shrink-0 w-[28px] h-[18px] flex items-center justify-center text-[11px] font-bold tracking-widest">
+          <span className="flex-shrink-0 w-[28px] h-[18px] flex items-center justify-center text-[11px] font-bold">
             ...
           </span>
           <span className="flex-1 text-left text-[11px]">
@@ -1649,15 +1743,9 @@ function QuickLookPreview({ doc }: { doc: any }) {
     if (!MEDIA_EXTENSIONS.has(ext)) return undefined;
     setBlobUrl(null);
     setError(false);
-    // For video/audio, prefer streaming URL (no full blob download)
-    if (VIDEO_EXTENSIONS.has(ext) || AUDIO_EXTENSIONS.has(ext)) {
-      const streamUrl = api.documents.streamUrl(doc);
-      if (streamUrl) {
-        setBlobUrl(streamUrl);
-        return undefined;
-      }
-    }
-    api.documents.preview(doc.id).then((url) => {
+    // Video and audio play while they download; anything else (or a failed address) loads whole.
+    const streams = VIDEO_EXTENSIONS.has(ext) || AUDIO_EXTENSIONS.has(ext);
+    (streams ? api.documents.streamUrl(doc.id).catch(() => api.documents.preview(doc.id)) : api.documents.preview(doc.id)).then((url) => {
       if (cancelled) {
         if (url.startsWith("blob:")) URL.revokeObjectURL(url);
         return;
@@ -1781,6 +1869,7 @@ function documentStatusPollInterval(value: unknown): number | false {
 /* ── Main component ────────────────────────────────── */
 
 export default function Knowledge() {
+  const pageVisible = usePageVisible();
   const queryClient = useQueryClient();
   const toast = useToastStore();
   const { activeIds: downloadingIds, downloadDocument } = useDocumentDownload();
@@ -1892,31 +1981,25 @@ export default function Knowledge() {
   const navigateToDocument = useCallback(
     (doc: any, mode: "edit" | "view" | "default" = "default") => {
       const canEdit = isEditable(doc) && canEditDoc(doc);
-      const path = mode === "view" && isViewable(doc)
-        ? `/viewer/${doc.id}`
-        : mode === "edit" && canEdit
-          ? `/editor/${doc.id}`
-          : canEdit
-            ? `/editor/${doc.id}`
-            : isViewable(doc)
-              ? `/viewer/${doc.id}`
-              : null;
+      const canOpen = isViewable(doc) || isEditable(doc);
+      // Every file opens to be read; editing is one click from there.
+      const path = mode === "edit" && canEdit
+        ? `/editor/${doc.id}`
+        : canOpen
+          ? `/viewer/${doc.id}`
+          : null;
       if (path) navigate(path, { state: knowledgeReturnState });
     },
     [canEditDoc, knowledgeReturnState, navigate],
   );
 
   const openDocument = useCallback((doc: any) => {
-    if (isViewable(doc)) {
+    if (isViewable(doc) || isEditable(doc)) {
       navigateToDocument(doc, "view");
       return;
     }
-    if (isEditable(doc) && canEditDoc(doc)) {
-      navigateToDocument(doc, "edit");
-      return;
-    }
     void downloadDocument(doc);
-  }, [canEditDoc, navigateToDocument, downloadDocument]);
+  }, [navigateToDocument, downloadDocument]);
 
   // Inline folder creation
   const [creatingFolder, setCreatingFolder] = useState(false);
@@ -2007,6 +2090,8 @@ export default function Knowledge() {
     // (agents, other users, editors in other tabs), so re-check on focus.
     refetchOnWindowFocus: true,
   });
+  // Expired signed thumbnails on a card ask for the listed pages once more.
+  const refreshSignedMedia = useSignedMediaRefresh(retryBrowse);
   const data = useMemo(() => {
     const pages = browsePages?.pages;
     if (!pages?.length) return undefined;
@@ -2042,10 +2127,10 @@ export default function Knowledge() {
       }
       return (await Promise.all(batches.map((ids) => api.documents.indexingStatuses(ids)))).flat();
     },
-    enabled: inProgressDocumentIds.length > 0,
+    enabled: pageVisible && inProgressDocumentIds.length > 0,
     staleTime: 0,
     refetchOnWindowFocus: true,
-    refetchInterval: (query) => (
+    refetchInterval: (query) => displayReadInterval(query.state,
       query.state.data === undefined
         ? DOCUMENT_POLL_INTERVAL_MS
         : documentStatusPollInterval(query.state.data)
@@ -2084,6 +2169,8 @@ export default function Knowledge() {
   const { data: folders = [] } = useQuery({
     queryKey: ["folder-tree"],
     queryFn: () => api.folders.tree(false),
+    // The page lists its own folders; the whole tree can follow without competing.
+    enabled: !isLoading,
     staleTime: 60_000,
     refetchOnWindowFocus: true,
   });
@@ -3081,17 +3168,17 @@ export default function Knowledge() {
 
     const items: MenuItem[] = [
       {
-        label: isViewable(doc) ? t("page.knowledge.view") : (isEditable(doc) && canEdit) ? t("page.knowledge.open_in_editor") : t("page.knowledge.download"),
-        icon: isViewable(doc) ? <IconDocument size={14} /> : (isEditable(doc) && canEdit) ? <IconExternalLink size={14} /> : <IconDocument size={14} />,
+        label: isViewable(doc) || isEditable(doc) ? t("page.knowledge.view") : t("page.knowledge.download"),
+        icon: <IconDocument size={14} />,
         onClick: () => openDocument(doc),
       },
-      ...(isViewable(doc) && isEditable(doc) && canEdit ? [{
+      ...(isEditable(doc) && canEdit ? [{
         label: t("page.knowledge.open_in_editor"),
         icon: <IconExternalLink size={14} />,
         onClick: () => navigateToDocument(doc, "edit"),
       } as MenuItem] : []),
       ...((isVideoFile(doc.name, doc.file_type) || isVideoProjectFile(doc.name)) && canEdit ? [{
-        label: "Open in video editor",
+        label: t("ui.open_in_video_editor"),
         icon: <IconExternalLink size={14} />,
         onClick: () => navigate(`/video-editor/${doc.id}`, { state: knowledgeReturnState }),
       } as MenuItem] : []),
@@ -3333,6 +3420,7 @@ export default function Knowledge() {
   ) : null;
 
   return (
+    <SignedMediaRefreshContext.Provider value={refreshSignedMedia}>
     <div className="knowledge-page flex min-h-[calc(100vh-11rem)] w-full gap-0 overflow-hidden">
       <style>{STYLES}</style>
 
@@ -3487,9 +3575,6 @@ export default function Knowledge() {
         <PageHeader
           title={t("page.knowledge.knowledge_base")}
           subtitle={t("page.knowledge.subtitle")}
-          meta={data
-            ? `${fileCount}${hasNextPage ? "+" : ""} ${fileCount === 1 ? t("page.knowledge.file") : t("page.knowledge.files").toLocaleLowerCase()}`
-            : undefined}
           toolbar={librarySection !== "trash" ? (
               <div className="flex w-full flex-wrap items-center gap-2 lg:w-auto lg:justify-end">
                 <SmartToolbar
@@ -3513,7 +3598,7 @@ export default function Knowledge() {
                     <button
                       key={m}
                       onClick={() => handleViewModeChange(m)}
-                      className={`kb-view-btn ${viewMode === m ? "bg-stone-950 text-white" : "bg-transparent text-stone-400"}`}
+                      className={`kb-view-btn ${viewMode === m ? "bg-stone-100 text-stone-900" : "bg-transparent text-stone-400"}`}
                     >
                       {m === "table" ? (
                         <IconList size={14} />
@@ -3596,7 +3681,7 @@ export default function Knowledge() {
 
         {librarySection !== "trash" && (
             <div className="flex min-w-0 flex-wrap items-center gap-1 pb-2 text-[13px]">
-            {breadcrumbs.map((crumb, i) => {
+            {breadcrumbs.length > 1 && breadcrumbs.map((crumb, i) => {
               const isLast = i === breadcrumbs.length - 1;
               const crumbFolderId = i === 0 ? null : folderPath[i - 1]?.id ?? null;
               const isDragOver = draggingItem && !isLast && (dragOverTarget === (crumbFolderId ?? "__root__"));
@@ -3743,22 +3828,19 @@ export default function Knowledge() {
         <>
         {/* ── Files View ─────────────────────────── */}
         <>
-            {/* File count display */}
-            <div className="flex items-center gap-2 pb-2 text-xs text-stone-400">
-              {folderCount > 0 && <span>{folderCount} {t("page.knowledge.folder")}{folderCount !== 1 ? "s" : ""}</span>}
-              {folderCount > 0 && fileCount > 0 && <span className="w-[3px] h-[3px] rounded-full bg-stone-300" />}
-              {fileCount > 0 && <span>{fileCount} {t("page.knowledge.file")}{fileCount !== 1 ? "s" : ""}</span>}
-              {folderCount === 0 && fileCount === 0 && visibleUploadingFiles.length === 0 && !isLoading && (
-                <span>{t("page.knowledge.empty_folder")}</span>
-              )}
-            </div>
+            {/* The header already counts files; only an empty folder says so here. */}
+            {folderCount === 0 && fileCount === 0 && visibleUploadingFiles.length === 0 && !isLoading && (
+              <div className="pb-2 text-[13px] text-[color:var(--text-faint)]">
+                {t("page.knowledge.empty_folder")}
+              </div>
+            )}
 
             {/* Hidden file input (always in DOM so refs work) */}
             <input
               ref={fileInputRef}
               type="file"
               multiple
-              aria-label="Choose upload file"
+              aria-label={t("ui.choose_upload_file")}
               className="hidden"
               onChange={(e) => {
                 const folderId = filePickerFolderIdRef.current === undefined
@@ -3935,17 +4017,15 @@ export default function Knowledge() {
                     <section>
                       <div className="kb-section-header">
                         <h3 className="kb-section-title">
-                          <IconFolder size={14} />
                           {t("page.knowledge.folders")}
                         </h3>
-                        <span className="kb-section-count">{folderCount} {t("page.knowledge.folder")}{folderCount !== 1 ? "s" : ""}</span>
                       </div>
                       <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3">
                         {/* Inline folder creation card */}
                         {creatingFolder && (
                           <div className="kb-folder-card">
-                            <div className="w-10 h-10 rounded-[12px] bg-gradient-to-br from-amber-500/10 to-orange-500/10 flex items-center justify-center flex-shrink-0">
-                              <IconFolder size={20} className="text-amber-600" />
+                            <div className="w-10 h-10 rounded-[12px] bg-[color:var(--surface-muted)] flex items-center justify-center flex-shrink-0">
+                              <IconFolder size={20} className="text-[color:var(--text-muted)]" />
                             </div>
                             <div className="flex-1 min-w-0">
                               <input
@@ -4004,8 +4084,8 @@ export default function Knowledge() {
                                 )}
                               </div>
                             )}
-                            <div className="w-10 h-10 rounded-[12px] bg-gradient-to-br from-amber-500/10 to-orange-500/10 flex items-center justify-center flex-shrink-0">
-                              <IconFolder size={20} className="text-amber-600" />
+                            <div className="w-10 h-10 rounded-[12px] bg-[color:var(--surface-muted)] flex items-center justify-center flex-shrink-0">
+                              <IconFolder size={20} className="text-[color:var(--text-muted)]" />
                             </div>
                             <div className="flex-1 min-w-0">
                               <p className="text-[14px] font-semibold text-stone-800 truncate">{folderDisplayName(folder)}</p>
@@ -4025,10 +4105,8 @@ export default function Knowledge() {
                   <section>
                     <div className="kb-section-header">
                       <h3 className="kb-section-title">
-                        <IconDocument size={14} />
                         {t("page.knowledge.files")}
                       </h3>
-                      <span className="kb-section-count">{fileCount} {t("page.knowledge.file")}{fileCount !== 1 ? "s" : ""}</span>
                     </div>
                     {allDocuments.length === 0 && visibleUploadingFiles.length === 0 ? (
                       <p className="kb-section-empty">{t("page.knowledge.no_files_in_current_folder")}</p>
@@ -4051,7 +4129,7 @@ export default function Knowledge() {
                                 className="w-full flex items-center justify-center"
                                 style={{ aspectRatio: "16/10", background: typeInfo.bg }}
                               >
-                                <span className="text-2xl font-black tracking-wide" style={{ color: typeInfo.color, opacity: 0.7 }}>{typeInfo.icon}</span>
+                                <span className="kb-file-type-label" style={{ color: typeInfo.color }}>{typeInfo.icon}</span>
                               </div>
                               <div className="kb-file-card-body">
                                 <p className="text-[13px] font-semibold text-stone-800 mb-1 truncate">{upload.fileName}</p>
@@ -4122,11 +4200,9 @@ export default function Knowledge() {
                       const docCanManageMetadata = canManageDocMetadata(doc);
                       const docManage = docCanManageMetadata || canDeleteDoc(doc);
                       const folderPathLabel = isSearching ? folderPathLabelForDocument(doc) : "";
-                      const selectionSourcePath = isViewable(doc)
+                      const selectionSourcePath = isViewable(doc) || isEditable(doc)
                         ? `/viewer/${doc.id}`
-                        : isEditable(doc) && canEditDoc(doc)
-                          ? `/editor/${doc.id}`
-                          : `${location.pathname}${location.search}`;
+                        : `${location.pathname}${location.search}`;
                       return (
                         <div
                           key={doc.id}
@@ -4160,15 +4236,19 @@ export default function Knowledge() {
 
                           {/* Card header: media preview or icon banner */}
                           {media ? (
-                            <div className="w-full bg-stone-100" style={{ height: 100 }}>
-                              <DocumentMediaPreview doc={doc} media={media} />
+                            <div className="w-full" style={{ height: 100, background: "var(--surface-muted)" }}>
+                              {media.type === "text" ? (
+                                <DocumentTextPreview doc={doc} fallback={<FileTypeTile typeInfo={typeInfo} />} />
+                              ) : (
+                                <DocumentMediaPreview doc={doc} media={media} fallback={<FileTypeTile typeInfo={typeInfo} />} />
+                              )}
                             </div>
                           ) : (
                             <div
                               className="w-full flex items-center justify-center"
                               style={{ height: 100, background: typeInfo.bg }}
                             >
-                              <span className="text-2xl font-black tracking-wide" style={{ color: typeInfo.color, opacity: 0.7 }}>{typeInfo.icon}</span>
+                              <span className="text-2xl font-black" style={{ color: typeInfo.color, opacity: 0.7 }}>{typeInfo.icon}</span>
                             </div>
                           )}
 
@@ -4213,10 +4293,8 @@ export default function Knowledge() {
                     <section>
                       <div className="kb-section-header">
                         <h3 className="kb-section-title">
-                          <IconFolder size={14} />
                           {t("page.knowledge.folders")}
                         </h3>
-                        <span className="kb-section-count">{folderCount} {t("page.knowledge.folder")}{folderCount !== 1 ? "s" : ""}</span>
                       </div>
                       <table className="glass-table">
                         <thead>
@@ -4233,8 +4311,8 @@ export default function Knowledge() {
                               {selectMode && <td />}
                               <td>
                                 <div className="flex items-center gap-3">
-                                  <div className="w-9 h-9 rounded-[10px] bg-gradient-to-br from-amber-500/10 to-orange-500/10 flex items-center justify-center flex-shrink-0">
-                                    <IconFolder size={16} className="text-amber-600" />
+                                  <div className="w-9 h-9 rounded-[10px] bg-[color:var(--surface-muted)] flex items-center justify-center flex-shrink-0">
+                                    <IconFolder size={16} className="text-[color:var(--text-muted)]" />
                                   </div>
                                   <input
                                     ref={inlineFolderRef}
@@ -4299,8 +4377,8 @@ export default function Knowledge() {
                               )}
                               <td>
                                 <div className="flex items-center gap-3">
-                                  <div className="w-9 h-9 rounded-[10px] bg-gradient-to-br from-amber-500/10 to-orange-500/10 flex items-center justify-center flex-shrink-0">
-                                    <IconFolder size={16} className="text-amber-600" />
+                                  <div className="w-9 h-9 rounded-[10px] bg-[color:var(--surface-muted)] flex items-center justify-center flex-shrink-0">
+                                    <IconFolder size={16} className="text-[color:var(--text-muted)]" />
                                   </div>
                                   <span className="text-sm font-semibold text-stone-800">{folderDisplayName(folder)}</span>
                                 </div>
@@ -4330,10 +4408,8 @@ export default function Knowledge() {
                   <section>
                     <div className="kb-section-header">
                       <h3 className="kb-section-title">
-                        <IconDocument size={14} />
                         {t("page.knowledge.files")}
                       </h3>
-                      <span className="kb-section-count">{fileCount} {t("page.knowledge.file")}{fileCount !== 1 ? "s" : ""}</span>
                     </div>
                     {(allDocuments.length > 0 || visibleUploadingFiles.length > 0) ? (
                       <table className="glass-table">
@@ -4603,7 +4679,7 @@ export default function Knowledge() {
 
               {/* Metadata */}
               <div className="mt-6 space-y-2.5">
-                <h4 className="text-xs font-bold text-stone-400 uppercase tracking-wide mb-3">{t("page.knowledge.file_details")}</h4>
+                <h4 className="text-xs font-bold text-stone-400 mb-3">{t("page.knowledge.file_details")}</h4>
                 {[
                   { label: t("page.qr.size"), value: quickLookDoc.file_size != null ? formatFileSize(quickLookDoc.file_size) : t("page.workspace_detail.unknown") },
                   { label: t("page.dashboard.created"), value: quickLookDoc.created_at ? new Date(quickLookDoc.created_at).toLocaleString(undefined, { timeZone: getPreferredTimeZone() }) : t("page.workspace_detail.unknown") },
@@ -4731,7 +4807,7 @@ export default function Knowledge() {
               { label: t("page.dashboard.created"), value: infoTarget.created_at ? new Date(infoTarget.created_at).toLocaleString(undefined, { timeZone: getPreferredTimeZone() }) : t("page.workspace_detail.unknown") },
             ].map((row) => (
               <div key={row.label} className="flex items-center justify-between py-1.5">
-                <span className="text-xs font-semibold text-stone-500 uppercase tracking-wide">{row.label}</span>
+                <span className="text-xs font-semibold text-stone-500">{row.label}</span>
                 <span className="text-sm text-stone-700 font-medium">{row.value}</span>
               </div>
             ))}
@@ -4741,13 +4817,13 @@ export default function Knowledge() {
                 FileViewer's details drawer so labels stay consistent. */}
             <div className="pt-3 mt-1 border-t border-stone-200/50">
               <div className="flex items-center justify-between py-1.5">
-                <span className="text-xs font-semibold text-stone-500 uppercase tracking-wide">
+                <span className="text-xs font-semibold text-stone-500">
                   {t("page.file_viewer.details.classification")}
                 </span>
                 <ClassificationBadge level={infoTarget.classification} size="sm" />
               </div>
               <div className="flex items-center justify-between py-1.5">
-                <span className="text-xs font-semibold text-stone-500 uppercase tracking-wide">
+                <span className="text-xs font-semibold text-stone-500">
                   {t("page.file_viewer.details.visibility")}
                 </span>
                 <span className="inline-flex items-center gap-1.5 text-sm text-stone-700 font-medium">
@@ -4757,16 +4833,16 @@ export default function Knowledge() {
               </div>
               {infoTarget.client_visible && (
                 <div className="flex items-center justify-between py-1.5">
-                  <span className="text-xs font-semibold text-stone-500 uppercase tracking-wide">
+                  <span className="text-xs font-semibold text-stone-500">
                     {t("page.file_viewer.details.client_portal")}
                   </span>
-                  <span className="text-sm font-medium" style={{ color: "#57534e" }}>
+                  <span className="text-sm font-medium" style={{ color: "var(--text-muted)" }}>
                     {t("page.file_viewer.details.client_visible_value")}
                   </span>
                 </div>
               )}
               <div className="flex items-center justify-between py-1.5">
-                <span className="text-xs font-semibold text-stone-500 uppercase tracking-wide">
+                <span className="text-xs font-semibold text-stone-500">
                   {t("page.file_viewer.details.owner")}
                 </span>
                 <span className="text-sm text-stone-700 font-medium truncate ml-2" title={infoTarget.owner_id || ""}>
@@ -4920,7 +4996,7 @@ export default function Knowledge() {
             onFocus={(e) => e.currentTarget.select()}
           />
           <div>
-            <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-2">
+            <label className="block text-xs font-semibold text-stone-500 mb-2">
               {t("page.knowledge.file_type")}
             </label>
             <div className="grid grid-cols-4 gap-2">
@@ -4935,7 +5011,7 @@ export default function Knowledge() {
                 { key: "json", label: t("page.skill_form.json"), ext: ".json" },
                 { key: "html", label: t("page.skill_form.html"), ext: ".html" },
               ] as const).map((ft) => {
-                const typeInfo = FILE_TYPE_ICONS[ft.key] || { icon: ft.key.toUpperCase(), color: "#57534e", bg: "#f5f5f4" };
+                const typeInfo = FILE_TYPE_ICONS[ft.key] || { icon: ft.key.toUpperCase(), color: "var(--text-muted)", bg: "#f5f5f7" };
                 return (
                   <button
                     key={ft.key}
@@ -5030,7 +5106,7 @@ export default function Knowledge() {
             placeholder={t("page.knowledge.auto_generate_from_content")}
           />
           <div>
-            <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-2">
+            <label className="block text-xs font-semibold text-stone-500 mb-2">
               {t("page.knowledge.prompt")}
             </label>
             <Textarea
@@ -5041,7 +5117,7 @@ export default function Knowledge() {
             />
           </div>
           <div>
-            <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-2">
+            <label className="block text-xs font-semibold text-stone-500 mb-2">
               {t("page.knowledge.file_type")}
             </label>
             <div className="grid grid-cols-4 gap-2">
@@ -5055,7 +5131,7 @@ export default function Knowledge() {
                 { key: "json", label: t("page.skill_form.json"), ext: ".json" },
                 { key: "html", label: t("page.skill_form.html"), ext: ".html" },
               ] as const).map((ft) => {
-                const typeInfo = FILE_TYPE_ICONS[ft.key] || { icon: ft.key.toUpperCase(), color: "#57534e", bg: "#f5f5f4" };
+                const typeInfo = FILE_TYPE_ICONS[ft.key] || { icon: ft.key.toUpperCase(), color: "var(--text-muted)", bg: "#f5f5f7" };
                 return (
                   <button
                     key={ft.key}
@@ -5191,6 +5267,7 @@ export default function Knowledge() {
         />
       )}
     </div>
+    </SignedMediaRefreshContext.Provider>
   );
 }
 

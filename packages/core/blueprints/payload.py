@@ -545,6 +545,50 @@ def _validate_contract_variables(contract: dict[str, Any]) -> None:
             raise PayloadError(f"{path}.materialize must be a boolean")
 
 
+_SCHEDULE_KIND_FIELDS = {"cron": "cron_expr", "every": "every_seconds", "interval": "every_seconds", "at": "run_at"}
+
+
+_UNREAD_CADENCE_FIELDS = ("schedule", "cadence", "cron", "cron_expr", "every_seconds", "run_at")
+
+
+def _validate_scheduled_job_clock(job: dict[str, Any], path: str) -> None:
+    """A clock the Job declares must be one the installer reads and can run.
+
+    Jobs with another kind (``manual``, ``once``) or with no cadence at all
+    run on request and need no clock. A missing ``schedule_kind`` next to a
+    cadence would install a Job that silently never runs.
+    """
+    kind = job.get("schedule_kind")
+    if kind in (None, ""):
+        declared = [field for field in _UNREAD_CADENCE_FIELDS if job.get(field) not in (None, "")]
+        if declared:
+            raise PayloadError(
+                f"{path}.schedule_kind is required (cron, every or at) for its {declared[0]}"
+            )
+    elif kind in _SCHEDULE_KIND_FIELDS and job.get(_SCHEDULE_KIND_FIELDS[kind]) in (None, ""):
+        raise PayloadError(f"{path}.{_SCHEDULE_KIND_FIELDS[kind]} is required for schedule_kind {kind!r}")
+    if job.get("cron_expr") not in (None, ""):
+        from packages.core.cron import validate_cron_expression
+
+        try:
+            validate_cron_expression(job["cron_expr"])
+        except ValueError as exc:
+            raise PayloadError(f"{path}.cron_expr is invalid: {exc}") from None
+    if kind in {"every", "interval"}:
+        try:
+            if float(job["every_seconds"]) <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise PayloadError(f"{path}.every_seconds must be a positive number") from None
+    if job.get("timezone") not in (None, ""):
+        from packages.core.schedule_cadence import normalize_timezone
+
+        try:
+            normalize_timezone(job["timezone"])
+        except ValueError as exc:
+            raise PayloadError(f"{path}.timezone is invalid: {exc}") from None
+
+
 def _validate_scheduled_jobs(recipe: dict[str, Any]) -> None:
     seen: set[str] = set()
     workflow_slugs = {
@@ -579,7 +623,10 @@ def _validate_scheduled_jobs(recipe: dict[str, Any]) -> None:
                 f"{path} is runtime-derived; declare its Workspace, Goal, or "
                 "Stat configuration instead"
             )
-        if job.get("execution_type") == "skill":
+        # The installer runs a Job without execution_type as an Agent Job;
+        # validate the same default so the target is checked before install.
+        execution_type = job.get("execution_type") or "agent"
+        if execution_type == "skill":
             target = job.get("execution_target")
             if not isinstance(target, dict) or not (
                 str(target.get("skill_component_key") or "").strip()
@@ -588,7 +635,7 @@ def _validate_scheduled_jobs(recipe: dict[str, Any]) -> None:
                 raise PayloadError(
                     f"{path} requires a portable Skill target"
                 )
-        if job.get("execution_type") == "workflow":
+        if execution_type == "workflow":
             target = job.get("execution_target")
             workflow_slug = str(
                 target.get("workflow_slug")
@@ -598,7 +645,7 @@ def _validate_scheduled_jobs(recipe: dict[str, Any]) -> None:
                 raise PayloadError(
                     f"{path} requires a declared portable Workflow target"
                 )
-        if job.get("execution_type") in {"agent", "agent_message"}:
+        if execution_type in {"agent", "agent_message"}:
             target = job.get("execution_target")
             service_key = str(
                 (target.get("service_key") or "")
@@ -635,6 +682,7 @@ def _validate_scheduled_jobs(recipe: dict[str, Any]) -> None:
         for field in ("enabled", "delete_after_run"):
             if field in job and not isinstance(job[field], bool):
                 raise PayloadError(f"{path}.{field} must be a boolean")
+        _validate_scheduled_job_clock(job, path)
 
 
 _BLUEPRINT_SETUP_EXECUTION_TYPES = frozenset({
@@ -1707,7 +1755,7 @@ def _scan_local_reference_values(node: Any) -> set[str]:
 #        "steps": [
 #          {"id": "draft", "kind": "agent_call",
 #           "service_key": "social.x.poster",
-#           "input": "Draft post on ${{vars.post_topic}}"},
+#           "input": "Draft post on {{post_topic}}"},
 #          {"id": "review", "kind": "hitl_approval",
 #           "depends_on": ["draft"], "channel": "telegram",
 #           "timeout_minutes": 60}

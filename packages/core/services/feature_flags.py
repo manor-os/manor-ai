@@ -20,7 +20,9 @@ Because unknown keys fail closed, a flag the code gates on is invisible
 in the admin Flags page until somebody types its exact key by hand.
 ``KNOWN_FLAGS`` closes that gap: every key the code actually checks is
 declared here, and ``seed_known_flags`` inserts the missing rows at
-their safe default on boot (and on demand from the admin API). Seeding
+their safe default on boot, in the cloud post-rollout publish job
+(``scripts/publish_platform_blueprints.py``), and on demand from the
+admin API. Seeding
 only ever CREATES — an ops-set default or an archived status always
 wins over the registry.
 
@@ -38,7 +40,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import desc, select
+from sqlalchemy import and_, desc, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -96,6 +98,23 @@ KNOWN_FLAGS: tuple[KnownFlag, ...] = (
             "On: the Strategist prompt reads the consolidator briefing instead "
             "of the legacy context sections (default off). Review runs, "
             "proposal items and approval are the same either way."
+        ),
+        default_enabled=False,
+    ),
+    KnownFlag(
+        key="attention_delivery",
+        description=(
+            "On: open attention items are told once per stage in Workspace chat "
+            "and notifications, replacing the HITL reminder, account, setup and "
+            "goal pace notices. Off (default): those senders run as before."
+        ),
+        default_enabled=False,
+    ),
+    KnownFlag(
+        key="workspace_architect_parts",
+        description=(
+            "On: the Workspace Architect commits a build spec and has part designers (Agents, Knowledge, "
+            "Workflows, Automations, App) design larger Drafts in parallel waves. Off (default): it builds alone."
         ),
         default_enabled=False,
     ),
@@ -205,12 +224,93 @@ async def evaluate(
     )).scalar_one_or_none()
     if flag is None:
         return FlagEvaluation(enabled=False, source="missing")
+    overrides = await _overrides_by_key(
+        db, [key], entity_id=entity_id, user_id=user_id,
+    )
+    return _evaluate_flag(
+        flag, overrides.get(key, []),
+        entity_id=entity_id, user_id=user_id, now=datetime.now(timezone.utc),
+    )
 
-    now = datetime.now(timezone.utc)
 
+async def enabled_flags(
+    db: AsyncSession,
+    flags: list[FeatureFlag],
+    *,
+    entity_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+) -> dict[str, bool]:
+    """``is_enabled`` for each active flag row, reading overrides once."""
+    out: dict[str, bool] = {}
+    missing: list[FeatureFlag] = []
+    for flag in flags:
+        cached = _cache.get((flag.key, entity_id, user_id))
+        if cached and (time.time() - cached[1]) < _CACHE_TTL_SECONDS:
+            out[flag.key] = cached[0]
+        else:
+            missing.append(flag)
+    if missing:
+        overrides = await _overrides_by_key(
+            db, [flag.key for flag in missing],
+            entity_id=entity_id, user_id=user_id,
+        )
+        now = datetime.now(timezone.utc)
+        for flag in missing:
+            result = _evaluate_flag(
+                flag, overrides.get(flag.key, []),
+                entity_id=entity_id, user_id=user_id, now=now,
+            ).enabled
+            _cache[(flag.key, entity_id, user_id)] = (result, time.time())
+            out[flag.key] = result
+    return out
+
+
+async def _overrides_by_key(
+    db: AsyncSession,
+    keys: list[str],
+    *,
+    entity_id: Optional[str],
+    user_id: Optional[str],
+) -> dict[str, list[FeatureFlagOverride]]:
+    """Every override that can apply to this user and entity, by flag."""
+    targets = []
+    if user_id:
+        targets.append(and_(
+            FeatureFlagOverride.scope == "user",
+            FeatureFlagOverride.scope_id == user_id,
+        ))
+    if entity_id:
+        targets.append(and_(
+            FeatureFlagOverride.scope == "tenant",
+            FeatureFlagOverride.scope_id == entity_id,
+        ))
+        targets.append(FeatureFlagOverride.scope == "percent")
+    if not keys or not targets:
+        return {}
+    rows = (await db.execute(
+        select(FeatureFlagOverride).where(
+            FeatureFlagOverride.flag_key.in_(keys),
+            or_(*targets),
+        )
+    )).scalars().all()
+    by_key: dict[str, list[FeatureFlagOverride]] = {}
+    for row in rows:
+        by_key.setdefault(row.flag_key, []).append(row)
+    return by_key
+
+
+def _evaluate_flag(
+    flag: FeatureFlag,
+    overrides: list[FeatureFlagOverride],
+    *,
+    entity_id: Optional[str],
+    user_id: Optional[str],
+    now: datetime,
+) -> FlagEvaluation:
+    """User override, then tenant override, then percent rollout, then default."""
     # 1. User override
     if user_id:
-        user_ov = await _override_for(db, key, "user", user_id, now)
+        user_ov = _target_override(overrides, "user", user_id, now)
         if user_ov is not None:
             return FlagEvaluation(
                 enabled=user_ov.enabled, source="user_override",
@@ -219,7 +319,7 @@ async def evaluate(
 
     # 2. Tenant override
     if entity_id:
-        tenant_ov = await _override_for(db, key, "tenant", entity_id, now)
+        tenant_ov = _target_override(overrides, "tenant", entity_id, now)
         if tenant_ov is not None:
             return FlagEvaluation(
                 enabled=tenant_ov.enabled, source="tenant_override",
@@ -228,7 +328,7 @@ async def evaluate(
 
     # 3. Percent rollout — only meaningful when an entity_id is known.
     if entity_id:
-        percent_ov = await _percent_match(db, key, entity_id, now)
+        percent_ov = _percent_match(flag.key, overrides, entity_id, now)
         if percent_ov is not None:
             return FlagEvaluation(
                 enabled=percent_ov, source="percent",
@@ -238,16 +338,13 @@ async def evaluate(
     return FlagEvaluation(enabled=bool(flag.default_enabled), source="default")
 
 
-async def _override_for(
-    db: AsyncSession, key: str, scope: str, scope_id: str, now: datetime,
+def _target_override(
+    overrides: list[FeatureFlagOverride], scope: str, scope_id: str, now: datetime,
 ) -> Optional[FeatureFlagOverride]:
-    row = (await db.execute(
-        select(FeatureFlagOverride).where(
-            FeatureFlagOverride.flag_key == key,
-            FeatureFlagOverride.scope == scope,
-            FeatureFlagOverride.scope_id == scope_id,
-        ).limit(1)
-    )).scalar_one_or_none()
+    row = next(
+        (o for o in overrides if o.scope == scope and o.scope_id == scope_id),
+        None,
+    )
     if row is None:
         return None
     if row.expires_at and row.expires_at <= now:
@@ -255,18 +352,16 @@ async def _override_for(
     return row
 
 
-async def _percent_match(
-    db: AsyncSession, key: str, entity_id: str, now: datetime,
+def _percent_match(
+    key: str, overrides: list[FeatureFlagOverride], entity_id: str, now: datetime,
 ) -> Optional[bool]:
     """Look at percent overrides for this flag — find the highest-target
     one that includes this entity. Deterministic so an entity stays
     inside or outside the rollout across requests."""
-    rows = list((await db.execute(
-        select(FeatureFlagOverride).where(
-            FeatureFlagOverride.flag_key == key,
-            FeatureFlagOverride.scope == "percent",
-        ).order_by(desc(FeatureFlagOverride.scope_id))  # higher % first
-    )).scalars().all())
+    rows = sorted(
+        (o for o in overrides if o.scope == "percent"),
+        key=lambda o: o.scope_id, reverse=True,  # higher % first
+    )
     if not rows:
         return None
 

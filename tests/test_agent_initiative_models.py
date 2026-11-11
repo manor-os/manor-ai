@@ -157,3 +157,19 @@ def test_agent_initiative_revision_and_blueprint_boundaries_are_registered() -> 
         job_id="initiative:01JTEST",
         execution_type="agent_initiative",
     )
+
+
+def test_initiative_channels_are_ones_routing_can_deliver() -> None:
+    # A channel the contract accepts but routing cannot deliver fails every
+    # attempt in the outbox (it happened with "whatsapp").
+    import typing
+
+    from packages.core.constants.notification_types import SUPPORTED_CHANNELS
+    from packages.core.contracts.agent_initiative import NotificationPolicy
+
+    item_type = typing.get_args(NotificationPolicy.model_fields["channels"].annotation)[0]
+    assert set(typing.get_args(item_type)) <= set(SUPPORTED_CHANNELS)
+
+    # Rows saved before still load, without the undeliverable channel.
+    assert NotificationPolicy(channels=["whatsapp"]).channels == ["inapp"]
+    assert NotificationPolicy(channels=["email", "whatsapp"]).channels == ["email"]

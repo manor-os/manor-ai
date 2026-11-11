@@ -8,6 +8,8 @@ from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
 
+from packages.core.constants.workspace_drafts import STAFF_REQUEST_TEXT_FIELD
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("selections", [None, [], "account", {"channel:0:telegram": None}])
@@ -432,6 +434,47 @@ async def test_workspace_draft_stream_keeps_quiet_architect_turn_connected(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("architect_turn", [True, False])
+async def test_only_architect_turn_streams_stop_when_they_send_nothing_but_keepalives(architect_turn):
+    """A stuck turn's keepalives must not count as progress, or its stream
+    slot is renewed for as long as it hangs. Finalize keeps running after a
+    disconnect, so it has no stall watchdog."""
+    from apps.api.routers import workspace_drafts
+
+    wrapped: dict = {}
+
+    class FakeDB:
+        async def commit(self):
+            return None
+
+        async def close(self):
+            return None
+
+    class FakeLease:
+        def wrap(self, source, **watchdog):
+            wrapped.update(watchdog)
+            return source
+
+    async def source():
+        yield workspace_drafts._sse("done", {})
+
+    await workspace_drafts._workspace_draft_streaming_response(
+        FakeDB(), FakeLease(), source(), architect_turn=architect_turn,
+    )
+
+    if not architect_turn:
+        assert wrapped == {}
+        return
+    assert wrapped["stall_timeout_seconds"] > 0
+    is_progress = wrapped["is_progress"]
+    assert not is_progress(workspace_drafts._sse("keepalive", {"draft_id": "d"}))
+    for event in ("start", "token", "tool_start", "tool_progress", "tool_end", "done"):
+        assert is_progress(workspace_drafts._sse(event, {}))
+    # The saved request runs a stopped turn again, so nobody is told it stopped.
+    assert wrapped["stalled_chunk"]().startswith("event: continuing\n")
+
+
+@pytest.mark.asyncio
 async def test_workspace_draft_stream_releases_request_db_before_wrapping():
     from apps.api.routers import workspace_drafts
 
@@ -445,7 +488,7 @@ async def test_workspace_draft_stream_releases_request_db_before_wrapping():
             lifecycle.append("close")
 
     class FakeLease:
-        def wrap(self, source):
+        def wrap(self, source, **_watchdog):
             assert lifecycle == ["commit", "close"]
             lifecycle.append("wrap")
             return source
@@ -477,7 +520,7 @@ async def test_stream_response_is_not_created_until_draft_shell_is_persisted(
         async def release(self):
             calls.append("release")
 
-        async def wrap(self, source):
+        async def wrap(self, source, **_watchdog):
             async for chunk in source:
                 yield chunk
 
@@ -522,7 +565,7 @@ async def test_empty_stream_request_starts_architect_discovery(
         async def release(self):
             return None
 
-        def wrap(self, stream):
+        def wrap(self, stream, **_watchdog):
             return stream
 
     stream_turn = Mock(return_value=iter(()))
@@ -652,7 +695,7 @@ async def test_stream_resume_does_not_recheck_new_workspace_plan(
         async def release(self):
             return None
 
-        async def wrap(self, source):
+        async def wrap(self, source, **_watchdog):
             async for chunk in source:
                 yield chunk
 
@@ -891,7 +934,7 @@ async def test_finalize_stream_preserves_workspace_plan_limit_detail(
             return None
 
     class FakeLease:
-        async def wrap(self, source):
+        async def wrap(self, source, **_watchdog):
             async for chunk in source:
                 yield chunk
 
@@ -951,7 +994,7 @@ async def test_finalize_stream_commits_verified_not_ready_state(
             commits.append(True)
 
     class FakeLease:
-        async def wrap(self, source):
+        async def wrap(self, source, **_watchdog):
             async for chunk in source:
                 yield chunk
 
@@ -1036,7 +1079,7 @@ async def test_finalize_stream_rolls_back_resource_materialization_failure(
             rollbacks.append(True)
 
     class FakeLease:
-        async def wrap(self, source):
+        async def wrap(self, source, **_watchdog):
             async for chunk in source:
                 yield chunk
 
@@ -1089,7 +1132,7 @@ async def test_finalize_stream_done_preserves_post_commit_dispatch_warning(
             return None
 
     class FakeLease:
-        async def wrap(self, source):
+        async def wrap(self, source, **_watchdog):
             async for chunk in source:
                 yield chunk
 
@@ -1132,3 +1175,415 @@ async def test_finalize_stream_done_preserves_post_commit_dispatch_warning(
     assert '"dispatch_warning": "workspace_startup_dispatch_failed"' in body
     assert "strategist queue unavailable" not in body
     assert '"strategist_eta_seconds": null' in body
+
+
+async def _committed_draft(db_session, **fields):
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.workspace_draft import WorkspaceDraft
+
+    draft = WorkspaceDraft(
+        entity_id=generate_ulid(), user_id=generate_ulid(), status="active",
+        fields=dict(fields), messages=[], missing=[], ready=False,
+    )
+    db_session.add(draft)
+    await db_session.commit()
+    return draft
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("holder", ["row_lock", "running_turn"])
+async def test_a_message_to_a_busy_draft_is_a_409_not_a_500(db_session, monkeypatch, holder):
+    """Regression (staging 2026-11-01): a message sent while the opening turn
+    ran hit lock_timeout in claim() and surfaced as an unexpected 500."""
+    import time
+
+    from fastapi import HTTPException
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from apps.api.routers import workspace_drafts
+    from packages.core.services import workspace_draft_service
+
+    claim = {"id": "other-turn", "expires_at": time.time() + 300}
+    draft = await _committed_draft(
+        db_session, **({workspace_draft_service.TURN_CLAIM_FIELD: claim} if holder == "running_turn" else {}),
+    )
+    architect = AsyncMock(return_value="unused")
+    monkeypatch.setattr(workspace_draft_service, "_architect_turn", architect)
+    user = SimpleNamespace(id=draft.user_id, entity_id=draft.entity_id)
+    request = SimpleNamespace(state=SimpleNamespace(auth_claims={}))
+    async with AsyncSession(db_session.bind, expire_on_commit=False) as holder_db, \
+            AsyncSession(db_session.bind, expire_on_commit=False) as db:
+        if holder == "row_lock":
+            await workspace_draft_service.get_draft(
+                holder_db, draft.id, draft.entity_id, draft.user_id, for_update=True,
+            )
+            await db.execute(text("SET LOCAL lock_timeout = '100ms'"))
+        with pytest.raises(HTTPException) as caught:
+            await workspace_drafts.post_draft_message(
+                draft.id, workspace_drafts.DraftMessageRequest(message="Add a weekly report"),
+                request, user=user, db=db,
+            )
+        await holder_db.rollback()
+
+    assert caught.value.status_code == 409
+    assert caught.value.detail["code"] == "draft_busy"
+    assert caught.value.headers["Retry-After"] == str(workspace_draft_service.DRAFT_BUSY_RETRY_SECONDS)
+    architect.assert_not_awaited()
+    await db_session.refresh(draft)
+    assert draft.messages == []
+    # Another turn's claim is left alone.
+    assert (draft.fields.get(workspace_draft_service.TURN_CLAIM_FIELD) == claim) is (holder == "running_turn")
+
+
+@pytest.mark.asyncio
+async def test_synchronous_create_holds_a_claim_not_the_row_and_is_retryable(db_session, monkeypatch):
+    """POST /workspace-drafts runs its opening turn the way /stream does: the
+    shell is committed first, the turn owns a claim, so the draft reads as
+    working rather than locked. A retry with the same draft_id replays it."""
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from apps.api.routers import workspace_drafts
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.workspace_draft import WorkspaceDraft
+    from packages.core.services import workspace_draft_service
+
+    sessions = async_sessionmaker(db_session.bind, class_=AsyncSession, expire_on_commit=False)
+    monkeypatch.setattr(workspace_drafts, "async_session", sessions)
+    monkeypatch.setattr(workspace_draft_service, "_refresh_missing_from_lint", AsyncMock())
+    seen: dict = {}
+
+    async def architect(db, *, draft, **kwargs):
+        # Mid-turn, another connection reads the draft without waiting on a lock.
+        async with sessions() as other:
+            row = (await other.execute(
+                select(WorkspaceDraft).where(WorkspaceDraft.id == draft.id).with_for_update(nowait=True)
+            )).scalar_one()
+            seen["working"] = (await workspace_drafts._hydrate_response(other, row)).working
+            await other.rollback()
+        seen["mcp_client"] = kwargs.get("mcp_client", False)
+        return "Who orders from the bakery?"
+
+    monkeypatch.setattr(workspace_draft_service, "_architect_turn", architect)
+    entity_id, user_id, draft_id = generate_ulid(), generate_ulid(), generate_ulid()
+    user = SimpleNamespace(id=user_id, entity_id=entity_id)
+    request = SimpleNamespace(state=SimpleNamespace(auth_claims={"act": {"sub": "mcp:claude-code"}}))
+    req = workspace_drafts.StartDraftRequest(initial_brief="A bakery", draft_id=draft_id)
+
+    for _ in range(2):
+        async with sessions() as db:
+            response = await workspace_drafts.create_draft(req, request, _gate=None, user=user, db=db)
+        assert response.reply == "Who orders from the bakery?"
+        assert response.draft.id == draft_id and response.draft.working is False
+
+    assert seen == {"working": True, "mcp_client": True}
+    async with sessions() as db:
+        stored = await db.get(WorkspaceDraft, draft_id)
+    assert [m["role"] for m in stored.messages] == ["user", "assistant"]  # the retry replayed, no second turn
+    assert workspace_draft_service.TURN_CLAIM_FIELD not in stored.fields
+
+
+@pytest.mark.asyncio
+async def test_a_turn_whose_process_died_is_answered_by_the_recovery_sweep(db_session, monkeypatch):
+    """Regression (staging 2026-11-02): a release restarted the pod mid-turn;
+    the draft kept no message, reported not working and never got a reply.
+    The message is saved before the turn, a live turn keeps its claim alive,
+    and once the claim expires the sweep runs the turn again."""
+    import time
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from apps.api.routers import workspace_drafts
+    from packages.core import database
+    from packages.core.models.workspace_draft import WorkspaceDraft
+    from packages.core.services import workspace_draft_service as drafts
+    from packages.core.tasks import workspace_draft_tasks
+
+    sessions = async_sessionmaker(db_session.bind, class_=AsyncSession, expire_on_commit=False)
+    monkeypatch.setattr(database, "async_session", sessions)
+    monkeypatch.setattr(workspace_draft_tasks, "async_session", sessions)
+    monkeypatch.setattr(drafts, "_refresh_missing_from_lint", AsyncMock())
+    monkeypatch.setattr(drafts, "TURN_CLAIM_RENEW_SECONDS", 0.05)
+    # The process dies: none of the turn's cleanup runs.
+    monkeypatch.setattr(drafts.DraftTurn, "abandon", AsyncMock())
+    draft = await _committed_draft(db_session)
+
+    async def stored() -> WorkspaceDraft:
+        async with sessions() as db:
+            return await db.get(WorkspaceDraft, draft.id)
+
+    class PodRestarted(Exception):
+        pass
+
+    claim_renewed = []
+
+    async def dying_turn(db, *, draft, **kwargs):
+        before = (await stored()).fields[drafts.TURN_CLAIM_FIELD]["expires_at"]
+        await asyncio.sleep(0.3)
+        claim_renewed.append((await stored()).fields[drafts.TURN_CLAIM_FIELD]["expires_at"] > before)
+        raise PodRestarted()
+
+    monkeypatch.setattr(drafts, "_architect_turn", dying_turn)
+    user_message = {"role": "user", "content": "Add a weekly report"}
+    staff_request_text = "Set up a weekly report and have Amy review it."
+    stored_user_message = {**user_message, STAFF_REQUEST_TEXT_FIELD: staff_request_text}
+    async with sessions() as db:
+        with pytest.raises(PodRestarted):
+            await drafts.process_draft_message(
+                db, draft_id=draft.id, entity_id=draft.entity_id, user_id=draft.user_id,
+                user_message=user_message["content"], staff_request_text=staff_request_text,
+            )
+    assert claim_renewed == [True]
+
+    lost = await stored()
+    assert lost.messages == [stored_user_message]
+
+    handed_off: list[str] = []
+    monkeypatch.setattr(workspace_draft_tasks, "enqueue_draft_turn_recovery", handed_off.append)
+    # A claim that has not expired may belong to a live turn: left alone.
+    await workspace_draft_tasks.recover_draft_turns()
+    assert draft.id not in handed_off
+    expired = time.time() + drafts.TURN_CLAIM_TTL_SECONDS + 1
+    await workspace_draft_tasks.recover_draft_turns(now=expired)
+    await workspace_draft_tasks.recover_draft_turns(now=expired + 1)
+    assert handed_off.count(draft.id) == 1  # handed off once
+
+    # From here on the dead turn's claim has expired.
+    monkeypatch.setattr(drafts, "_turn_claim_active", lambda claim, now: False)
+    async with sessions() as db:
+        assert (await workspace_drafts._hydrate_response(db, await stored())).working is True
+
+    seen: dict = {}
+
+    async def recovered_turn(db, *, draft, **kwargs):
+        seen.update(user_message=kwargs["user_message"], history=list(draft.messages)[:kwargs["history_len"]])
+        return "Added a weekly report to the plan."
+
+    monkeypatch.setattr(drafts, "_architect_turn", recovered_turn)
+    assert await workspace_draft_tasks.resume_draft_turn(draft.id) is True
+
+    assert seen == {"user_message": "Add a weekly report", "history": []}
+    answered = await stored()
+    assert answered.messages == [
+        stored_user_message,
+        {"role": "assistant", "content": "Added a weekly report to the plan.", "recovered": True},
+    ]
+    assert drafts.TURN_REQUEST_FIELD not in answered.fields
+    assert drafts.TURN_CLAIM_FIELD not in answered.fields
+    async with sessions() as db:
+        response = await workspace_drafts._hydrate_response(db, answered)
+    assert response.working is False
+    assert response.messages[0] == user_message
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_turn_is_answered_once_however_its_sender_resends(db_session, monkeypatch):
+    """Regression (jr acceptance 2026-11-04): a stream was told "send your message
+    again" while recovery was answering it. A stopped turn tells its client it
+    continues, and sending the message again spends nothing more."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from apps.api.routers import workspace_drafts
+    from packages.core import database
+    from packages.core.models.workspace_draft import WorkspaceDraft
+    from packages.core.services import workspace_draft_service as drafts
+    from packages.core.tasks import workspace_draft_tasks
+
+    sessions = async_sessionmaker(db_session.bind, class_=AsyncSession, expire_on_commit=False)
+    monkeypatch.setattr(database, "async_session", sessions)
+    monkeypatch.setattr(workspace_drafts, "async_session", sessions)
+    monkeypatch.setattr(workspace_draft_tasks, "async_session", sessions)
+    monkeypatch.setattr(drafts, "_refresh_missing_from_lint", AsyncMock())
+    draft = await _committed_draft(db_session)
+    owner = {"draft_id": draft.id, "entity_id": draft.entity_id, "user_id": draft.user_id}
+    handed_off: list[str] = []
+    monkeypatch.setattr(workspace_draft_tasks, "enqueue_draft_turn_recovery", handed_off.append)
+    started = asyncio.Event()
+
+    async def hanging_turn(db, *, draft, **kwargs):
+        started.set()
+        await asyncio.sleep(60)
+
+    # What the stall watchdog and a dropped connection do: close the stream. The
+    # turn stops, and the sweep runs its saved request again with nobody listening.
+    monkeypatch.setattr(drafts, "_architect_turn", hanging_turn)
+    stream = workspace_drafts._stream_turn(**owner, user_message="Add a weekly report", mode="message")
+    next_frame = asyncio.ensure_future(anext(stream))
+    await next_frame
+    keepalive_or_end = asyncio.ensure_future(anext(stream))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    keepalive_or_end.cancel()
+    await asyncio.gather(keepalive_or_end, return_exceptions=True)
+    await stream.aclose()
+    await workspace_draft_tasks.recover_draft_turns()
+    assert handed_off.count(draft.id) == 1
+
+    async def failing_turn(db, *, draft, **kwargs):
+        raise RuntimeError("provider connection reset")
+
+    monkeypatch.setattr(drafts, "_architect_turn", failing_turn)
+    frames = [frame async for frame in workspace_drafts._stream_turn(
+        **owner, user_message="Add a weekly report", mode="message",
+    )]
+    # Saved and run again: the person is not sent to resend, or shown the fault.
+    assert frames[-1].startswith("event: continuing\n") and "provider connection" not in "".join(frames)
+
+    # A message that never got saved has nothing running for it.
+    frames = [frame async for frame in workspace_drafts._stream_turn(
+        **{**owner, "draft_id": "no-such-draft"}, user_message="Add a weekly report", mode="message",
+    )]
+    assert frames[-1].startswith("event: error\n")
+
+    spent = []
+
+    async def answering_turn(db, *, draft, **kwargs):
+        spent.append(kwargs["user_message"])
+        return "Added a weekly report to the plan."
+
+    monkeypatch.setattr(drafts, "_architect_turn", answering_turn)
+    assert await workspace_draft_tasks.resume_draft_turn(draft.id) is True
+    assert spent == ["Add a weekly report"]
+
+    async def send(message: str) -> str:
+        async with sessions() as db:
+            reply, _ = await drafts.process_draft_message(db, **owner, user_message=message)
+            await db.commit()
+            return reply
+
+    # The resend that waited out the recovery gets its answer, for free.
+    assert await send("Add a weekly report") == "Added a weekly report to the plan."
+    assert spent == ["Add a weekly report"]
+    # Only once: the same words sent after that answer are a new request.
+    await send("Add a weekly report")
+    assert spent == ["Add a weekly report", "Add a weekly report"]
+    async with sessions() as db:
+        stored = await db.get(WorkspaceDraft, draft.id)
+    assert [message["role"] for message in stored.messages] == ["user", "assistant", "user", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_a_stream_gives_up_waiting_for_another_turn_before_it_counts_as_stalled(monkeypatch):
+    """A stall frame says the turn continues, so it must only ever find a saved message."""
+    from apps.api.routers import workspace_drafts
+
+    seen: dict = {}
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return None
+
+    async def fake_process_message(_db, **kwargs):
+        seen.update(kwargs)
+        raise ValueError("busy")
+
+    async def not_continuing(_db, **_kwargs):
+        return False
+
+    monkeypatch.setattr(workspace_drafts, "async_session", FakeSession)
+    monkeypatch.setattr(workspace_drafts.draft_service, "process_draft_message", fake_process_message)
+    monkeypatch.setattr(workspace_drafts.draft_service, "turn_continues", not_continuing)
+    frames = [frame async for frame in workspace_drafts._stream_turn(
+        entity_id="e", user_id="u", draft_id="d", user_message="hi", mode="message",
+    )]
+    assert frames[-1].startswith("event: error\n")
+    assert 0 < seen["claim_wait_seconds"] < workspace_drafts._draft_turn_stall_seconds()
+
+
+@pytest.mark.asyncio
+async def test_a_lost_turn_nobody_waited_on_is_left_for_the_user_to_continue(db_session, monkeypatch):
+    """Regression (2026-11-03): a turn lost when a machine slept was run again
+    2.5 hours later, spending the user's BYOK tokens with nobody watching.
+    Past the age limit it is not run again, the draft stops reporting working,
+    and the user's next message continues from the same conversation."""
+    import time
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from apps.api.routers import workspace_drafts
+    from packages.core import database
+    from packages.core.models.workspace_draft import WorkspaceDraft
+    from packages.core.services import workspace_draft_service as drafts
+    from packages.core.tasks import workspace_draft_tasks
+
+    sessions = async_sessionmaker(db_session.bind, class_=AsyncSession, expire_on_commit=False)
+    monkeypatch.setattr(database, "async_session", sessions)
+    monkeypatch.setattr(workspace_draft_tasks, "async_session", sessions)
+    monkeypatch.setattr(drafts, "_refresh_missing_from_lint", AsyncMock())
+    architect = AsyncMock(return_value="Picked it up.")
+    monkeypatch.setattr(drafts, "_architect_turn", architect)
+    handed_off: list[str] = []
+    monkeypatch.setattr(workspace_draft_tasks, "enqueue_draft_turn_recovery", handed_off.append)
+    too_old = time.time() - drafts.TURN_RECOVERY_MAX_AGE_SECONDS - 1
+    in_time = time.time() - drafts.TURN_RECOVERY_MAX_AGE_SECONDS + 60
+
+    async def lost_draft(requested_at: float, *, claim_expires_at: float) -> WorkspaceDraft:
+        draft = await _committed_draft(db_session, **{
+            drafts.TURN_REQUEST_FIELD: {
+                "id": "lost", "message": "Add a weekly report", "history_len": 0,
+                "requested_at": requested_at, "recoveries": 0,
+            },
+            drafts.TURN_CLAIM_FIELD: {"id": "lost-claim", "expires_at": claim_expires_at},
+        })
+        draft.messages = [{"role": "user", "content": "Add a weekly report"}]
+        await db_session.commit()
+        return draft
+
+    async def stored(draft_id: str) -> WorkspaceDraft:
+        async with sessions() as db:
+            return await db.get(WorkspaceDraft, draft_id)
+
+    async def working(draft_id: str) -> bool:
+        async with sessions() as db:
+            return (await workspace_drafts._hydrate_response(db, await stored(draft_id))).working
+
+    expired_claim = time.time() - 1
+    old = await lost_draft(too_old, claim_expires_at=expired_claim)
+    queued = await lost_draft(too_old, claim_expires_at=expired_claim)
+    fresh = await lost_draft(in_time, claim_expires_at=expired_claim)
+    # A turn that is still alive is not lost, however long ago it was asked.
+    running = await lost_draft(too_old, claim_expires_at=time.time() + 300)
+
+    # Nothing spins even if no sweep runs (e.g. the environment just woke up).
+    assert await working(old.id) is False
+    assert await working(fresh.id) is True
+    assert await working(running.id) is True
+
+    # A recovery already in the queue when the limit passed does not run either.
+    assert await workspace_draft_tasks.resume_draft_turn(queued.id) is False
+    architect.assert_not_awaited()
+    assert drafts.TURN_REQUEST_FIELD not in (await stored(queued.id)).fields
+    assert drafts.TURN_CLAIM_FIELD not in (await stored(queued.id)).fields
+
+    await workspace_draft_tasks.recover_draft_turns()
+    assert fresh.id in handed_off
+    assert old.id not in handed_off and running.id not in handed_off
+    architect.assert_not_awaited()
+    assert drafts.TURN_REQUEST_FIELD in (await stored(running.id)).fields
+    assert (await stored(running.id)).fields[drafts.TURN_CLAIM_FIELD]["id"] == "lost-claim"
+    expired = await stored(old.id)
+    # A process that wakes after this finds its claim gone and stops at its next write.
+    assert drafts.TURN_REQUEST_FIELD not in expired.fields
+    assert drafts.TURN_CLAIM_FIELD not in expired.fields
+    assert expired.messages == [{"role": "user", "content": "Add a weekly report"}]
+
+    # Inside the limit the lost turn still recovers by itself.
+    assert await workspace_draft_tasks.resume_draft_turn(fresh.id) is True
+    assert (await stored(fresh.id)).messages[-1] == {"role": "assistant", "content": "Picked it up.", "recovered": True}
+
+    # The user's next message is a new turn that sees the unanswered one.
+    architect.reset_mock()
+    async with sessions() as db:
+        reply, _ = await drafts.process_draft_message(
+            db, draft_id=old.id, entity_id=old.entity_id, user_id=old.user_id, user_message="Please continue",
+        )
+        await db.commit()
+    assert reply == "Picked it up."
+    assert architect.await_args.kwargs["history_len"] == 1
+    assert [m["content"] for m in (await stored(old.id)).messages] == [
+        "Add a weekly report", "Please continue", "Picked it up.",
+    ]
+    assert await working(old.id) is False

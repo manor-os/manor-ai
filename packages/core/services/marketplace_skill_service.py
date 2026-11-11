@@ -25,22 +25,16 @@ from packages.core.services.reusable_resource_locks import (
 )
 
 
-async def ensure_marketplace_skill_installed(
-    db: AsyncSession,
-    *,
-    entity_id: str,
-    skill_id: str,
-    owner_user_id: Optional[str] = None,
+async def resolve_platform_marketplace_skill(
+    db: AsyncSession, *, entity_id: str, skill_id: str,
 ) -> Skill:
-    """Return the Skill for one exact Marketplace Skill id.
+    """Read the platform Marketplace source Skill for one exact id, or raise.
 
-    Local Skill IDs are resolved by the normal binding path instead; accepting
-    one here would let a local resource masquerade as a catalog identity.
-    Built-ins remain platform-owned and are bound directly, without a copy.
+    ``builtin:<slug>`` is the portable id Blueprint export writes for a
+    built-in; it resolves to the current packaged row. Any other id must name
+    a public platform row. Draft lint and install share this rule so a ref the
+    lint accepts is one the install can bind.
     """
-    await lock_reusable_resource_lifecycle(db, entity_id=entity_id)
-    # See the Agent installer: source templates are immutable and intentionally
-    # read without row locks so recursive installs cannot form a catalog cycle.
     if skill_id.startswith("builtin:"):
         from packages.core.services.builtin_skill_loader import resolve_packaged_builtin_skill
 
@@ -58,7 +52,29 @@ async def ensure_marketplace_skill_installed(
         raise ValueError("Skill id is local, not a Marketplace Skill")
     if source.entity_id is not None or not source.is_public:
         raise ValueError("Skill is not available from the Marketplace")
-    if (source.config or {}).get("source") == "builtin":
+    return source
+
+
+async def ensure_marketplace_skill_installed(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    skill_id: str,
+    owner_user_id: Optional[str] = None,
+) -> Skill:
+    """Return the Skill for one exact Marketplace Skill id.
+
+    Local Skill IDs are resolved by the normal binding path instead; accepting
+    one here would let a local resource masquerade as a catalog identity.
+    Built-ins remain platform-owned and are bound directly, without a copy.
+    """
+    await lock_reusable_resource_lifecycle(db, entity_id=entity_id)
+    # See the Agent installer: source templates are immutable and intentionally
+    # read without row locks so recursive installs cannot form a catalog cycle.
+    source = await resolve_platform_marketplace_skill(
+        db, entity_id=entity_id, skill_id=skill_id,
+    )
+    if skill_id.startswith("builtin:") or (source.config or {}).get("source") == "builtin":
         return source
 
     link = await get_marketplace_resource_link(

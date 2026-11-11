@@ -1,0 +1,329 @@
+/* Form controls drawn from a field's schema (WorkflowFormControlFields.tsx). Borderless, tokens only. */
+
+/* A question an agent asks in chat reads one field per row inside its bubble. */
+.chat-question-form {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.chat-question-form > .workflow-starter-input-schema-fields { grid-template-columns: minmax(0, 1fr); }
+
+.form-draft-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.workflow-form-muted {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.workflow-form-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  justify-self: start;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.workflow-form-link:hover:not(:disabled) { color: var(--text-strong); }
+.workflow-form-link:disabled { cursor: not-allowed; opacity: .5; }
+.workflow-form-link:focus-visible { outline: 0; border-radius: 4px; box-shadow: 0 0 0 3px var(--accent-ring); }
+
+/* Date range: two pickers on one line, stacked on a phone. */
+.workflow-form-range {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: end;
+  gap: 8px;
+  min-width: 0;
+}
+
+.workflow-form-range > label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.workflow-form-range > label > span {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.workflow-form-range-dash {
+  padding-bottom: 8px;
+  color: var(--text-faint);
+}
+
+@media (max-width: 480px) {
+  .workflow-form-range { grid-template-columns: minmax(0, 1fr); }
+  .workflow-form-range-dash { display: none; }
+}
+
+/* Tags: chips and the box they are typed into share one surface. */
+.workflow-form-tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 5px 8px;
+  border-radius: var(--radius-control);
+  background: var(--surface-muted);
+}
+
+.workflow-form-tags:focus-within { box-shadow: 0 0 0 3px var(--accent-ring); }
+
+.workflow-form-tags > input,
+.workflow-starter-input-field .workflow-form-tags > input:not([type="checkbox"]) {
+  flex: 1 1 120px;
+  min-width: 80px;
+  min-height: 0;
+  padding: 3px 2px;
+  border: 0;
+  outline: 0;
+  box-shadow: none;
+  background: transparent;
+  color: var(--text-strong);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 400;
+}
+
+.workflow-form-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 3px 4px 3px 9px;
+  border-radius: 999px;
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-sm);
+  color: var(--text-strong);
+  font-size: 12px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.workflow-form-tag > button,
+.workflow-form-icon-button {
+  display: inline-grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.workflow-form-tag > button:hover:not(:disabled),
+.workflow-form-icon-button:hover:not(:disabled) { background: var(--surface-sunken); color: var(--text-strong); }
+.workflow-form-tag > button:focus-visible,
+.workflow-form-icon-button:focus-visible { outline: 0; box-shadow: 0 0 0 3px var(--accent-ring); }
+
+/* Colour: the system swatch beside its code. */
+.workflow-form-color {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.workflow-form-color > input[type="color"],
+.workflow-starter-input-field .workflow-form-color > input[type="color"] {
+  flex: 0 0 36px;
+  width: 36px;
+  height: 36px;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: none;
+  box-shadow: none;
+  cursor: pointer;
+}
+
+.workflow-form-color > input[type="color"]::-webkit-color-swatch-wrapper { padding: 0; }
+.workflow-form-color > input[type="color"]::-webkit-color-swatch { border: 0; border-radius: var(--radius-control); box-shadow: var(--shadow-sm); }
+.workflow-form-color > input[type="text"] { flex: 1 1 auto; min-width: 0; max-width: 140px; }
+
+/* Rating: a row of stars; the chosen and lower ones are filled. */
+.workflow-form-rating {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.workflow-form-rating > [role="radiogroup"] { display: inline-flex; gap: 2px; }
+
+.workflow-form-rating [role="radio"] {
+  display: inline-grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+
+.workflow-form-rating [role="radio"][data-filled="true"] { color: var(--accent); }
+.workflow-form-rating [role="radio"][data-filled="true"] svg { fill: currentColor; }
+.workflow-form-rating [role="radio"]:hover:not(:disabled) { background: var(--surface-muted); }
+.workflow-form-rating [role="radio"]:focus-visible { outline: 0; box-shadow: 0 0 0 3px var(--accent-ring); }
+
+/* Markdown text: write / preview and a few marks. */
+.workflow-form-rich { display: grid; gap: 6px; min-width: 0; }
+
+.workflow-form-rich-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.workflow-form-rich-marks { display: inline-flex; gap: 2px; }
+
+.workflow-form-rich-marks > button {
+  min-width: 30px;
+  height: 28px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.workflow-form-rich-marks > button:hover:not(:disabled) { background: var(--surface-muted); color: var(--text-strong); }
+.workflow-form-rich-marks > button:focus-visible { outline: 0; box-shadow: 0 0 0 3px var(--accent-ring); }
+
+.workflow-form-rich-preview {
+  min-height: 96px;
+  padding: 8px 10px;
+  border-radius: var(--radius-control);
+  background: var(--surface-muted);
+  color: var(--text-default);
+  font-size: 13px;
+  font-weight: 400;
+  overflow-wrap: anywhere;
+}
+
+.workflow-form-address { display: grid; gap: 4px; min-width: 0; }
+
+/* Signature: a pad that keeps the ink in the theme's text colour. */
+.workflow-form-signature {
+  position: relative;
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text-strong);
+}
+
+.workflow-form-signature > canvas {
+  display: block;
+  width: 100%;
+  aspect-ratio: 720 / 220;
+  border-radius: var(--radius-control);
+  background: var(--surface-muted);
+  touch-action: none;
+  cursor: crosshair;
+}
+
+.workflow-form-signature-hint {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: grid;
+  place-items: center;
+  aspect-ratio: 720 / 220;
+  color: var(--text-faint);
+  font-size: 12px;
+  font-weight: 400;
+  pointer-events: none;
+}
+
+.workflow-form-signature-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.workflow-form-signature.is-signed > img {
+  display: block;
+  max-width: 100%;
+  max-height: 120px;
+  border-radius: var(--radius-control);
+  background: var(--surface-muted);
+}
+
+/* Line items: a compact table that scrolls sideways on a phone instead of the page. */
+.workflow-form-lines { display: grid; gap: 6px; min-width: 0; }
+.workflow-form-lines-scroll { min-width: 0; overflow-x: auto; }
+
+.workflow-form-lines table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.workflow-form-lines th {
+  padding: 4px 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.workflow-form-lines th[data-numeric], .workflow-form-lines td[data-numeric] { text-align: right; }
+
+.workflow-form-lines td {
+  padding: 3px 4px;
+  border-top: 1px solid rgba(29, 29, 31, 0.06);
+  vertical-align: middle;
+}
+
+.workflow-form-lines td input,
+.workflow-form-lines td select {
+  width: 100%;
+  min-width: 72px;
+}
+
+.workflow-form-lines td input.mono { text-align: right; }
+.workflow-form-lines tfoot td { color: var(--text-strong); font-weight: 600; }
+.workflow-form-lines td:last-child { width: 30px; }
+
+html[data-theme="dark"] .workflow-form-lines td { border-top-color: rgba(255, 255, 255, 0.08); }

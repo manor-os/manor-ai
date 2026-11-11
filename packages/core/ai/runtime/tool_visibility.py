@@ -102,6 +102,8 @@ _AGENT_EAGER_CAPABILITY_TOOLS = {
     # Every surface can stop and ask the user; the durable loop resumes on the
     # answer, other loops end the turn on the question.
     "human.input": ("request_input",),
+    # Facts, preferences and corrections are saved when they are said.
+    "memory.write": ("remember",),
 }
 
 # Server-owned grants every internal Agent holds without an explicit binding
@@ -190,6 +192,7 @@ _WORKSPACE_AGENT_CONTEXTUAL_CAPABILITY_TOOLS = {
         "get_workflow_run",
         "cancel_workflow_run",
         "resume_workflow_run",
+        "retry_workflow_run",
         "import_workflow",
     ),
     "workflow.run": (
@@ -198,6 +201,7 @@ _WORKSPACE_AGENT_CONTEXTUAL_CAPABILITY_TOOLS = {
         "get_workflow_run",
         "cancel_workflow_run",
         "resume_workflow_run",
+        "retry_workflow_run",
     ),
     "communication.notify": ("find_team_members", "notify_user"),
 }

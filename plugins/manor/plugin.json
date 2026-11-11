@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "manor",
-  "version": "0.9.1",
+  "version": "0.23.0",
   "description": "Build, version, test and deliver Manor Workspaces for your customers.",
   "author": {
     "name": "Manor AI",

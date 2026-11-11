@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,6 +19,8 @@ _BILLING_CONTEXT_KEYS = {
     "suppress",
     "byok",
     "payer_entity_id",
+    "operation_id",
+    "task_id",
 }
 
 _SYSTEM_TASK_USER_IDS = {"ai-agent"}
@@ -112,6 +116,18 @@ def runtime_ensure_billing_context(
     ensure_billing_context(entity_id, source=source, **billing_kwargs)
 
 
+def runtime_usage_subsource_scope(name: str):
+    """Record a sub-agent's LLM usage apart from its caller's.
+
+    Calls in the scope are logged as ``<caller source>.<name>`` while the
+    caller's billing context still decides payer, BYOK and credits.
+    """
+
+    from packages.core.ai.llm_client import llm_usage_subsource_scope
+
+    return llm_usage_subsource_scope(name)
+
+
 def runtime_llm_billing_context(
     entity_id: str,
     *,
@@ -122,6 +138,8 @@ def runtime_llm_billing_context(
     source: str = RUNTIME_SYSTEM_SOURCE,
     byok: bool = False,
     payer_entity_id: str | None = None,
+    task_id: str | None = None,
+    operation_id: str | None = None,
 ):
     """Return the async LLM billing context manager through the Runtime boundary."""
 
@@ -136,6 +154,51 @@ def runtime_llm_billing_context(
         source=source,
         byok=byok,
         payer_entity_id=payer_entity_id,
+        task_id=task_id,
+        operation_id=operation_id,
+    )
+
+
+def runtime_set_callback_settled_billing_context(
+    entity_id: str,
+    *,
+    user_id: str | None = None,
+    agent_id: str | None = None,
+    workspace_id: str | None = None,
+    conversation_id: str | None = None,
+    source: str = RUNTIME_CHAT_SOURCE,
+    payer_entity_id: str | None = None,
+    operation_id: str | None = None,
+    task_id: str | None = None,
+) -> RuntimeBillingContextHandle:
+    """Bind a billing context whose loop rounds settle through their own callbacks.
+
+    Automatic recording stays on for every call outside a round, and a round's
+    call is left to its settle callback (see ``llm_round_settled_by_callback_scope``).
+    ``payer_entity_id`` pins the credit gate to the payer the loop's callbacks charge.
+    """
+
+    from packages.core.ai.llm_client import (
+        LLMBillingContext,
+        _billing_ctx_var,
+        inherited_billing_task_id,
+    )
+
+    context = LLMBillingContext(
+        entity_id=entity_id,
+        user_id=user_id,
+        agent_id=agent_id,
+        workspace_id=workspace_id,
+        conversation_id=conversation_id,
+        source=source,
+        durable_per_call=True,
+        payer_entity_id=payer_entity_id,
+        operation_id=operation_id,
+        task_id=inherited_billing_task_id(entity_id, task_id),
+    )
+    return RuntimeBillingContextHandle(
+        context=context,
+        token=_billing_ctx_var.set(context),
     )
 
 
@@ -149,6 +212,7 @@ def runtime_set_suppressed_billing_context(
     source: str = RUNTIME_CHAT_SOURCE,
     durable_per_call: bool = False,
     payer_entity_id: str | None = None,
+    task_id: str | None = None,
 ) -> RuntimeBillingContextHandle:
     """Bind a suppressing billing context for callers with custom billing.
 
@@ -156,7 +220,11 @@ def runtime_set_suppressed_billing_context(
     the same entity.
     """
 
-    from packages.core.ai.llm_client import LLMBillingContext, _billing_ctx_var
+    from packages.core.ai.llm_client import (
+        LLMBillingContext,
+        _billing_ctx_var,
+        inherited_billing_task_id,
+    )
 
     context = LLMBillingContext(
         entity_id=entity_id,
@@ -168,11 +236,75 @@ def runtime_set_suppressed_billing_context(
         suppress=True,
         durable_per_call=durable_per_call,
         payer_entity_id=payer_entity_id,
+        task_id=inherited_billing_task_id(entity_id, task_id),
     )
     return RuntimeBillingContextHandle(
         context=context,
         token=_billing_ctx_var.set(context),
     )
+
+
+@contextmanager
+def runtime_durable_loop_billing(
+    *,
+    source_prefix: str,
+    entity_id: str,
+    user_id: str | None,
+    agent_id: str | None,
+    workspace_id: str | None,
+    conversation_id: str | None,
+    fallback_model: str | None,
+    payer_entity_id: str | None = None,
+    source: str | None = None,
+    operation_id: str | None = None,
+    task_id: str | None = None,
+) -> Iterator[tuple[Callable[..., Any], Callable[..., Any]]]:
+    """Per-call reserve/settle billing for one invocation of an agent loop.
+
+    Yields the ``(reserve, settle)`` callbacks for the loop's
+    ``on_llm_call_before`` / ``on_llm_usage_settled`` and binds a
+    callback-settled billing context around it: each round's provider call
+    reserves before it runs and is charged once by its settlement, while
+    calls outside a round keep their automatic record. ``source_prefix``
+    must be unique per invocation, so provider work repeated after a crash
+    is charged again rather than hidden by an earlier settlement fence.
+    ``payer_entity_id`` pins who pays in both the callbacks and the context.
+    """
+    from packages.core.ai.llm_client import inherited_billing_task_id
+    from packages.core.services.usage_service import build_durable_llm_billing_callbacks
+
+    task_id = inherited_billing_task_id(entity_id, task_id)
+    reserve_llm_call, settle_llm_call = build_durable_llm_billing_callbacks(
+        source_prefix=source_prefix,
+        entity_id=entity_id,
+        user_id=user_id,
+        agent_id=agent_id,
+        workspace_id=workspace_id,
+        conversation_id=conversation_id,
+        fallback_model=fallback_model,
+        payer_entity_id=payer_entity_id,
+        source=source,
+        operation_id=operation_id,
+        task_id=task_id,
+    )
+    context_kwargs: dict[str, Any] = {}
+    if source:
+        context_kwargs["source"] = source
+    billing_handle = runtime_set_callback_settled_billing_context(
+        entity_id,
+        user_id=user_id,
+        agent_id=agent_id,
+        workspace_id=workspace_id,
+        conversation_id=conversation_id,
+        payer_entity_id=payer_entity_id,
+        operation_id=operation_id,
+        task_id=task_id,
+        **context_kwargs,
+    )
+    try:
+        yield reserve_llm_call, settle_llm_call
+    finally:
+        runtime_release_billing_context(billing_handle)
 
 
 def runtime_release_billing_context(handle: RuntimeBillingContextHandle | None) -> None:
@@ -204,6 +336,34 @@ def runtime_current_billing_context() -> Any | None:
     from packages.core.ai.llm_client import _billing_ctx_var
 
     return _billing_ctx_var.get()
+
+
+def runtime_current_billing_operation_id(entity_id: str | None) -> str | None:
+    """The run id the bound billing context attributes calls to, for ``entity_id``.
+
+    Only a context for the same data owner counts, so a call on another
+    entity's data is never tied to this run.
+    """
+
+    context = runtime_current_billing_context()
+    if context is None or not entity_id or getattr(context, "entity_id", None) != entity_id:
+        return None
+    return getattr(context, "operation_id", None) or None
+
+
+def runtime_current_billing_task_id(entity_id: str | None) -> str | None:
+    """The Task the bound billing context attributes calls to, for ``entity_id``.
+
+    ``entity_id`` may be the context's data owner or its pinned payer; a call
+    for any other entity is never tied to this Task.
+    """
+
+    context = runtime_current_billing_context()
+    if context is None or not entity_id:
+        return None
+    if entity_id not in (getattr(context, "entity_id", None), getattr(context, "payer_entity_id", None)):
+        return None
+    return getattr(context, "task_id", None) or None
 
 
 async def runtime_assert_credit_available(
@@ -291,12 +451,19 @@ def _billing_scope_from_row(row: Any | None) -> RuntimeResolvedBillingScope:
     )
 
 
-def _bind_resolved_billing_scope(scope: RuntimeResolvedBillingScope, *, source: str) -> None:
+def _bind_resolved_billing_scope(
+    scope: RuntimeResolvedBillingScope,
+    *,
+    source: str,
+    task_id: str | None = None,
+) -> None:
     if not scope.entity_id:
         return
     kwargs: dict[str, Any] = {
         "workspace_id": scope.workspace_id,
     }
+    if task_id:
+        kwargs["task_id"] = task_id
     if scope.user_id:
         kwargs["user_id"] = scope.user_id
     if scope.byok:
@@ -414,7 +581,7 @@ async def runtime_ensure_task_billing_context(
         user_id=resolved_user_id,
     )
     scope = await _resolve_scope_byok(db, scope, model_role=model_role)
-    _bind_resolved_billing_scope(scope, source=source)
+    _bind_resolved_billing_scope(scope, source=source, task_id=task_id)
     return scope
 
 

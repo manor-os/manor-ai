@@ -5,6 +5,14 @@ from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from typing import Any, Literal
 
+from packages.core.ai.runtime.editor_document import (
+    CURRENT_EDITOR_FILE_ALIAS,
+    EDITOR_DOCUMENT_SNAPSHOT_KEY,
+    EditorDocumentRoundProcessor,
+    EditorDocumentSnapshotRef,
+    editor_snapshot_ref,
+    render_editor_document_map_user_context,
+)
 from packages.core.ai.runtime.profiles import RuntimeProfile
 from packages.core.ai.runtime.surfaces import ChatSurface
 
@@ -112,16 +120,9 @@ EDITOR_UI_ROUTE_PREFIXES = (
     "/workspaces/",
     "/api/",
 )
+# Content above this no longer goes in the prompt, whichever way it arrived.
 EDITOR_CURRENT_DOCUMENT_MAX_CHARS = 200_000
-
-
-class EditorCurrentDocumentTooLargeError(ValueError):
-    def __init__(self, actual_chars: int, max_chars: int = EDITOR_CURRENT_DOCUMENT_MAX_CHARS):
-        self.actual_chars = actual_chars
-        self.max_chars = max_chars
-        super().__init__(
-            f"Current editor document is too large ({actual_chars} characters; maximum {max_chars})."
-        )
+EDITOR_DOCUMENT_MAP_KEY = "document_map"
 
 FILE_READ_TOOLS = {"read_file", "list_files", "glob_files", "grep_files"}
 FILE_WRITE_TOOLS = {
@@ -171,7 +172,7 @@ def editor_context_without_inline_document_content(editor_context: dict | None) 
     return {
         key: value
         for key, value in (editor_context or {}).items()
-        if key not in EDITOR_CURRENT_DOCUMENT_CONTENT_KEYS
+        if key not in EDITOR_CURRENT_DOCUMENT_CONTENT_KEYS and key != EDITOR_DOCUMENT_MAP_KEY
     }
 
 
@@ -185,6 +186,9 @@ def editor_current_document_content(editor_context: dict | None) -> str | None:
 def render_editor_current_document_user_context(editor_context: dict | None) -> str | None:
     """Render editor content as escaped, explicitly untrusted user-turn data."""
 
+    document_map = (editor_context or {}).get(EDITOR_DOCUMENT_MAP_KEY)
+    if isinstance(document_map, dict):
+        return render_editor_document_map_user_context(document_map)
     content = editor_current_document_content(editor_context)
     if content is None:
         return None
@@ -238,11 +242,6 @@ def runtime_parse_editor_context(value: str | dict | None) -> dict | None:
         return None
 
     current_document_content = editor_current_document_content(data)
-    if (
-        current_document_content is not None
-        and len(current_document_content) > EDITOR_CURRENT_DOCUMENT_MAX_CHARS
-    ):
-        raise EditorCurrentDocumentTooLargeError(len(current_document_content))
 
     context = {
         "path": _get("path", "sourcePath", "source_path"),
@@ -303,6 +302,7 @@ def file_context_mounts_for_request(request) -> list[FileContextMount]:
                 "supports_image_generation",
                 "supportsNativeFilePatch",
                 "supports_native_file_patch",
+                EDITOR_DOCUMENT_SNAPSHOT_KEY,
             )
             if editor_context.get(key) is not None
         }
@@ -424,6 +424,36 @@ def file_context_mounts_from_envelope(envelope: Any) -> tuple[FileContextMount, 
         for path in getattr(envelope, "file_context_mounts", ()) or ()
         if str(path or "").strip()
     )
+
+
+def editor_document_snapshot_for_path(envelope: Any, path: str) -> EditorDocumentSnapshotRef | None:
+    """The snapshot this turn reads instead of the saved file at ``path``."""
+
+    if envelope is None or not str(path or "").strip():
+        return None
+    for mount in file_context_mounts_from_envelope(envelope):
+        if mount.kind != "current_editor_file":
+            continue
+        ref = editor_snapshot_ref(mount.metadata.get(EDITOR_DOCUMENT_SNAPSHOT_KEY))
+        if ref is not None and (
+            _normalize_rel_path(path) == CURRENT_EDITOR_FILE_ALIAS or _path_matches_mount(path, mount)
+        ):
+            return ref
+    return None
+
+
+def editor_document_round_processor(envelope: Any, entity_id: str | None) -> EditorDocumentRoundProcessor | None:
+    from packages.core.ai.runtime.file_actions import runtime_entity_file_root
+
+    root = runtime_entity_file_root(entity_id) if entity_id and envelope is not None else None
+    if not root:
+        return None
+    for mount in file_context_mounts_from_envelope(envelope):
+        if mount.kind == "current_editor_file":
+            ref = editor_snapshot_ref(mount.metadata.get(EDITOR_DOCUMENT_SNAPSHOT_KEY))
+            if ref is not None:
+                return EditorDocumentRoundProcessor(root, ref)
+    return None
 
 
 def runtime_allows_file_context_reader(

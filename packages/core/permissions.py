@@ -276,7 +276,33 @@ async def user_staff_role_assignment(
     ``membership_role``, when given, receives ``{"role": ...}`` -- the raw
     UserMembership role (any status) -- read in the same Staff query whenever
     Staff rows exist; it stays empty when there are none.
+
+    Within one authenticated request the answer is read once: access checks
+    ask it several times, and the memo ends with the request's first write.
     """
+    from packages.core.services.actor_authorization import admitted_request_memo
+
+    memo = admitted_request_memo(db) if membership_role is None else None
+    memo_key = ("staff_role_assignment", user_id, entity_id)
+    if memo is not None and memo_key in memo:
+        has_staff_record, role_id, role_name, permissions = memo[memo_key]
+        return has_staff_record, role_id, role_name, list(permissions)
+    assignment = await _read_staff_role_assignment(
+        db, user_id, entity_id, membership_role=membership_role,
+    )
+    if memo is not None:
+        has_staff_record, role_id, role_name, permissions = assignment
+        memo[memo_key] = (has_staff_record, role_id, role_name, tuple(permissions))
+    return assignment
+
+
+async def _read_staff_role_assignment(
+    db: "AsyncSession",
+    user_id: str,
+    entity_id: str,
+    *,
+    membership_role: dict | None,
+) -> tuple[bool, str | None, str | None, list[str]]:
     from packages.core.models.staff import Staff, StaffRole
 
     statement = select(Staff).where(

@@ -17,6 +17,7 @@
     "mcp__outlook__move_message",
     "mcp__outlook__categorize",
     "mcp__outlook__list_folders",
+    "mcp__outlook__save_attachment_to_workspace",
     "mcp__outlook__download_attachment",
     "mcp__outlook__get_profile"
   ],

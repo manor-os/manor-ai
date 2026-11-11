@@ -7,6 +7,7 @@ import pytest
 from auth_helpers import register_user_and_get_token
 from packages.core.services.workspace_app_view import (
     normalize_app_view_config,
+    normalize_app_view_data_contract,
     project_workspace_app_view,
     validate_app_view_data_contract,
 )
@@ -469,6 +470,26 @@ async def test_architect_rejects_legacy_tool_wrapper_for_project_workflow(monkey
     assert "workflow_project" in json.loads(result)["error"]
 
 
+@pytest.mark.asyncio
+async def test_architect_rejects_project_operation_the_runner_lacks(monkeypatch):
+    draft = SimpleNamespace(fields={})
+    monkeypatch.setattr(workspace_arch_tools, "_load_draft", AsyncMock(return_value=draft))
+    project = {"project_type": "article", "schema_version": 1,
+               "state_schema": {"type": "object", "properties": {"draft": {"type": "string"}}}}
+    result = json.loads(await workspace_arch_tools._propose_workflow(
+        None, entity_id="entity-1", draft_id="draft-1", slug="articles", name="Articles",
+        steps=[
+            {"id": "create_article", "type": "workflow_project",
+             "config": {**project, "operation": "create", "state": {}}},
+            {"id": "writing_stage", "type": "workflow_project", "depends_on": ["create_article"],
+             "config": {**project, "operation": "update", "project_id": "{{create_article.project_id}}"}},
+        ],
+    ))
+    assert result["ok"] is False
+    assert "unsupported workflow_project operation 'update'" in result["error"]
+    assert draft.fields == {}
+
+
 @pytest.mark.parametrize("config", [
     {"hero": "https://example.com"},
     {"order": ["service:one", "service:one"]},
@@ -480,6 +501,17 @@ async def test_architect_rejects_legacy_tool_wrapper_for_project_workflow(monkey
     {"forms": {"unknown:one": [{"key": "x", "label": "X", "type": "text"}]}},
     {"forms": {"service:one": [{"key": "x", "label": "X", "type": "file"}, {"key": "x", "label": "Y", "type": "text"}]}},
     {"forms": {"service:one": [{"key": "x", "label": "X", "type": "select"}]}},
+    {"forms": {"service:one": [{"key": "x", "label": "X", "type": "picture_choice", "options": ["ink", "clay"]}]}},
+    {"forms": {"service:one": [{"key": "x", "label": "X", "type": "picture_choice", "options": ["ink", "clay"],
+                                "option_images": ["/blueprints/styles/gif/ink.webp"]}]}},
+    {"forms": {"service:one": [{"key": "x", "label": "X", "type": "picture_choice", "options": ["ink", "clay"],
+                                "option_images": ["https://example.com/ink.webp", "/blueprints/styles/gif/clay.webp"]}]}},
+    {"forms": {"service:one": [{"key": "x", "label": "X", "type": "picture_choice", "options": ["ink"],
+                                "option_images": ["/blueprints/../private.webp"]}]}},
+    {"forms": {"service:one": [{"key": "x", "label": "X", "type": "picture_choice", "options": ["ink", "ink "],
+                                "option_images": ["/blueprints/ink.webp", "/blueprints/clay.webp"]}]}},
+    {"forms": {"service:one": [{"key": "x", "label": "X", "type": "select", "options": ["ink"],
+                                "option_images": ["/blueprints/styles/gif/ink.webp"]}]}},
     {"visual": "video"},
     {"motion_cover_url": "https://example.com/animated.mp4"},
     {"motion_cover_url": "javascript:alert(1)", "motion_cover_source_url": "/cover.png"},
@@ -513,6 +545,28 @@ async def test_architect_rejects_legacy_tool_wrapper_for_project_workflow(monkey
 def test_app_view_rejects_untrusted_layout_or_action_references(config):
     with pytest.raises(ValueError):
         normalize_app_view_config(config)
+
+
+def test_picture_choice_form_keeps_its_options_labels_and_page_pictures():
+    normalized = normalize_app_view_config({"forms": {"service:one": [{
+        "key": "style", "label": "Style", "type": "picture_choice", "options": ["ink", "clay"],
+        "option_labels": ["Ink", "Clay"],
+        "option_images": ["/blueprints/styles/gif/ink.webp", "/blueprints/styles/gif/clay.webp"],
+    }]}})
+    field = normalized["forms"]["service:one"][0]
+    assert field["type"] == "picture_choice"
+    assert field["options"] == ["ink", "clay"]
+    assert field["option_labels"] == ["Ink", "Clay"]
+    assert field["option_images"] == ["/blueprints/styles/gif/ink.webp", "/blueprints/styles/gif/clay.webp"]
+    # Labels default to the option values when none are given.
+    plain = normalize_app_view_config({"forms": {"service:one": [{
+        "key": "style", "label": "Style", "type": "picture_choice", "options": ["ink"],
+        "option_images": ["/blueprints/styles/gif/ink.webp"],
+    }]}})["forms"]["service:one"][0]
+    assert plain["option_labels"] == ["ink"]
+    # Other field types never carry pictures.
+    assert "option_images" not in normalize_app_view_config({"forms": {"service:one": [{
+        "key": "pick", "label": "Pick", "type": "select", "options": ["ink"]}]}})["forms"]["service:one"][0]
 
 
 def test_app_action_inputs_keep_the_steps_their_form_is_paged_by():
@@ -598,6 +652,28 @@ def test_app_view_update_replaces_and_resets_sections():
     assert reset["operating_model"]["app_view"]["sections"] is None
 
 
+def test_a_run_that_only_asked_for_input_leaves_outputs_once_its_flow_runs_again():
+    from packages.core.services.workspace_app_sections import _without_superseded_asks
+
+    def run(run_id, flow, status, outcome=None, files=(), binding=True):
+        return {"run_id": run_id, "workflow_id": f"wf-{flow}", "binding_id": flow if binding else None,
+                "status": status, "business_outcome": outcome, "files": list(files)}
+
+    items = [  # newest first
+        run("made", "article", "completed", files=[{"name": "article.md"}]),
+        run("asked-again", "article", "completed", "needs_input"),
+        # A direct run of the Flow has no App entry; it is still that Flow's run.
+        run("asked-directly", "article", "completed", "needs_input", binding=False),
+        run("waiting", "image", "paused", "needs_input"),
+        run("asked-image", "image", "completed", "needs_input"),
+        run("asked-alone", "topic", "completed", "needs_input"),
+        run("batch", "daily", "completed", files=[{"name": "post.md"}]),
+        # The files it asked the person to fill in do not keep a stale ask on the page.
+        run("asked-for-knowledge", "daily", "completed", "needs_input", files=[{"name": "source-intake.md"}]),
+    ]
+    assert [item["run_id"] for item in _without_superseded_asks(items)] == ["made", "waiting", "asked-alone", "batch"]
+
+
 def test_a_section_title_heads_it_and_is_kept_only_when_set():
     view = normalize_app_view_config({"sections": [
         {"id": "decks", "block": "outputs", "source": "workflow:binding-1", "title": "  Decks "}, {"block": "actions"},
@@ -664,6 +740,74 @@ async def _seed_chat_entrypoint(
     db.add(binding)
     await db.flush()
     return binding
+
+
+@pytest.mark.asyncio
+async def test_listed_entry_points_read_entry_nodes_not_the_step_graph(db_session):
+    # Catches: Postgres picking different entry nodes or service keys than the
+    # Python rules, or a list reading every Flow's whole step graph again.
+    from sqlalchemy import cast, event, func, select
+    from sqlalchemy.dialects.postgresql import JSONB, JSONPATH
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.workflow import WorkflowDefinition
+    from packages.core.models.workspace import Workspace
+    from packages.core.services import workspace_app_view
+    from packages.core.services.workspace_workflow_router import (
+        list_workspace_chat_entrypoints,
+        normalize_chat_entrypoint,
+    )
+
+    entity_id = generate_ulid()
+    workspace = Workspace(entity_id=entity_id, name="Entry nodes", status="active")
+    db_session.add(workspace)
+    await db_session.flush()
+    binding = await _seed_chat_entrypoint(
+        db_session, entity_id=entity_id, workspace_id=workspace.id, title="Make",
+    )
+    flow = await db_session.get(WorkflowDefinition, binding.workflow_id)
+    flow.steps = [
+        {"id": "work", "type": "agent", "config": {"prompt": "x" * 20_000, "tools": [{"service_key": "writer"}]}},
+        {"id": "start", "type": "Trigger", "config": {"run_inputs": [{
+            "key": "topic", "type": "string", "label": "Topic", "i18n": {"zh": {"label": "主题"}},
+        }]}},
+        {"id": "hook", "type": "webhook", "config": {
+            "service_key": "inbox", "input_rules": [{"required": ["topic"], "x-message": "Topic first"}],
+        }},
+        "not a node",
+    ]
+    flow.variables = {"tone": "plain"}
+    await db_session.commit()
+
+    sent: list[str] = []
+
+    def record(_conn, _cursor, statement, *_args):
+        sent.append(statement)
+
+    engine = db_session.bind.sync_engine
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        listed = await list_workspace_chat_entrypoints(
+            db_session, entity_id=entity_id, workspace_id=workspace.id, locale="zh-CN",
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    assert listed == [normalize_chat_entrypoint(binding, flow, locale="zh-CN")]
+    assert listed[0].run_inputs[0]["label"] == "主题"
+    assert listed[0].input_rules == ({"required": ["topic"], "x-message": "Topic first"},)
+    selected = [statement.split(" FROM ", 1)[0] for statement in sent]
+    assert any("jsonb_path_query_array(workflow_definitions.steps" in columns for columns in selected)
+    assert not any(
+        "workflow_definitions.steps" in columns
+        .replace("jsonb_typeof(workflow_definitions.steps)", "")
+        .replace("jsonb_path_query_array(workflow_definitions.steps", "")
+        for columns in selected
+    )
+    keys = set((await db_session.execute(select(func.jsonb_path_query(
+        WorkflowDefinition.steps, cast(workspace_app_view._SERVICE_KEYS_PATH, JSONPATH), type_=JSONB,
+    )).where(WorkflowDefinition.id == flow.id))).scalars())
+    assert keys == workspace_app_view.workflow_service_keys([flow.steps]) == {"writer", "inbox"}
 
 
 @pytest.mark.asyncio
@@ -884,7 +1028,7 @@ def test_data_view_display_normalizes_defaults_and_complete_groups():
 @pytest.mark.parametrize("display", [
     "tabs",
     {"unknown": True},
-    {"layout": "grid"},
+    {"layout": "masonry"},
     {"hidden": 1},
     {"hidden_blocks": ["unknown"]},
     {"hidden_blocks": ["metrics", "metrics"]},
@@ -963,6 +1107,39 @@ def test_project_source_normalizes_stage_datetime_order_and_rollup_contract():
     ]
 
 
+def _workspace_calendar(source_type="workflow_projects", **calendar):
+    sources = {"courses": {"type": "workflow_projects", "project_type": "course", "fields": [["title"]],
+                           "producer_workflows": ["workflow_definition:course"]},
+               "reminders": {"type": source_type, "project_type": "reminder", "fields": [["due_at"]],
+                             "order": {"field": ["due_at"], "type": "datetime", "direction": "asc"},
+                             "producer_workflows": ["workflow_definition:reminder"],
+                             **({"parent": "courses", "parent_state_path": ["course_id"]}
+                                if source_type == "related_projects" else {})}}
+    return normalize_app_view_config({"data_sources": sources, "components": [{
+        "type": "data_view", "key": "posting", "context": {"kind": "workspace"}, "blocks": [
+            {"key": "calendar", "type": "progress", "source": "reminders"},
+            {"key": "rollup", "type": "project_rollup", "source": "reminders", "count_by_stage": True}],
+        "display": {"calendar": {"block": "calendar", "date_field": ["due_at"], "attention_stages": [],
+                                 "collection_title": "Reminders", **calendar}}}]})
+
+
+def test_a_workspace_view_carries_one_calendar_of_every_dated_project():
+    """Dated posts with no period project (a week, a campaign) still go on a calendar."""
+    assert _workspace_calendar()["components"][0]["display"]["calendar"] == {
+        "block": "calendar", "date_field": ["due_at"], "rollup_block": None, "context_block": None,
+        "attention_stages": [], "collection_title": "Reminders"}
+    assert _workspace_calendar(rollup_block="rollup")["components"][0]["display"]["calendar"]["rollup_block"] == "rollup"
+    # A weekly schedule opens on its week; a month is the default and is not written out.
+    assert _workspace_calendar(span="week")["components"][0]["display"]["calendar"]["span"] == "week"
+    assert "span" not in _workspace_calendar(span="month")["components"][0]["display"]["calendar"]
+    with pytest.raises(ValueError, match="display.calendar.span must be one of month, week"):
+        _workspace_calendar(span="day")
+    # No period to summarise, and children of a parent are read within that parent.
+    for source_type, extra in (("workflow_projects", {"context_block": "rollup"}), ("related_projects", {})):
+        with pytest.raises(ValueError, match="calendar display references"):
+            _workspace_calendar(source_type, **extra)
+
+
 @pytest.mark.parametrize("source_stages,date_field", [(["scheduled"], ["due_at"]), (None, ["other_at"])])
 def test_calendar_display_requires_an_all_stage_source_and_its_ordered_date(source_stages, date_field):
     with pytest.raises(ValueError, match="calendar display references"):
@@ -986,6 +1163,50 @@ def test_calendar_display_requires_an_all_stage_source_and_its_ordered_date(sour
                                  "context_block": "context", "attention_stages": [], "collection_title": "Courses",
                              }}}]})
 
+def _calendar_with_extra_blocks(extra_blocks, *, extra_order="due_at", **calendar_options):
+    """A calendar whose items also come from a second progress block over the same context, ordered by date."""
+    return normalize_app_view_config({"data_sources": {
+        "courses": {"type": "workflow_projects", "project_type": "course", "fields": [["title"]],
+                    "producer_workflows": ["workflow_definition:course"]},
+        "reminders": {"type": "related_projects", "project_type": "reminder", "parent": "courses",
+                      "parent_state_path": ["course_id"], "fields": [["due_at"]],
+                      "order": {"field": ["due_at"], "type": "datetime", "direction": "asc"},
+                      "producer_workflows": ["workflow_definition:reminder"]},
+        "sessions": {"type": "related_projects", "project_type": "session", "parent": "courses",
+                     "parent_state_path": ["course_id"], "fields": [["due_at"], ["start_at"]],
+                     "order": {"field": [extra_order], "type": "datetime", "direction": "asc"},
+                     "producer_workflows": ["workflow_definition:session"]},
+    }, "components": [{"type": "data_view", "key": "course_calendar", "context": {"kind": "project", "source": "courses"},
+                       "blocks": [
+                           {"key": "calendar", "type": "progress", "source": "reminders"},
+                           {"key": "sessions", "type": "progress", "source": "sessions"},
+                           {"key": "rollup", "type": "project_rollup", "source": "reminders", "count_by_stage": True},
+                           {"key": "context", "type": "summary", "source": "courses", "fields": [
+                               {"label": "Title", "field": ["title"]},
+                           ]},
+                       ], "display": {"calendar": {
+                           "block": "calendar", "date_field": ["due_at"], "rollup_block": "rollup",
+                           "context_block": "context", "attention_stages": [], "collection_title": "Courses",
+                           "extra_blocks": extra_blocks, **calendar_options,
+                       }}}]})
+
+
+def test_calendar_items_can_join_from_a_second_block_and_hide_a_stage_once_they_exist():
+    calendar = _calendar_with_extra_blocks(["sessions"], hide_stages=["done"])["components"][0]["display"]["calendar"]
+    assert calendar["extra_blocks"] == ["sessions"] and calendar["hide_stages"] == ["done"]
+    # Optional options may be left out; the calendar then reads as before.
+    plain = _calendar_with_extra_blocks([])["components"][0]["display"]["calendar"]
+    assert plain["extra_blocks"] == []
+    assert "hide_stages" not in plain
+    # An extra block must be ordered by the same date, so its items sit on the same days.
+    with pytest.raises(ValueError, match="extra_blocks"):
+        _calendar_with_extra_blocks(["sessions"], extra_order="start_at")
+    with pytest.raises(ValueError, match="extra_blocks"):
+        _calendar_with_extra_blocks(["calendar"])
+    with pytest.raises(ValueError, match="extra_blocks"):
+        _calendar_with_extra_blocks(["missing"])
+
+
 def test_workspace_progress_lists_projects_with_labeled_fields():
     """A Workspace-level list of projects reads like a selected project's fields."""
     sources = {
@@ -1006,6 +1227,462 @@ def test_workspace_progress_lists_projects_with_labeled_fields():
         normalize_app_view_config({"data_sources": sources, "components": [{
             "type": "data_view", "key": "tracked", "context": {"kind": "workspace"},
             "blocks": [{"key": "jobs", "type": "progress", "source": "jobs", "fields": fields[:1]}]}]})
+
+
+def _menu(block):
+    return normalize_app_view_config({"data_sources": {"dishes": {
+        "type": "workflow_projects", "project_type": "dish", "fields": [["name"], ["price"], ["spice"]],
+        "producer_workflows": ["workflow_definition:dish"]}}, "components": [{
+        "type": "data_view", "key": "menu", "context": {"kind": "workspace"},
+        "blocks": [{"key": "dishes", "type": "progress", "source": "dishes", **block}]}]})
+
+
+def test_a_card_action_fills_its_form_from_the_record_and_may_ask_first():
+    from packages.core.services.workspace_app_data import _present_items
+
+    edit = {"action": "workflow:edit_dish", "input": "dish_id", "label": "Edit", "prefill": {"name": ["name"], "price": ["price"]}}
+    retire = {"action": "workflow:retire_dish", "input": "dish_id", "label": "Take off the menu", "confirm": "Take it off the menu?"}
+    block = _menu({"item_action": edit, "item_actions": [retire]})["components"][0]["blocks"][0]
+    assert (block["item_action"], block["item_actions"]) == (edit, [retire])
+    # Only plain values travel to the form, by the entry they fill.
+    items = _present_items(block, [{"id": "d1", "stage": "active", "fields": {"name": "Boiled fish", "price": 38, "spice": "hot"}},
+                                   {"id": "d2", "stage": "active", "fields": {"name": {"zh": "Fish"}, "price": None}}])
+    assert items[0]["action_values"] == {"workflow:edit_dish": {"name": "Boiled fish", "price": 38}}
+    assert "action_values" not in items[1]
+
+    for change, message in (
+            ({"item_action": {**edit, "prefill": {"photo": ["photo"]}}}, "fills photo from fields its source does not read"),
+            ({"item_action": edit, "item_actions": [{**retire, "action": edit["action"]}]}, "each open a different entry"),
+            ({"item_action": {**edit, "prefill": {"dish_id": ["name"]}}}, "other than input")):
+        with pytest.raises(ValueError, match=message):
+            _menu(change)
+
+
+def test_a_menu_list_declares_its_formats_filters_and_search():
+    price = {"field": ["price"], "label": "Price", "format": "money", "currency": "CNY"}
+    block = _menu({"fields": [price], "filters": [{"field": ["spice"], "label": "Spice"}, {"by": "stage", "label": "Status"}],
+                   "search": {"fields": [["name"]], "label": "Find a dish"}})["components"][0]["blocks"][0]
+    assert block["fields"][0]["currency"] == "CNY"
+    assert block["filters"] == [{"field": ["spice"], "label": "Spice"}, {"by": "stage", "label": "Status"}]
+    assert block["search"] == {"fields": [["name"]], "label": "Find a dish"}
+    for change, message in (
+            ({"fields": [{**price, "currency": None}]}, "money takes a currency"),
+            ({"fields": [{**price, "format": "number"}]}, "and only money does"),
+            ({"filters": [{"field": ["photo"], "label": "Photo"}]}, "which its source does not read"),
+            ({"filters": [{"by": "owner", "label": "Owner"}]}, "can only be stage"),
+            ({"search": {"fields": [["name"], ["photo"]]}}, "search reads photo")):
+        with pytest.raises(ValueError, match=message):
+            _menu(change)
+    with pytest.raises(ValueError, match="only a workspace view lists"):
+        normalize_app_view_config({"data_sources": {"dishes": {
+            "type": "workflow_projects", "project_type": "dish", "fields": [["name"]],
+            "producer_workflows": ["workflow_definition:dish"]}}, "components": [{
+            "type": "data_view", "key": "menu", "context": {"kind": "project", "source": "dishes"},
+            "blocks": [{"key": "dishes", "type": "progress", "source": "dishes", "search": {"fields": [["name"]]}}]}]})
+
+
+def _episodes(fields):
+    """A podcast's episode list (a second scenario beside the restaurant menu)."""
+    return normalize_app_view_config({"data_sources": {"episodes": {
+        "type": "workflow_projects", "project_type": "episode", "producer_workflows": ["workflow_definition:episode"],
+        "fields": [["title"], ["length"], ["listened"], ["airs_on"], ["airs_until"], ["chapters_done"], ["chapters"],
+                   ["topics"], ["host"], ["notes"], ["weight"]]}}, "components": [{
+        "type": "data_view", "key": "episodes", "context": {"kind": "workspace"},
+        "blocks": [{"key": "episodes", "type": "progress", "source": "episodes", "fields": fields}]}]})
+
+
+def test_each_field_format_takes_its_own_options_and_only_those():
+    from packages.core.services.workspace_app_view import app_module_catalog
+
+    def field(path, fmt, **options):
+        return {"field": [path], "label": path.title(), "format": fmt, **options}
+
+    fields = [field("length", "duration"), field("listened", "percent", scale=100),
+              field("airs_on", "date_range", end_field=["airs_until"]), field("airs_until", "date", relative=True),
+              field("chapters_done", "progress", max_field=["chapters"]), field("topics", "tags", copy=True),
+              field("host", "member"), field("notes", "text", copy=True), field("weight", "number", unit="g")]
+    block = _episodes(fields)["components"][0]["blocks"][0]
+    assert [{key: value for key, value in item.items() if key not in {"field", "label", "hide_when_empty"}}
+            for item in block["fields"]] == [
+        {"format": "duration"}, {"format": "percent", "scale": 100},
+        {"format": "date_range", "end_field": ["airs_until"]}, {"format": "date", "relative": True},
+        {"format": "progress", "max_field": ["chapters"]}, {"format": "tags", "copy": True},
+        {"format": "member"}, {"format": "text", "copy": True}, {"format": "number", "unit": "g"}]
+    # The designer reads every format and option from the catalog.
+    catalog = app_module_catalog()
+    assert {"percent", "duration", "date_range", "phone", "email", "address", "tags", "progress", "member",
+            "file_size", "color", "audio", "images", "code"} <= set(catalog["data_field_formats"])
+    assert {"scale", "end_field", "relative", "max", "max_field", "unit", "copy"} <= set(catalog["data_field_options"])
+
+    for fields, message in (
+            ([field("listened", "percent")], "percent takes scale 1 .* or 100"),
+            ([field("listened", "percent", scale=10)], "percent takes scale"),
+            ([field("listened", "percent", scale=True)], "percent takes scale"),
+            ([field("length", "number", scale=100)], "scale needs format percent"),
+            ([field("airs_on", "date_range")], "date_range takes end_field"),
+            # A range's end is read like any field: its source declares it.
+            ([field("airs_on", "date_range", end_field=["ends"])], "add ends to the fields of source"),
+            ([field("airs_on", "date", relative="yes")], "relative must be boolean"),
+            ([field("chapters_done", "progress", max=0)], "max must be a positive number"),
+            ([field("chapters_done", "progress", max=10, max_field=["chapters"])], "max or max_field, not both"),
+            ([field("weight", "money", currency="CNY", unit="g")], "unit needs format number"),
+            ([field("host", "member", copy=True)], "copy needs format text or link"),
+            ([field("notes", "text", copy="yes")], "copy must be boolean")):
+        with pytest.raises(ValueError, match=message):
+            _episodes(fields)
+
+
+def _release(block, *, source=None, fields=None):
+    """A music release's cover art and cuts (a scenario of its own beside the menu and the podcast)."""
+    return normalize_app_view_config({"data_sources": {
+        "covers": {"type": "workflow_results", "producer_workflows": ["workflow_definition:cover"],
+                   "fields": [["cover", "title"]], "label_fields": [["cover", "title"]],
+                   "media": [{"field": ["cover", "files"]}], **(source or {})},
+        "tracks": {"type": "workflow_projects", "project_type": "track", "producer_workflows": ["workflow_definition:track"],
+                   "fields": [["title"], ["master"], ["demo"], ["lyrics"], ["sections"], ["video"], ["captions"],
+                              ["artwork"], ["sketch"], ["stems"], ["edit"]]}},
+        "components": [{"type": "data_view", "key": "release", "context": {"kind": "workspace"}, "blocks": [
+            {"key": "covers", "type": "gallery", "source": "covers", **block},
+            {"key": "tracks", "type": "progress", "source": "tracks", "fields": fields or [
+                {"field": ["title"], "label": "Title"}]}]}]})
+
+
+def test_a_gallery_presents_its_files_its_way_and_acts_on_one():
+    from packages.core.services.workspace_app_view import app_module_catalog
+
+    media = {"layout": "masonry", "aspect": "9:16", "group": "record", "size_label": True, "transparent": False,
+             "hover_play": True, "details": True, "download": True, "comments": True}
+    action = {"action": "workflow:pick_cover", "label": "Use this frame", "input": "video", "time_input": "at"}
+    config = _release({"media": media, "item_action": action}, source={"versions": True})
+    block = config["components"][0]["blocks"][0]
+    # A false flag is the default and is not kept.
+    assert block["media"] == {"layout": "masonry", "aspect": "9:16", "group": "record", "size_label": True,
+                              "hover_play": True, "details": True, "download": True, "comments": True}
+    assert block["item_action"] == {"action": "workflow:pick_cover", "input": "video", "time_input": "at",
+                                    "label": "Use this frame"}
+    assert config["data_sources"]["covers"]["versions"] is True
+    span = _release({"item_action": {"action": "workflow:ringtone", "label": "Cut this part", "input": "track",
+                                     "start_input": "from", "end_input": "to"}})
+    assert span["components"][0]["blocks"][0]["item_action"]["start_input"] == "from"
+    catalog = app_module_catalog()
+    assert catalog["data_block_media"]["layouts"] == ["grid", "masonry", "carousel", "strip", "board", "list"]
+    assert "group" in catalog["data_block_media"]["options"] and "time_input" in catalog["data_block_media"]["item_action_inputs"]
+    assert "media" in catalog["data_block_options"]
+
+    for block, source, message in (
+            ({"media": {"layout": "collage"}}, None, "media.layout must be one of"),
+            ({"media": {"aspect": "2:1"}}, None, "media.aspect must be one of"),
+            ({"media": {"group": "aspect"}}, None, "media.group must be one of"),
+            ({"media": {"download": "yes"}}, None, "media.download must be boolean"),
+            ({"media": {"zoom": True}}, None, "media takes layout"),
+            ({"media": {}}, None, "media takes layout"),
+            ({"item_action": {**action, "time_input": "video"}}, None, "each name another Flow input"),
+            ({"item_action": {"action": "workflow:ringtone", "label": "Cut", "input": "track", "start_input": "from"}},
+             None, "start_input with end_input"),
+            ({"item_action": {**action, "confirm": "Use it?"}}, None, "drop confirm"),
+            ({}, {"versions": "all"}, "versions must be boolean")):
+        with pytest.raises(ValueError, match=message):
+            _release(block, source=source)
+    # Only a gallery presents files this way, and only its files take a moment of the player.
+    with pytest.raises(ValueError, match="media needs a gallery block"):
+        normalize_app_view_config({"data_sources": config["data_sources"], "components": [{
+            "type": "data_view", "key": "release", "context": {"kind": "workspace"},
+            "blocks": [{"key": "tracks", "type": "progress", "source": "tracks", "media": {"layout": "list"}}]}]})
+    with pytest.raises(ValueError, match="takes action"):
+        normalize_app_view_config({"data_sources": config["data_sources"], "components": [{
+            "type": "data_view", "key": "release", "context": {"kind": "workspace"},
+            "blocks": [{"key": "tracks", "type": "progress", "source": "tracks", "item_action": action}]}]})
+
+
+def test_media_fields_take_a_frame_and_what_goes_with_them():
+    def field(path, fmt, **options):
+        return {"field": [path], "label": path.title(), "format": fmt, **options}
+
+    fields = [field("video", "video", aspect="9:16", captions_field=["captions"], chapters_field=["sections"],
+                    compare_field=["demo"]),
+              field("master", "audio", transcript_field=["lyrics"], chapters_field=["sections"]),
+              field("artwork", "image", compare_field=["sketch"], transparent=True, aspect="auto"),
+              field("stems", "images", layout="carousel"), field("demo", "clips", aspect="1:1"),
+              field("edit", "timeline")]
+    shown = _release({}, fields=fields)["components"][0]["blocks"][1]["fields"]
+    assert [{key: value for key, value in item.items() if key not in {"field", "label", "hide_when_empty"}} for item in shown] == [
+        {"format": "video", "aspect": "9:16", "compare_field": ["demo"], "captions_field": ["captions"],
+         "chapters_field": ["sections"], "compare": "side_by_side"},
+        {"format": "audio", "transcript_field": ["lyrics"], "chapters_field": ["sections"]},
+        {"format": "image", "aspect": "auto", "transparent": True, "compare_field": ["sketch"], "compare": "slider"},
+        {"format": "images", "layout": "carousel"}, {"format": "clips", "aspect": "1:1"}, {"format": "timeline"}]
+    from packages.core.services.workspace_app_view import DOCUMENT_FIELD_FORMATS, app_module_catalog
+    assert "clips" in DOCUMENT_FIELD_FORMATS
+    assert {"clips", "timeline"} <= set(app_module_catalog()["data_field_formats"])
+
+    for fields, message in (
+            ([field("master", "audio", captions_field=["captions"])], "captions_field needs format video"),
+            ([field("title", "text", aspect="1:1")], "aspect needs format image"),
+            ([field("stems", "images", layout="wall")], "layout must be one of strip"),
+            ([field("video", "video", compare_field=["demo"], compare="slider")], "slider .pictures only."),
+            ([field("artwork", "image", compare="slider")], "compare needs compare_field"),
+            ([field("artwork", "image", transparent="yes")], "transparent must be boolean"),
+            # What goes with a file is read like any field: its source declares it.
+            ([field("video", "video", transcript_field=["subtitles"])], "add subtitles to the fields of source")):
+        with pytest.raises(ValueError, match=message):
+            _release({}, fields=fields)
+
+
+def test_a_progress_list_can_show_as_a_table_or_a_board():
+    assert _menu({"view": "table"})["components"][0]["blocks"][0]["view"] == "table"
+    assert _menu({"view": "board"})["components"][0]["blocks"][0]["view"] == "board"
+    # A list is the default and is not written out.
+    assert "view" not in _menu({"view": "list"})["components"][0]["blocks"][0]
+    with pytest.raises(ValueError, match="view needs a progress block and one of list, table, board, timeline, gantt, places, tree, not 'grid'"):
+        _menu({"view": "grid"})
+    with pytest.raises(ValueError, match="view needs a progress block"):
+        normalize_app_view_config({"data_sources": {"dishes": {
+            "type": "workflow_projects", "project_type": "dish", "fields": [["name"]],
+            "producer_workflows": ["workflow_definition:dish"]}}, "components": [{
+            "type": "data_view", "key": "menu", "context": {"kind": "project", "source": "dishes"},
+            "blocks": [{"key": "dish", "type": "summary", "source": "dishes", "view": "table",
+                        "fields": [{"field": ["name"], "label": "Name"}]}]}]})
+
+
+_POST_FIELDS = [["platform"], ["caption"], ["hashtags"], ["thread"], ["images"], ["author"], ["scheduled_at"], ["insight_id"]]
+
+
+def _thought_leadership(block=None, *, calendar=None, receipts=None):
+    """A B2B founder's insights, each written as a LinkedIn post and an X thread (beside the menu and the release)."""
+    sources = {
+        "insights": {"type": "workflow_projects", "project_type": "insight", "fields": [["title"]],
+                     "producer_workflows": ["workflow_definition:insight"]},
+        "posts": {"type": "related_projects", "project_type": "post", "parent": "insights", "parent_state_path": ["insight_id"],
+                  "fields": _POST_FIELDS, "order": {"field": ["scheduled_at"], "type": "datetime", "direction": "asc"},
+                  "producer_workflows": ["workflow_definition:post"]},
+        "receipts": {"type": "project_records", "parent": "posts", "record_path": ["publication"],
+                     "record_schema": "publication-receipt/v1"},
+        "results": {"type": "publication_stats", "parent": "receipts", "subject": "posts",
+                    "metric_keys": ["impressions", "likes", "comments", "shares"]},
+    }
+    blocks = [{"key": "posts", "type": "progress", "source": "posts", **(block or {})}]
+    if receipts is not None:
+        blocks.append({"key": "published", "type": "records", "source": "receipts", "metrics_source": "results", **receipts})
+    components = [{"type": "data_view", "key": "insight", "context": {"kind": "project", "source": "insights"}, "blocks": blocks}]
+    if calendar is not None:
+        # Every post of the Workspace on one schedule.
+        sources["schedule"] = {"type": "workflow_projects", "project_type": "post", "fields": _POST_FIELDS,
+                               "order": {"field": ["scheduled_at"], "type": "datetime", "direction": "asc"},
+                               "producer_workflows": ["workflow_definition:post"]}
+        components.append({"type": "data_view", "key": "schedule", "context": {"kind": "workspace"},
+                           "blocks": [{"key": "calendar", "type": "progress", "source": "schedule"}],
+                           "display": {"calendar": {"block": "calendar", "date_field": ["scheduled_at"],
+                                                    "attention_stages": [], "collection_title": "Posts", **calendar}}})
+    return normalize_app_view_config({"data_sources": sources, "components": components})
+
+
+def test_a_block_shows_each_record_as_the_post_it_will_be_on_its_platform():
+    from packages.core.services.workspace_app_view import app_module_catalog, preview_platform
+
+    preview = {"fields": {"platform": ["platform"], "caption": ["caption"], "hashtags": ["hashtags"], "thread": ["thread"],
+                          "images": ["images"], "account": ["author"], "published_at": ["scheduled_at"]},
+               "layout": "side_by_side", "group_field": ["insight_id"], "aspect": "4:5"}
+    block = _thought_leadership({"preview": preview})["components"][0]["blocks"][0]
+    assert block["preview"] == {**preview, "layout": "side_by_side"}
+    # A fixed frame instead of each record's own platform; a feed is the default and is not written out.
+    fixed = _thought_leadership({"preview": {"platform": "linkedin", "fields": {"caption": ["caption"]}, "layout": "feed"}})
+    assert fixed["components"][0]["blocks"][0]["preview"] == {"platform": "linkedin", "fields": {"caption": ["caption"]}}
+    # A receipt is the post that went out: its parts read the post project the receipt belongs to.
+    receipts = _thought_leadership(receipts={"preview": {"fields": {"caption": ["caption"], "images": ["images"],
+                                                                    "platform": ["platform"]}}})
+    assert receipts["components"][0]["blocks"][1]["preview"]["fields"]["caption"] == ["caption"]
+    # The names Workflows give platforms read as their frames.
+    assert [preview_platform(name) for name in ("LinkedIn", "Twitter", "小红书", "Instagram Reels", "朋友圈", "Weibo", None)] == [
+        "linkedin", "x", "xiaohongshu", "instagram_reels", "wechat_moments", None, None]
+    catalog = app_module_catalog()["data_block_preview"]
+    assert {"instagram", "xiaohongshu", "x", "linkedin", "wechat_moments", "pinterest"} <= set(catalog["platforms"])
+    assert catalog["blocks"] == ["progress", "records", "gallery"] and "comments" in catalog["fields"]
+    assert "preview" in app_module_catalog()["data_block_options"]
+
+    for block, message in (
+            ({"preview": {"fields": {"caption": ["caption"]}}}, "needs platform"),
+            ({"preview": {"platform": "myspace", "fields": {"caption": ["caption"]}}}, "preview.platform must be one of"),
+            ({"preview": {"platform": "x", "fields": {"hashtags": ["hashtags"]}}}, "at least one of images"),
+            ({"preview": {"platform": "x", "fields": {"body": ["caption"]}}}, "preview.fields maps parts"),
+            ({"preview": {"platform": "x", "fields": {"caption": ["notes"]}}}, "preview reads notes, which source 'posts'"),
+            ({"preview": {"platform": "x", "fields": {"caption": ["caption"]}, "layout": "grid"}}, "preview.layout must be"),
+            ({"preview": {"platform": "x", "fields": {"caption": ["caption"]}, "group_field": ["insight_id"]}},
+             "group_field needs layout side_by_side"),
+            ({"preview": {"platform": "x", "fields": {"caption": ["caption"]}, "aspect": "2:1"}}, "preview.aspect must be"),
+            ({"preview": {"platform": "x", "fields": {"caption": ["caption"]}, "frame": "phone"}}, "preview takes platform")):
+        with pytest.raises(ValueError, match=message):
+            _thought_leadership(block)
+    with pytest.raises(ValueError, match="source 'posts' does not declare .a receipt's post is its parent project"):
+        _thought_leadership(receipts={"preview": {"platform": "x", "fields": {"caption": ["body"]}}})
+    with pytest.raises(ValueError, match="preview needs a progress, records, gallery block, not summary"):
+        normalize_app_view_config({"data_sources": {"insights": {
+            "type": "workflow_projects", "project_type": "insight", "fields": [["title"]],
+            "producer_workflows": ["workflow_definition:insight"]}}, "components": [{
+            "type": "data_view", "key": "insight", "context": {"kind": "project", "source": "insights"},
+            "blocks": [{"key": "insight", "type": "summary", "source": "insights", "fields": [{"field": ["title"], "label": "Title"}],
+                        "preview": {"platform": "x", "fields": {"caption": ["title"]}}}]}]})
+
+
+def test_a_calendar_week_lays_the_posts_out_by_platform_and_day():
+    calendar = _thought_leadership(calendar={"lane_field": ["platform"], "span": "week"})["components"][1]["display"]["calendar"]
+    assert calendar["lane_field"] == ["platform"] and calendar["span"] == "week"
+    with pytest.raises(ValueError, match="lane_field channel must be read by every calendar block's source"):
+        _thought_leadership(calendar={"lane_field": ["channel"]})
+
+
+_DEAL_FIELDS = [["account"], ["amount"], ["closed_at"], ["region"], ["owner"], ["office"], ["starts_on"], ["ends_on"],
+                ["after"], ["lat"], ["lng"]]
+
+
+def _pipeline(*blocks, context="workspace", layout=None, extra_sources=None):
+    """A B2B sales pipeline: deals by stage, with an amount, a close date, a region and the office that runs them."""
+    sources = {"deals": {"type": "workflow_projects", "project_type": "deal", "fields": _DEAL_FIELDS,
+                         "stages": ["lead", "qualified", "proposal", "won", "lost"],
+                         "producer_workflows": ["workflow_definition:deal"]},
+               "revenue": {"type": "workspace_stats", "stat_keys": ["mrr", "pipeline_value"]},
+               **(extra_sources or {})}
+    component = {"type": "data_view", "key": "pipeline", "context": {"kind": "workspace"} if context == "workspace"
+                 else {"kind": "project", "source": "deals"}, "blocks": list(blocks),
+                 **({"display": {"layout": layout}} if layout else {})}
+    return normalize_app_view_config({"data_sources": sources, "components": [component]})["components"][0]
+
+
+def test_a_list_groups_ticks_totals_exports_and_lays_out_in_time_place_or_a_tree():
+    from packages.core.services.workspace_app_view import app_module_catalog
+
+    amount = {"field": ["amount"], "label": "Amount", "format": "money", "currency": "USD", "bar": True}
+    table = _pipeline({"key": "deals", "type": "progress", "source": "deals", "view": "table", "fields": [amount],
+                       "group_by": [{"field": ["region"], "label": "Region"}, {"by": "stage", "label": "Stage"}],
+                       "select": True, "export": True, "totals": [{"field": ["amount"], "agg": "sum"}]})["blocks"][0]
+    assert table["group_by"] == [{"field": ["region"], "label": "Region"}, {"by": "stage", "label": "Stage"}]
+    assert table["select"] is table["export"] is True and table["totals"] == [{"field": ["amount"], "agg": "sum"}]
+    assert table["fields"][0]["bar"] is True
+    gantt = _pipeline({"key": "plan", "type": "progress", "source": "deals", "view": "gantt",
+                       "timeline": {"date_field": ["starts_on"], "end_field": ["ends_on"], "depends_field": ["after"]}})["blocks"][0]
+    assert gantt["timeline"] == {"date_field": ["starts_on"], "end_field": ["ends_on"], "depends_field": ["after"]}
+    places = _pipeline({"key": "offices", "type": "progress", "source": "deals", "view": "places",
+                        "places": {"address_field": ["office"], "lat_field": ["lat"], "lng_field": ["lng"]}})["blocks"][0]
+    assert places["places"] == {"address_field": ["office"], "lat_field": ["lat"], "lng_field": ["lng"]}
+    # A series, its episodes, their shots: a tree over the related sources under each record.
+    tree_sources = {
+        "series": {"type": "workflow_projects", "project_type": "series", "fields": [["title"]], "producer_workflows": ["workflow_definition:series"]},
+        "episodes": {"type": "related_projects", "project_type": "episode", "parent": "series", "parent_state_path": ["series_id"],
+                     "fields": [["title"]], "producer_workflows": ["workflow_definition:episode"]},
+        "shots": {"type": "related_projects", "project_type": "shot", "parent": "episodes", "parent_state_path": ["episode_id"],
+                  "fields": [["title"]], "producer_workflows": ["workflow_definition:shot"]}}
+    tree = _pipeline({"key": "tree", "type": "progress", "source": "series", "view": "tree",
+                      "tree": {"children": ["episodes", "shots"]}}, extra_sources=tree_sources)["blocks"][0]
+    assert tree["tree"] == {"children": ["episodes", "shots"]}
+    catalog = app_module_catalog()
+    assert {"group_by", "select", "export", "totals", "timeline", "places", "tree", "chart"} <= set(catalog["data_block_options"])
+    assert {"timeline", "gantt", "places", "tree"} <= set(catalog["data_block_views"])
+    assert catalog["data_block_collection"]["places"] == ["address_field", "name_field", "lat_field", "lng_field"]
+    assert "sparkline" in catalog["data_field_formats"] and "bar" in catalog["data_field_options"]
+    assert "grid" in catalog["data_display_layouts"]
+
+    def deals(**block):
+        return _pipeline({"key": "deals", "type": "progress", "source": "deals", "fields": [amount], **block})
+
+    for block, message in (
+            ({"group_by": [{"field": ["industry"], "label": "Industry"}]}, "group_by\\[0\\].field reads industry, which its source does not read"),
+            ({"group_by": [{"by": "owner", "label": "Owner"}]}, "group_by\\[0\\].by can only be stage"),
+            ({"view": "timeline", "timeline": {"date_field": ["closed_at"]}, "group_by": [{"by": "stage", "label": "Stage"}]}, "group_by needs view list"),
+            ({"totals": [{"field": ["closed_at"], "agg": "sum"}]}, "must be one of the block's fields with format number"),
+            ({"totals": [{"field": ["amount"], "agg": "median"}]}, "takes exactly field and agg"),
+            ({"view": "gantt", "timeline": {"date_field": ["starts_on"]}}, "view gantt needs timeline.end_field"),
+            ({"view": "timeline", "timeline": {"date_field": ["closed_at"], "depends_field": ["after"]}}, "depends_field .* needs view gantt"),
+            ({"view": "timeline"}, "view timeline needs timeline"),
+            ({"timeline": {"date_field": ["closed_at"]}}, "timeline belongs with view timeline or gantt"),
+            ({"view": "places", "places": {"address_field": ["office"], "lat_field": ["lat"]}}, "places takes address_field"),
+            ({"view": "tree", "tree": {"children": ["deals"]}}, "tree child 'deals' must be a related_projects source whose parent is 'deals'"),
+            ({"select": "yes"}, "select must be boolean"),
+            ({"fields": [{"field": ["region"], "label": "Region", "bar": True}]}, "bar needs format number")):
+        with pytest.raises(ValueError, match=message):
+            deals(**block)
+    with pytest.raises(ValueError, match="totals add up every record of the Workspace: it needs a workspace context"):
+        _pipeline({"key": "deals", "type": "progress", "source": "deals", "fields": [amount],
+                   "totals": [{"field": ["amount"], "agg": "sum"}]}, context="project")
+    with pytest.raises(ValueError, match="select needs a progress block"):
+        _pipeline({"key": "deals", "type": "records", "source": "deals", "select": True})
+
+
+def test_a_chart_block_draws_its_records_or_stats_as_one_of_its_kinds():
+    revenue = {"kind": "line", "x": {"field": ["closed_at"], "bucket": "month"}, "value": {"agg": "sum", "field": ["amount"]},
+               "format": "money", "currency": "USD", "target": {"goal": "q4_revenue", "label": "Q4 goal"}}
+    funnel = {"kind": "funnel", "x": {"by": "stage"}, "order": ["lead", "qualified", "proposal", "won"]}
+    heatmap = {"kind": "heatmap", "x": {"field": ["closed_at"], "bucket": "hour"}, "series": {"field": ["closed_at"], "bucket": "weekday"}}
+    leaders = {"kind": "leaderboard", "value": {"field": ["amount"]}, "limit": 5}
+    stats = {"kind": "area", "x": {"bucket": "week"}, "value": {"agg": "max"}}
+    page = _pipeline(*({"key": key, "type": "chart", "source": source, "title": key, "chart": chart} for key, source, chart in (
+        ("revenue", "deals", revenue), ("funnel", "deals", funnel), ("heatmap", "deals", heatmap), ("leaders", "deals", leaders),
+        ("mrr", "revenue", stats))), layout="grid")
+    charts = {block["key"]: block["chart"] for block in page["blocks"]}
+    assert charts["revenue"] == {**revenue, "target": {"goal": "q4_revenue", "label": "Q4 goal"}}
+    assert charts["funnel"] == {**funnel, "value": {"agg": "count"}, "format": "number"}
+    assert charts["leaders"] == {**leaders, "format": "number"}
+    assert charts["mrr"] == {**stats, "format": "number"}
+    assert page["display"]["layout"] == "grid"
+    # A stat chart without x reads each value by day.
+    assert _pipeline({"key": "mrr", "type": "chart", "source": "revenue", "chart": {"kind": "line"}})["blocks"][0]["chart"]["x"] == {"bucket": "day"}
+
+    def chart(source="deals", **value):
+        return _pipeline({"key": "c", "type": "chart", "source": source, "chart": value})
+
+    for value, message in (
+            ({"kind": "pie", "x": {"by": "stage"}}, "chart.kind must be one of"),
+            ({"kind": "line", "x": {"by": "stage"}}, "a line chart runs over time"),
+            ({"kind": "bar"}, "a bar chart needs chart.x"),
+            ({"kind": "stacked_bar", "x": {"by": "stage"}}, "a stacked_bar chart needs chart.series"),
+            ({"kind": "donut", "x": {"field": ["region"]}, "series": {"by": "stage"}}, "a donut chart shows one series"),
+            ({"kind": "funnel", "x": {"field": ["region"]}}, "a funnel needs its steps in order"),
+            ({"kind": "bar", "x": {"field": ["industry"]}}, "chart.x.field reads industry, which its source does not read"),
+            ({"kind": "bar", "x": {"field": ["region"], "bucket": "year"}}, "chart.x.bucket must be one of"),
+            ({"kind": "bar", "x": {"field": ["region"]}, "value": {"agg": "sum"}}, "sum, avg, min and max need the field"),
+            ({"kind": "bar", "x": {"field": ["region"]}, "value": {"agg": "count", "field": ["amount"]}}, "count counts records"),
+            ({"kind": "scatter", "x": {"field": ["amount"]}}, "a scatter's second number"),
+            ({"kind": "scatter", "x": {"field": ["amount"], "bucket": "day"}, "y": {"field": ["lat"]}}, "is a number, so it takes no bucket"),
+            ({"kind": "leaderboard", "value": {"agg": "sum", "field": ["amount"]}}, "ranks each record by its own number"),
+            ({"kind": "bar", "x": {"field": ["region"]}, "format": "money"}, "chart.format money takes a currency"),
+            ({"kind": "bar", "x": {"field": ["region"]}, "format": "percent"}, "chart.format percent takes scale"),
+            ({"kind": "donut", "x": {"field": ["region"]}, "target": {"value": 3}}, "chart.target is a line across"),
+            ({"kind": "bar", "x": {"field": ["region"]}, "target": {"value": True}}, "chart.target is {value: a number}"),
+            ({"kind": "bar", "x": {"field": ["region"]}, "colour": "red"}, "chart takes kind")):
+        with pytest.raises(ValueError, match=message):
+            chart(**value)
+    with pytest.raises(ValueError, match="a Stat chart is a line, area, bar"):
+        chart("revenue", kind="donut")
+    with pytest.raises(ValueError, match="a Stat chart has a series per Stat already"):
+        chart("revenue", kind="line", series={"by": "stage"})
+    with pytest.raises(ValueError, match="a chart block needs chart"):
+        _pipeline({"key": "c", "type": "chart", "source": "deals"})
+    with pytest.raises(ValueError, match="only a chart block takes it"):
+        _pipeline({"key": "c", "type": "progress", "source": "deals", "chart": funnel})
+
+
+def test_a_list_carries_the_entry_that_adds_to_it_and_exports_it_like_a_tile():
+    from packages.core.blueprints.app_view import remap_app_view
+
+    add = {"action": "workflow:add_dish", "label": "Add a dish"}
+    page = _menu({"view": "table", "add_action": add})
+    assert page["components"][0]["blocks"][0]["add_action"] == add
+    # It names an App entry like the tiles do, so a Blueprint carries it under the Workflow's portable key.
+    exported = remap_app_view(page, workflows={"add_dish": "menu_add"}, agents={}, automations={},
+                              workflow_definitions={"dish": "dish"})
+    assert exported["components"][0]["blocks"][0]["add_action"] == {"action": "workflow:menu_add", "label": "Add a dish"}
+    for change, message in (
+            ({"add_action": {**add, "input": "dish_id"}}, "add_action needs a progress block over workflow_projects"),
+            ({"add_action": {"action": "add dish", "label": "Add"}}, "add_action needs an action"),
+            ({"add_action": {"action": add["action"]}}, "add_action label")):
+        with pytest.raises(ValueError, match=message):
+            _menu(change)
+    # Only a list of every record of a type: a project's own records are added by its Workflows.
+    with pytest.raises(ValueError, match="add_action needs a progress block over workflow_projects"):
+        normalize_app_view_config({"data_sources": {"dishes": {
+            "type": "workflow_projects", "project_type": "dish", "fields": [["name"]],
+            "producer_workflows": ["workflow_definition:dish"]}}, "components": [{
+            "type": "data_view", "key": "menu", "context": {"kind": "project", "source": "dishes"},
+            "blocks": [{"key": "dish", "type": "summary", "source": "dishes", "add_action": add,
+                        "fields": [{"field": ["name"], "label": "Name"}]}]}]})
 
 
 def test_training_delivery_presentation_contract_is_portable_and_bounded():
@@ -1090,6 +1767,51 @@ def test_a_packs_block_follows_a_plan_and_offers_one_action_per_pack():
             normalize_app_view_config(config(bad))
 
 
+def test_a_scheduled_item_offers_its_own_action():
+    """A progress item (a calendar slot) can open an App action with itself as the input; a document cannot."""
+    sources = {
+        "weeks": {"type": "workflow_projects", "project_type": "week", "fields": [["title"]], "producer_workflows": ["workflow_definition:plan"]},
+        "slots": {"type": "related_projects", "project_type": "slot", "parent": "weeks", "parent_state_path": ["week_id"],
+                  "fields": [["due_at"]], "producer_workflows": ["workflow_definition:slot"]},
+    }
+    slots = {"key": "slots", "type": "progress", "source": "slots",
+             "item_action": {"action": "workflow:write-script", "input": "plan_slot", "label": "Write the script", "stages": ["idea"]}}
+
+    def config(block):
+        return {"data_sources": sources, "components": [{"type": "data_view", "key": "week",
+                "context": {"kind": "project", "source": "weeks"}, "blocks": [block]}]}
+
+    block = normalize_app_view_config(config(slots))["components"][0]["blocks"][0]
+    assert block["item_action"] == {"action": "workflow:write-script", "input": "plan_slot", "label": "Write the script",
+                                    "stages": ["idea"]}
+    # The open project itself, summarised, can end itself the same way.
+    week = {"key": "week", "type": "summary", "source": "weeks", "fields": [{"field": ["title"], "label": "Week"}],
+            "item_action": {"action": "workflow:end-week", "input": "week_id", "label": "End this week", "stages": ["open"]}}
+    assert normalize_app_view_config(config(week))["components"][0]["blocks"][0]["item_action"]["input"] == "week_id"
+    # A confirm sentence is kept, so the App asks before the action runs in place; an empty one is refused.
+    asked = {**slots, "item_action": {**slots["item_action"], "confirm": "  Delete this slot?  "}}
+    assert normalize_app_view_config(config(asked))["components"][0]["blocks"][0]["item_action"]["confirm"] == "Delete this slot?"
+    with pytest.raises(ValueError, match="confirm"):
+        normalize_app_view_config(config({**slots, "item_action": {**slots["item_action"], "confirm": "   "}}))
+    with pytest.raises(ValueError, match="item_action needs a packs, progress, summary or gallery block"):
+        normalize_app_view_config(config({**slots, "type": "records"}))
+    # A scheduled item can act on its parent project instead of itself (a publish time's campaign).
+    parent_action = {"action": "workflow:end-week", "input": "week_id", "label": "Delete week", "input_from": "parent"}
+    block = normalize_app_view_config(config({**slots, "item_action": parent_action}))["components"][0]["blocks"][0]
+    assert block["item_action"] == parent_action
+    with pytest.raises(ValueError, match="input_from"):
+        normalize_app_view_config(config({**slots, "item_action": {**parent_action, "input_from": "grandparent"}}))
+    # An action about its results sits beside them, next to its own action; only a scheduled item has results.
+    refresh = {"action": "workflow:refresh", "input": "plan_slot", "label": " Refresh ", "stages": ["published"]}
+    block = normalize_app_view_config(config({**slots, "result_action": refresh}))["components"][0]["blocks"][0]
+    assert block["result_action"] == {**refresh, "label": "Refresh"}
+    assert block["item_action"]["action"] == "workflow:write-script"
+    for bad in ({**week, "result_action": refresh}, {**slots, "result_action": {**refresh, "placement": "x"}},
+                {**slots, "result_action": {**refresh, "input": ""}}):
+        with pytest.raises(ValueError, match="result_action"):
+            normalize_app_view_config(config(bad))
+
+
 def test_document_source_requires_a_string_typed_schema_field():
     config = normalize_app_view_config({"data_sources": {
         "projects": {"type": "workflow_projects", "project_type": "client_delivery", "fields": [],
@@ -1103,6 +1825,28 @@ def test_document_source_requires_a_string_typed_schema_field():
         validate_app_view_data_contract(config["data_sources"], [], catalog={
             "workflow_definitions": {"delivery"}, "workflow_bindings": set(), "stat_keys": set(), "workflows": [workflow],
         })
+
+
+def test_plain_record_list_fields_carry_labels_and_formats():
+    sources = {
+        "boards": {"type": "workflow_projects", "project_type": "board", "fields": [["posts"]],
+                   "producer_workflows": ["workflow_definition:board"]},
+        "posts": {"type": "project_records", "parent": "boards", "record_path": ["posts"],
+                  "fields": [["creator"], ["url"]]},
+    }
+    fields = [{"label": "Creator", "field": ["creator"]}, {"label": "Open", "field": ["url"], "format": "link"}]
+    config = normalize_app_view_config({"data_sources": sources, "components": [{
+        "type": "data_view", "schema_version": 1, "key": "board", "context": {"kind": "workspace"},
+        "blocks": [{"key": "posts", "type": "records", "source": "posts", "fields": fields,
+                    "stage_labels": {"top": "Top post"}}]}]})
+    assert [f["label"] for f in config["components"][0]["blocks"][0]["fields"]] == ["Creator", "Open"]
+    assert config["components"][0]["blocks"][0]["stage_labels"] == {"top": "Top post"}
+    # A versioned receipt keeps its own presentation.
+    sources["posts"]["record_schema"] = "publication-receipt/v1"
+    with pytest.raises(ValueError, match="plain project_records or project source"):
+        normalize_app_view_config({"data_sources": sources, "components": [{
+            "type": "data_view", "schema_version": 1, "key": "board", "context": {"kind": "workspace"},
+            "blocks": [{"key": "posts", "type": "records", "source": "posts", "fields": fields}]}]})
 
 
 def test_record_metrics_and_display_require_declared_project_ancestry():
@@ -1372,6 +2116,60 @@ async def test_app_outputs_section_lists_workspace_runs_with_only_openable_files
     })).json()
     outsider_headers = {"Authorization": f"Bearer {outsider['access_token']}"}
     assert (await client.get(f"{endpoint}/outputs", headers=outsider_headers)).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_a_flow_outputs_section_lists_runs_started_by_hand_without_its_binding(client):
+    """Staging 2026-11-02: articles run from a builder tool had no binding and never reached the App's outputs."""
+    from datetime import datetime, timezone
+
+    import packages.core.database as db_module
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.workflow import WorkflowBinding, WorkflowRun
+    from packages.core.models.workspace import Workspace
+
+    owner = (await client.post("/api/v1/auth/register", json={
+        "username": "flow_outputs_owner", "email": "flow_outputs_owner@test.com",
+        "password": "pass123", "entity_name": "Flow Outputs",
+    })).json()
+    headers = {"Authorization": f"Bearer {owner['access_token']}"}
+    entity_id = (await client.get("/api/v1/auth/me", headers=headers)).json()["entity_id"]
+    workspace = (await client.post("/api/v1/workspaces", headers=headers, json={"name": "Articles"})).json()
+    workflow_id, other_workflow, binding_id, other_binding = (generate_ulid() for _ in range(4))
+    async with db_module.async_session() as session:
+        session.add_all([
+            WorkflowBinding(id=binding_id, entity_id=entity_id, workflow_id=workflow_id, workspace_id=workspace["id"]),
+            WorkflowBinding(id=other_binding, entity_id=entity_id, workflow_id=workflow_id, workspace_id=workspace["id"]),
+        ])
+        row = await session.get(Workspace, workspace["id"])
+        row.operating_model = {**(row.operating_model or {}), "app_view": {"sections": [
+            {"id": "articles", "block": "outputs", "source": f"workflow:{binding_id}", "view": "list"}]}}
+
+        def run(name: str, **fields) -> WorkflowRun:
+            return WorkflowRun(entity_id=entity_id, workspace_id=workspace["id"],
+                               trigger_data={"_workflow_name": name}, **{"status": "completed", **fields})
+
+        session.add_all([
+            run("From the entry", workflow_id=workflow_id, binding_id=binding_id, trigger_source="manual"),
+            run("By hand", workflow_id=workflow_id, trigger_source="manual"),
+            # Another entry's runs, a scheduled run of no binding and another Flow stay out.
+            run("Other entry", workflow_id=workflow_id, binding_id=other_binding, trigger_source="manual"),
+            run("Unbound schedule", workflow_id=workflow_id, trigger_source="schedule"),
+            run("Other flow", workflow_id=other_workflow, trigger_source="manual"),
+        ])
+        # A failed run and its retry are one result, shown by the retry.
+        first_id = generate_ulid()
+        session.add_all([
+            run("First attempt", id=first_id, workflow_id=workflow_id, trigger_source="manual", status="failed",
+                lineage_root_run_id=first_id, attempt_number=1, created_at=datetime(2026, 11, 2, 18, 0, tzinfo=timezone.utc)),
+            run("Retry", workflow_id=workflow_id, trigger_source="manual", retry_of_run_id=first_id,
+                lineage_root_run_id=first_id, attempt_number=2, created_at=datetime(2026, 11, 2, 18, 5, tzinfo=timezone.utc)),
+        ])
+        await session.commit()
+
+    response = await client.get(f"/api/v1/workspaces/{workspace['id']}/app-view/sections/articles", headers=headers)
+    assert response.status_code == 200, response.text
+    assert sorted(item["title"] for item in response.json()["items"]) == ["By hand", "From the entry", "Retry"]
 
 
 @pytest.mark.asyncio
@@ -1901,3 +2699,19 @@ def test_an_entry_asks_for_a_hidden_flow_input_the_other_entries_never_show():
     assert added["operating_model"]["app_view"]["asks"] == {"action:next": ["series_id"]}
     removed = _apply_single_patch(added, {"op": "app_view.update", "payload": {"entries": {"action:next": None}}})
     assert removed["operating_model"]["app_view"]["asks"] == {}
+
+
+@pytest.mark.parametrize("component,named", [
+    # The 2026-10-27 studio draft gave up after six rejections that never
+    # said which part was wrong; the message names it so the model can fix it.
+    ({"record_display": {}}, "record_display"),
+    ({"blocks": [{"key": "articles", "type": "project_records", "source": "articles"}]}, "project_records"),
+    ({"blocks": [{"key": "articles", "type": "records", "data_source": "articles"}]}, "data_source"),
+])
+def test_an_invalid_component_names_what_is_wrong(component, named):
+    sources = {"articles": {"type": "workflow_projects", "project_type": "article",
+                            "producer_workflows": ["workflow_definition:article"], "fields": [["title"]]}}
+    base = {"type": "data_view", "schema_version": 1, "key": "tracker", "context": {"kind": "workspace"},
+            "blocks": [{"key": "articles", "type": "records", "source": "articles"}]}
+    with pytest.raises(ValueError, match=named):
+        normalize_app_view_data_contract(sources, [{**base, **component}])

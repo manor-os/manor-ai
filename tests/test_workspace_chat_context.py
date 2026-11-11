@@ -67,6 +67,25 @@ def test_operating_rules_reach_the_chat_summary_as_bounded_instructions() -> Non
     assert len(block) < 5200
 
 
+@pytest.mark.asyncio
+async def test_rules_text_reads_the_live_rules_uncached(db_session) -> None:
+    """A running Task is handed the rules in force now, not the cached summary's."""
+    from packages.core.workspace_chat.context import rules_text
+
+    entity_id = generate_ulid()
+    workspace = Workspace(
+        id=generate_ulid(), entity_id=entity_id, name="Rules test", kind="project", status="active",
+        operating_model={"rules": [{"name": "English only", "description": "Write in English."}]},
+    )
+    db_session.add(workspace)
+    await db_session.flush()
+    assert "- English only: Write in English." in await rules_text(db_session, workspace.id, entity_id)
+
+    workspace.operating_model = {"rules": []}
+    await db_session.flush()
+    assert (await rules_text(db_session, workspace.id, entity_id)).startswith("Operating rules: none.")
+
+
 def test_query_matches_exact_substring_and_any_token() -> None:
     assert _query_matches("tour", "Lift lead-to-tour conversion to 40%")
     assert _query_matches(
@@ -149,6 +168,44 @@ async def test_workspace_search_goals_and_tasks_match_keyword_bags(db_session) -
         query="playlist pitching",
     )
     assert "Rights clearance ready" not in miss
+
+
+@pytest.mark.asyncio
+async def test_workspace_search_finds_the_records_workflows_keep(db_session, monkeypatch) -> None:
+    """A dish added from the App must be findable by the Agent that makes the campaign."""
+    from packages.core.models.workflow import WorkflowProject
+    from packages.core.workspace_chat import context
+
+    entity_id, workspace_id, other_workspace_id = generate_ulid(), generate_ulid(), generate_ulid()
+    db_session.add_all([
+        Workspace(id=workspace_id, entity_id=entity_id, name="Restaurant", kind="project", status="active"),
+        Workspace(id=other_workspace_id, entity_id=entity_id, name="Other", kind="project", status="active"),
+    ])
+    dish = WorkflowProject(
+        entity_id=entity_id, workspace_id=workspace_id, project_type="dish", current_stage="active",
+        state={"name": "水煮鱼", "price": 28.95, "spice_level": "特辣"}, revision=1, created_by=generate_ulid(),
+    )
+    elsewhere = WorkflowProject(
+        entity_id=entity_id, workspace_id=other_workspace_id, project_type="dish", current_stage="active",
+        state={"name": "水煮鱼 elsewhere"}, created_by=generate_ulid(),
+    )
+    db_session.add_all([dish, elsewhere])
+    await db_session.flush()
+
+    by_name = await workspace_search(db_session, workspace_id, entity_id, category="records", query="水煮鱼")
+    assert f"record_id={dish.id} type=dish stage=active" in by_name
+    assert "28.95" in by_name
+    assert "elsewhere" not in by_name
+    # Agents usually search everything; records are part of that. These bare
+    # Workspaces have no approval configuration, which the rules search needs.
+    async def no_rules(*_args, **_kwargs):
+        return ""
+
+    monkeypatch.setattr(context, "_search_rules", no_rules)
+    assert f"record_id={dish.id}" in await workspace_search(db_session, workspace_id, entity_id, query="水煮鱼")
+    assert "Workflow records" not in await workspace_search(
+        db_session, workspace_id, entity_id, category="records", query="麻婆豆腐",
+    )
 
 
 @pytest.mark.asyncio

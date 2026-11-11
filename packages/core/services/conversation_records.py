@@ -93,6 +93,9 @@ async def list_conversations(
     db: AsyncSession,
     entity_id: str,
     user_id: str | None = None,
+    *,
+    workspace_id: str | None = None,
+    channel: str | None = None,
 ) -> list[Conversation]:
     """List recent conversations, sorting by newest message when available."""
 
@@ -132,6 +135,10 @@ async def list_conversations(
                 ),
             )
         )
+    if workspace_id:
+        q = q.where(Conversation.workspace_id == workspace_id)
+    if channel:
+        q = q.where(func.lower(Conversation.channel) == channel.lower())
     q = q.order_by(
         func.coalesce(last_msg.c.last_msg_at, Conversation.created_at).desc()
     ).limit(50)

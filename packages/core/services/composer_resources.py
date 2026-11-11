@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from sqlalchemy import select
+from sqlalchemy.orm import load_only
 
 from packages.core.models.permission import Visibility
 from packages.core.models.workspace import Workspace
@@ -17,7 +18,8 @@ async def resource_workspace_names(db, resources, user) -> dict[str, str]:
     workspaces = (
         (
             await db.execute(
-                select(Workspace).where(
+                # The name is all a resource shows of its home Workspace.
+                select(Workspace).options(load_only(Workspace.id, Workspace.name)).where(
                     Workspace.id.in_(workspace_ids),
                     Workspace.entity_id == user.entity_id,
                     Workspace.deleted_at.is_(None),

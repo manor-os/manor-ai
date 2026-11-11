@@ -46,7 +46,8 @@ test("DOCX text editing autosaves and clears its saved confirmation", async ({ p
     const skipTour = page.getByRole("button", { name: "Skip", exact: true });
     if (await skipTour.isVisible()) await skipTour.click();
 
-    await expect(page.locator(".manor-editor-header").getByText("Word document", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Save", exact: true })).toBeVisible();
+    await expect(page.locator(".manor-editor-header").getByText("Word document", { exact: true })).toHaveCount(0);
     await expect(page.locator(".manor-editor-header").getByText("DOCX", { exact: true })).toHaveCount(0);
     await expect(page.locator(".manor-editor-header").getByText("Word", { exact: true })).toHaveCount(0);
     await expect(page.getByText(/OOXML fidelity|fidelity mode|Lightweight edit/i)).toHaveCount(0);

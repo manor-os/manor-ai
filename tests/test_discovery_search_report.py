@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy import select
 
 from packages.core.models.base import generate_ulid
 from packages.core.models.skill import Skill
@@ -93,9 +94,16 @@ async def test_outcomes_come_from_the_query_and_the_models_next_call(db_session)
 @pytest.mark.asyncio
 async def test_skills_are_named_by_row_id_and_tenant_skills_are_candidates(db_session):
     s = timedelta(seconds=1)
-    builtin_row, tenant_row = generate_ulid(), generate_ulid()
+    # db_session keeps rows from earlier tests, and any of them may have seeded
+    # the built-in Skills already; the platform has one "docx" either way.
+    builtin_row = (await db_session.execute(
+        select(Skill.id).where(Skill.entity_id.is_(None), Skill.slug == "docx")
+    )).scalar_one_or_none()
+    if builtin_row is None:
+        builtin_row = generate_ulid()
+        db_session.add(Skill(id=builtin_row, entity_id=None, name="docx", slug="docx", system_prompt="-"))
+    tenant_row = generate_ulid()
     db_session.add_all([
-        Skill(id=builtin_row, entity_id=None, name="docx", slug="docx", system_prompt="-"),
         Skill(id=tenant_row, entity_id="ent-skills", name="Quarterly board pack", slug="board-pack",
               description="Assemble the quarterly board pack from finance exports.", system_prompt="-"),
         Skill(id=generate_ulid(), entity_id="ent-elsewhere", name="Board pack elsewhere", slug="board-pack-2",

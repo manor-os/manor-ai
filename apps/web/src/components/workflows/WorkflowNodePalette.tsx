@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { TYPE_META, NodeIcon } from "./WorkflowCanvas";
 import Input from "../ui/Input";
+import { t } from "../../lib/i18n";
 
 /* A grouped, searchable palette of the canonical node types. Clicking a node
    adds it to the workflow. Mirrors the catalogue ComfyUI / n8n surface, backed
@@ -18,12 +19,24 @@ export const NODE_GROUPS: { group: string; types: string[] }[] = [
   { group: "Annotate", types: ["note"] },
 ];
 
-function meta(t: string) {
-  return TYPE_META[t] || { color: "#9b938c", label: t.toUpperCase() };
+function meta(type: string) {
+  return TYPE_META[type] || { color: "#9b938c", label: type };
 }
 
-export default function WorkflowNodePalette({ onPick }: { onPick: (type: string) => void }) {
+// The steps people actually mean; every other node type waits under "More".
+const COMMON_STEPS: { type: string; label: string }[] = [
+  { type: "agent", label: t("component.workflow_palette.agent") },
+  { type: "wait", label: t("component.workflow_palette.wait") },
+  { type: "condition", label: t("component.workflow_palette.condition") },
+  { type: "loop", label: t("component.workflow_palette.loop") },
+  { type: "connector", label: t("component.workflow_palette.connector") },
+  { type: "notify", label: t("component.workflow_palette.notify") },
+  { type: "subworkflow", label: t("component.workflow_palette.subworkflow") },
+];
+
+export default function WorkflowNodePalette({ onPick }: { onPick: (type: string, label?: string) => void }) {
   const [q, setQ] = useState("");
+  const [showAll, setShowAll] = useState(false);
 
   const groups = useMemo(() => {
     const needle = q.trim().toLowerCase();
@@ -31,33 +44,49 @@ export default function WorkflowNodePalette({ onPick }: { onPick: (type: string)
     return NODE_GROUPS.map((g) => ({
       ...g,
       types: g.types.filter(
-        (t) => t.includes(needle) || meta(t).label.toLowerCase().includes(needle),
+        (type) => type.includes(needle) || meta(type).label.toLowerCase().includes(needle),
       ),
     })).filter((g) => g.types.length > 0);
   }, [q]);
 
+  if (!showAll) {
+    return (
+      <div className="workflow-palette-common">
+        {COMMON_STEPS.map((step) => (
+          <button key={step.type} type="button" className="workflow-palette-row" onClick={() => onPick(step.type, step.label)}>
+            <NodeIcon type={step.type} size={16} />
+            <span>{step.label}</span>
+          </button>
+        ))}
+        <button type="button" className="workflow-palette-more" onClick={() => setShowAll(true)}>
+          {t("component.workflow_palette.more")}
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-      <Input placeholder="Search nodes…" value={q} onChange={(e) => setQ(e.target.value)} />
+      <Input placeholder={t("component.workflow_palette.search")} value={q} onChange={(e) => setQ(e.target.value)} />
 
       <div style={{ maxHeight: 360, overflowY: "auto", display: "flex", flexDirection: "column", gap: 14 }}>
         {groups.map((g) => (
           <div key={g.group}>
             <div
               style={{
-                fontSize: 11, fontWeight: 700, letterSpacing: 0.4, textTransform: "uppercase",
+                fontSize: 11, fontWeight: 700,
                 color: "var(--text-faint)", marginBottom: 8,
               }}
             >
               {g.group}
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}>
-              {g.types.map((t) => {
-                const m = meta(t);
+              {g.types.map((type) => {
+                const m = meta(type);
                 return (
                   <button
-                    key={t}
-                    onClick={() => onPick(t)}
+                    key={type}
+                    onClick={() => onPick(type)}
                     style={{
                       display: "flex", alignItems: "center", gap: 8,
                       padding: "9px 11px", borderRadius: 10, cursor: "pointer",
@@ -74,7 +103,7 @@ export default function WorkflowNodePalette({ onPick }: { onPick: (type: string)
                         display: "flex", alignItems: "center", justifyContent: "center",
                       }}
                     >
-                      <NodeIcon type={t} size={15} />
+                      <NodeIcon type={type} size={15} />
                     </span>
                     <span style={{ fontSize: 12.5, fontWeight: 600, color: "var(--text-strong)" }}>{m.label}</span>
                   </button>
@@ -84,7 +113,7 @@ export default function WorkflowNodePalette({ onPick }: { onPick: (type: string)
           </div>
         ))}
         {groups.length === 0 && (
-          <div style={{ fontSize: 13, color: "var(--text-faint)", padding: "12px 0" }}>No matching nodes.</div>
+          <div style={{ fontSize: 13, color: "var(--text-faint)", padding: "12px 0" }}>{t("component.workflow_palette.no_match")}</div>
         )}
       </div>
     </div>

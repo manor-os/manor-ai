@@ -6,7 +6,7 @@ import re
 import time
 from copy import deepcopy
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import PurePath
 from typing import Any, Literal
 
@@ -1416,6 +1416,19 @@ class AssistantBlocksBuilder:
         self._drafts: dict[str, str] = {}
         if started_at_ms is not None:
             self._ensure_process()
+
+    def map_text(self, transform: Callable[[str], str]) -> None:
+        """Rewrite text already in the timeline, dropping blocks left empty."""
+        kept: list[dict[str, Any]] = []
+        for block in self._blocks:
+            if block.get("type") == "text":
+                block["text"] = transform(str(block.get("text") or ""))
+                if not block["text"]:
+                    if block is self._active_text:
+                        self._active_text = None
+                    continue
+            kept.append(block)
+        self._blocks[:] = kept
 
     def append_text(self, text: str, *, phase: str = "opening", after_step_seq: int | None = None) -> None:
         if not text:

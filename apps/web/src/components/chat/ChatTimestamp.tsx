@@ -57,8 +57,10 @@ export function formatChatDayLabel(
   const timeZone = getPreferredTimeZone();
   const day = chatDayKey(timestamp);
   const today = now.toLocaleDateString("en-CA", { timeZone });
-  const yesterday = new Date(now.getTime() - 86_400_000)
-    .toLocaleDateString("en-CA", { timeZone });
+  // Move one calendar day in the viewer's zone; DST days need not last 24 hours.
+  const previousDay = new Date(`${today}T12:00:00Z`);
+  previousDay.setUTCDate(previousDay.getUTCDate() - 1);
+  const yesterday = previousDay.toISOString().slice(0, 10);
   const sameYear = day.slice(0, 4) === today.slice(0, 4);
   const calendar = date.toLocaleDateString(LOCALES[getLocale()] || undefined, {
     ...(sameYear ? {} : { year: "numeric" }),

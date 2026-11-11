@@ -28,11 +28,12 @@ REASON_CODES: frozenset[str] = frozenset({
     "STALE_REVISION",
     "INSUFFICIENT_DATA",
     "SUPERSEDED",
+    "EXPIRED",
     "OTHER",
 })
 
 # The subset a human may pick in the UI / API. POLICY_BLOCKED,
-# STALE_REVISION, INSUFFICIENT_DATA and SUPERSEDED are system-only
+# STALE_REVISION, INSUFFICIENT_DATA, SUPERSEDED and EXPIRED are system-only
 # outcomes and are never offered on the reject card; an unknown
 # user-supplied code falls back to OTHER instead of erroring.
 USER_REASON_CODES: tuple[str, ...] = (
@@ -48,8 +49,9 @@ USER_REASON_CODES: tuple[str, ...] = (
 # rejection-reason distribution. SUPERSEDED means "a fresher review
 # replaced this cohort" — it says nothing about whether the proposal was
 # any good, so counting it as negative feedback would teach the
-# Strategist to avoid perfectly sound proposals.
-LEARNING_EXCLUDED_REASON_CODES: frozenset[str] = frozenset({"SUPERSEDED"})
+# Strategist to avoid perfectly sound proposals. EXPIRED (nobody answered
+# in time) is likewise no verdict on the proposal.
+LEARNING_EXCLUDED_REASON_CODES: frozenset[str] = frozenset({"SUPERSEDED", "EXPIRED"})
 
 ITEM_KINDS: tuple[str, ...] = tuple(ProposalItemKind.values())
 

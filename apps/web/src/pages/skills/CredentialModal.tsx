@@ -73,7 +73,7 @@ export function CredentialModal({ skill, open, onClose }: CredentialModalProps) 
     >
       {skill && (
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-          <p style={{ fontSize: 13, color: "#78716c", margin: "0 0 4px" }}>
+          <p style={{ fontSize: 13, color: "var(--text-muted)", margin: "0 0 4px" }}>
             {t("page.credential_modal.requires_env_vars")}
           </p>
           {envVars.map((ev: any) => {
@@ -90,7 +90,7 @@ export function CredentialModal({ skill, open, onClose }: CredentialModalProps) 
                   style={{
                     fontSize: 12,
                     fontWeight: 700,
-                    color: "#44403c",
+                    color: "var(--text-muted)",
                     display: "flex",
                     alignItems: "center",
                     gap: 4,
@@ -102,7 +102,7 @@ export function CredentialModal({ skill, open, onClose }: CredentialModalProps) 
                   )}
                 </label>
                 {desc && (
-                  <p style={{ fontSize: 11, color: "#a8a29e", margin: 0 }}>
+                  <p style={{ fontSize: 11, color: "var(--text-muted)", margin: 0 }}>
                     {desc}
                   </p>
                 )}

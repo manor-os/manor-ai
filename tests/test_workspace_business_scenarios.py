@@ -645,6 +645,7 @@ async def _create_business_workspace(db_session, scenario: dict[str, Any]):
 async def _create_approval_owner(db, entity_id, user_id):
     db.add_all([Entity(id=entity_id, name="Scenario account", settings={"approval_defaults": account_defaults()}),
         User(id=user_id, entity_id=entity_id, email=f"{user_id}@example.test", password_hash="test-only", role="owner",
+            timezone="Asia/Shanghai",
             preferences={"approval_policy": {entity_id: local_defaults(entity_id)}}),
         UserMembership(user_id=user_id, entity_id=entity_id, role="owner", status="active", is_primary=True)])
     await db.flush()
@@ -1112,6 +1113,11 @@ async def _assert_automations(db_session, workspace_id: str, scenario):
         assert job.execution_type == "agent"
         assert job.schedule_kind == "cron"
         assert job.cron_expr == automation["cron_expr"]
+        # Created while the Workspace was provisioning, released when it became
+        # active, and on the creator's clock rather than UTC.
+        assert job.enabled is True and job.workspace_hold is False
+        assert job.next_run_at is not None
+        assert job.timezone == "Asia/Shanghai"
         assert automation["description"] in (job.payload_message or "")
         assert f"Responsible service: {automation['service_key']}." in (job.payload_message or "")
 

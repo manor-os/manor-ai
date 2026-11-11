@@ -11,7 +11,7 @@ import { EMBED } from "../embed/embedContext";
 import { closeEmbeddedSession } from "../embed/embeddedSession";
 import { normalizeLocale, setLocaleIfCurrent, type Locale } from "../lib/i18n";
 import type { User } from "../lib/types";
-import { useChatStreamStore } from "./chatStream";
+import { runSessionResets } from "../lib/sessionReset";
 import { useDisplayPreferences } from "./displayPreferences";
 
 
@@ -47,7 +47,7 @@ interface AuthState {
 }
 
 function clearVolatileUserState() {
-  useChatStreamStore.getState().reset();
+  runSessionResets();
   localStorage.removeItem("manor_pending_chat_retry");
 }
 

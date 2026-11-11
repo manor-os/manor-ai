@@ -147,6 +147,138 @@ async def test_project_workflow_schedule_preserves_inputs_scope_and_finite_lifet
         await schedule_workflow(db_session, **kwargs, inputs={"project_id": project.id})
 
 
+async def test_ending_a_project_stops_the_scheduled_work_it_owns(db_session, monkeypatch):
+    """A campaign had no way to stop early: its jobs ran until their own stop_after.
+    Any project moved to ended or cancelled now stops the jobs it owns (kept, disabled),
+    refuses new ones, and a job of an ended project does not dispatch."""
+    from packages.core.models.scheduler import ScheduledJob
+    from packages.core.models.user import Entity, User
+    from packages.core.models.workflow import WorkflowDefinition, WorkflowProject
+    from packages.core.models.workspace import Workspace, WorkspaceStaff
+    from packages.core.services.workflow_project_service import patch_workflow_project
+    from packages.core.services.workflow_service import schedule_workflow
+    from packages.core.tasks import scheduler_tasks
+
+    entity_id, user_id = generate_ulid(), generate_ulid()
+    workspace = Workspace(entity_id=entity_id, name="Maintenance")
+    user = User(id=user_id, entity_id=entity_id, email=f"{user_id}@test.com", password_hash="unused", role="owner", status="active")
+    db_session.add_all([Entity(id=entity_id, name="Ended projects"), user, workspace])
+    await db_session.flush()
+    db_session.add(WorkspaceStaff(workspace_id=workspace.id, user_id=user_id, role="owner", status="active"))
+    plan, other = (
+        WorkflowProject(entity_id=entity_id, workspace_id=workspace.id, project_type="maintenance_plan",
+                        project_key=key, state={}, created_by=user_id, current_stage="active")
+        for key in ("north", "south")
+    )
+    workflow = WorkflowDefinition(entity_id=entity_id, workspace_id=workspace.id, name="Inspect equipment", steps=[
+        {"id": "start", "type": "trigger", "config": {"run_inputs": [
+            {"key": "project_id", "type": "string", "required": True},
+        ]}, "next": ["done"]},
+        {"id": "done", "type": "end", "config": {}, "next": []},
+    ])
+    db_session.add_all([plan, other, workflow])
+    await db_session.flush()
+
+    async def schedule(project, key):
+        return await schedule_workflow(
+            db_session, entity_id=entity_id, workflow_id=workflow.id, workspace_id=workspace.id,
+            cron="0 9 * * 1", created_by=user_id, owner_project_id=project.id, idempotency_key=key,
+            inputs={"project_id": project.id},
+        )
+
+    weekly, monthly, kept = await schedule(plan, "weekly"), await schedule(plan, "monthly"), await schedule(other, "other")
+    await db_session.flush()
+    kept_id, other_id = kept.id, other.id
+
+    await patch_workflow_project(
+        db_session, project_id=plan.id, entity_id=entity_id, workspace_id=workspace.id,
+        expected_revision=plan.revision, state={"end": {"reason": "Equipment retired"}}, current_stage="ended",
+    )
+    await db_session.commit()
+    for job in (weekly, monthly, kept):
+        await db_session.refresh(job)
+    assert (weekly.enabled, monthly.enabled, kept.enabled) == (False, False, True)
+    # The jobs stay, with their history; nothing is deleted.
+    assert await db_session.get(ScheduledJob, weekly.id) is not None
+    # An ended project schedules nothing new.
+    with pytest.raises(ValueError, match="owning project has ended"):
+        await schedule(plan, "again")
+    await db_session.rollback()
+
+    # A job of a project ended some other way (here, its stage set directly) does not run again.
+    other = await db_session.get(WorkflowProject, other_id)
+    other.current_stage = "cancelled"
+    (await db_session.get(ScheduledJob, kept_id)).next_run_at = datetime(2030, 2, 1, tzinfo=timezone.utc)
+    await db_session.commit()
+    assert await scheduler_tasks._prepare_scheduler_parent_dispatch(
+        kept_id, datetime(2030, 2, 1, 1, tzinfo=timezone.utc),
+    ) is None
+    db_session.expire_all()
+    stopped = await db_session.get(ScheduledJob, kept_id)
+    assert stopped.enabled is False and stopped.next_run_at is None
+
+
+@pytest.mark.parametrize("execution_type", ["workflow", "skill", "agent"])
+async def test_ended_project_run_now_cannot_start_owned_work(db_session, monkeypatch, execution_type):
+    """Run now may run a disabled job, but cannot restart an ended project's work."""
+    from sqlalchemy import select
+
+    from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun
+    from packages.core.models.user import Entity, User
+    from packages.core.models.workflow import WorkflowProject
+    from packages.core.models.workspace import Workspace, WorkspaceStaff
+    from packages.core.tasks import scheduler_tasks
+
+    entity_id, user_id = generate_ulid(), generate_ulid()
+    workspace = Workspace(entity_id=entity_id, name="Ended project run now")
+    db_session.add_all([
+        Entity(id=entity_id, name="Ended project"), workspace,
+        User(id=user_id, entity_id=entity_id, email=f"{user_id}@test.com",
+             password_hash="unused", role="owner", status="active"),
+    ])
+    await db_session.flush()
+    db_session.add(WorkspaceStaff(workspace_id=workspace.id, user_id=user_id, role="owner", status="active"))
+    project = WorkflowProject(entity_id=entity_id, workspace_id=workspace.id,
+                              project_type="maintenance_plan", current_stage="ended", state={}, created_by=user_id)
+    db_session.add(project)
+    await db_session.flush()
+    job = ScheduledJob(
+        job_id=f"ended-run-now:{generate_ulid()}", name="Retained project automation",
+        entity_id=entity_id, workspace_id=workspace.id, owner_project_id=project.id,
+        user_id=user_id, execution_type=execution_type, enabled=False,
+    )
+    db_session.add(job)
+    await db_session.commit()
+    job_id, public_job_id = job.id, job.job_id
+
+    queued = []
+    monkeypatch.setattr(scheduler_tasks, "_publish_scheduled_dispatch", queued.append)
+
+    async def unexpected_credit_check(*args, **kwargs):
+        raise AssertionError("ended project must stop before credit admission or child execution")
+
+    monkeypatch.setattr(scheduler_tasks, "_preflight_scheduled_job_credits", unexpected_credit_check)
+    occurrence_key = f"manual:{generate_ulid()}"
+    dispatch = await scheduler_tasks.dispatch_job_occurrence(
+        job_db_id=job_id, occurrence_key=occurrence_key, requesting_user_id=user_id,
+    )
+    assert dispatch is not None and len(queued) == 1
+    parent = queued.pop()
+    await scheduler_tasks._async_dispatch_single(*parent["args"], **parent["kwargs"])
+
+    db_session.expire_all()
+    run = await db_session.scalar(select(ScheduledJobRun).where(
+        ScheduledJobRun.job_id == public_job_id, ScheduledJobRun.idempotency_key == occurrence_key,
+    ))
+    assert run.status == "error" and "project" in run.error and "ended" in run.error
+    assert run.completed_at is not None
+    assert (await db_session.get(ScheduledJob, job_id)).enabled is False
+    assert queued == []
+    # Redelivery retains the terminal occurrence instead of creating a child.
+    await scheduler_tasks._async_dispatch_single(*parent["args"], **parent["kwargs"])
+    assert queued == []
+
+
 async def test_workspace_schedule_uses_its_active_main_conversation_when_unspecified(db_session):
     from packages.core.models.task import Conversation
     from packages.core.models.user import Entity, User
@@ -1124,6 +1256,119 @@ async def test_paused_workspace_keeps_independent_workflow_schedule_enabled(
     )
     assert disabled.status_code == 200, disabled.text
     assert disabled.json()["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_workspace_start_releases_only_the_jobs_its_lifecycle_held(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.scheduler import ScheduledJob
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.scheduler_service import pause_workspace_automations
+    from packages.core.services.workspace_runtime import sync_workspace_runtime_schedules
+
+    headers = await _auth(client, "sched_lifecycle_hold_release")
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Lifecycle hold workspace"},
+    )
+    assert workspace.status_code == 201, workspace.text
+    workspace_id = workspace.json()["id"]
+
+    async def create(job_id: str) -> str:
+        created = await client.post(
+            "/api/v1/jobs",
+            headers=headers,
+            json={
+                "job_id": job_id, "name": job_id, "workspace_id": workspace_id,
+                "schedule_kind": "cron", "cron_expr": "0 9 * * 1",
+            },
+        )
+        assert created.status_code == 201, created.text
+        return created.json()["id"]
+
+    paused_with_workspace = await create("hold-paused-with-workspace")
+    turned_off_by_user = await create("hold-turned-off-by-user")
+    paused = await client.post(f"/api/v1/workspaces/{workspace_id}/pause", headers=headers)
+    assert paused.status_code == 200, paused.text
+    created_while_paused = await create("hold-created-while-paused")
+    toggled = await client.post(
+        f"/api/v1/jobs/{turned_off_by_user}/toggle", headers=headers, json={"enabled": False},
+    )
+    assert toggled.status_code == 200, toggled.text
+
+    started = await client.post(f"/api/v1/workspaces/{workspace_id}/resume", headers=headers)
+    assert started.status_code == 200, started.text
+
+    async def state(job_pk: str) -> tuple[bool, bool, bool]:
+        """(enabled, has a next run, still held)."""
+        job = await db_session.get(ScheduledJob, job_pk, populate_existing=True)
+        return bool(job.enabled), job.next_run_at is not None, bool(job.workspace_hold)
+
+    assert await state(paused_with_workspace) == (True, True, False)
+    assert await state(created_while_paused) == (True, True, False)
+    # A person's own off switch outranks the Workspace starting.
+    assert await state(turned_off_by_user) == (False, False, False)
+
+    # A delivered Workspace waits for the recipient: its held Jobs stay off.
+    paused = await client.post(f"/api/v1/workspaces/{workspace_id}/pause", headers=headers)
+    assert paused.status_code == 200, paused.text
+    stored = await db_session.get(Workspace, workspace_id, populate_existing=True)
+    await pause_workspace_automations(db_session, workspace_id, stored.entity_id)
+    stored.status = "active"
+    await sync_workspace_runtime_schedules(db_session, stored)
+    await db_session.commit()
+    assert await state(paused_with_workspace) == (False, False, False)
+
+
+@pytest.mark.asyncio
+async def test_run_whose_task_waits_on_a_person_is_shown_waiting(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.scheduler import ScheduledJobRun
+    from packages.core.models.task import Task
+
+    headers = await _auth(client, "sched_run_waits_on_person")
+    created = await client.post(
+        "/api/v1/jobs",
+        headers=headers,
+        json={"job_id": "daily-check-waiting", "name": "Daily check", "schedule_kind": "cron", "cron_expr": "0 8 * * *"},
+    )
+    assert created.status_code == 201, created.text
+    entity_id = created.json()["entity_id"]
+
+    async def occurrence(task_status: str, summary: str) -> str:
+        task = Task(
+            id=generate_ulid(), entity_id=entity_id, title="[Auto] Daily check", status=task_status,
+            actual_output={"result": {"summary": summary}},
+        )
+        run = ScheduledJobRun(
+            id=generate_ulid(), job_id="daily-check-waiting", status="running", trigger_type="cron",
+            started_at=datetime.now(timezone.utc),
+            result={"scheduled_child_kind": "agent_task", "scheduled_child_id": task.id},
+        )
+        db_session.add_all([task, run])
+        await db_session.commit()
+        return run.id
+
+    blocked = await occurrence("blocked", "An operator must fix the approval configuration.")
+    working = await occurrence("in_progress", "Reading the ledger.")
+
+    runs = await client.get(f"/api/v1/jobs/{created.json()['id']}/runs", headers=headers)
+    assert runs.status_code == 200, runs.text
+    by_id = {run["id"]: run for run in runs.json()}
+    # Retries are spent and a person must act: it is not still running.
+    assert by_id[blocked]["status"] == "waiting"
+    assert by_id[blocked]["waiting_reason"] == "An operator must fix the approval configuration."
+    assert by_id[blocked]["waiting_task_id"]
+    assert (by_id[working]["status"], by_id[working]["waiting_task_id"]) == ("running", None)
+
+    detail = await client.get(f"/api/v1/jobs/{created.json()['id']}/runs/{blocked}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["run"]["status"] == "waiting"
 
 
 @pytest.mark.asyncio
@@ -3780,6 +4025,138 @@ async def test_failed_scheduled_agent_run_auto_pauses_and_finalizes_once(
 
 
 @pytest.mark.asyncio
+async def test_failing_initiative_driver_backs_off_instead_of_auto_pausing(
+    db_session,
+    monkeypatch,
+):
+    """Three failed Initiative occurrences keep the driver enabled (so the
+    Initiative's active status stays true), push its clock out, alert ops
+    once, and never send the owner an automation_paused notice."""
+    from sqlalchemy import func, select
+
+    import packages.core.services.platform_faults as platform_faults
+    from packages.core.models.notification import Notification
+    from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun
+    from packages.core.services.scheduler_service import (
+        INITIATIVE_REPEATED_FAILURE_FAULT_CODE,
+    )
+    from packages.core.services.task_service import create_task
+    from packages.core.tasks.ai_tasks import _update_job_run_status_async
+
+    reports: list[dict] = []
+
+    async def capture_report(**kwargs):
+        reports.append(kwargs)
+        return True
+
+    monkeypatch.setattr(platform_faults, "report_platform_fault", capture_report)
+
+    from packages.core.models.agent_initiative import AgentInitiative
+    from packages.core.models.workspace import AgentSubscription
+
+    entity_id = generate_ulid()
+    user_id = generate_ulid()
+    subscription = AgentSubscription(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        agent_id=generate_ulid(),
+        owner_user_id=user_id,
+        name="Inbox agent",
+        status="active",
+    )
+    initiative = AgentInitiative(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        agent_subscription_id=subscription.id,
+        owner_user_id=user_id,
+        name="Watch the inbox",
+        instruction="Report a material update.",
+        trigger_kind="interval",
+        trigger_config={"version": "1", "kind": "interval", "every_seconds": 300},
+        status="active",
+        revision=1,
+    )
+    db_session.add(subscription)
+    await db_session.flush()
+    db_session.add(initiative)
+    await db_session.flush()
+    initiative_id = initiative.id
+    now = datetime.now(timezone.utc)
+    natural_next_run = now + timedelta(minutes=5)
+    job = ScheduledJob(
+        id=generate_ulid(),
+        job_id=f"initiative:{initiative_id}",
+        entity_id=entity_id,
+        user_id=user_id,
+        name="Watch the inbox",
+        job_type="every",
+        schedule_kind="every",
+        every_seconds=300,
+        timezone="UTC",
+        execution_type="agent_initiative",
+        execution_target={
+            "managed_by": "agent_initiative",
+            "initiative_id": initiative_id,
+        },
+        agent_initiative_id=initiative_id,
+        enabled=True,
+        next_run_at=natural_next_run,
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    @asynccontextmanager
+    async def session_context():
+        yield db_session
+
+    failure = {"status": "failed", "error": "provider timed out"}
+    for index in range(3):
+        task = await create_task(
+            db_session,
+            entity_id,
+            title="[Initiative] Watch the inbox",
+            task_type="ai_generated",
+            details={"scheduled_job_id": job.job_id},
+        )
+        task.status = "in_progress"
+        run = ScheduledJobRun(
+            id=generate_ulid(),
+            job_id=job.job_id,
+            status="running",
+            trigger_type="every",
+            started_at=now - timedelta(minutes=10 - index),
+        )
+        task.details = {**task.details, "scheduled_run_id": run.id}
+        db_session.add(run)
+        await db_session.commit()
+        await _update_job_run_status_async(session_context, task.id, failure)
+        await asyncio.sleep(0)
+
+    await db_session.refresh(job)
+    await db_session.refresh(initiative)
+    notification_count = await db_session.scalar(
+        select(func.count())
+        .select_from(Notification)
+        .where(
+            Notification.entity_id == entity_id,
+            Notification.type == "automation_paused",
+        )
+    )
+    next_run_at = job.next_run_at
+    if next_run_at.tzinfo is None:
+        next_run_at = next_run_at.replace(tzinfo=timezone.utc)
+
+    assert job.consecutive_errors == 3
+    assert job.enabled is True
+    assert initiative.status == "active"
+    assert next_run_at >= now + timedelta(minutes=59)
+    assert notification_count == 0
+    assert [(r["target"], r["code"]) for r in reports] == [
+        (f"initiative:{initiative_id}", INITIATIVE_REPEATED_FAILURE_FAULT_CODE),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_dispatch_exhaustion_persists_one_terminal_occurrence(
     db_session,
     monkeypatch,
@@ -5757,7 +6134,7 @@ async def test_workspace_chat_automation_defaults_to_executable_agent(
 
 @pytest.mark.asyncio
 async def test_runtime_workspace_automation_tools_stay_in_current_workspace(
-    client: AsyncClient, db_session,
+    client: AsyncClient, db_session, monkeypatch,
 ):
     from packages.core.ai.runtime.scheduling import (
         runtime_cancel_scheduled_job_action,
@@ -5798,6 +6175,20 @@ async def test_runtime_workspace_automation_tools_stay_in_current_workspace(
     )
     assert "runtime-scope-a" in listed
     assert "runtime-scope-b" not in listed
+    # The chat handler passes the user_id; tenant-wide read (None) still
+    # narrows to the current Workspace.
+    from packages.core.services import workspace_access
+
+    async def _reads_all(*_args, **_kwargs):
+        return True
+
+    with monkeypatch.context() as patch:
+        patch.setattr(workspace_access, "user_can_read_all_workspaces", _reads_all)
+        owner_listed = await runtime_list_scheduled_jobs_action(
+            entity_id=entity_id, user_id=user_id, runtime_kwargs=runtime_kwargs,
+        )
+    assert "runtime-scope-a" in owner_listed
+    assert "runtime-scope-b" not in owner_listed
 
     queried = await runtime_query_scheduled_jobs_action(
         entity_id=entity_id,
@@ -5972,3 +6363,23 @@ async def test_agent_execution_workspace_scope_is_read_write_protected(client: A
         json={"status": "completed"},
     )
     assert updated_by_viewer.status_code == 403, updated_by_viewer.text
+
+
+def test_a_workspace_automation_reports_in_its_chat_by_default():
+    """Local eval 2026-11-03: a generated Monday reminder completed and reached nobody."""
+    from types import SimpleNamespace
+
+    from packages.core.tasks.ai_tasks import _scheduled_agent_result_projection
+
+    task = SimpleNamespace(id="task-1", entity_id="e", workspace_id="w", details={})
+
+    def projection(job_id, mode=None, response="The list is empty."):
+        job = SimpleNamespace(job_id=job_id, execution_type="skill", default_delivery_mode=mode)
+        return _scheduled_agent_result_projection(task=task, job=job, result={"response": response})
+
+    assert projection("wa:w:monday-reminder").task_id == "task-1"
+    assert projection("wa:w:monday-reminder", response="") is None
+    # A delivery mode someone chose stands, and other jobs keep needing one.
+    assert projection("wa:w:monday-reminder", mode="silent") is None
+    assert projection("my-job") is None
+    assert projection("my-job", mode="workspace_chat").task_id == "task-1"

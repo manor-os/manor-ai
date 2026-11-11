@@ -1,7 +1,7 @@
 """Risk level(s) per action key, snapshotted from the classifier before the
 effect contract (base 3e08e0a01). Effect declarations must never change risk:
-approval outcomes stay the user's own policy choice. Regenerate only when a
-classifier table changes a risk on purpose."""
+approval outcomes stay the user's own policy choice. Extend for new classified
+actions; change an existing risk only when the classifier changes it on purpose."""
 
 RISK_LEVELS: dict[str, tuple[str, ...]] = {
     'aider.run': ('medium',),
@@ -356,6 +356,9 @@ RISK_LEVELS: dict[str, tuple[str, ...]] = {
     'workspace.agent.capabilities.modify': ('medium',),
     'workspace.agent.create': ('high',),
     'workspace.agent_file.modify': ('medium',),
+    # The person's own Always-allow choices (list / undo), added with them.
+    'workspace.approval_rule.list': ('low',),
+    'workspace.approval_rule.revoke': ('low',),
     'workspace.automation.agent_initiative.create': ('high',),
     'workspace.automation.agent_initiative.delete': ('high',),
     'workspace.automation.agent_initiative.mute': ('medium',),
@@ -422,6 +425,8 @@ RISK_LEVELS: dict[str, tuple[str, ...]] = {
     'workspace.skill.delete': ('high',),
     'workspace.skill.modify': ('medium',),
     'workspace.stat.create': ('medium',),
+    'workspace.stat.delete': ('high',),
+    'workspace.stat.record': ('medium',),
     'workspace.stat.update': ('medium',),
     'workspace.strategist.run': ('medium',),
     'workspace.task.create': ('medium',),

@@ -63,7 +63,7 @@ export default function UserAvatar({ name, avatarUrl, type = "user", seed, size 
         borderRadius: "50%", flexShrink: 0,
         background: "#33302c",
         display: "flex", alignItems: "center", justifyContent: "center",
-        color: "#e7e5e4",
+        color: "#e5e5ea",
         border: "1.5px solid rgba(255,255,255,0.8)",
         ...style,
       }}>
@@ -107,16 +107,15 @@ export default function UserAvatar({ name, avatarUrl, type = "user", seed, size 
     );
   }
 
-  // Fallback: gradient circle with icon or initials
+  // Fallback: a gray circle with an icon or initials
   return (
     <div style={{
       width: size, height: size, borderRadius: "50%", flexShrink: 0,
-      background: type === "user" ? "linear-gradient(135deg, #e8eff4, #ddd6fe)"
-        : "#f5f5f4",
+      background: "rgba(120, 120, 128, 0.16)",
       display: "flex", alignItems: "center", justifyContent: "center",
-      color: "#78716c",
-      fontSize: Math.round(size * 0.38), fontWeight: 700,
-      border: "1.5px solid rgba(255,255,255,0.8)", ...style,
+      color: "var(--text-muted)",
+      fontSize: Math.round(size * 0.38), fontWeight: 600,
+      ...style,
     }}>
       {name ? name.slice(0, 2).toUpperCase()
         : <IconUser size={Math.round(size * 0.52)} />}

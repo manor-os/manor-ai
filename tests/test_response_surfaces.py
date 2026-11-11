@@ -38,6 +38,7 @@ from packages.core.services.response_surfaces import (
     RESPONSE_SURFACE_POLICY,
     ResponseSurfaceValidationError,
     normalize_response_surface,
+    response_surface_from_tool_result,
 )
 
 
@@ -422,6 +423,8 @@ def test_response_surface_generated_html_rejects_host_and_network_capabilities(
 
 
 def test_render_response_surface_schema_describes_each_template_shape() -> None:
+    from packages.core.ai.tools.response_surface_tools import _CARD_TEMPLATE_PROPS
+
     tool = get_tools()[0][0]["function"]
     schema = tool["parameters"]
     props = schema["properties"]["template_props"]
@@ -446,6 +449,7 @@ def test_render_response_surface_schema_describes_each_template_shape() -> None:
         "tests",
         "prompt",
         "options",
+        *_CARD_TEMPLATE_PROPS,
     }
     assert props["properties"]["tests"]["items"] == {"type": "string", "maxLength": 2000}
     assert props["properties"]["languages"]["maxItems"] == 8
@@ -1948,3 +1952,94 @@ def test_assistant_blocks_ignore_unvalidated_response_surface() -> None:
     )
 
     assert all(block["type"] != "surface" for block in builder.blocks())
+
+
+def _card(template_id: str, props: dict) -> dict:
+    return {
+        "version": 1,
+        "title": "Card",
+        "render": {"kind": "template", "template_id": template_id, "template_version": 1, "props": props},
+        "display": {"preferred": "inline", "inline_height": 360},
+        "actions": [{"id": "send", "label": "Send"}],
+        "fallback_markdown": "The same content as text.",
+    }
+
+
+_VALID_CARDS = {
+    "card.email": {"subject": "Re: tasting", "snippet": "Friday works.", "to": ["Chen"], "attachments": [{"name": "plan.pdf", "url": "/viewer/01ABC"}]},
+    "card.delivery": {"items": [{"label": "Email", "status": "sent", "count": 40}, {"label": "Bad address", "status": "failed", "count": 3}]},
+    "card.search_results": {"total": 12, "results": [{"title": "Report", "source": "example.com", "url": "https://example.com/r"}]},
+    "card.person": {"name": "Chen", "title": "Manager", "email": "chen@example.com"},
+    "card.event": {"events": [{"title": "Tasting", "date": "2026-11-14", "time": "14:00-16:00", "attendees": ["Lin"], "status": "proposed"}]},
+    "card.stock": {"name": "Demo", "symbol": "DEMO", "price": 128.4, "change": 1.52, "history": [120, 128.4]},
+    "card.product": {"products": [{"name": "Grinder", "price": "$99", "url": "https://example.com/p"}]},
+    "card.map": {"places": [{"name": "Loft", "lat": 31.2, "lng": 121.4}, {"name": "Unknown"}]},
+    "card.comment": {"platform": "TikTok", "post_title": "Review", "total": 86, "comments": [{"author": "@a", "text": "Nice", "likes": 3, "reply": {"text": "Thanks", "status": "draft"}}]},
+    "card.post": {"posts": [{"platform": "TikTok", "format": "vertical_video", "status": "draft", "media": {"name": "clip.mp4", "url": "/viewer/01ABC"}}]},
+    "card.chart": {"chart_type": "line", "categories": ["W1", "W2"], "series": [{"name": "Rate", "values": [1, 2.5]}], "reference": {"label": "Goal", "value": 2}},
+}
+
+
+def test_code_lab_without_languages_survives_being_stored() -> None:
+    surface = normalize_response_surface(_card("learning.code_lab", {
+        "language": "python",
+        "instructions": "Finish the function.",
+        "starter_code": "def f():\n    pass\n",
+        "tests": ["assert f() is None"],
+    }))
+    assert response_surface_from_tool_result({"ok": True, "response_surface": surface}) is not None
+
+
+@pytest.mark.parametrize("template_id", sorted(_VALID_CARDS))
+def test_response_card_keeps_its_props_and_offers_no_actions(template_id: str) -> None:
+    surface = normalize_response_surface(_card(template_id, _VALID_CARDS[template_id]))
+    # A stored surface is normalized again; failing here would drop it from the reply.
+    assert normalize_response_surface(surface) == surface
+    assert surface["render"]["template_id"] == template_id
+    # A card only shows: an action on it could not run through the approval flow.
+    assert surface["actions"] == []
+    for key in _VALID_CARDS[template_id]:
+        assert key in surface["render"]["props"]
+
+
+@pytest.mark.parametrize(
+    ("template_id", "props", "code"),
+    [
+        ("card.email", {"subject": "No content"}, "email_content"),
+        ("card.delivery", {"items": [{"label": "Email", "status": "maybe"}]}, "choice"),
+        ("card.delivery", {"items": [{"label": "Email", "status": ["sent"]}]}, "choice"),
+        ("card.delivery", {"items": [{"label": "Email", "status": "sent", "count": True}]}, "count"),
+        ("card.search_results", {"results": [{"title": "T", "source": "S", "url": "javascript:alert(1)"}]}, "link"),
+        ("card.search_results", {"total": 0, "results": [{"title": "T", "source": "S"}]}, "total"),
+        ("card.post", {"posts": [{"platform": "X", "status": "draft", "images": [{"name": "a.png", "url": "javascript:alert(1)"}]}]}, "link"),
+        ("card.person", {"title": "No name"}, "required"),
+        ("card.event", {"events": [{"title": "T", "date": "Friday"}]}, "date"),
+        ("card.stock", {"name": "D", "symbol": "D", "price": "high"}, "number"),
+        ("card.stock", {"name": "D", "symbol": "D", "price": 10**400}, "number"),
+        ("card.stock", {"name": "D", "symbol": "D", "price": 1, "history": [1]}, "history"),
+        ("card.product", {"products": [{"name": "P", "url": "javascript:alert(1)"}]}, "link"),
+        ("card.map", {"places": [{"name": "P", "lat": 91, "lng": 0}]}, "coordinates"),
+        ("card.map", {"places": [{"name": "P", "lat": 30}]}, "coordinates"),
+        ("card.comment", {"platform": "X", "comments": []}, "items"),
+        ("card.comment", {"comments": [{"author": "a", "text": "b"}]}, "required"),
+        ("card.comment", {"platform": "X", "comments": [{"author": "a", "text": "b", "reply": {"text": "c"}}]}, "choice"),
+        ("card.comment", {"platform": "X", "total": 0, "comments": [{"author": "a", "text": "b"}]}, "total"),
+        ("card.post", {"posts": [{"platform": "X", "status": "draft", "url": "data:text/html,x"}]}, "link"),
+        ("card.chart", {"chart_type": "line", "categories": ["A", "B"], "series": [{"name": "S", "values": [1]}]}, "values"),
+        ("card.chart", {"chart_type": "line", "categories": ["A"], "series": [{"name": "S", "values": [float("nan")]}]}, "values"),
+        ("card.chart", {"chart_type": "bar", "categories": ["A"], "series": [{"name": "S", "values": [1]}, {"name": "T", "values": [2]}]}, "items"),
+        ("card.chart", {"chart_type": "share", "categories": ["A"], "series": [{"name": "S", "values": [-1]}]}, "values"),
+    ],
+)
+def test_response_card_rejects_what_it_cannot_show_safely(template_id: str, props: dict, code: str) -> None:
+    with pytest.raises(ResponseSurfaceValidationError) as raised:
+        normalize_response_surface(_card(template_id, props))
+    assert code in {issue["code"] for issue in raised.value.errors}
+
+
+def test_response_card_templates_are_offered_by_the_tool() -> None:
+    from packages.core.ai.tools.response_surface_tools import RENDER_RESPONSE_SURFACE_SCHEMA
+    from packages.core.services.response_cards import RESPONSE_CARD_TEMPLATE_IDS
+
+    parameters = RENDER_RESPONSE_SURFACE_SCHEMA["function"]["parameters"]["properties"]
+    assert RESPONSE_CARD_TEMPLATE_IDS <= set(parameters["template_id"]["enum"])

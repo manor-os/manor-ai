@@ -228,6 +228,8 @@ FILE_CONVERSION_TARGETS = {
     **{source: IMAGE_CONVERSION_TARGETS for source in sorted(IMAGE_CONVERSION_TYPES)},
 }
 FILE_CONVERSION_MAX_INPUT_BYTES = 50 * 1024 * 1024
+# A public web image saved by generate_file source={url}: covers and thumbnails, not originals.
+PUBLIC_IMAGE_MAX_BYTES = 15 * 1024 * 1024
 FILE_CONVERSION_MAX_OUTPUT_BYTES = 100 * 1024 * 1024
 OPERATION_GENERATION_TYPES = frozenset({"docx", "pptx", "xlsx"})
 TEMPLATE_OPERATION_GENERATION_TYPES = OPERATION_GENERATION_TYPES | {"xlsm"}

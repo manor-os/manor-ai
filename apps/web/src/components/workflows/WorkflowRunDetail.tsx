@@ -1,3 +1,6 @@
+import { displayReadInterval } from "../../lib/readRefreshPolicy";
+import { usePageVisible } from "../../lib/usePageVisible";
+import { selectedWorkflowRunRefetchInterval, workflowRunListRefetchInterval } from "../../lib/workspaceLiveRefresh";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, translateApiError } from "../../lib/api";
@@ -16,6 +19,7 @@ import {
   IconClock,
   IconEye,
   IconFlow,
+  IconPause,
   IconRefresh,
   IconStop,
 } from "../icons";
@@ -301,10 +305,12 @@ function ValueBlock({ label, value, error = false }: { label: string; value: unk
 }
 
 function WorkflowChildRunDetail({ childRunId }: { childRunId: string }) {
+  const visible = usePageVisible();
   const childQuery = useQuery({
     queryKey: ["workflow-run-history-child", childRunId],
     queryFn: () => api.workflows.getRun(childRunId),
-    refetchInterval: (query) => runIsActive(query.state.data as WorkflowHistoryRun | undefined) ? ACTIVE_WORKFLOW_RUN_POLL_MS : false,
+    enabled: visible,
+    refetchInterval: (query) => displayReadInterval(query.state, selectedWorkflowRunRefetchInterval(query.state.data?.status)),
     refetchIntervalInBackground: false,
   });
 
@@ -312,7 +318,7 @@ function WorkflowChildRunDetail({ childRunId }: { childRunId: string }) {
     return (
       <div className="workflow-run-history-child-state" aria-live="polite">
         <LoadingSpinner size={16} />
-        {t("component.workflow_run_history.loading_child")}
+        <span className="sr-only">{t("component.workflow_run_history.loading_child")}</span>
       </div>
     );
   }
@@ -437,6 +443,7 @@ export default function WorkflowRunDetail({
   onRequestCancel,
   cancellingRunId,
 }: WorkflowRunDetailProps) {
+  const visible = usePageVisible();
   const queryClient = useQueryClient();
   const headingRef = useRef<HTMLHeadingElement>(null);
   const nestedRecoveryWasActiveRef = useRef(false);
@@ -444,18 +451,18 @@ export default function WorkflowRunDetail({
   const detailQuery = useQuery({
     queryKey: ["workflow-run-history-detail", runId],
     queryFn: () => api.workflows.getRun(runId),
-    refetchInterval: (query) => (
-      runIsActive(query.state.data as WorkflowHistoryRun | undefined) ? ACTIVE_WORKFLOW_RUN_POLL_MS : false
-    ),
+    enabled: visible,
+    refetchInterval: (query) => displayReadInterval(query.state, selectedWorkflowRunRefetchInterval(query.state.data?.status)),
     refetchIntervalInBackground: false,
   });
   const run = detailQuery.data as WorkflowHistoryRun | undefined;
   const familyQuery = useQuery({
     queryKey: ["workflow-run-history-family", runId],
     queryFn: () => api.workflows.getRunFamily(runId),
+    enabled: visible,
     refetchInterval: (query) => {
       const familyRuns = (query.state.data || []) as WorkflowHistoryRun[];
-      return familyRuns.some(runIsActive) ? ACTIVE_WORKFLOW_FAMILY_POLL_MS : false;
+      return displayReadInterval(query.state, workflowRunListRefetchInterval(familyRuns));
     },
     refetchIntervalInBackground: false,
   });
@@ -469,15 +476,13 @@ export default function WorkflowRunDetail({
   const latestDetailQuery = useQuery({
     queryKey: ["workflow-run-history-detail", controlRunId],
     queryFn: () => api.workflows.getRun(controlRunId),
-    enabled: Boolean(
+    enabled: visible && Boolean(
       run
       && familyQuery.isSuccess
       && controlRunId
       && controlRunId !== run.id
     ),
-    refetchInterval: (query) => (
-      runIsActive(query.state.data as WorkflowHistoryRun | undefined) ? ACTIVE_WORKFLOW_RUN_POLL_MS : false
-    ),
+    refetchInterval: (query) => displayReadInterval(query.state, selectedWorkflowRunRefetchInterval(query.state.data?.status)),
     refetchIntervalInBackground: false,
   });
   const latestDetailedRun = controlRunId === run?.id
@@ -500,13 +505,28 @@ export default function WorkflowRunDetail({
     // The history family can retain a stale running projection after the
     // runner has cancelled an uncertain external effect. Fetch the compact
     // authoritative state before deciding whether a recovery control exists.
-    enabled: Boolean(familyQuery.isSuccess && controlRunId && canControl),
-    refetchInterval: (query) => (
-      runIsActive(query.state.data as WorkflowHistoryRun | undefined) ? 1_000 : false
+    enabled: visible && Boolean(familyQuery.isSuccess && controlRunId && canControl),
+    // Follow an active control run at run cadence; a settled one only needs a
+    // slow check for nested recovery.
+    refetchInterval: (query) => displayReadInterval(
+      query.state,
+      selectedWorkflowRunRefetchInterval(query.state.data?.status) || 60_000,
     ),
-    refetchIntervalInBackground: true,
+    refetchIntervalInBackground: false,
   });
   const compactRun = controlQuery.data as WorkflowHistoryRun | undefined;
+  const detailedControlStatus = controlRun?.status || "";
+  // The compact read outranks the detail, so re-read it as soon as the faster
+  // detail poll sees the run move on instead of showing a stale status.
+  const compactStatus = compactRun?.status || "";
+  useEffect(() => {
+    if (!controlRunId || !compactStatus || !detailedControlStatus) return;
+    if (compactStatus === detailedControlStatus) return;
+    void queryClient.invalidateQueries({
+      queryKey: ["workflow-run-history-control", controlRunId],
+      exact: true,
+    });
+  }, [compactStatus, controlRunId, detailedControlStatus, queryClient]);
   const controlStatus = compactRun?.status || controlRun?.status || "";
   const canHaveRetry = ["failed", "cancelled", "completed"].includes(controlStatus);
   const canCancel = Boolean(controlRun && canCancelWorkflowRun({
@@ -568,11 +588,22 @@ export default function WorkflowRunDetail({
     },
   });
 
+  // Chat shows a run as one line; pausing it from there happens here.
+  const pauseMutation = useMutation({
+    mutationFn: (pausedRunId: string) => api.workflows.pauseRun(pausedRunId),
+    onSuccess: (_paused, pausedRunId) => {
+      void queryClient.invalidateQueries({ queryKey: ["workflow-run-history-control", pausedRunId] });
+      void queryClient.invalidateQueries({ queryKey: ["workflow-run-history-detail"] });
+      void queryClient.invalidateQueries({ queryKey: ["workflow-run-history-family"] });
+      void queryClient.invalidateQueries({ queryKey: ["workspace-workflow-runs", workspaceId] });
+    },
+  });
+
   if (detailQuery.isLoading) {
     return (
       <section className="workflow-run-history-detail is-loading" aria-live="polite">
         <LoadingSpinner size={24} />
-        <span>{t("component.workflow_run_history.loading_detail")}</span>
+        <span className="sr-only">{t("component.workflow_run_history.loading_detail")}</span>
       </section>
     );
   }
@@ -675,6 +706,21 @@ export default function WorkflowRunDetail({
             <span aria-hidden="true" />
             {t(familyStatusPresentation.stateKey)}
           </span>
+          {canControl && ["pending", "running"].includes(controlStatus) && (
+            <button
+              type="button"
+              className="workflow-run-history-detail-cancel workflow-run-history-detail-pause"
+              title={t("component.workflow_run.action.pause")}
+              aria-label={t("component.workflow_run.action.pause")}
+              disabled={pauseMutation.isPending || cancellingRunId === controlRun.id}
+              onClick={() => pauseMutation.mutate(controlRun.id)}
+            >
+              {pauseMutation.isPending
+                ? <LoadingSpinner size={13} />
+                : <IconPause size={13} aria-hidden="true" />}
+              <span>{t("component.workflow_run.action.pause_short")}</span>
+            </button>
+          )}
           {canCancel && (
             <button
               type="button"
@@ -692,6 +738,12 @@ export default function WorkflowRunDetail({
           )}
         </div>
       </header>
+
+      {pauseMutation.isError && (
+        <p className="workflow-run-history-control-error" role="alert">
+          {translateApiError(pauseMutation.error, t("component.workflow_run.pause_error"))}
+        </p>
+      )}
 
       {legacy && (
         <div className="workflow-run-history-legacy" role="status">
@@ -770,7 +822,7 @@ export default function WorkflowRunDetail({
 
       {canControl && controlRun.status === "paused" && controlRun.resume_action && (
         <section className="workflow-run-history-controls" aria-label={t("component.workflow_run_history.controls")}>
-          <WorkflowRunResumeControl runId={controlRun.id} />
+          <WorkflowRunResumeControl runId={controlRun.id} action={controlRun.resume_action} />
         </section>
       )}
 
@@ -779,7 +831,7 @@ export default function WorkflowRunDetail({
           {controlQuery.isLoading ? (
             <div className="workflow-run-history-control-state" aria-live="polite">
               <LoadingSpinner size={15} />
-              {t("component.workflow_run_history.loading_controls")}
+              <span className="sr-only">{t("component.workflow_run_history.loading_controls")}</span>
             </div>
           ) : controlQuery.isError ? (
             <p className="workflow-run-history-control-error" role="alert">

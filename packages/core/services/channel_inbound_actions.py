@@ -47,10 +47,9 @@ async def maybe_claim_channel_link_token(
         await db.commit()
 
     if outcome.ok:
-        channel_label = {
-            "telegram": "Telegram",
-            "discord": "Discord",
-        }.get(contact.channel_type, contact.channel_type.title())
+        from packages.core.services.integration_service import channel_display_name
+
+        channel_label = channel_display_name(contact.channel_type)
         ack = (
             f"✅ Linked! This {channel_label} account is now connected to your "
             "Manor profile. You'll receive your notifications here."

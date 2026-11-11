@@ -379,6 +379,16 @@ def test_datetime_node_resolves_bound_amount_and_rejects_invalid_amount(runner):
     )["code"] == "datetime_amount_invalid"
 
 
+def test_datetime_node_formats_the_calendar_date_of_a_timezone(runner):
+    # 03:30 UTC is still the previous evening in Los Angeles.
+    step = {"type": "datetime", "config": {
+        "operation": "format", "value": "2026-11-04T03:30:00Z", "format": "%Y-%m-%d", "timezone": "{{zone}}",
+    }}
+    assert runner._execute_datetime_step(step, {"zone": "America/Los_Angeles"})["output"] == "2026-11-03"
+    assert runner._execute_datetime_step(step, {"zone": ""})["output"] == "2026-11-04"
+    assert runner._execute_datetime_step(step, {"zone": "Mars/Base"})["code"] == "datetime_timezone_invalid"
+
+
 class _CheckpointDb:
     def __init__(self) -> None:
         self.commit_count = 0
@@ -1949,6 +1959,46 @@ async def test_http_node_preserves_cookies_across_pinned_redirect_hops(runner, m
 
 
 @pytest.mark.asyncio
+async def test_http_node_sends_its_body_with_references_resolved(runner, monkeypatch):
+    import httpcore
+
+    sent = []
+
+    class Stream(httpcore.AsyncMockStream):
+        async def write(self, buffer, timeout=None):
+            sent[-1] += buffer
+
+    class NetworkBoundary:
+        async def connect_tcp(self, host, port, **_kwargs):
+            sent.append(b"")
+            return Stream([b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{"ok":true}'])
+
+    monkeypatch.setattr(workflow_runner_module.socket, "getaddrinfo", lambda hostname, port, **kwargs: [(2, 1, 6, "", ("93.184.216.34", port))])
+    monkeypatch.setattr(httpcore, "AnyIOBackend", NetworkBoundary)
+    variables = {"video": {"id": 7, "tags": ["cut", "final"], "title": "Final"}, "edit": "Trimmed the intro."}
+
+    async def send(body):
+        return await runner._execute_http_step(
+            {"id": "h", "type": "http", "config": {"url": "https://example.test/hook", "method": "POST", "body": body}},
+            variables,
+        )
+
+    result = await send({"id": "{{video.id}}", "tags": "{{video.tags}}", "note": "Cut {{video.title}}", "by": "{{reviewer}}"})
+    assert result["status"] == "completed"
+    assert json.loads(sent[-1].split(b"\r\n\r\n", 1)[1]) == {"id": 7, "tags": ["cut", "final"], "note": "Cut Final"}
+
+    # An imported n8n jsonBody is JSON text; it goes out as the object it spells.
+    result = await send('{"id": "{{video.id}}", "note": "{{edit}}"}')
+    assert result["status"] == "completed"
+    assert json.loads(sent[-1].split(b"\r\n\r\n", 1)[1]) == {"id": 7, "note": "Trimmed the intro."}
+
+    connections = len(sent)
+    failed = await send({"duration": "{{edit.duration}}"})
+    assert failed["code"] == "workflow_reference_unresolved"
+    assert len(sent) == connections
+
+
+@pytest.mark.asyncio
 async def test_parallel_node_does_not_share_db_session_concurrently(runner, monkeypatch):
     active = 0
     max_active = 0
@@ -1981,7 +2031,7 @@ async def test_parallel_node_does_not_share_db_session_concurrently(runner, monk
 async def test_llm_node_routes_to_agent_step(runner, monkeypatch):
     seen = {}
 
-    async def fake_agent(step, variables, entity_id, user_id, runtime_context, db):
+    async def fake_agent(step, variables, entity_id, user_id, runtime_context, db, **_kwargs):
         seen["called"] = True
         return {"status": "completed", "output": "drafted"}
 
@@ -3537,6 +3587,7 @@ def test_workflow_tools_exposed():
         "get_workflow_run",
         "cancel_workflow_run",
         "resume_workflow_run",
+        "retry_workflow_run",
         "import_workflow",
     }
     run = next(s for s, _ in tools if s["function"]["name"] == "run_workflow")
@@ -4323,6 +4374,72 @@ async def test_subworkflow_child_inherits_nested_chat_origin_without_reusing_roo
 
 
 @pytest.mark.asyncio
+async def test_foreach_subworkflow_children_inherit_nested_chat_origin(runner, monkeypatch):
+    # Without the origin, an item's reviews have no chat card and never reach Needs you.
+    target = SimpleNamespace(
+        id="wf-child",
+        variables={},
+        steps=[{"id": "start", "type": "trigger", "config": {"trigger_type": "internal"}, "next": []}],
+    )
+
+    class Result:
+        def scalar_one_or_none(self):
+            return target
+
+    class Db:
+        def __init__(self):
+            self.children = []
+
+        async def execute(self, _query):
+            return Result()
+
+        def add(self, child):
+            self.children.append(child)
+
+        async def flush(self):
+            return None
+
+        async def commit(self):
+            return None
+
+        async def refresh(self, _child):
+            return None
+
+    async def lock_reference(*_args, **_kwargs):
+        return None
+
+    async def leave_child_running(_runner, _run_id):
+        return None
+
+    monkeypatch.setattr(
+        "packages.core.services.reusable_resource_locks.lock_reusable_resource_reference", lock_reference,
+    )
+    monkeypatch.setattr(WorkflowRunner, "run", leave_child_running)
+    db = Db()
+    origin = {
+        "enabled": True, "conversation_id": "conversation-1", "activity_message_id": "activity-1",
+        "projection": {"progress": True}, "wait_bridge": True,
+    }
+    parent = _run({"slots": [{"platform": "linkedin"}, {"platform": "x"}]})
+    parent.id = "root-run"
+    parent.trigger_data = {"_workflow_chat_origin": origin}
+
+    result = await runner._execute_foreach_subworkflow_step(
+        {"id": "dispatch", "type": "foreach_subworkflow", "config": {
+            "workflow_id": target.id, "over": "slots", "item_key": "platform", "concurrency": 2,
+        }},
+        parent.variables,
+        parent,
+        db,
+    )
+
+    assert result["status"] == "paused"
+    assert len(db.children) == 2
+    for child in db.children:
+        assert child.trigger_data["_workflow_chat_origin"] == {**origin, "host_run_id": parent.id, "nested": True}
+
+
+@pytest.mark.asyncio
 async def test_nested_chat_cancel_cascades_cancel_to_parent_subworkflow_barrier(
     runner,
     db_session,
@@ -4849,7 +4966,7 @@ async def test_webhook_node_passthrough(runner):
 @pytest.mark.asyncio
 async def test_classifier_routes_to_agent_step(runner, monkeypatch):
     seen = {}
-    async def fake_agent(step, variables, entity_id, user_id, runtime_context, db):
+    async def fake_agent(step, variables, entity_id, user_id, runtime_context, db, **_kwargs):
         seen["t"] = step["type"]
         return {"status": "completed", "output": "billing"}
     monkeypatch.setattr(runner, "_execute_agent_step", fake_agent)
@@ -4981,6 +5098,28 @@ async def test_wait_input_pauses_with_schema_when_required_value_is_missing(runn
 
 
 @pytest.mark.asyncio
+async def test_wait_input_edit_form_with_only_optional_fields_waits_for_the_person(runner):
+    # An edit form opens with the record's current values and requires nothing;
+    # no answer yet must not count as an empty answer that saves the record.
+    schema = {"type": "object", "properties": {
+        "price": {"type": "number", "default": "{{get.state.price}}"},
+        "status": {"type": "string", "enum": ["active", "retired"], "default": "{{get.state.status}}"},
+    }}
+    step = {"id": "changes", "type": "wait", "config": {
+        "wait_type": "input", "response_variable": "changes", "input_schema": schema,
+    }}
+
+    result = await runner._execute_step(step, _run({"get": {"state": {"price": 26.95, "status": "active"}}}), None)
+
+    assert result["status"] == "paused"
+    assert result["input_schema"]["properties"]["price"]["default"] == 26.95
+    # A value the run already holds still answers it.
+    answered = await runner._execute_step(step, _run({"changes": {"price": 28.95}}), None)
+    assert answered["status"] == "completed"
+    assert answered["output"]["price"] == 28.95
+
+
+@pytest.mark.asyncio
 async def test_wait_input_safe_dispatch_pauses_before_required_submission(runner):
     schema = {"type": "object", "properties": {"cover_art": {"type": "array", "minItems": 1}}, "required": ["cover_art"]}
     step = {"id": "cover_input", "type": "wait", "config": {"wait_type": "input", "input_schema": schema}}
@@ -4997,6 +5136,7 @@ async def test_wait_input_form_opens_with_defaults_bound_to_the_run(runner):
         "title": {"type": "string", "default": "{{draft.title}}"},
         "summary": {"type": "string", "default": "From {{draft.author}}"},
         "notes": {"type": "string", "default": "{{missing.value}}"},
+        "photo": {"type": "array", "default": [{"document_id": "{{draft.photo_document_id}}"}]},
     }}
     step = {"id": "confirm", "type": "wait", "config": {"wait_type": "input", "input_schema": schema}}
 
@@ -5008,6 +5148,9 @@ async def test_wait_input_form_opens_with_defaults_bound_to_the_run(runner):
     assert properties["summary"]["default"] == "From Ana"
     # An unresolved binding is never shown to the person as {{...}} text.
     assert "default" not in properties["notes"]
+    # Nor when it sits inside an upload's list, as an edit form's photo does
+    # for a record that has none yet.
+    assert "default" not in properties["photo"]
     # The configured form keeps its bindings for the next run.
     assert schema["properties"]["title"]["default"] == "{{draft.title}}"
 
@@ -5148,6 +5291,13 @@ async def test_notify_dispatches(runner, monkeypatch):
     assert calls["user_id"] == "user1"
     assert calls["body"] == "Hi Sam"          # templated
     assert calls["channels"] == ["slack"]
+    assert calls["title"] == "Ping"
+
+    # A step named after its id (what a Blueprint install writes) is titled for people.
+    calls.clear()
+    step = {"id": "tell_owner", "type": "notify", "name": "tell_owner", "config": {"message": "Ready"}}
+    await runner._execute_step(step, run, None)
+    assert calls["title"] == "Tell owner"
 
 
 @pytest.mark.asyncio
@@ -5485,6 +5635,32 @@ def test_trigger_named_outputs_resolve_from_trigger_payload(runner):
     )
 
     assert run.variables["source"] == "approved topic"
+
+
+def test_a_binding_whose_reference_has_no_value_is_left_unbound(runner):
+    """Named outputs, named inputs and Set fields never hold their own ``{{...}}`` text."""
+    run = _run({"photo": "stale.jpg"})
+    runner._record_step_result(
+        {"id": "start", "next": [], "config": {"outputs": [
+            {"key": "name", "value": "{{start.name}}", "type": "text"},
+            {"key": "photo", "value": "{{start.photo}}", "type": "text"},
+        ]}},
+        {"status": "completed", "output": {"name": "水煮鱼"}},
+        run,
+    )
+    assert run.variables["name"] == "水煮鱼" and "photo" not in run.variables
+
+    scope = dict(run.variables)
+    workflow_runner_module._bind_inputs({"inputs": [
+        {"key": "cover", "value": "{{start.photo}}"},
+        {"key": "dish", "value": {"name": "{{name}}", "photo": "{{photo}}"}, "type": "json"},
+    ]}, scope)
+    assert "cover" not in scope and scope["dish"] == {"name": "水煮鱼"}
+
+    result = runner._execute_transform_step({"id": "shape", "type": "transform", "config": {"set": {
+        "photo": "{{start.photo}}", "caption": "{{name}} {{start.photo}}",
+    }}}, scope, run)
+    assert "photo" not in result["output"] and result["output"]["caption"] == "水煮鱼 "
 
 
 @pytest.mark.asyncio
@@ -6013,3 +6189,747 @@ async def test_agent_step_without_an_agent_uses_only_its_declared_standalone_too
 
     assert seen["tools"] == expected_tools
     assert seen["system"].startswith(expected_system)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config", "blocked"),
+    [({}, ("code_project",)), ({"tools": ["generate_file", "code_project"]}, None)],
+)
+async def test_agent_step_in_a_project_run_is_told_its_folder_and_gets_no_unasked_code_project(
+    runner, monkeypatch, config, blocked,
+):
+    """Local B2B article run 2026-11-01: with one code project already in the
+    Workspace, the research and writing agents saved their memo and draft with
+    code_project into code/<topic>/, and the run's project folder stayed empty.
+
+    A step in a run that works on a WorkflowProject is told that folder, and it
+    gets code_project only when the step itself lists it.
+    """
+    from contextlib import nullcontext
+    from unittest.mock import AsyncMock
+
+    from packages.core.ai.runtime.tool_bindings import RuntimeAgentToolScope
+    from packages.core.services import generated_media_naming
+
+    seen: dict = {}
+
+    async def fake_appendix(*args, **kwargs):
+        seen["blocked"] = kwargs.get("blocked_tool_names")
+        seen["folder"] = kwargs["request"].workflow_project_folder
+        return SimpleNamespace(prompt_appendix="", tool_schemas=[], allowed_tool_names=set(), envelope=None)
+
+    async def fake_loop(**kwargs):
+        return SimpleNamespace(
+            content="done", usage={}, tool_calls_made=[], rounds=1,
+            stop_reason=None, error=None, error_detail=None, control=None,
+        )
+
+    async def project_folder(**kwargs):
+        assert kwargs["workflow_project_root"] == "projects/onboarding-article"
+        return "Workspaces/_by_id/F1/projects/onboarding-article"
+
+    class _Db:
+        async def execute(self, *_args, **_kwargs):
+            return SimpleNamespace(scalar_one_or_none=lambda: None)
+
+    monkeypatch.setattr(workflow_runner_module, "runtime_agent_tool_scope", AsyncMock(return_value=RuntimeAgentToolScope(
+        bound_tool_names=frozenset({"generate_file", "code_project"}), mcp_allowed_names=frozenset(),
+    )))
+    monkeypatch.setattr(workflow_runner_module, "release_read_transaction", AsyncMock())
+    monkeypatch.setattr(runner, "_session_factory", lambda: nullcontext(None))
+    monkeypatch.setattr(generated_media_naming, "resolve_workspace_artifact_base_dir", project_folder)
+    monkeypatch.setattr(workflow_runner_module, "runtime_prepare_prompt_appendix_for_turn", fake_appendix)
+    monkeypatch.setattr(workflow_runner_module, "runtime_execute_workflow_agent_loop", fake_loop)
+
+    await runner._execute_agent_step(
+        {"id": "research", "type": "agent", "config": {"prompt": "Save a research memo.", "agent_id": "agent-1", **config}},
+        {},
+        "entity-1",
+        "user-1",
+        {"workspace_id": "ws-1", "workflow_run_id": "RUN1", "workflow_project_root": "projects/onboarding-article"},
+        _Db(),
+    )
+
+    assert seen == {"blocked": blocked, "folder": "Workspaces/_by_id/F1/projects/onboarding-article"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("saved", [["Final.docx"], ["feedback.md", "Final.docx"]])
+async def test_agent_step_still_replying_in_prose_gets_its_document_id_from_the_one_file_it_saved(
+    runner, monkeypatch, saved,
+):
+    """After the loop's repair turn the Edit Agent still answered in prose.
+
+    The host fills a document id from the step's own receipts when it saved
+    exactly one file. With more, it cannot tell which one is meant: the step
+    fails naming the field and the step that reads it, and operators are told.
+    """
+    from packages.core.services import platform_faults, workflow_connection_wait
+
+    seen: dict = {}
+
+    async def fake_appendix(*args, **kwargs):
+        return SimpleNamespace(prompt_appendix="", tool_schemas=[], allowed_tool_names=set(), envelope=None)
+
+    async def fake_loop(**kwargs):
+        seen["contract"] = kwargs["output_schema"]
+        return SimpleNamespace(
+            content="Saved the final Word document.", usage={}, tool_calls_made=[], rounds=2,
+            stop_reason="error", error="output_schema_validation_failed",
+            error_detail={"validation_error": "$: not valid JSON"}, control=None,
+            tool_evidence={"receipts": [
+                {"kind": "file", "operation": "create", "document_id": f"DOC{index}", "name": name}
+                for index, name in enumerate(saved)
+            ]},
+        )
+
+    reports = []
+
+    async def report(**kwargs):
+        reports.append(kwargs)
+        return True
+
+    async def no_connection_wait(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(workflow_runner_module, "runtime_prepare_prompt_appendix_for_turn", fake_appendix)
+    monkeypatch.setattr(workflow_runner_module, "runtime_execute_workflow_agent_loop", fake_loop)
+    monkeypatch.setattr(platform_faults, "report_platform_fault", report)
+    monkeypatch.setattr(workflow_connection_wait, "connection_wait_for_failed_step", no_connection_wait)
+    step = {"id": "edit", "name": "Edit", "type": "agent", "config": {"prompt": "Edit and save the Word file."}}
+
+    result = await runner._execute_agent_step(
+        step, {}, "entity-1", "user-1", {}, None,
+        output_field_reads={"deliverable_document_id": ["review_status"]},
+    )
+
+    assert seen["contract"]["required"] == ["summary", "deliverable_document_id"]
+    if len(saved) == 1:
+        assert result["status"] == "completed"
+        assert result["output"] == {"summary": "Saved the final Word document.", "deliverable_document_id": "DOC0"}
+        return
+    assert (result["status"], result["code"]) == ("failed", "workflow_agent_output_missing")
+    assert result["error"] == (
+        "Edit finished without reporting deliverable_document_id, which review_status needs. "
+        "Nothing was saved in its place."
+    )
+    settled = await runner._settle_failure(step, result, _run(), None)
+    assert settled["error"] == result["error"]
+    assert [(item["target"], item["code"]) for item in reports] == [("workflow:wf1", "workflow_agent_output_missing")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_name", ["editor", "written-article"])
+async def test_a_field_a_project_keeps_as_is_takes_the_type_the_project_declares(monkeypatch, output_name):
+    from packages.core.ai.workflow_runner import workflow_output_field_types
+
+    schema = {"type": "object", "properties": {
+        "editor_notes": {"type": "string"}, "word_count": {"type": ["integer", "null"]},
+        "report": {"type": "object", "properties": {"summary": {"type": "string"}}},
+        "approval": {"type": "string"}, "verdict": {"type": "string"}}}
+    steps = [
+        {"id": "editor", "type": "agent", "config": {"prompt": "Review.", "output_var": output_name}},
+        {"id": "save", "type": "workflow_project", "config": {"operation": "patch", "state_schema": schema, "patch": {
+            "editor_notes": "{{" + output_name + ".editor_notes}}", "word_count": "{{editor.word_count}}",
+            "report": {"summary": "{{editor.summary}}"},
+            # Not the value itself: the project keeps a sentence, so nothing is asked of the step's type.
+            "approval": "Approved: {{editor.approval}}",
+            "verdict": "{{editor.verdict}}"}}},
+        # Kept again elsewhere under another type: the field stays untyped.
+        {"id": "log", "type": "workflow_project", "config": {
+            "operation": "patch", "state_schema": {"type": "object", "properties": {"verdict": {"type": "object"}}},
+            "patch": {"verdict": "{{editor.verdict}}"}}},
+    ]
+    inferred = workflow_output_field_types(steps)
+    assert inferred[output_name]["editor_notes"] == ["string"]
+    assert {key: value for key, value in inferred["editor"].items() if key != "editor_notes"} == {
+        "word_count": ["integer"], "summary": ["string"]}
+
+    # A run learns them once and hands each Agent step its own.
+    runner = workflow_runner_module.WorkflowRunner()
+    run = _run()
+    runner._learn_run_steps(run, steps)
+    handed: dict = {}
+
+    async def agent_step(step, *args, **kwargs):
+        handed.update(kwargs)
+        return {"status": "completed", "output": {}}
+
+    monkeypatch.setattr(runner, "_execute_agent_step", agent_step)
+    await runner._execute_step(steps[0], run, None)
+    assert handed["output_field_types"]["editor_notes"] == ["string"]
+    assert handed["output_field_reads"]["editor_notes"] == ["save"]
+
+
+def test_a_field_only_an_expression_reads_is_asked_of_the_agent():
+    """Staging article run 2026-11-02: ``check_final`` tested ``revise.verified == true``.
+
+    Nothing asked Revise for ``verified`` (only ``{{...}}`` counted as a
+    read), so it returned its two document ids and the run ended as
+    "not verified" with a verified Word file saved.
+    """
+    from packages.core.ai.workflow_runner import (
+        _agent_output_contract, workflow_output_field_reads, workflow_output_field_types,
+    )
+
+    steps = [
+        {"id": "revise", "type": "agent", "config": {"prompt": "Revise and verify."}},
+        {"id": "save_final", "type": "workflow_project", "config": {"patch": {
+            "final_document_id": "{{revise.final_document_id}}", "condition": "revise.literal == true"}}},
+        {"id": "check_final", "type": "condition", "config": {"expression": "revise.verified == true"}},
+        {"id": "check_review", "type": "condition", "config": {"expression": "revise.review.verified == true"}},
+        {"id": "route", "type": "switch", "config": {"cases": [
+            {"expression": "len(revise.open_issues) > 0 and revise.tone != 'final.draft' "
+                           "and revise.tone != 'it\\'s revise.quoted'", "next": ["fix"]}]}},
+        {"id": "keep", "type": "filter", "config": {"condition": "item.score > 0.7"}},
+        {"id": "indexed", "type": "switch", "config": {"switch_mode": "expression",
+             "output_index": "{{revise.route_index}}", "cases": [{"expression": "revise.switch_literal == true"}]}},
+        {"id": "dated", "type": "filter", "config": {"items": "{{revise.items}}", "field": "due_date",
+             "operation": "after", "condition": "revise.date_literal == true"}},
+        {"id": "failed", "type": "end", "config": {"fail_when": "revise.blocked",
+             "output": {"condition": "revise.end_literal == true"}}},
+    ]
+
+    reads = workflow_output_field_reads(steps)
+    assert reads["revise"] == {
+        "final_document_id": ["save_final"], "verified": ["check_final"],
+        "review": ["check_review"],
+        "open_issues": ["route"], "tone": ["route"], "blocked": ["failed"],
+        "route_index": ["indexed"], "items": ["dated"],
+    }
+    assert "final" not in reads  # quoted text is not a reference
+    types = workflow_output_field_types(steps)["revise"]
+    assert types == {"verified": ["boolean"]}
+
+    contract = _agent_output_contract(steps[0], reads["revise"], types)
+    assert contract["properties"]["verified"]["type"] == "boolean"
+    assert "verified" in contract["required"]
+    assert contract["properties"]["review"]["type"] != "boolean"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loop_outcome", ["completed", "validation_failed"])
+async def test_an_agent_answering_with_an_object_where_its_project_keeps_text_still_saves(
+    runner, monkeypatch, loop_outcome,
+):
+    """Staging 2026-11-02: the Editor returned editor_notes as an object; the
+    project keeps it as text, so the save failed and the article run stopped.
+
+    The step is asked for text, and an object that still comes back is
+    written out as readable text instead of failing the run.
+    """
+    seen: dict = {}
+    notes = {"disposition": "Revisions required", "must_fix": ["Qualify the headline claim", "Cite FSMA 204"]}
+
+    async def fake_appendix(*args, **kwargs):
+        return SimpleNamespace(prompt_appendix="", tool_schemas=[], allowed_tool_names=set(), envelope=None)
+
+    async def fake_loop(**kwargs):
+        seen["contract"] = kwargs["output_schema"]
+        reply = {"summary": "Reviewed the draft.", "editor_notes": notes}
+        if loop_outcome == "completed":
+            return SimpleNamespace(content=json.dumps(reply), usage={}, tool_calls_made=[], rounds=2,
+                                   stop_reason="completed", error=None, error_detail=None, control=None,
+                                   tool_evidence={"receipts": []})
+        return SimpleNamespace(content=json.dumps(reply), usage={}, tool_calls_made=[], rounds=3,
+                               stop_reason="error", error="output_schema_validation_failed",
+                               error_detail={"validation_error": "$.editor_notes: not a string"}, control=None,
+                               tool_evidence={"receipts": []})
+
+    monkeypatch.setattr(workflow_runner_module, "runtime_prepare_prompt_appendix_for_turn", fake_appendix)
+    monkeypatch.setattr(workflow_runner_module, "runtime_execute_workflow_agent_loop", fake_loop)
+    step = {"id": "editor", "name": "Editorial review", "type": "agent", "config": {"prompt": "Review the draft."}}
+
+    result = await runner._execute_agent_step(
+        step, {}, "entity-1", "user-1", {}, None,
+        output_field_reads={"editor_notes": ["save_editor"]}, output_field_types={"editor_notes": ["string"]},
+    )
+
+    assert seen["contract"]["properties"]["editor_notes"]["type"] == "string"
+    assert result["status"] == "completed", result
+    assert result["output"]["editor_notes"] == (
+        "disposition: Revisions required\nmust_fix: - Qualify the headline claim\n- Cite FSMA 204")
+    assert result["output_text_from_structure"] == ["editor_notes"]
+
+
+def test_an_inferred_numeric_output_type_is_not_bypassed_by_contract_recovery():
+    step = {"id": "measure", "type": "agent", "config": {}}
+    reads = {"word_count": ["save"]}
+    contract = workflow_runner_module._agent_output_contract(step, reads, {"word_count": ["integer"]})
+    result = workflow_runner_module._with_output_contract(
+        step, {"status": "failed", "runtime_error": "output_schema_validation_failed",
+               "output": {"summary": "Measured.", "word_count": "not a number"}},
+        contract, reads, [],
+    )
+    assert result["status"] == "failed"
+    assert result["code"] == "workflow_agent_output_missing"
+    assert result["missing_output_fields"] == ["word_count"]
+
+
+_SAVED_DOCX_ID = "01M6D0C00000000000000000S1"
+
+
+def _round_limit_loop_result(reply: dict | str, *, rounds: int, receipts: list[dict], stop_reason: str = "max_rounds"):
+    return SimpleNamespace(
+        content=reply if isinstance(reply, str) else json.dumps(reply), usage={},
+        tool_calls_made=["sandbox"] * rounds, rounds=rounds,
+        stop_reason=stop_reason, error=None, error_detail=None, control=None,
+        tool_evidence={"receipts": receipts}, run_state=SimpleNamespace(rounds=rounds),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["saves_in_second_budget", "never_saves", "saves_but_replies_in_prose"])
+async def test_agent_step_its_round_limit_stops_before_saving_continues_the_same_conversation(
+    runner, monkeypatch, scenario,
+):
+    """Staging run 01M6CDWDTVZ1RP128CVWPKSPM5: the Edit Agent built the DOCX in
+    its sandbox, ran out of its 20 rounds before saving it and answered
+    ``deliverable_document_id: "NOT_SAVED"``.
+
+    The host sees from its receipts and the output contract what is still
+    owed, so the same conversation continues with a fresh budget (transcript,
+    ledger and sandbox carried in ``run_state``). Continuations are bounded;
+    after them the host fills the id from the one saved file, or the step
+    fails without storing the placeholder.
+    """
+    calls: list[dict] = []
+    saved = {"kind": "file", "operation": "create", "document_id": _SAVED_DOCX_ID, "name": "Final.docx"}
+
+    async def fake_appendix(*args, **kwargs):
+        return SimpleNamespace(prompt_appendix="", tool_schemas=[], allowed_tool_names=set(), envelope=None)
+
+    async def fake_loop(**kwargs):
+        calls.append(kwargs)
+        budget = len(calls)
+        if scenario == "saves_but_replies_in_prose":
+            return _round_limit_loop_result("Saved Final.docx; out of rounds.", rounds=21 * budget, receipts=[saved])
+        if scenario == "saves_in_second_budget" and budget == 2:
+            return _round_limit_loop_result(
+                {"summary": "Saved Final.docx.", "deliverable_document_id": _SAVED_DOCX_ID},
+                rounds=25, receipts=[saved], stop_reason="completed",
+            )
+        return _round_limit_loop_result(
+            {"summary": "Blocked: the tool limit was reached.", "deliverable_document_id": "NOT_SAVED"},
+            rounds=21 * budget, receipts=[],
+        )
+
+    async def no_connection_wait(*_args, **_kwargs):
+        return None
+
+    from packages.core.services import workflow_connection_wait
+
+    monkeypatch.setattr(workflow_runner_module, "runtime_prepare_prompt_appendix_for_turn", fake_appendix)
+    monkeypatch.setattr(workflow_runner_module, "runtime_execute_workflow_agent_loop", fake_loop)
+    monkeypatch.setattr(workflow_connection_wait, "connection_wait_for_failed_step", no_connection_wait)
+    step = {"id": "edit", "name": "Edit", "type": "agent",
+            "config": {"prompt": "Edit and save the Word file.", "expects": ["files"]}}
+
+    result = await runner._execute_agent_step(
+        step, {}, "entity-1", "user-1", {}, None,
+        output_field_reads={"deliverable_document_id": ["review_status"]},
+    )
+
+    owed = "reply with the object" if scenario == "saves_but_replies_in_prose" else \
+        "save the file this step makes; reply with the object"
+    first, *continuations = calls
+    assert "run_state" not in first
+    for index, continued in enumerate(continuations):
+        assert continued["run_state"] is not None
+        assert continued["max_rounds"] == 21 * (index + 1) + 20
+        assert f"Still to do: {owed}" in continued["user_message"]
+        assert continued["forced_tool_calls"] is None and continued["runtime_checkpoint"] is None
+    if scenario == "saves_in_second_budget":
+        assert len(calls) == 2
+        assert result["status"] == "completed"
+        assert result["output"]["deliverable_document_id"] == _SAVED_DOCX_ID
+        return
+    assert len(calls) == 1 + workflow_runner_module._AGENT_ROUND_LIMIT_CONTINUATIONS
+    if scenario == "saves_but_replies_in_prose":
+        assert result["status"] == "completed"
+        assert result["output_filled_from_receipts"] == ["deliverable_document_id"]
+        assert result["output"]["deliverable_document_id"] == _SAVED_DOCX_ID
+        return
+    assert (result["status"], result["code"]) == ("failed", "workflow_agent_output_missing")
+    assert result["missing_output_fields"] == ["deliverable_document_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("receipts", [[], ["Final.docx"]])
+async def test_agent_step_reporting_a_placeholder_document_id_counts_it_as_missing(runner, monkeypatch, receipts):
+    """``"NOT_SAVED"`` is not a document. The contract asks for a document id,
+    so the loop's schema repair rejects it; a reply that still carries it gets
+    the id from the one file the step saved, or fails naming the field."""
+    seen: dict = {}
+
+    async def fake_appendix(*args, **kwargs):
+        return SimpleNamespace(prompt_appendix="", tool_schemas=[], allowed_tool_names=set(), envelope=None)
+
+    async def fake_loop(**kwargs):
+        seen["contract"] = kwargs["output_schema"]
+        return _round_limit_loop_result(
+            {"summary": "Done.", "deliverable_document_id": "NOT_SAVED"}, rounds=3, stop_reason="completed",
+            receipts=[{"kind": "file", "operation": "create", "document_id": _SAVED_DOCX_ID, "name": name}
+                      for name in receipts],
+        )
+
+    async def no_connection_wait(*_args, **_kwargs):
+        return None
+
+    from packages.core.contracts.json_schema import SchemaContractValidatorFactory
+    from packages.core.services import workflow_connection_wait
+
+    monkeypatch.setattr(workflow_runner_module, "runtime_prepare_prompt_appendix_for_turn", fake_appendix)
+    monkeypatch.setattr(workflow_runner_module, "runtime_execute_workflow_agent_loop", fake_loop)
+    monkeypatch.setattr(workflow_connection_wait, "connection_wait_for_failed_step", no_connection_wait)
+    step = {"id": "edit", "name": "Edit", "type": "agent", "config": {"prompt": "Edit and save the Word file."}}
+
+    result = await runner._execute_agent_step(
+        step, {}, "entity-1", "user-1", {}, None,
+        output_field_reads={"deliverable_document_id": ["review_status"]},
+    )
+
+    validator = SchemaContractValidatorFactory.build(seen["contract"])
+    assert not validator.is_valid({"summary": "x", "deliverable_document_id": "NOT_SAVED"})
+    assert validator.is_valid({"summary": "x", "deliverable_document_id": _SAVED_DOCX_ID})
+    if receipts:
+        assert result["status"] == "completed"
+        assert result["output"]["deliverable_document_id"] == _SAVED_DOCX_ID
+        assert result["output_filled_from_receipts"] == ["deliverable_document_id"]
+        return
+    assert (result["status"], result["code"]) == ("failed", "workflow_agent_output_missing")
+
+
+_REVISE_STEP = {"id": "revise", "name": "Revise", "type": "agent", "config": {"prompt": "Revise and verify."}}
+_REVISE_READS = {
+    "output_field_reads": {"final_document_id": ["save_final"], "verified": ["check_final"]},
+    "output_field_types": {"verified": ["boolean"]},
+}
+_SEND_STEP = {"id": "send_reply", "name": "Send", "type": "agent", "config": {
+    "prompt": "Send the reply and confirm delivery.", "output_format": "json",
+    "output_schema": {"type": "object", "properties": {"verified": {"type": "boolean"}}, "required": ["verified"]},
+}}
+
+
+def _revise_reply(*, verified: bool) -> dict:
+    return {"summary": "Report not saved before the limit." if not verified else "Verified and saved.",
+            "final_document_id": _SAVED_DOCX_ID, "verified": verified}
+
+
+def _script_agent_step(monkeypatch, loop) -> None:
+    async def fake_appendix(*args, **kwargs):
+        return SimpleNamespace(prompt_appendix="", tool_schemas=[], allowed_tool_names=set(), envelope=None)
+
+    async def no_connection_wait(*_args, **_kwargs):
+        return None
+
+    from packages.core.services import workflow_connection_wait
+
+    monkeypatch.setattr(workflow_runner_module, "runtime_prepare_prompt_appendix_for_turn", fake_appendix)
+    monkeypatch.setattr(workflow_runner_module, "runtime_execute_workflow_agent_loop", loop)
+    monkeypatch.setattr(workflow_connection_wait, "connection_wait_for_failed_step", no_connection_wait)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("step", "reads", "first_reply", "last_reply"), [
+    pytest.param(_REVISE_STEP, _REVISE_READS, _revise_reply(verified=False), _revise_reply(verified=True), id="article"),
+    pytest.param(_SEND_STEP, {}, {"verified": False}, {"verified": True}, id="customer-reply-own-schema"),
+])
+@pytest.mark.parametrize("finishes", [True, False], ids=["finishes_next_budget", "never_finishes"])
+async def test_a_well_formed_reply_forced_by_the_round_limit_gets_a_turn_with_tools(
+    runner, monkeypatch, step, reads, first_reply, last_reply, finishes,
+):
+    """Staging run 01M6HT7W4HZ74112VC0BTNQ6H3: Revise saved the Word file, ran
+    out of rounds before its verification report, and the forced tool-free
+    reply said ``verified: false``. That matches the schema and the file exists,
+    so no continuation fired and ``check_final`` failed a finished article.
+
+    The step continues, and its own later answer decides the condition: one
+    that never finishes still reports false and the Flow still fails it.
+    """
+    calls: list[dict] = []
+    saved = {"kind": "file", "operation": "create", "document_id": _SAVED_DOCX_ID, "name": "Final.docx"}
+
+    async def fake_loop(**kwargs):
+        calls.append(kwargs)
+        if finishes and len(calls) == 2:
+            return _round_limit_loop_result(last_reply, rounds=25, receipts=[saved], stop_reason="completed")
+        return _round_limit_loop_result(first_reply, rounds=21 * len(calls), receipts=[saved])
+
+    _script_agent_step(monkeypatch, fake_loop)
+
+    result = await runner._execute_agent_step(step, {}, "entity-1", "user-1", {}, None, **reads)
+
+    assert len(calls) == (2 if finishes else 1 + workflow_runner_module._AGENT_ROUND_LIMIT_CONTINUATIONS)
+    assert all(continued["run_state"] is not None for continued in calls[1:])
+    assert result["status"] == "completed"
+    assert result["output"]["verified"] is finishes
+    check_final = {"config": {"expression": f"{step['id']}.verified == true"}}
+    assert runner._evaluate_condition(check_final, {step["id"]: result["output"]}) is finishes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("step", "reads", "reply", "stop_reason", "error_detail"), [
+    pytest.param(_REVISE_STEP, _REVISE_READS, _revise_reply(verified=False), "completed", None,
+                 id="the_agent_chose_to_report_false"),
+    pytest.param(_REVISE_STEP, _REVISE_READS, _revise_reply(verified=False), "max_rounds", {"stop": "no_progress"},
+                 id="stopped_going_in_circles"),
+    pytest.param({"id": "notes", "type": "agent", "config": {"prompt": "Take notes."}}, {}, "Notes so far.",
+                 "max_rounds", None, id="no_output_schema"),
+])
+async def test_no_continuation_when_the_reply_was_not_forced_or_more_rounds_cannot_help(
+    runner, monkeypatch, step, reads, reply, stop_reason, error_detail,
+):
+    """A verification that really failed reaches the Flow's condition as it is."""
+    calls: list[dict] = []
+
+    async def fake_loop(**kwargs):
+        calls.append(kwargs)
+        result = _round_limit_loop_result(reply, rounds=21, receipts=[], stop_reason=stop_reason)
+        result.error_detail = error_detail
+        return result
+
+    _script_agent_step(monkeypatch, fake_loop)
+
+    result = await runner._execute_agent_step(step, {}, "entity-1", "user-1", {}, None, **reads)
+
+    assert len(calls) == 1
+    assert result["status"] == "completed"
+    assert result["output"] == reply
+
+
+@pytest.mark.asyncio
+async def test_the_real_loop_hands_a_round_limited_step_its_tools_and_transcript_back(runner, monkeypatch):
+    """Through the real loop and harness, with only the provider and tools
+    faked: the forced reply is tool-free, the continuation has tools and the
+    whole transcript, and the reply the Flow reads is the one after the work."""
+    import importlib
+
+    from packages.core.ai.runtime import harness
+
+    loop_module = importlib.import_module("packages.core.ai.agentic_loop")
+    tool_rounds: list[dict] = []
+    executed: list[dict] = []
+    tool = {"type": "function", "function": {
+        "name": "save_report", "description": "Save.", "parameters": {"type": "object", "properties": {
+            "part": {"type": "integer"}}}}}
+
+    async def fake_tool_round(messages, tools, **kwargs):
+        tool_rounds.append({"messages": list(messages), "tools": list(tools)})
+        if len(tool_rounds) <= 3:
+            call = {"id": f"call_{len(tool_rounds)}", "name": "save_report", "arguments": {"part": len(tool_rounds)}}
+            return "", [call], {"prompt": 1, "completion": 1, "total": 2}
+        return json.dumps(_revise_reply(verified=True)), [], {"prompt": 1, "completion": 1, "total": 2}
+
+    async def fake_final(messages, **kwargs):
+        return json.dumps(_revise_reply(verified=False)), {"prompt": 1, "completion": 1, "total": 2}
+
+    async def fake_executor(name, args):
+        executed.append(args)
+        return json.dumps({"ok": True, "part": args["part"]})
+
+    async def real_loop_with_fake_tools(**kwargs):
+        return await harness.runtime_execute_workflow_agent_loop(
+            **{**kwargs, "tools": [tool], "allowed_tool_names": {"save_report"}, "tool_executor": fake_executor},
+        )
+
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_tool_completion", fake_tool_round)
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_final_completion", fake_final)
+    _script_agent_step(monkeypatch, real_loop_with_fake_tools)
+    step = {**_REVISE_STEP, "config": {**_REVISE_STEP["config"], "max_rounds": 2}}
+
+    result = await runner._execute_agent_step(step, {}, "entity-1", "user-1", {}, None, **_REVISE_READS)
+
+    assert [args["part"] for args in executed] == [1, 2, 3]
+    assert result["status"] == "completed", result
+    assert result["output"]["verified"] is True
+    continued = tool_rounds[2]
+    assert [schema["function"]["name"] for schema in continued["tools"]] == ["save_report"]
+    transcript = json.dumps(continued["messages"])
+    assert "call_1" in transcript and "call_2" in transcript
+    assert '\\"verified\\": false' in transcript
+
+
+def _flow(*steps: tuple[str, str, dict]) -> list[dict]:
+    """Steps routed in the order given: (id, type, config)."""
+    ids = [step_id for step_id, _type, _config in steps]
+    return [
+        {"id": step_id, "type": step_type, "config": config, "next": ids[index + 1:index + 2]}
+        for index, (step_id, step_type, config) in enumerate(steps)
+    ]
+
+
+_APPROVE = {"wait_type": "approval", "options": ["approve", "revise"], "approval_values": ["approve"]}
+_CONFIRM = {"wait_type": "approval", "message": "Confirm once the Word file is delivered.", "options": ["confirm"]}
+
+
+@pytest.mark.parametrize(("steps", "reviewed"), [
+    pytest.param(_flow(
+        ("start", "trigger", {}), ("create_article", "workflow_project", {"operation": "create"}),
+        ("research", "agent", {}), ("writing_stage", "workflow_project", {"operation": "patch"}),
+        ("write", "agent", {}), ("edit", "agent", {}),
+        ("read_revision", "workflow_project", {"operation": "get"}),
+        ("review_stage", "workflow_project", {"operation": "patch"}),
+        ("approve", "wait", {**_APPROVE, "revise_from": "edit", "review": {"files": ["{{edit.deliverable_document_id}}"]}}),
+        ("delivery_stage", "workflow_project", {"operation": "patch"}),
+        ("confirm_delivery", "wait", _CONFIRM), ("end", "end", {}),
+    ), {"edit"}, id="article-to-client"),
+    pytest.param(_flow(
+        ("start", "trigger", {}), ("classify", "classifier", {}), ("draft_reply", "llm", {}),
+        ("approve_reply", "wait", {**_APPROVE, "message": "Approve this reply to the customer?"}),
+        ("send_reply", "agent", {}), ("end", "end", {}),
+    ), {"draft_reply"}, id="customer-email-reply"),
+    pytest.param(_flow(
+        ("start", "trigger", {}), ("compile_report", "agent", {}),
+        ("mark_sent", "wait", _CONFIRM), ("end", "end", {}),
+    ), set(), id="confirmation-only"),
+])
+def test_approval_reviewed_steps_are_the_last_work_before_each_approval(steps, reviewed):
+    """The step whose result a person approves is the last Agent or llm stage
+    before the approval wait; earlier stages, later ones and a wait where the
+    person only confirms what they did are not."""
+    from packages.core.ai.workflow_runner import workflow_approval_reviewed_steps
+
+    assert workflow_approval_reviewed_steps(steps) == reviewed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("step_id", "reviewed"), [("edit", True), ("write", False)])
+async def test_agent_step_a_person_approves_is_told_its_result_is_delivered_as_is(
+    runner, monkeypatch, step_id, reviewed,
+):
+    """Studio article run 2026-11-01 (01M6CNN9466CR37SCDTQ4ZJX33): the Edit step
+    saved "..._approval-candidate.docx" with a "Source notes — not article copy"
+    section and "not approved for client delivery" in it, and nothing after the
+    approval rewrites the file. A step whose result is approved is told the
+    approved result is the deliverable and reviewer notes go elsewhere."""
+    from packages.core.ai.workflow_runner import WORKFLOW_APPROVED_OUTPUT_IS_FINAL, workflow_approval_reviewed_steps
+
+    steps = _flow(
+        ("write", "agent", {"prompt": "Write about {{topic}}."}),
+        ("edit", "agent", {"prompt": "Edit {{topic}} and save the Word file."}),
+        ("approve", "wait", {**_APPROVE, "revise_from": "edit"}), ("end", "end", {}),
+    )
+    run = _run({"topic": "SOC 2"})
+    runner._run_approval_reviewed[run.id] = workflow_approval_reviewed_steps(steps)
+    seen: dict = {}
+
+    async def fake_appendix(*args, **kwargs):
+        return SimpleNamespace(prompt_appendix="", tool_schemas=[], allowed_tool_names=set(), envelope=None)
+
+    async def fake_loop(**kwargs):
+        seen["message"] = kwargs["user_message"]
+        return SimpleNamespace(
+            content="done", usage={}, tool_calls_made=[], rounds=1,
+            stop_reason=None, error=None, error_detail=None, control=None,
+        )
+
+    monkeypatch.setattr(workflow_runner_module, "runtime_prepare_prompt_appendix_for_turn", fake_appendix)
+    monkeypatch.setattr(workflow_runner_module, "runtime_execute_workflow_agent_loop", fake_loop)
+
+    step = next(step for step in steps if step["id"] == step_id)
+    await runner._execute_step(step, run, None)
+
+    assert seen["message"].startswith(step["config"]["prompt"].replace("{{topic}}", "SOC 2"))
+    assert (WORKFLOW_APPROVED_OUTPUT_IS_FINAL in seen["message"]) is reviewed
+
+
+@pytest.mark.asyncio
+async def test_a_notify_step_turns_document_ids_into_what_a_person_can_open(db_session, monkeypatch):
+    """Local eval 2026-11-03: chat hides bare ids, so "Your report is ready:" led nowhere."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.document import Document
+    from packages.core.models.task import Message
+    from packages.core.models.workspace import Workspace
+    from packages.core.services import notify as notify_module
+    from packages.core.workspace_chat import service as chat_service
+    from sqlalchemy import select
+
+    entity_id = generate_ulid()
+    workspace = Workspace(entity_id=entity_id, name="Reports")
+    report = Document(entity_id=entity_id, name="Weekly recap.docx")
+    binned = Document(entity_id=entity_id, name="Old recap.docx", is_trashed=True)
+    elsewhere = Document(entity_id=generate_ulid(), name="Their secret.docx")
+    db_session.add_all([workspace, report, binned, elsewhere])
+    await db_session.commit()
+    factory = async_sessionmaker(db_session.bind, class_=AsyncSession, expire_on_commit=False)
+    monkeypatch.setattr("packages.core.database.create_worker_session", lambda: factory)
+    told: list[dict] = []
+
+    async def notify(**kwargs):
+        told.append(kwargs)
+
+    async def publish(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(chat_service, "publish_workspace_chat_message_event", publish)
+    monkeypatch.setattr(notify_module, "notify", notify)
+    step = {"id": "tell", "name": "Share", "type": "notify",
+            "config": {"channel": "workspace_chat", "message": "Ready: {{a}}. Others: {{b}} {{c}} [seen](/viewer/{{a}})"}}
+    values = {"a": report.id, "b": binned.id, "c": elsewhere.id}
+
+    result = await WorkflowRunner()._execute_notify_step(step, values, entity_id, "user-1", {"workspace_id": workspace.id})
+
+    message = (await db_session.execute(select(Message).where(Message.id == result["output"]["message_id"]))).scalar_one()
+    assert message.content == (f"Ready: [Weekly recap.docx](/viewer/{report.id}). "
+                               f"Others: {binned.id} {elsewhere.id} [seen](/viewer/{report.id})")
+    # The bell and other channels can't follow a relative link; they get the name.
+    assert told[0]["body"].startswith("Ready: Weekly recap.docx. Others: ")
+
+
+async def test_a_notify_step_tells_the_workspace_chat_and_does_not_claim_a_failed_post(db_session, monkeypatch):
+    """Local eval 2026-11-03: flows had no way to say "the report is ready" in chat."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.task import Conversation, Message
+    from packages.core.models.workspace import Workspace
+    from packages.core.services import notify as notify_module
+    from packages.core.workspace_chat import service as chat_service
+    from sqlalchemy import select
+
+    entity_id = generate_ulid()
+    workspace = Workspace(entity_id=entity_id, name="Reports")
+    db_session.add(workspace)
+    await db_session.commit()
+    factory = async_sessionmaker(db_session.bind, class_=AsyncSession, expire_on_commit=False)
+    monkeypatch.setattr("packages.core.database.create_worker_session", lambda: factory)
+    published: list[str] = []
+
+    async def publish(_entity_id, *, workspace_id, message):
+        published.append(message.id)
+
+    told: list[dict] = []
+
+    async def notify(**kwargs):
+        told.append(kwargs)
+
+    monkeypatch.setattr(chat_service, "publish_workspace_chat_message_event", publish)
+    monkeypatch.setattr(notify_module, "notify", notify)
+    runner = WorkflowRunner()
+    step = {"id": "tell", "name": "Share report", "type": "notify",
+            "config": {"channel": "workspace_chat", "message": "Report ready: {{doc}}"}}
+    context = {"workspace_id": workspace.id}
+
+    result = await runner._execute_notify_step(step, {"doc": "doc-1"}, entity_id, "user-1", context)
+    assert result["status"] == "completed" and result["output"]["channel"] == "workspace_chat"
+    assert published == [result["output"]["message_id"]]
+    message = (await db_session.execute(select(Message).where(Message.id == result["output"]["message_id"]))).scalar_one()
+    assert message.content == "Report ready: doc-1"
+    conversation = await db_session.get(Conversation, message.conversation_id)
+    assert conversation.workspace_id == workspace.id
+    assert told[0]["user_id"] == "user-1" and told[0]["channels"] is None
+
+    # A scheduled run may have nobody to tell; the chat still hears it.
+    assert (await runner._execute_notify_step(step, {"doc": "doc-2"}, entity_id, "", context))["status"] == "completed"
+
+    async def broken(*_args, **_kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(chat_service, "post_message", broken)
+    failed = await runner._execute_notify_step(step, {"doc": "doc-3"}, entity_id, "user-1", context)
+    assert failed["status"] == "failed" and "could not post" in failed["error"]
+    assert (await runner._execute_notify_step(step, {"doc": "x"}, entity_id, "user-1", {}))["status"] == "failed"

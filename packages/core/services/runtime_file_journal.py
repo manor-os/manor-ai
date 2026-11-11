@@ -1,7 +1,7 @@
 """Write-ahead file recovery; never replay a tool, authorize a write, or bill.
 
 Callers hold the entity mutation lock. Prepared rows commit before installing
-bytes; the committed marker commits with the Document. A missing exact inode
+bytes; the marker commits with the Document or memory audit. A missing exact inode
 receipt is deliberately not repaired by guessing from a filename or hash.
 """
 from __future__ import annotations
@@ -88,8 +88,9 @@ def _is_restored_source(row: RuntimeFileCommit, snapshot: EntityFileRollbackSnap
 
 
 class RuntimeFileJournal:
-    def __init__(self, entity_id: str) -> None:
+    def __init__(self, entity_id: str, *, memory_audit: bool = False) -> None:
         self.entity_id = entity_id
+        self.memory_audit = memory_audit
         self.transaction_id = generate_ulid()
         self.entries: dict[str, str] = {}
 
@@ -97,13 +98,16 @@ class RuntimeFileJournal:
         from packages.core.database import async_session
         from packages.core.ai.runtime.authorization_receipts import runtime_current_tool_authorization_receipt
 
-        receipt = runtime_current_tool_authorization_receipt()
+        receipt = None if self.memory_audit else runtime_current_tool_authorization_receipt()
         owner = {name: getattr(receipt, name, None) for name in (
             "workspace_id", "task_id", "conversation_id", "tool_name", "tool_call_id",
         )} if receipt is not None else {}
         from packages.core.services.runtime_file_effect_recovery import runtime_file_effect_owner
 
-        owner.update(runtime_file_effect_owner(self.entity_id, receipt))
+        if self.memory_audit:
+            owner = {"kind": "memory_audit"}
+        else:
+            owner.update(runtime_file_effect_owner(self.entity_id, receipt))
         effect_id = (owner.get("file_effect") or {}).get("fields", {}).get("effect_id")
         row_id = generate_ulid()
         record = _snapshot_record(snapshot)
@@ -154,16 +158,18 @@ class RuntimeFileJournal:
                 raise RuntimeError("File commit journal lost its prepared identity")
             await db.commit()
 
-    async def mark_committed(self, db, documents: dict[str, str]) -> None:
-        """Use the SAME session/transaction that commits the Knowledge rows."""
+    async def mark_committed(self, db, documents: dict[str, str] | None = None) -> None:
+        """Mark files in the transaction that commits their Knowledge or memory audit rows."""
+        if (documents is None) != self.memory_audit:
+            raise RuntimeError("File journal commit does not match its database records")
         for path, row_id in self.entries.items():
-            if path not in documents:
+            if documents is not None and path not in documents:
                 raise RuntimeError("File commit is missing its Knowledge receipt")
             result = await db.execute(update(RuntimeFileCommit).where(
                 RuntimeFileCommit.id == row_id,
                 RuntimeFileCommit.state == FileCommitState.PREPARED.value,
                 RuntimeFileCommit.written_version.is_not(None),
-            ).values(state=FileCommitState.COMMITTED.value, document_id=documents[path]))
+            ).values(state=FileCommitState.COMMITTED.value, document_id=documents[path] if documents is not None else None))
             if result.rowcount != 1:
                 raise RuntimeError("File commit journal changed before Knowledge commit")
 

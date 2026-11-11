@@ -167,7 +167,7 @@ function CandidateRow({
     <article
       style={{
         padding: "14px 0",
-        borderBottom: "1px solid rgba(28,25,23,0.06)",
+        borderBottom: "0.5px solid rgba(29, 29, 31,0.06)",
       }}
     >
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
@@ -303,7 +303,7 @@ export default function AgentLearningPanel({
             [t("page.agent_detail.learning_evidence_count"), evidence.length],
           ].map(([label, value]) => (
             <div key={String(label)} style={{ padding: "10px 12px", borderRadius: "var(--radius-control)", background: "var(--surface-muted)" }}>
-              <div style={{ color: "var(--text-faint)", fontSize: 10, fontWeight: 700, letterSpacing: "0.03em", textTransform: "uppercase" }}>{label}</div>
+              <div style={{ color: "var(--text-faint)", fontSize: 10, fontWeight: 700, }}>{label}</div>
               <div className="mono" style={{ marginTop: 4, color: "var(--text-strong)", fontSize: 18, fontWeight: 750 }}>{value}</div>
             </div>
           ))}
@@ -337,7 +337,7 @@ export default function AgentLearningPanel({
                 item.metrics?.tool_call_count ? `${item.metrics.tool_call_count} ${t("page.agent_detail.learning_tools")}` : "",
               ].filter(Boolean).join(" · ");
               return (
-                <article key={item.id} style={{ padding: "13px 0", borderBottom: "1px solid rgba(28,25,23,0.06)" }}>
+                <article key={item.id} style={{ padding: "13px 0", borderBottom: "0.5px solid rgba(29, 29, 31,0.06)" }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
                     <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                       <StatusBadge type={evidenceStatusType(item.status)} dot>{humanize(item.status)}</StatusBadge>

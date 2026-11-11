@@ -13,6 +13,7 @@ import type {
 import { formatDateLong } from "../../lib/format";
 import { t } from "../../lib/i18n";
 import { useIsCollaborator } from "../../lib/collaboratorSession";
+import { useAfterStartup } from "../../lib/useAfterStartup";
 import { closeDetail, openDetail } from "../../stores/detail";
 import {
   IconArrowLeft,
@@ -87,10 +88,11 @@ export function conversationInitiativeItems(
 export function useConversationInitiativesQuery(conversationId?: string | null) {
   // Agent initiatives are a company surface an external collaborator can't open.
   const collaborator = useIsCollaborator();
+  const startupSettled = useAfterStartup();
   return useQuery({
     queryKey: ["agent-initiatives", "conversation", conversationId],
     queryFn: () => api.agentInitiatives.listForConversation(conversationId as string),
-    enabled: Boolean(conversationId) && !collaborator,
+    enabled: Boolean(conversationId) && !collaborator && startupSettled,
     staleTime: 30_000,
   });
 }
@@ -287,7 +289,7 @@ function ConversationInitiativeList({
         aria-live="polite"
       >
         <LoadingSpinner size={20} />
-        <span>{t("page.agent_initiative.current_chat_loading")}</span>
+        <span className="sr-only">{t("page.agent_initiative.current_chat_loading")}</span>
       </div>
     );
   }

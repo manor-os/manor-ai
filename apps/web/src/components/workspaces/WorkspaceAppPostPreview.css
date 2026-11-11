@@ -1,0 +1,136 @@
+/* A record as the post it will be: neutral platform frames (layout and proportions only), its counts, copies and receipt.
+   Tokens only; borderless; works from 375 px up and in both themes. */
+
+.workspace-app-preview__feedlist { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); gap: 20px; min-width: 0; }
+.workspace-app-preview__rows { display: grid; gap: 20px; min-width: 0; }
+.workspace-app-preview__group { display: grid; gap: 10px; min-width: 0; }
+.workspace-app-preview__group > h4 { margin: 0; color: var(--text-strong); font-size: 13px; font-weight: 600; }
+.workspace-app-preview__row-wrap { display: grid; gap: 10px; min-width: 0; }
+/* A post's platform versions in one row, scrolled sideways inside the block, never the page. */
+.workspace-app-preview__row { display: flex; gap: 16px; min-width: 0; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: thin; padding-bottom: 4px; }
+.workspace-app-preview__row > .workspace-app-preview__card { flex: 0 0 min(320px, 100%); }
+.workspace-app-preview__row.is-narrow > .workspace-app-preview__card { flex-basis: 100%; }
+
+.workspace-app-preview__card { display: grid; align-content: start; gap: 8px; min-width: 0; }
+/* The phone-like surface a post sits on. */
+.workspace-app-preview__frame { width: 100%; max-width: 360px; justify-self: center; overflow: hidden; border-radius: var(--radius-card);
+  background: var(--surface-panel); color: var(--text-default); box-shadow: var(--shadow-sm); font-size: 13px; line-height: 1.4; }
+.workspace-app-preview__frame h5 { margin: 0; color: var(--text-strong); font-size: 14px; font-weight: 600; line-height: 1.3; overflow-wrap: anywhere; }
+.workspace-app-preview__frame small { color: var(--text-muted); font-size: 11px; }
+
+.workspace-app-preview__media { position: relative; display: grid; place-items: center; width: 100%; overflow: hidden; background: var(--surface-muted); color: var(--text-muted); }
+.workspace-app-preview__media:not([style]) { aspect-ratio: 1; }
+.workspace-app-preview__media > img, .workspace-app-preview__grid-item > img, .workspace-app-preview__clip > img,
+.workspace-app-preview__avatar > img { width: 100%; height: 100%; object-fit: cover; }
+.workspace-app-preview__badge { position: absolute; top: 8px; right: 8px; padding: 1px 7px; border-radius: 999px; background: rgba(29, 29, 31, 0.6); color: #fff; font-size: 11px; }
+.workspace-app-preview__clip { position: relative; display: grid; place-items: center; width: 100%; height: 100%; padding: 0; border: 0; background: var(--surface-muted); color: inherit; cursor: pointer; }
+.workspace-app-preview__media .workspace-app-media__video, .workspace-app-preview__media video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+.workspace-app-preview__play { position: absolute; display: grid; place-items: center; width: 44px; height: 44px; border-radius: 50%; background: rgba(29, 29, 31, 0.55); color: #fff; }
+.workspace-app-preview__grid { display: grid; gap: 3px; width: 100%; }
+.workspace-app-preview__grid-item { position: relative; display: grid; place-items: center; aspect-ratio: 1; overflow: hidden; background: var(--surface-muted); color: var(--text-muted); }
+.workspace-app-preview__grid.is-1 .workspace-app-preview__grid-item { aspect-ratio: 4 / 3; }
+.workspace-app-preview__more { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(29, 29, 31, 0.45); color: #fff; font-size: 18px; font-weight: 600; }
+.workspace-app-preview__frame .workspace-app-media__carousel { width: 100%; }
+.workspace-app-preview__frame .workspace-app-media__dots { margin: 6px 0 0; }
+
+.workspace-app-preview__avatar { display: inline-grid; flex: none; place-items: center; overflow: hidden; border-radius: 50%; background: var(--surface-sunken); color: var(--text-muted); font-size: 12px; font-weight: 600; }
+.workspace-app-preview__header { display: flex; align-items: center; gap: 8px; padding: 10px 12px; color: var(--text-muted); }
+.workspace-app-preview__header > span:not(.workspace-app-preview__avatar) { display: grid; flex: 1; min-width: 0; }
+.workspace-app-preview__header strong { overflow: hidden; color: var(--text-strong); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-preview__caption { display: grid; justify-items: start; min-width: 0; color: var(--text-default); }
+.workspace-app-preview__caption > p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.workspace-app-preview__caption > p.is-clamped { display: -webkit-box; -webkit-box-orient: vertical; overflow: hidden; }
+.workspace-app-preview__caption strong { color: var(--text-strong); }
+.workspace-app-preview__tags { color: var(--text-strong); font-weight: 600; }
+.workspace-app-preview__more-text { padding: 0; border: 0; background: none; color: var(--text-muted); font: inherit; cursor: pointer; }
+.workspace-app-preview__more-text:focus-visible { outline: 2px solid var(--accent-ring); outline-offset: 2px; }
+.workspace-app-preview__actions { display: flex; gap: 16px; padding: 8px 12px; color: var(--text-strong); }
+.workspace-app-preview__link-card { display: grid; gap: 2px; margin: 0 12px; padding: 10px 12px; border-radius: calc(10px * var(--app-radius-scale, 1));
+  background: var(--surface-muted); color: var(--text-default); text-decoration: none; overflow-wrap: anywhere; }
+
+/* Feed posts: words first (X, LinkedIn, Facebook) or the picture first (Instagram). */
+.workspace-app-preview__feed { display: grid; }
+.workspace-app-preview__feed > h5, .workspace-app-preview__feed > .workspace-app-preview__caption { padding: 0 12px 10px; }
+.workspace-app-preview__feed.is-instagram > .workspace-app-preview__caption { padding: 0 12px 12px; }
+.workspace-app-preview__feed > .workspace-app-preview__grid, .workspace-app-preview__feed.is-x > .workspace-app-preview__media { margin: 0 12px; width: auto; border-radius: calc(12px * var(--app-radius-scale, 1)); overflow: hidden; }
+.workspace-app-preview__feed.is-x > .workspace-app-preview__link-card, .workspace-app-preview__feed > .workspace-app-preview__link-card { margin-top: 8px; }
+.workspace-app-preview__thread { display: grid; gap: 10px; margin: 0; padding: 4px 12px 12px; list-style: none; }
+.workspace-app-preview__thread li { position: relative; display: flex; gap: 8px; }
+.workspace-app-preview__thread li::before { content: ""; position: absolute; top: -10px; left: 11px; width: 2px; height: 10px; background: var(--surface-sunken); }
+.workspace-app-preview__thread p { margin: 0 0 2px; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* A 9:16 screen with the parts the platform covers marked, so the caption and the picture's key part stay clear. */
+.workspace-app-preview__frame[data-platform="instagram_reels"], .workspace-app-preview__frame[data-platform="instagram_story"],
+.workspace-app-preview__frame[data-platform="tiktok"], .workspace-app-preview__frame[data-platform="douyin"],
+.workspace-app-preview__frame[data-platform="youtube_shorts"] { max-width: 280px; background: #111; }
+.workspace-app-preview__screen { position: relative; color: #fff; }
+.workspace-app-preview__screen .workspace-app-preview__media { background: #1d1d1f; }
+.workspace-app-preview__safe { position: absolute; top: var(--safe-top, 10%); right: var(--safe-right, 0); bottom: var(--safe-bottom, 20%); left: 4%;
+  border: 1px dashed rgba(255, 255, 255, 0.35); border-radius: 6px; pointer-events: none; }
+.workspace-app-preview__screen > .workspace-app-preview__actions { position: absolute; right: 6px; bottom: 30%; flex-direction: column; gap: 18px; padding: 0; color: #fff; filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.5)); }
+.workspace-app-preview__overlay { position: absolute; right: var(--safe-right, 16%); bottom: 0; left: 0; display: grid; gap: 4px; padding: 40px 12px 14px;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.65), transparent); }
+.workspace-app-preview__overlay strong { color: #fff; font-size: 13px; }
+.workspace-app-preview__overlay .workspace-app-preview__caption, .workspace-app-preview__overlay .workspace-app-preview__tags,
+.workspace-app-preview__overlay .workspace-app-preview__more-text { color: #fff; }
+.workspace-app-preview__story-bar { position: absolute; top: 8px; right: 8px; left: 8px; height: 2px; border-radius: 2px; background: rgba(255, 255, 255, 0.35); }
+.workspace-app-preview__story-bar i { display: block; width: 40%; height: 100%; border-radius: inherit; background: #fff; }
+
+/* 小红书: a cover, a short bold title, the note and its tags. */
+.workspace-app-preview__note { display: grid; gap: 8px; padding-bottom: 12px; }
+.workspace-app-preview__note > h5, .workspace-app-preview__note > .workspace-app-preview__caption { padding: 0 12px; }
+.workspace-app-preview__note > footer, .workspace-app-preview__pin > footer { display: flex; align-items: center; gap: 6px; padding: 0 12px; color: var(--text-muted); font-size: 12px; }
+.workspace-app-preview__note > footer > time { margin-left: auto; color: var(--text-faint); font-size: 11px; }
+
+/* YouTube: a 16:9 thumbnail, the title and the channel. */
+.workspace-app-preview__video-card { display: grid; gap: 8px; padding-bottom: 12px; }
+.workspace-app-preview__video-meta { display: flex; gap: 10px; padding: 0 12px; }
+.workspace-app-preview__video-meta > span { display: grid; gap: 2px; min-width: 0; }
+.workspace-app-preview__video-meta strong { color: var(--text-strong); font-size: 14px; overflow-wrap: anywhere; }
+.workspace-app-preview__video-card > .workspace-app-preview__caption { padding: 0 12px 0 50px; color: var(--text-muted); font-size: 12px; }
+
+/* 公众号: an article page. */
+.workspace-app-preview__article { display: grid; gap: 10px; padding: 16px; }
+.workspace-app-preview__article > h5 { font-size: 18px; }
+.workspace-app-preview__article .workspace-app-preview__media { border-radius: calc(6px * var(--app-radius-scale, 1)); }
+.workspace-app-preview__summary { margin: 0; padding: 8px 10px; border-radius: calc(6px * var(--app-radius-scale, 1)); background: var(--surface-muted); color: var(--text-muted); font-size: 12px; }
+
+/* 朋友圈: a face, the words and a 1–9 grid. */
+.workspace-app-preview__moments { display: flex; gap: 10px; padding: 12px; }
+.workspace-app-preview__moments > div { display: grid; flex: 1; gap: 6px; min-width: 0; }
+.workspace-app-preview__moments strong { color: var(--text-strong); }
+.workspace-app-preview__moments .workspace-app-preview__grid { max-width: 240px; }
+.workspace-app-preview__moments .workspace-app-preview__grid.is-1 { max-width: 180px; }
+.workspace-app-preview__moments .workspace-app-preview__link-card { margin: 0; }
+.workspace-app-preview__moments footer { display: flex; justify-content: space-between; color: var(--text-faint); font-size: 11px; }
+
+/* Pinterest: a tall picture with round corners, its title and who saved it. */
+.workspace-app-preview__frame[data-platform="pinterest"] { max-width: 260px; background: transparent; box-shadow: none; }
+.workspace-app-preview__pin { display: grid; gap: 6px; }
+.workspace-app-preview__pin .workspace-app-preview__media { border-radius: calc(16px * var(--app-radius-scale, 1)); }
+.workspace-app-preview__pin .workspace-app-preview__media:not([style]) { aspect-ratio: 2 / 3; }
+.workspace-app-preview__pin > h5, .workspace-app-preview__pin > .workspace-app-preview__caption { padding: 0 4px; }
+.workspace-app-preview__pin > footer { padding: 0 4px; }
+
+/* What the person does with the post: its platform, how much of each limit it uses, the copies and its receipt. */
+.workspace-app-preview__meta, .workspace-app-preview__copies { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; color: var(--text-muted); font-size: 11px; }
+.workspace-app-preview__platform { color: var(--text-strong); font-weight: 600; }
+.workspace-app-preview__count { padding: 1px 6px; border-radius: 999px; background: var(--surface-muted); }
+.workspace-app-preview__count.is-over, .workspace-app-preview__thread .is-over { color: var(--chip-danger-fg); }
+.workspace-app-preview__copy { display: inline-flex; align-items: center; gap: 4px; min-height: 28px; padding: 0 10px; border: 0; border-radius: 999px;
+  background: var(--surface-muted); color: var(--text-default); font: inherit; font-size: 12px; cursor: pointer; }
+.workspace-app-preview__copy:hover { background: var(--surface-sunken); }
+.workspace-app-preview__copy:focus-visible { outline: 2px solid var(--accent-ring); outline-offset: 2px; }
+.workspace-app-preview__receipt { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; color: var(--text-muted); font-size: 12px; }
+.workspace-app-preview__receipt > svg { color: var(--text-strong); }
+.workspace-app-preview__receipt a { display: inline-flex; align-items: center; gap: 3px; color: var(--text-strong); font-weight: 600; }
+.workspace-app-data__preview-footer { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.workspace-app-data__preview-metrics { display: flex; flex-wrap: wrap; gap: 4px 12px; flex-basis: 100%; color: var(--text-muted); font-size: 12px; }
+.workspace-app-data__preview-metrics b { color: var(--text-strong); font-variant-numeric: tabular-nums; }
+.workspace-app-preview__comments { font-size: 12px; }
+.workspace-app-preview__comments summary { color: var(--text-muted); cursor: pointer; }
+.workspace-app-preview__comments ol { display: grid; gap: 8px; margin: 8px 0 0; padding: 0; list-style: none; }
+.workspace-app-preview__comments li { display: grid; gap: 2px; overflow-wrap: anywhere; }
+.workspace-app-preview__comments li strong { color: var(--text-strong); }
+.workspace-app-preview__comments li small { display: flex; gap: 8px; color: var(--text-faint); font-size: 11px; }
+.workspace-app-preview__comments li small span { display: inline-flex; align-items: center; gap: 2px; }

@@ -41,6 +41,9 @@ from packages.core.ai.runtime.manor_actions import (
     runtime_manor_get_task_details,
     runtime_manor_list_channel_bindings,
     runtime_manor_list_conversations,
+    runtime_manor_read_conversation_messages,
+    runtime_manor_read_memory,
+    runtime_manor_search_conversation_messages,
     runtime_manor_list_integrations,
     runtime_manor_list_notifications,
     runtime_manor_get_dashboard_summary,
@@ -88,6 +91,10 @@ from packages.core.ai.runtime.stat_actions import ADD_ASSESSED_METRICS_GUIDANCE,
 from packages.core.ai.runtime.notification_actions import (
     runtime_notify_members_action,
 )
+from packages.core.ai.runtime.always_allow_actions import (
+    runtime_list_always_allow,
+    runtime_stop_always_allow,
+)
 from packages.core.ai.runtime.workspace_composite_actions import (
     runtime_workspace_composite_action,
 )
@@ -102,6 +109,7 @@ from packages.core.ai.runtime.tool_context import (
     runtime_trusted_workspace_id_from_context,
     runtime_allowed_tool_names_from_context,
     runtime_tool_call_context_from_kwargs,
+    runtime_tool_call_context_is_person_chat,
 )
 from packages.core.constants.agents import MANOR_AGENT_ID
 from packages.core.constants.task import TASK_STATUSES
@@ -141,7 +149,7 @@ _ACTIONS: dict[str, list[tuple[str, str]]] = {
         ),
         ("get_document", "Get document details (params: document_id)"),
         ("upload_document", "Upload a document to knowledge base"),
-        ("delete_document", "Delete a document (params: document_id)"),
+        ("delete_document", "Delete a document (params: document_id, or document_ids for up to 200)"),
         (
             "search_documents",
             "Search user-visible documents by name and text (params: query plus "
@@ -182,7 +190,30 @@ _ACTIONS: dict[str, list[tuple[str, str]]] = {
             "Send email via a configured account. Pass params.integration_account_id "
             "from list_ready_integrations to choose the sender; omit it for the default.",
         ),
-        ("list_conversations", "List conversations by agent/user"),
+        (
+            "list_conversations",
+            "List the conversations the current person may read: personal chats, group and "
+            "private rooms, Workspace chats, external channels. Params: kind?, workspace_id?, limit?.",
+        ),
+        (
+            "search_conversation_messages",
+            "Search chat records the current person may read, across conversations. "
+            "Params: query (2-100 chars), kind?, conversation_id? (with kind), workspace_id?, "
+            "sender_user_id?, after?, before?, cursor?. Defaults to the last 90 days. "
+            "In a Workspace chat only that Workspace is searched.",
+        ),
+        (
+            "read_conversation_messages",
+            "Read one conversation's messages. Params: kind, conversation_id, then one of "
+            "around_message_id (from a search hit), before, after; limit?.",
+        ),
+        (
+            "read_memory",
+            "Read a memory file you are allowed to see. Params: layer (org | workspace | profile | "
+            "preferences | private), workspace_id? (workspace layer; defaults to this Workspace), "
+            "user_id? (profile of another member of this Workspace). Preferences are readable only "
+            "by their owner, private notes only in the owner's own chat.",
+        ),
         ("list_notifications", "List notifications with read/unread filter"),
         (
             "notify_members",
@@ -263,6 +294,18 @@ _ACTIONS: dict[str, list[tuple[str, str]]] = {
         ("update_skill", "Patch an existing skill by describing what to change"),
         ("delete_skill", "Delete a custom skill"),
         ("invoke_skill", "Execute a skill by name"),
+    ],
+    "Approvals": [
+        (
+            "list_always_allow",
+            "List what the person chose to always allow without asking (in this Workspace, "
+            "or their own settings outside one), with rule_id and action_key.",
+        ),
+        (
+            "stop_always_allow",
+            "Undo an 'Always allow' the person chose, when they ask to be asked again. "
+            "Params: rule_id or action_key from list_always_allow. Cannot add one.",
+        ),
     ],
     "Automations": [
         (
@@ -509,7 +552,12 @@ async def _dispatch_action(
                     db,
                     entity_id=entity_id,
                     user_id=user_id,
+                    workspace_id=authorization_workspace_id,
                     params=params,
+                    person_in_chat=(
+                        runtime_context is not None
+                        and runtime_tool_call_context_is_person_chat(runtime_context)
+                    ),
                 )
 
             if action == "upload_document":
@@ -533,6 +581,10 @@ async def _dispatch_action(
                     workspace_id=authorization_workspace_id,
                     params=params,
                     user_wording=active_user_message,
+                    person_in_chat=(
+                        runtime_context is not None
+                        and runtime_tool_call_context_is_person_chat(runtime_context)
+                    ),
                 )
 
             if action == "list_workspace_artifacts":
@@ -675,6 +727,7 @@ async def _dispatch_action(
                     user_id=user_id or "",
                     params=params,
                     runtime_envelope=runtime_envelope,
+                    active_user_message=active_user_message,
                 )
 
             if action == "continue_workspace_draft":
@@ -682,6 +735,7 @@ async def _dispatch_action(
                     entity_id=entity_id,
                     user_id=user_id or "",
                     params=params,
+                    active_user_message=active_user_message,
                 )
 
             if action == "update_workspace":
@@ -1046,6 +1100,17 @@ async def _dispatch_action(
                     user_id=user_id,
                 )
 
+            if action == "list_always_allow":
+                return await runtime_list_always_allow(
+                    db, entity_id=entity_id, user_id=user_id, workspace_id=authorization_workspace_id,
+                )
+
+            if action == "stop_always_allow":
+                return await runtime_stop_always_allow(
+                    db, entity_id=entity_id, user_id=user_id, workspace_id=authorization_workspace_id,
+                    params=params,
+                )
+
             if action == "notify_members":
                 return await runtime_notify_members_action(
                     entity_id=entity_id,
@@ -1054,12 +1119,35 @@ async def _dispatch_action(
                     agent_id=getattr(runtime_envelope, "agent_id", None),
                 )
 
+            if action == "read_memory":
+                return await runtime_manor_read_memory(
+                    db, entity_id=entity_id, user_id=user_id, params=params,
+                    runtime_envelope=runtime_envelope,
+                )
+
             # Conversations
-            if action == "list_conversations":
-                return await runtime_manor_list_conversations(
+            if action in {"list_conversations", "search_conversation_messages", "read_conversation_messages"}:
+                chat_history_handler = {
+                    "list_conversations": runtime_manor_list_conversations,
+                    "search_conversation_messages": runtime_manor_search_conversation_messages,
+                    "read_conversation_messages": runtime_manor_read_conversation_messages,
+                }[action]
+                shared_run = bool(task_id or workflow_run_id)
+                if shared_run and not getattr(runtime_envelope, "workspace_id", None):
+                    return json.dumps({"error": "Chat records in a Task or Workflow require a Runtime Workspace scope."})
+                # A model may narrow a private read, but cannot choose the
+                # audience of a shared run: that comes from its envelope/thread.
+                workspace_ids = (getattr(runtime_envelope, "workspace_id", None),) if shared_run else (
+                    workspace_id, authorization_workspace_id, getattr(runtime_envelope, "workspace_id", None),
+                )
+                return await chat_history_handler(
                     db,
                     entity_id=entity_id,
                     user_id=user_id,
+                    params=params,
+                    workspace_ids=workspace_ids,
+                    conversation_id=conversation_id,
+                    shared_run=shared_run,
                 )
 
             if action == "send_email":
@@ -1222,7 +1310,8 @@ MANOR_SCHEMA = {
             "App targets/Workflow attachments use configuration drafts; author/run Workflows via dedicated actions. "
             "CRM uses company-scoped client/contact/activity/deal/followup actions. Followups/email activities are records; Ledger links stay in the current Workspace. "
             "Use dedicated actions for ScheduledJobs/Agent Initiatives, never action='workspace'. "
-            "search_documents finds documents by name and text; generate_file creates artifacts. "
+            "search_documents finds documents by name/text; search_conversation_messages finds chat text; "
+            "generate_file creates artifacts. "
             "create_agent_initiative is only for private Agent/Manor Chat. "
             "Workspace recurrence uses create_scheduled_job; ScheduledJobs lack conversational delivery, mute, quiet-hours and Initiative history. "
             "Use exact active params.agent_id from action='list_agents'; omit for the calling Agent."
@@ -1232,7 +1321,7 @@ MANOR_SCHEMA = {
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "Action to execute. Use 'search' to find actions.",
+                    "description": "Action to execute.",
                 },
                 "query": {
                     "type": "string",
@@ -1245,7 +1334,7 @@ MANOR_SCHEMA = {
                         "params={action:'create_task',params:{title,description,"
                         "runtime_instructions,rules,start}}. description holds objective, "
                         "filename and deliverables; runtime_instructions holds task "
-                        "rules and output language; start=true runs now. A drafted "
+                        "rules and output language; start=false: for later. A drafted "
                         "Task: params={action:'start_task',params:{task_id}}. "
                         "Workspace input: action='workspace', params={action:'resolve_hitl',"
                         "params:{message_id,action:'respond',response:'the user reply'}}. "
@@ -1327,6 +1416,8 @@ async def _manor_handler(entity_id: str = "", **kwargs: Any) -> str:
         return _unsupported_action_response(action)
 
     params = _merge_action_params(kwargs)
+    if action == "search_conversation_messages" and kwargs.get("query"):
+        params.setdefault("query", kwargs["query"])
     if legacy_create_workspace and not params.get("initial_brief"):
         brief_parts = []
         for key, label in (

@@ -1,7 +1,9 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
 import { api, type MediaJob } from "../../lib/api";
 import { t } from "../../lib/i18n";
+import { displayReadInterval } from "../../lib/readRefreshPolicy";
+import { usePageVisible } from "../../lib/usePageVisible";
 import MediaJobCard from "./MediaJobCard";
 
 /**
@@ -29,24 +31,62 @@ function clipLabel(job: MediaJob, index: number): string {
  * versions and regenerate controls. Renders nothing for runs without clips.
  */
 export default function RunMediaClips({ runId, running }: { runId: string; running: boolean }) {
+  const visible = usePageVisible();
+  const queryClient = useQueryClient();
+  const eventTimer = useRef<number | null>(null);
+  const pendingEvent = useRef(false);
+  const lastUnknownReconcileAt = useRef(0);
   const clips = useQuery({
     queryKey: ["media-jobs", "run", runId],
-    queryFn: () => api.mediaJobs.forRun(runId),
-    refetchInterval: running ? 5000 : false,
+    queryFn: ({ signal }) => api.mediaJobs.forRun(runId, AbortSignal.any([signal, AbortSignal.timeout(15_000)])),
+    enabled: visible,
+    retry: false,
+    // A completed run can still receive a late persisted clip, but it does not
+    // need the live rendering cadence.
+    refetchInterval: (query) => displayReadInterval(query.state, running ? 15_000 : 60_000),
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: true,
   });
-  const { data, refetch } = clips;
+  const { data } = clips;
 
-  // A job this list has not seen yet may be a new clip of this run: look
-  // again now rather than at the next poll. Known clips update themselves.
+  // New clips are coalesced. A payload without run_id cannot be attributed,
+  // so it receives only a bounded reconciliation of the current run.
   useEffect(() => {
     const known = new Set((data || []).map((job) => job.id));
+    const flush = () => {
+      eventTimer.current = null;
+      if (!pendingEvent.current) return;
+      pendingEvent.current = false;
+      void queryClient.invalidateQueries(
+        { queryKey: ["media-jobs", "run", runId] },
+        { cancelRefetch: false },
+      );
+    };
+    const schedule = () => {
+      if (eventTimer.current !== null) return;
+      eventTimer.current = window.setTimeout(flush, 500);
+    };
     const onEvent = (event: Event) => {
-      const id = (event as CustomEvent).detail?.id;
-      if (id && !known.has(id)) void refetch();
+      const update = (event as CustomEvent<Partial<MediaJob>>).detail;
+      if (!visible || !update) return;
+      if (update.run_id === runId && update.id && !known.has(update.id)) {
+        pendingEvent.current = true;
+        schedule();
+        return;
+      }
+      if (!update.run_id && Date.now() - lastUnknownReconcileAt.current >= 15_000) {
+        lastUnknownReconcileAt.current = Date.now();
+        pendingEvent.current = true;
+        schedule();
+      }
     };
     window.addEventListener("manor:media-job-update", onEvent);
-    return () => window.removeEventListener("manor:media-job-update", onEvent);
-  }, [data, refetch]);
+    return () => {
+      window.removeEventListener("manor:media-job-update", onEvent);
+      if (eventTimer.current !== null) window.clearTimeout(eventTimer.current);
+      eventTimer.current = null;
+    };
+  }, [data, queryClient, runId, visible]);
 
   // Each card follows its own clip once shown; handing it a fresh snapshot on
   // every poll would reset the version the person is looking at.

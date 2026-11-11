@@ -310,7 +310,18 @@ class BlueprintSetupPreflightFactory:
                 ChannelConfig.channel_type == channel_type,
             )
             if spec.get("provider"):
-                statement = statement.where(ChannelConfig.provider == provider)
+                # A connection names its accounts with the adapter's spelling
+                # ("slack" connects "slack_app" accounts).
+                from packages.core.services.channels.base import INTEGRATION_CHANNEL_ACCOUNTS
+
+                account_providers = {provider} | {
+                    account_provider
+                    for account_type, account_provider in INTEGRATION_CHANNEL_ACCOUNTS.get(
+                        canonical_provider_key(provider), (),
+                    )
+                    if account_type == channel_type
+                }
+                statement = statement.where(ChannelConfig.provider.in_(account_providers))
             attached_ids: set[str] = set()
             matching_ids: set[str] = set()
             if workspace_id:

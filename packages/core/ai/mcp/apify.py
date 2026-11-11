@@ -1,4 +1,7 @@
-"""Scoped Instagram collection tools backed by durable Apify operations.
+"""Scoped public social collection tools backed by durable Apify operations.
+
+Tool names keep their original Instagram prefix so installed Workflows and
+approval rules stay valid; post_metrics mode also reads YouTube and TikTok.
 
 The dispatcher supplies actor and credential scope through ContextVar, never
 through model-authored arguments. Collection service owns admission, provider
@@ -35,6 +38,8 @@ def _schema(properties: dict, required: list[str]) -> dict:
     }
 
 
+# apify_client.WAIT_SECONDS_MAX; that module imports this package, so it is not imported here.
+WAIT_SECONDS_MAX = 45
 _COLLECTION_ID = {
     "type": "string", "minLength": 1, "maxLength": 64,
     "description": "Manor collection ID returned by quote/start, not an Apify run ID.",
@@ -43,25 +48,34 @@ _TOOLS = [
     {
         "name": "quote_instagram_collection",
         "description": (
-            "Prepare a bounded Instagram collection and return its maximum Credits "
-            "charge without starting Apify. Search creators, collect one profile's "
-            "last 7/14/28 days, or process one selected Reel. Present the budget "
-            "before starting; AI adaptation and asset generation are separate."
+            "Prepare a bounded Apify collection and return its maximum Credits "
+            "charge without starting Apify. Instagram: search creators, collect one profile's "
+            "last 7/14/28 days, process one selected Reel, or read one Post or Reel "
+            "from its link (caption, type, counts, cover). post_metrics: read public "
+            "view/like/comment counts for up to 20 Instagram, YouTube or TikTok post "
+            "links of one platform in a single run (TikTok needs max_cost_usd >= 0.50). "
+            "Present the budget before starting; AI adaptation and asset generation are separate."
             " Select a connected integration_account_id to use customer-funded "
             "Apify; without a selection, configured Manor platform funding takes precedence."
         ),
         "inputSchema": _schema({
-            "mode": {"type": "string", "enum": ["search", "profile", "reel"]},
+            "mode": {"type": "string", "enum": ["search", "profile", "reel", "post", "post_metrics"]},
             "query": {"type": "string", "minLength": 1, "maxLength": 100,
                       "description": "Creator search text; search mode only."},
             "profile_url": {"type": "string", "minLength": 1, "maxLength": 250,
                             "description": "One Instagram profile URL or handle; profile mode only."},
             "reel_url": {"type": "string", "minLength": 1, "maxLength": 250,
                          "description": "One public Instagram Reel URL; reel mode only."},
+            "post_url": {"type": "string", "minLength": 1, "maxLength": 250,
+                         "description": "One public Instagram Post or Reel URL (/p/, /reel/ or /tv/); post mode only."},
+            "post_urls": {"type": "array", "minItems": 1, "maxItems": 20,
+                          "items": {"type": "string", "minLength": 1, "maxLength": 250},
+                          "description": "post_metrics mode only: public post links on ONE platform - Instagram /p/ or /reel/, "
+                                         "YouTube watch, Shorts or youtu.be, or TikTok /@handle/video/ID."},
             "lookback_days": {"type": "integer", "enum": [7, 14, 28],
                               "description": "Profile mode only; default 14."},
             "results_limit": {"type": "integer", "minimum": 1, "maximum": 200,
-                              "description": "Profile: default 50, max 200. Search: default 10, max 20. Reel: 1."},
+                              "description": "Profile: default 50, max 200. Search: default 10, max 20. Reel and post: 1. Not used by post_metrics."},
             "include_transcript": {"type": "boolean", "default": False,
                                    "description": "Paid audio transcript add-on; selected Reel only."},
             "include_downloaded_video": {"type": "boolean", "default": False,
@@ -74,7 +88,7 @@ _TOOLS = [
     {
         "name": "start_instagram_collection",
         "description": (
-            "Start the exact previously quoted Instagram collection. Reserves its "
+            "Start the exact previously quoted Apify collection. Reserves its "
             "maximum Manor Credits before provider work when platform funded. "
             "Reuse the same quote ID on retry; never create a fresh quote to retry "
             "an unknown or pending start. Returns a durable collection ID."
@@ -87,10 +101,17 @@ _TOOLS = [
         "description": (
             "Check an existing collection, settle completed provider usage once, "
             "and read available results. Does not start another run or charge a "
-            "per-poll fee. Preserve coverage/partial indicators; temporary media "
+            "per-poll fee. To wait for a running collection, pass wait_seconds: the "
+            "call returns as soon as Apify finishes, so poll with it instead of pausing "
+            "for a guessed time. Preserve coverage/partial indicators; temporary media "
             "links and transcripts are reference data, not finished Knowledge artifacts."
         ),
-        "inputSchema": _schema({"collection_id": _COLLECTION_ID}, ["collection_id"]),
+        "inputSchema": _schema({
+            "collection_id": _COLLECTION_ID,
+            "wait_seconds": {"type": "integer", "minimum": 0, "maximum": WAIT_SECONDS_MAX, "default": 0,
+                             "description": f"Wait up to this many seconds (max {WAIT_SECONDS_MAX}) for a running "
+                                            "collection to finish before returning; 0 returns the current status."},
+        }, ["collection_id"]),
         "annotations": {"readOnlyHint": True, "idempotentHint": True},
     },
     {
@@ -161,6 +182,7 @@ async def call_tool(name: str, arguments: dict[str, Any], bearer_token: str) -> 
             result = await apify_collections.get_collection(
                 **scope, collection_id=arguments["collection_id"],
                 token=bearer_token, include_items=True,
+                wait_seconds=arguments.get("wait_seconds", 0),
             )
         else:
             result = await apify_collections.cancel_collection(

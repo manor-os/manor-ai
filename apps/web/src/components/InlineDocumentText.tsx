@@ -1,7 +1,8 @@
-import { lazy, Suspense, useState } from "react";
+import { lazy, Suspense } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { t } from "../lib/i18n";
+import CollapsibleSentMessage from "./chat/CollapsibleSentMessage";
 import { CsvPreview } from "./file-preview/CsvPreview";
 
 // Markdown rendering loads only when a written result is shown.
@@ -21,42 +22,44 @@ export function inlineDocumentTextKind(name?: string | null, fileType?: string |
 }
 
 /**
- * A Knowledge document's content shown inline, clamped until expanded.
+ * A Knowledge document's content shown inline: a short document or table in
+ * full, a long one from its first lines until expanded (see ``contentFold``).
  * ``live`` refetches a document that is edited in place (a pinned list);
  * delivered results are immutable and stay cached.
  */
-export default function InlineDocumentText({ documentId, kind, label, live = false }: {
+export default function InlineDocumentText({ documentId, kind, label, live = false, open = false }: {
   documentId: string;
   kind: InlineDocumentTextKind;
-  label: string;
+  /** Names the content as a region; omit it when a file header around it already does. */
+  label?: string;
   live?: boolean;
+  /** Shown whole, as where the result was opened to be read. */
+  open?: boolean;
 }) {
-  const [expanded, setExpanded] = useState(false);
   const text = useQuery({
     queryKey: ["inline-document-text", documentId, live],
     queryFn: async () => (await api.documents.previewBlob(documentId, live ? { force: true } : { cache: true })).text(),
     staleTime: live ? 0 : Infinity,
     retry: false,
   });
-  if (!text.data) {
+  if (text.data === undefined) {
     return <p className="inline-document-text__state" role={text.isError ? "alert" : "status"}>
       {text.isError ? t("component.result_files.preview_failed") : t("component.result_files.loading_preview")}
     </p>;
   }
   const content = text.data.length > INLINE_TEXT_LIMIT ? text.data.slice(0, INLINE_TEXT_LIMIT) : text.data;
+  const Region = label ? "section" : "div";
   return (
-    <section className={`inline-document-text${expanded ? " is-expanded" : ""}`} aria-label={label}>
-      <div className="inline-document-text__body">
-        {kind === "table"
-          ? <CsvPreview content={content} />
-          : <Suspense fallback={<pre className="inline-document-text__raw">{content}</pre>}>
-            <ChatMarkdown content={content} enableFileCards={false} />
-          </Suspense>}
-      </div>
-      <button type="button" className="inline-document-text__toggle" onClick={() => setExpanded((value) => !value)}
-        aria-expanded={expanded}>
-        {expanded ? t("component.result_files.show_less") : t("component.result_files.show_all")}
-      </button>
-    </section>
+    <Region className={`inline-document-text inline-document-text--${kind}`} aria-label={label}>
+      {kind === "table"
+        ? <CsvPreview content={content} compact />
+        : <div className="inline-document-text__body">
+          <CollapsibleSentMessage text={content} tone="assistant" kind="document" enabled={!open}>
+            <Suspense fallback={<pre className="inline-document-text__raw">{content}</pre>}>
+              <ChatMarkdown content={content} enableFileCards={false} preserveReferences />
+            </Suspense>
+          </CollapsibleSentMessage>
+        </div>}
+    </Region>
   );
 }

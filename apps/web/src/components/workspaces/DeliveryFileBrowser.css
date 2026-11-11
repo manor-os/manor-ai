@@ -1,0 +1,79 @@
+/* Borderless: sections and the open file are separated by fills and spacing (docs/UI_DESIGN_SYSTEM.md). */
+.delivery-files {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  width: 100%;
+  min-width: 0;
+}
+
+.delivery-files__group h4 {
+  margin: 0 0 4px;
+  padding: 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.delivery-files__item {
+  min-width: 0;
+  scroll-margin-top: 16px;
+}
+
+.delivery-files__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text-default);
+  text-align: left;
+  cursor: pointer;
+}
+
+.delivery-files__row:hover {
+  background: var(--surface-muted);
+}
+
+.delivery-files__row[aria-expanded="true"] {
+  background: var(--surface-sunken);
+  color: var(--text-strong);
+}
+
+.delivery-files__tile {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 10px;
+  background: var(--surface-muted);
+  color: var(--text-muted);
+}
+
+.delivery-files__name {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The open file sits directly under its row, indented to line up with the row's title. */
+.delivery-files__body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  min-width: 0;
+  max-width: 100%;
+  margin: 6px 0 4px 40px;
+  padding: 14px;
+  border-radius: 14px;
+  background: var(--surface-muted);
+  overflow-x: auto;
+}

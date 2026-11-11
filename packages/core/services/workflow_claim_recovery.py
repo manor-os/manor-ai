@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterable
 
+from packages.core.services.workflow_contracts import workflow_step_label
 from packages.core.services.workflow_run_trace import execution_trace_capacity
 
 # Internal ``trigger_data`` keys (underscore-prefixed like the other runner keys).
@@ -164,7 +165,7 @@ def decide_workflow_claim_loss(
         state.pop("effect_free_step_ids", None)
     if unsafe:
         step = unsafe[0]
-        label = str(step.get("name") or step.get("id"))
+        label = workflow_step_label(step)
         error = (
             f"Workflow execution was interrupted while step '{label}' "
             f"({step.get('type') or 'unknown'}) was running. It may already "

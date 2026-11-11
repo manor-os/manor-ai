@@ -1,15 +1,14 @@
-import en from "./i18n/en";
+import englishAtStartup from "./i18n/englishAtStartup";
 import { publicTranslations } from "./i18n/public";
 
 type TranslationCatalog = Record<string, string>;
 type Locale = "en" | "zh" | "es" | "fr"
 ;
 
-const translations: Partial<Record<Locale, TranslationCatalog>> & { en: TranslationCatalog } = {
-  en,
-};
+const translations: Partial<Record<Locale, TranslationCatalog>> = englishAtStartup ? { en: englishAtStartup } : {};
 
-const localeLoaders: Record<Exclude<Locale, "en">, () => Promise<{ default: TranslationCatalog }>> = {
+const localeLoaders: Record<Locale, () => Promise<{ default: TranslationCatalog }>> = {
+  en: () => import("./i18n/en"),
   zh: () => import("./i18n/zh"),
   es: () => import("./i18n/es"),
   fr: () => import("./i18n/fr"),
@@ -36,7 +35,6 @@ if (storedLocale && !isSupportedLocale(storedLocale)) {
 
 export async function loadLocale(locale: Locale): Promise<void> {
   if (translations[locale]) return;
-  if (locale === "en") return;
   if (!pendingLoads[locale]) {
     pendingLoads[locale] = localeLoaders[locale]()
       .then(({ default: catalog }) => {
@@ -49,9 +47,15 @@ export async function loadLocale(locale: Locale): Promise<void> {
   await pendingLoads[locale];
 }
 
+/** Chinese is complete (i18n-catalog-coverage.test.mjs); other languages fall back to English. */
+async function loadCatalogsFor(locale: Locale): Promise<void> {
+  await loadLocale(locale);
+  if (locale !== "zh") await loadLocale("en");
+}
+
 export async function setLocaleIfCurrent(locale: Locale, canCommit: () => boolean): Promise<boolean> {
   const changeVersion = ++localeChangeVersion;
-  await loadLocale(locale);
+  await loadCatalogsFor(locale);
   if (changeVersion !== localeChangeVersion || !canCommit()) return false;
   currentLocale = locale;
   localStorage.setItem("manor_locale", locale);
@@ -69,7 +73,8 @@ export function getLocale(): Locale {
 function translate(locale: Locale, key: string, vars?: Record<string, string | number>): string {
   let str = translations[locale]?.[key]
     || (publicTranslations[locale] as Record<string, string> | undefined)?.[key]
-    || translations.en[key]
+    || translations.en?.[key]
+    || translations[currentLocale]?.[key]
     || key;
   if (vars) {
     for (const [k, v] of Object.entries(vars)) {
@@ -101,6 +106,7 @@ export async function initializeLocale(): Promise<void> {
     if (localeChangeVersion !== initializationVersion + 1) return;
     currentLocale = "en";
     localStorage.setItem("manor_locale", currentLocale);
+    await loadLocale("en");
   }
 }
 

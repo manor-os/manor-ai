@@ -1,18 +1,11 @@
-import { useCallback, useEffect, useRef } from "react";
+import { displayReadInterval } from "../lib/readRefreshPolicy";
+import { useEffect, useRef } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { api, type WorkspaceSimulationRun } from "../lib/api";
-import { getLocale } from "../lib/i18n";
-import Button from "./ui/Button";
-import AgentActivityOrb, { activityForRuntimeStage } from "./ui/AgentActivityOrb";
-import StatusBadge from "./ui/StatusBadge";
-import {
-  IconBeaker,
-  IconCheck,
-  IconPlay,
-  IconRefresh,
-  IconRocket,
-} from "./icons";
+import { t } from "../lib/i18n";
+import UserAvatar from "./ui/UserAvatar";
+import { PromoteRequirementList } from "./blueprints/PromoteWorkspaceModal";
 import "./WorkspaceSimulationRuntime.css";
 
 export interface SimulationArtifact {
@@ -31,18 +24,13 @@ type RuntimeStatus = WorkspaceSimulationRun["status"];
 
 export interface WorkspaceSimulationRuntimeState {
   enabled: boolean;
+  workspaceId: string;
   run: WorkspaceSimulationRun | null;
   status: RuntimeStatus;
-  stageIndex: number;
-  stageCount: number;
-  stageLabel: string;
-  goalTitle: string;
-  waitingMessageId: string | null;
   loading: boolean;
   restarting: boolean;
   error: string | null;
   restart: () => void;
-  focusWaitingAction: () => void;
 }
 
 function refreshSimulationSurface(
@@ -69,7 +57,7 @@ export function useWorkspaceSimulationRuntime({
     queryKey: ["workspace-simulation-run", workspaceId],
     queryFn: () => api.workspaces.chat.simulationRun(workspaceId),
     enabled: Boolean(enabled && workspaceId),
-    refetchInterval: (result) => result.state.data?.status === "running" ? 5_000 : false,
+    refetchInterval: (result) => displayReadInterval(result.state, result.state.data?.status === "running" ? 5_000 : false),
     refetchIntervalInBackground: false,
   });
 
@@ -93,130 +81,97 @@ export function useWorkspaceSimulationRuntime({
     autoStartAttemptRef.current = null;
   }, [workspaceId]);
 
-  const focusWaitingAction = useCallback(() => {
-    const id = query.data?.waiting_message_id;
-    if (!id) return;
-    document.getElementById(`workspace-chat-message-${id}`)?.scrollIntoView({
-      behavior: "smooth",
-      block: "center",
-    });
-  }, [query.data?.waiting_message_id]);
-
   const run = query.data || startMutation.data || restartMutation.data || null;
-  const status = run?.status || "idle";
   const errorValue = query.error || startMutation.error || restartMutation.error;
-  const error = errorValue instanceof Error ? errorValue.message : null;
 
   return {
     enabled,
+    workspaceId,
     run,
-    status,
-    stageIndex: run?.stage_index || 0,
-    stageCount: Math.max(1, run?.stage_count || 1),
-    stageLabel: run?.stage_title || "Preparing Blueprint scenario",
-    goalTitle: run?.goal_title || "Run the Blueprint scenario",
-    waitingMessageId: run?.waiting_message_id || null,
+    status: run?.status || "idle",
     loading: query.isLoading || startMutation.isPending,
     restarting: restartMutation.isPending,
-    error,
+    error: errorValue instanceof Error ? errorValue.message : null,
     restart: () => restartMutation.mutate(),
-    focusWaitingAction,
   };
 }
 
-export function WorkspaceSimulationRuntimeBar({
+/** The one place a simulation says where it stands: a line under the Workspace name. */
+export function WorkspaceSimulationStatus({ runtime }: { runtime: WorkspaceSimulationRuntimeState }) {
+  if (!runtime.enabled) return null;
+  const run = runtime.run;
+  const total = run?.decision_total || 0;
+  const text = runtime.status === "completed"
+    ? t("component.workspace_simulation.status_completed")
+    : runtime.status === "waiting" && total > 0
+      ? t("component.workspace_simulation.status_waiting", {
+          step: Math.min(total, (run?.decision_count || 0) + 1),
+          total,
+        })
+      : t("component.workspace_simulation.status_running");
+  return <div className="workspace-simulation-status" aria-live="polite">{text}</div>;
+}
+
+export function WorkspaceSimulationChip() {
+  return <span className="workspace-simulation-chip">{t("component.workspace_simulation.chip")}</span>;
+}
+
+/** Where the composer would be: why there is none, and when there will be. */
+export function WorkspaceSimulationComposerNotice() {
+  return (
+    <div className="workspace-simulation-composer-notice" role="note">
+      {t("component.workspace_simulation.composer_notice")}
+    </div>
+  );
+}
+
+/**
+ * The end of a simulation, at the end of its chat: what happened, what live
+ * running still needs, and the one way forward.
+ */
+export function WorkspaceSimulationCompletion({
   runtime,
-  onPromoteToLive,
+  onPromote,
 }: {
   runtime: WorkspaceSimulationRuntimeState;
-  onPromoteToLive?: () => void;
+  onPromote?: () => void;
 }) {
-  if (!runtime.enabled) return null;
-  const zh = getLocale().toLowerCase().startsWith("zh");
-  const isBusy = runtime.loading || runtime.status === "running";
-  const statusCopy = runtime.error
-    ? (zh ? "需要重试" : "Needs retry")
-    : ({
-        idle: zh ? "正在准备" : "Preparing",
-        running: zh ? "自动执行中" : "Running automatically",
-        waiting: zh ? "等待你的操作" : "Waiting for you",
-        completed: zh ? "Goal 已完成" : "Goal completed",
-      } satisfies Record<RuntimeStatus, string>)[runtime.status];
-  const statusType = runtime.error
-    ? "danger"
-    : runtime.status === "completed"
-      ? "success"
-      : runtime.status === "waiting"
-        ? "warning"
-        : "teal";
-  const progress = Math.round((runtime.stageIndex / runtime.stageCount) * 100);
-
+  const completed = runtime.enabled && runtime.status === "completed";
+  const preflight = useQuery({
+    queryKey: ["promote-preflight", runtime.workspaceId],
+    queryFn: () => api.workspaces.promotePreflight(runtime.workspaceId),
+    enabled: completed && Boolean(onPromote),
+  });
+  if (!completed) return null;
+  const decisions = runtime.run?.decision_count || 0;
+  const unmet = preflight.data ?? [];
   return (
-    <section className="workspace-simulation-runtime" aria-live="polite" aria-busy={isBusy}>
-      <span className="workspace-simulation-runtime__icon">
-        {isBusy ? (
-          <AgentActivityOrb activity={activityForRuntimeStage(runtime.stageLabel)} iconOnly />
-        ) : runtime.status === "completed" ? (
-          <IconCheck size={16} aria-hidden="true" />
-        ) : (
-          <IconBeaker size={16} aria-hidden="true" />
+    <section className="workspace-simulation-completion" aria-label={t("component.workspace_simulation.status_completed")}>
+      <UserAvatar name="Manor" type="manor" size={28} />
+      <div className="workspace-simulation-completion__body">
+        <p>
+          {decisions > 0
+            ? t("component.workspace_simulation.completed_summary", { count: decisions })
+            : t("component.workspace_simulation.completed_summary_no_decisions")}
+        </p>
+        {unmet.length > 0 && (
+          <PromoteRequirementList workspaceId={runtime.workspaceId} requirements={unmet} />
         )}
-      </span>
-
-      <div className="workspace-simulation-runtime__copy">
-        <div className="workspace-simulation-runtime__heading">
-          <strong>{runtime.run?.title || (zh ? "Workspace 模拟体验" : "Workspace simulation")}</strong>
-          <StatusBadge type={statusType} dot pulse={isBusy && !runtime.error}>
-            {statusCopy}
-          </StatusBadge>
-        </div>
-        <div className="workspace-simulation-runtime__stage-row">
-          <span className="workspace-simulation-runtime__count">
-            {runtime.stageIndex}/{runtime.stageCount}
-          </span>
-          <span className="workspace-simulation-runtime__stage" title={runtime.goalTitle}>
-            {runtime.error || runtime.stageLabel}
-          </span>
-        </div>
-      </div>
-
-      <div
-        className="workspace-simulation-runtime__progress"
-        role="progressbar"
-        aria-label={zh ? "模拟运行进度" : "Simulation run progress"}
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={progress}
-      >
-        <span style={{ width: `${progress}%` }} />
-      </div>
-
-      <div className="workspace-simulation-runtime__actions">
-        {runtime.status === "waiting" && runtime.waitingMessageId && (
-          <Button size="sm" variant="primary" onClick={runtime.focusWaitingAction}>
-            <IconPlay size={14} /> {zh ? "查看操作" : "View decision"}
-          </Button>
-        )}
-        {runtime.status === "completed" && onPromoteToLive && (
-          <Button
-            size="sm"
-            variant="primary"
-            onClick={onPromoteToLive}
-            title={zh ? "保留配置并转为正式运行" : "Keep this setup and promote it to live"}
-          >
-            <IconRocket size={14} /> {zh ? "转为正式" : "Promote to live"}
-          </Button>
-        )}
-        {(runtime.status === "completed" || runtime.error) && (
-          <Button
-            size="sm"
-            variant="outline"
+        <div className="chat-hitl-actions">
+          {onPromote && (
+            <button type="button" className="chat-hitl-btn-primary" onClick={onPromote}>
+              {t("component.promote_workspace_modal.promote_to_live")}
+            </button>
+          )}
+          <button
+            type="button"
+            className="chat-hitl-btn-secondary"
             onClick={runtime.restart}
-            loading={runtime.restarting}
+            disabled={runtime.restarting}
           >
-            <IconRefresh size={14} /> {zh ? "重新运行" : "Run again"}
-          </Button>
-        )}
+            {t("component.workspace_simulation.run_again")}
+          </button>
+        </div>
       </div>
     </section>
   );

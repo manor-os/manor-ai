@@ -2,6 +2,7 @@ import { Suspense, lazy, useEffect, useLayoutEffect, useState, useSyncExternalSt
 import { createBrowserRouter, Navigate, Outlet, useLocation } from "react-router-dom";
 import RouteErrorBoundary from "../components/RouteErrorBoundary";
 import DetailDrawer from "../components/ui/DetailDrawer";
+import IntegrationConnectHost from "../components/integrations/IntegrationConnectHost";
 import EmptyState from "../components/ui/EmptyState";
 import { PageLoading } from "../components/ui/Skeleton";
 import { t } from "../lib/i18n";
@@ -26,7 +27,7 @@ function FrameState({ title }: { title: string }) {
 }
 
 function EmbeddedRoot() {
-  return <><Outlet /><DetailDrawer /></>;
+  return <><Outlet /><DetailDrawer /><IntegrationConnectHost /></>;
 }
 
 /** Waits for the parent's session; an ended or failed one stays on this screen (no sign-in page). */

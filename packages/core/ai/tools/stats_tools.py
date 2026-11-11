@@ -37,6 +37,9 @@ def _schema(name: str, description: str, properties: dict, required: list[str]) 
     }
 
 
+# Values one call may record: a page of posts, three counters each.
+_MAX_OBSERVATIONS = 60
+
 _SCHEMAS = [
     _schema(
         "configure_workspace_stat",
@@ -72,6 +75,39 @@ _SCHEMAS = [
             "after_id": {"type": "string"},
             "limit": {"type": "integer", "minimum": 1, "maximum": 20},
         },
+        [],
+    ),
+    _schema(
+        "record_workspace_stat_observations",
+        "Record values a Workflow measured itself (an API's counts) on manual Workspace Stats, without an agent "
+        "assessment. Each entry names its Stat by key; include its definition (name, value_type, unit, "
+        "collector_config) to configure the Stat on first use. A null value needs gaps saying why. "
+        "The same idempotency_key never records twice.",
+        {
+            "observations": {
+                "type": "array", "minItems": 1, "maxItems": _MAX_OBSERVATIONS,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string"},
+                        "value": {"type": ["number", "null"]},
+                        "idempotency_key": {"type": "string"},
+                        "evidence": {"type": "object"},
+                        "gaps": {"type": "array", "items": {"type": "string"}},
+                        "definition": {"type": "object"},
+                    },
+                    "required": ["key", "value", "idempotency_key"],
+                },
+            },
+        },
+        ["observations"],
+    ),
+    _schema(
+        "delete_workspace_stats",
+        "Permanently delete one family of Workspace Stats, with all their observations and collection "
+        "schedules: every Stat whose key starts with key_prefix (such as publication.<id>.), or every Stat "
+        "about one subject {kind, id} (such as a campaign project). Give exactly one.",
+        {"key_prefix": {"type": "string", "minLength": 3}, "subject": {"type": "object"}},
         [],
     ),
     _schema(
@@ -159,7 +195,7 @@ async def _selected_stats(
     if stat_ids:
         query = query.where(WorkspaceStat.id.in_(stat_ids))
     if prefix:
-        query = query.where(WorkspaceStat.key.startswith(prefix))
+        query = query.where(WorkspaceStat.key.startswith(prefix, autoescape=True))
     if subject is not None:
         query = query.where(WorkspaceStat.collector_config.contains({"subject": subject}))
     if after_id:
@@ -206,6 +242,128 @@ async def _context(db, entity_id: str, kwargs: dict[str, Any], *, write: bool):
     return context
 
 
+_DEFINITION_FIELDS = (
+    "name", "description", "value_type", "unit", "window", "collector_type", "collector_config",
+    "collection_cadence", "freshness_limit_seconds",
+)
+
+
+async def _configure(db, *, entity_id: str, workspace_id: str, params: dict[str, Any]) -> tuple[WorkspaceStat, bool]:
+    """Reuse the Stat this definition names, or create it; returns (stat, created)."""
+    key = str(params["key"]).strip().lower()
+    existing = await db.scalar(
+        select(WorkspaceStat).where(WorkspaceStat.workspace_id == workspace_id, WorkspaceStat.key == key)
+    )
+    definition = {field: params.get(field) for field in _DEFINITION_FIELDS if field in params}
+    if definition.get("collector_type") == "public_post":
+        definition["collector_config"] = normalize_public_post_config(definition["collector_config"])
+    # Display text and freshness policy never change what a Stat measures,
+    # so a reworded request reuses the Stat instead of conflicting with it.
+    identity = {
+        field: value
+        for field, value in definition.items()
+        if field not in {"name", "description", "freshness_limit_seconds"}
+    }
+    if definition.get("collector_type") == "public_post":
+        identity = {
+            "value_type": "number", "unit": None, "window": "latest", "collection_cadence": None,
+            **identity,
+        }
+        if existing is None:
+            # _context holds the Workspace lock through commit, serializing
+            # concurrent reconciliation without a scenario-specific identity.
+            existing = await db.scalar(select(WorkspaceStat).where(
+                WorkspaceStat.entity_id == entity_id,
+                WorkspaceStat.workspace_id == workspace_id,
+                *(getattr(WorkspaceStat, field) == value for field, value in identity.items()),
+            ).order_by(WorkspaceStat.created_at, WorkspaceStat.id).limit(1))
+    if existing is not None:
+        if existing.status != "active":
+            raise StatError("stat is inactive; use the native update API to change its status")
+        if any(getattr(existing, field) != value for field, value in identity.items()):
+            raise StatError("stat key already exists with a different definition; use the native update API")
+        return existing, False
+    stat = await create_stat(db, entity_id=entity_id, workspace_id=workspace_id, key=key, install_schedule=False,
+                             **definition)
+    return stat, True
+
+
+
+async def _record_observations(db, *, entity_id: str, workspace_id: str, params: dict[str, Any]) -> list[dict]:
+    """Write values a Workflow measured itself (an API's counts): no agent judges them.
+
+    Each entry names its Stat by key and may carry the Stat's definition, so the
+    first reading also configures it. Only manually collected Stats take values
+    this way; a collector or assessment Stat keeps its own path.
+    """
+    entries = params.get("observations")
+    if not isinstance(entries, list) or not 1 <= len(entries) <= _MAX_OBSERVATIONS:
+        raise StatError(f"observations must contain 1 to {_MAX_OBSERVATIONS} entries")
+    from packages.core.stats.service import record_observation
+
+    recorded = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not str(entry.get("key") or "").strip():
+            raise StatError("each observation needs a stat key")
+        idempotency_key = str(entry.get("idempotency_key") or "").strip()
+        if not idempotency_key or len(idempotency_key) > 200:
+            raise StatError("each observation needs an idempotency_key of at most 200 characters")
+        definition = entry.get("definition")
+        # An existing Stat keeps its own definition; the entry's only configures a missing one.
+        stat = await db.scalar(select(WorkspaceStat).where(
+            WorkspaceStat.entity_id == entity_id, WorkspaceStat.workspace_id == workspace_id,
+            WorkspaceStat.key == str(entry["key"]).strip().lower(),
+        ))
+        if stat is None:
+            if not isinstance(definition, dict) or (definition.get("collector_type") or "manual") != "manual":
+                raise StatError(f"stat {entry['key']!r} is not configured; include its manual definition")
+            stat, _ = await _configure(db, entity_id=entity_id, workspace_id=workspace_id,
+                                       params={**definition, "collector_type": "manual", "key": entry["key"]})
+        if stat.collector_type != "manual":
+            raise StatError(f"stat {stat.key!r} is collected by {stat.collector_type}, not recorded")
+        value = entry.get("value")
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
+            raise StatError(f"value for {stat.key!r} must be a number or null")
+        evidence = entry.get("evidence") if isinstance(entry.get("evidence"), dict) else {}
+        gaps = entry.get("gaps")
+        if gaps:
+            evidence = {**evidence, "gaps": [str(gap) for gap in gaps][:20]}
+        observation = await record_observation(
+            db, stat, value=value, source="workflow", evidence=evidence or None,
+            idempotency_key=f"workflow:{idempotency_key}",
+        )
+        recorded.append({"key": stat.key, "stat_id": stat.id, "observation_id": observation.id,
+                         "value": float(observation.value) if observation.value is not None else None,
+                         "observed_at": observation.observed_at.isoformat()})
+    return recorded
+
+
+async def _delete_stats(db, *, entity_id: str, workspace_id: str, params: dict[str, Any]) -> int:
+    """Delete one family of Stats (a key prefix, or one subject's) with observations and schedules."""
+    prefix = str(params.get("key_prefix") or "").strip().lower()
+    subject = params.get("subject")
+    if bool(prefix) == (subject is not None):
+        raise StatError("provide exactly one of key_prefix or subject")
+    # A selector names a family of Stats (publication.<post>., or one campaign's); never the whole Workspace.
+    if prefix and (len(prefix) < 3 or "." not in prefix):
+        raise StatError("key_prefix must name a family of stats, like publication.<id>.")
+    if subject is not None and (not isinstance(subject, dict) or not str(subject.get("kind") or "").strip()
+                                or not str(subject.get("id") or "").strip()):
+        raise StatError("subject needs a kind and an id")
+    from packages.core.stats.service import delete_stat
+
+    selector = (WorkspaceStat.key.startswith(prefix, autoescape=True) if prefix
+                else WorkspaceStat.collector_config.contains({"subject": {"kind": subject["kind"], "id": subject["id"]}}))
+    stats = list((await db.execute(select(WorkspaceStat).where(
+        WorkspaceStat.entity_id == entity_id, WorkspaceStat.workspace_id == workspace_id, selector,
+    ).limit(1001))).scalars())
+    if len(stats) > 1000:
+        raise StatError("the selector matches more than 1000 stats; name a narrower family")
+    for stat in stats:
+        await delete_stat(db, stat)
+    return len(stats)
+
+
 def _handler(name: str):
     async def handle(entity_id: str = "", **kwargs: Any) -> str:
         from packages.core.database import async_session
@@ -214,78 +372,26 @@ def _handler(name: str):
             try:
                 context = await _context(db, entity_id, kwargs, write=name != "query_workspace_stat_observations")
                 if name == "configure_workspace_stat":
-                    key = str(kwargs["key"]).strip().lower()
                     freshness_requested, requested_freshness_limit_seconds = _freshness_limit(kwargs)
-                    existing = await db.scalar(
-                        select(WorkspaceStat).where(
-                            WorkspaceStat.workspace_id == context.workspace_id, WorkspaceStat.key == key
-                        )
-                    )
-                    definition = {
-                        field: kwargs.get(field)
-                        for field in (
-                            "name",
-                            "description",
-                            "value_type",
-                            "unit",
-                            "window",
-                            "collector_type",
-                            "collector_config",
-                            "collection_cadence",
-                            "freshness_limit_seconds",
-                        )
-                        if field in kwargs
-                    }
-                    if definition.get("collector_type") == "public_post":
-                        definition["collector_config"] = normalize_public_post_config(definition["collector_config"])
-                    # Display text and freshness policy never change what a Stat measures,
-                    # so a reworded request reuses the Stat instead of conflicting with it.
-                    identity = {
-                        field: value
-                        for field, value in definition.items()
-                        if field not in {"name", "description", "freshness_limit_seconds"}
-                    }
-                    if definition.get("collector_type") == "public_post":
-                        identity = {
-                            "value_type": "number", "unit": None, "window": "latest", "collection_cadence": None,
-                            **identity,
-                        }
-                        if existing is None:
-                            # _context holds the Workspace lock through commit, serializing
-                            # concurrent reconciliation without a scenario-specific identity.
-                            existing = await db.scalar(select(WorkspaceStat).where(
-                                WorkspaceStat.entity_id == entity_id,
-                                WorkspaceStat.workspace_id == context.workspace_id,
-                                *(getattr(WorkspaceStat, field) == value for field, value in identity.items()),
-                            ).order_by(WorkspaceStat.created_at, WorkspaceStat.id).limit(1))
-                    if existing is not None:
-                        if existing.status != "active":
-                            raise StatError("stat is inactive; use the native update API to change its status")
-                        if any(getattr(existing, field) != value for field, value in identity.items()):
-                            raise StatError(
-                                "stat key already exists with a different definition; use the native update API"
-                            )
-                        return json.dumps(_configured_stat_response(
-                            existing,
-                            created=False,
-                            freshness_requested=freshness_requested,
-                            requested_freshness_limit_seconds=requested_freshness_limit_seconds,
-                        ))
-                    stat = await create_stat(
-                        db,
-                        entity_id=entity_id,
-                        workspace_id=context.workspace_id,
-                        key=key,
-                        install_schedule=False,
-                        **definition,
-                    )
+                    stat, created = await _configure(db, entity_id=entity_id, workspace_id=context.workspace_id,
+                                                     params=kwargs)
                     await db.commit()
                     return json.dumps(_configured_stat_response(
                         stat,
-                        created=True,
+                        created=created,
                         freshness_requested=freshness_requested,
                         requested_freshness_limit_seconds=requested_freshness_limit_seconds,
                     ))
+                if name == "record_workspace_stat_observations":
+                    recorded = await _record_observations(
+                        db, entity_id=entity_id, workspace_id=context.workspace_id, params=kwargs)
+                    await db.commit()
+                    return json.dumps({"observations": recorded}, default=str)
+                if name == "delete_workspace_stats":
+                    deleted = await _delete_stats(db, entity_id=entity_id, workspace_id=context.workspace_id,
+                                                  params=kwargs)
+                    await db.commit()
+                    return json.dumps({"deleted": deleted})
                 stats, next_cursor = await _selected_stats(
                     db, entity_id=entity_id, workspace_id=context.workspace_id, params=kwargs
                 )

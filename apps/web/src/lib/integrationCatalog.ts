@@ -11,6 +11,12 @@ export function integrationCatalogQueryOptions(enabled: boolean) {
     enabled,
     retry: 1,
     staleTime: 60_000,
+    // A failed read or a setup that could not be checked recovers by itself; nobody has to press retry.
+    refetchInterval: (query) => {
+      if (query.state.status === "error") return 15_000;
+      const rows = query.state.data;
+      return Array.isArray(rows) && rows.some((row) => row.setup_unavailable) ? 30_000 : false;
+    },
   });
 }
 

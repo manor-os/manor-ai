@@ -28,6 +28,7 @@ export const PendingActionKind = {
   WORKFLOW_INPUT: "workflow_input",
   WORKFLOW_APPROVAL: "workflow_approval",
   WORKFLOW_RETRY: "workflow_retry",
+  BLUEPRINT_UPDATE: "blueprint_update",
 } as const;
 
 export type PendingActionKindValue =

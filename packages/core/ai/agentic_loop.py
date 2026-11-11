@@ -57,6 +57,7 @@ from packages.core.ai.llm_client import (
     _llm_tool_schema_chars,
     _preflight_credit_check,
     llm_context_attribution_scope,
+    llm_round_settled_by_callback_scope,
 )
 from packages.core.ai.provider_retry import withheld_stream_events, withhold_stream_events
 from packages.core.ai.runtime.agentic_llm import (
@@ -205,12 +206,22 @@ FILE_VISUAL_HISTORY_IMAGE_TOKENS = 8_192
 # decoded image data. Retaining more than one such payload defeats the bounded
 # in-memory delivery contract even when the image count is small.
 FILE_VISUAL_HISTORY_MAX_BYTES = 15_000_000
+# Pixels of one image are sent at most this many times in a turn. Reading the
+# same frames again does not add evidence; it is the loop that evicts them.
+FILE_VISUAL_DELIVERIES_PER_IMAGE = 2
 LOOP_COMPACT_RATIO = float(os.environ.get("LOOP_COMPACT_RATIO", "0.75"))
 # A triggered compaction brings the request down to this share of the window.
 LOOP_COMPACT_TARGET_RATIO = float(os.environ.get("LOOP_COMPACT_TARGET_RATIO", "0.5"))
 # Fallback only: windows come from the called model (model_window(model=...)).
 MAX_CONTEXT_TOKENS = 128_000
 MAX_CONSECUTIVE_TRUNCATIONS = 3
+# Rounds in a row whose every call only repeated an earlier call's result
+# before the run is told it is going in circles (once per such streak).
+STALLED_ROUNDS_BEFORE_NOTICE = 3
+# A streak this long after the notice ends tool use: the turn answers from
+# what it already has instead of spending its whole round budget in circles.
+STALLED_ROUNDS_BEFORE_STOP = 6
+NO_PROGRESS_STOP = "no_progress"
 MAX_EMPTY_LLM_RESPONSES = 2
 MAX_OUTPUT_SCHEMA_RETRIES = 1
 MAX_PSEUDO_TOOL_MARKUP_RETRIES = 1
@@ -487,6 +498,55 @@ def _file_image_observation(
         ],
     }
     return observation, json.dumps(safe_payload, ensure_ascii=False, default=str)
+
+
+def _admit_file_visual_observation(
+    observation: dict[str, Any], safe_result: str, *,
+    round_identities: set[str], delivery_counts: dict[str, int],
+) -> tuple[dict[str, Any] | None, str]:
+    """Send pixels only when they can actually reach the next request.
+
+    The request keeps at most ``FILE_VISUAL_HISTORY_MAX_IMAGES`` images, so a
+    round that reads more would have its first images evicted before the model
+    ever sees them while their results still say delivered, and the model is
+    told to read them again. Reads past the per-round capacity, and reads of
+    an image already shown ``FILE_VISUAL_DELIVERIES_PER_IMAGE`` times this
+    turn, return a not-delivered status that says why and what to do instead.
+    """
+    try:
+        payload = json.loads(str(safe_result))
+    except (TypeError, json.JSONDecodeError):
+        return observation, safe_result
+    if not isinstance(payload, dict):
+        return observation, safe_result
+    identity = str(payload.get("source_sha256") or "") or hashlib.sha256(
+        json.dumps(observation, sort_keys=True).encode()
+    ).hexdigest()
+    if delivery_counts.get(identity, 0) >= FILE_VISUAL_DELIVERIES_PER_IMAGE:
+        payload["image"] = file_image_not_delivered(
+            "reread_limit",
+            deliveries_this_turn=delivery_counts[identity],
+            guidance=(
+                "This image was already shown to you in this turn. Use the observations you "
+                "recorded for it; if you did not record them, report that check as incomplete "
+                "instead of reading it again."
+            ),
+        )
+        return None, json.dumps(payload, ensure_ascii=False, default=str)
+    if identity not in round_identities and len(round_identities) >= FILE_VISUAL_HISTORY_MAX_IMAGES:
+        payload["image"] = file_image_not_delivered(
+            "round_image_limit",
+            max_images_per_round=FILE_VISUAL_HISTORY_MAX_IMAGES,
+            guidance=(
+                f"At most {FILE_VISUAL_HISTORY_MAX_IMAGES} images can be inspected per round. "
+                "Record your findings for the images you received, then read this one in a "
+                "later round."
+            ),
+        )
+        return None, json.dumps(payload, ensure_ascii=False, default=str)
+    round_identities.add(identity)
+    delivery_counts[identity] = delivery_counts.get(identity, 0) + 1
+    return observation, safe_result
 
 
 def _remember_file_visual_observation(
@@ -1472,7 +1532,8 @@ def _credit_exhausted_result(
             last_content = str(m["content"])
             break
     return AgenticResult(
-        content=last_content or f"[Credits exhausted: {exc}]",
+        # The limit's message is written for the user (and matches the notice).
+        content=last_content or str(exc),
         messages=messages,
         usage=usage,
         rounds=rounds,
@@ -2385,6 +2446,58 @@ class _ContextCompactionCancelled(Exception):
 
 class _AgenticTurnCancelled(Exception):
     """A user cancellation stops an in-flight tool without becoming a chat error."""
+
+
+class _RoundStreamMeter:
+    """Counts the text a round's provider call streamed before it was cut off.
+
+    It passes every event through and keeps the handler's declared withheld
+    events, so retry decisions about who has seen the output are unchanged.
+    """
+
+    def __init__(self, handler: Any) -> None:
+        self.text: list[str] = []
+        self.handler = None
+        if handler is not None:
+            async def metered(event_type: str, payload: dict[str, Any]) -> None:
+                if event_type == "text_delta":
+                    self.text.append(str((payload or {}).get("content") or ""))
+                await _emit_stream_event(handler, event_type, payload)
+
+            self.handler = withhold_stream_events(metered, withheld_stream_events(handler))
+
+    @property
+    def streamed(self) -> str:
+        return "".join(self.text)
+
+
+async def _settle_abandoned_round(
+    on_llm_usage_settled: Callable[..., Any] | None,
+    round_number: int,
+    *,
+    model: str | None,
+    llm_messages: list[dict] | None,
+    meter: _RoundStreamMeter | None,
+    billed: bool,
+) -> None:
+    """Settle a round whose provider call never returned a result.
+
+    A call the provider worked on is charged for what it billed: the request's
+    input tokens and the output that had streamed, estimated and flagged
+    ``partial``. A call that never reached the provider settles at zero, which
+    releases the credit its reservation held.
+    """
+    if on_llm_usage_settled is None:
+        return
+    usage: dict[str, Any] = {"prompt": 0, "completion": 0, "total": 0, "model": model, "abandoned": True}
+    if billed:
+        prompt = _estimate_tokens(llm_messages or [])
+        completion = runtime_estimate_tokens_for_text(meter.streamed if meter else "")
+        usage.update(prompt=prompt, completion=completion, total=prompt + completion, partial=True)
+    try:
+        await _invoke_llm_callback(on_llm_usage_settled, round_number, 0.0, usage)
+    except Exception:
+        logger.error("Unable to settle abandoned LLM round %d", round_number, exc_info=True)
 
 
 async def _await_cancellable(
@@ -4977,8 +5090,15 @@ async def _agentic_loop(
     initial_tool_calls_made: Optional[List[str]] = None,
     on_round_end: Optional[Callable[..., Any]] = None,
     on_round_end_strict: bool = False,
+    # Host-supplied updates to deliver between rounds; each is appended once.
+    # A text is a change to a running Task's instructions; a dict is a host
+    # notice delivered as written (the Workspace's rules changed).
+    incoming_updates: Optional[Callable[[], Awaitable[list[str | dict[str, Any]]]]] = None,
     tool_result_max_chars: int | None = None,
     turn_context: str | None = None,
+    # Repeated after the last tool result once tools ran: a long result
+    # otherwise buries the turn context the answer has to follow.
+    answer_reminder: str | None = None,
     gateway_tool_schemas: Optional[List[Dict[str, Any]]] = None,
     on_tool_start: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
     on_tool_end: Optional[Callable[..., Any]] = None,
@@ -5006,6 +5126,9 @@ async def _agentic_loop(
     capability_refresh_tool_names: frozenset[str] = frozenset(),
     hitl_resume_checkpoint: bool = False,
     tool_batch_planner: Optional[Callable[[List[Dict[str, Any]]], Awaitable[Any]]] = None,
+    # Sees each model call's text before it counts: it may shorten what stays in
+    # the transcript, withdraw the text, or send the model back with a note.
+    round_text_processor: Optional[Callable[..., Awaitable[Any]]] = None,
 ) -> AgenticResult:
     """
     Run an agentic loop: call the LLM with tools, execute any requested tools,
@@ -5157,6 +5280,16 @@ async def _agentic_loop(
         else None
     )
     resumed_checkpoint = checkpoint is not None
+    resource_failure = None
+    if checkpoint is not None and isinstance(checkpoint.pending_tool_result, dict):
+        stored = checkpoint.pending_tool_result
+        if (
+            stored.get("id") == checkpoint.pending_tool_call.get("id")
+            and stored.get("content") is not None
+            and isinstance(stored.get("terminal_failure"), str)
+            and stored.get("terminal_failure") in {"sandbox_allocation_failed", "sandbox_queue_timeout", "sandbox_capacity_timeout", "sandbox_runner_unavailable", "sandbox_allocation_rejected"}
+        ):
+            resource_failure = stored["terminal_failure"]
     seeded_transcript = (
         checkpoint is None
         and bool(initial_messages)
@@ -5360,6 +5493,7 @@ async def _agentic_loop(
                 raise
     consecutive_truncations = 0
     consecutive_empty_llm_responses = 0
+    stalled_rounds = 0
     reasoning_only_truncation_retries = 0
     search_injected_tool_names: set[str] = set()
     if checkpoint is not None:
@@ -5422,6 +5556,9 @@ async def _agentic_loop(
     # Replacing it on capture bounds memory and avoids replaying older images.
     latest_browser_visual_observations: list[dict[str, Any]] = []
     recent_file_visual_observations: list[dict[str, Any]] = []
+    file_visual_round_identities: set[str] = set()
+    file_visual_delivery_counts: dict[str, int] = {}
+    no_progress_stop = False
 
     def _model_accepts_images() -> bool | None:
         try:
@@ -5612,8 +5749,14 @@ async def _agentic_loop(
             if result is None:
                 from packages.core.ai.runtime.figure_provenance import delegation_figures_refusal
 
-                # A delegation brief must not hand children figures nobody gave.
-                if refusal := delegation_figures_refusal(name, public_args, messages):
+                from packages.core.ai.runtime.task_handoff import delegation_handoff_refusal
+
+                # Work handed to Tasks is not also done in Chat; a delegation
+                # brief must not hand children figures nobody gave.
+                if refusal := (
+                    delegation_handoff_refusal(name, public_args, messages)
+                    or delegation_figures_refusal(name, public_args, messages)
+                ):
                     result = RuntimePreflightValidationError(refusal)
             if result is None:
                 from packages.core.ai.runtime.tool_evidence import runtime_child_evidence_scope
@@ -5650,7 +5793,13 @@ async def _agentic_loop(
         if is_runtime_tool_suspension(result):
             return tool_call, result, duration_ms
         if tool_evidence is not None:
-            tool_evidence.observe_tool_result(name, str(tool_call.get("id") or ""), result, public_args)
+            from packages.core.ai.runtime.tool_evidence import runtime_split_children_settled
+
+            child_evidence, settled_by_children = runtime_split_children_settled(child_evidence)
+            tool_evidence.observe_tool_result(
+                name, str(tool_call.get("id") or ""), result, public_args,
+                settled_by_children=settled_by_children,
+            )
             if child_evidence:
                 # Delegated children feed the ledger, not the citable window.
                 tool_evidence.merge_child_observations(
@@ -5684,6 +5833,12 @@ async def _agentic_loop(
                 visual_observation, safe_result = _file_image_observation(
                     name, safe_result, model_accepts_images=_model_accepts_images(),
                 )
+                if visual_observation is not None:
+                    visual_observation, safe_result = _admit_file_visual_observation(
+                        visual_observation, safe_result,
+                        round_identities=file_visual_round_identities,
+                        delivery_counts=file_visual_delivery_counts,
+                    )
                 if visual_observation is not None:
                     _remember_file_visual_observation(
                         recent_file_visual_observations, visual_observation, safe_result,
@@ -6535,6 +6690,11 @@ async def _agentic_loop(
         # retaining its forced calls would execute the same request twice.
         forced_tool_calls = None
         resume_calls = [checkpoint.pending_tool_call, *checkpoint.remaining_tool_calls]
+        if resource_failure:
+            # Allocation already exhausted its retries. Retain the failed
+            # result but never run the pending call or its dependent suffix.
+            resume_calls = [checkpoint.pending_tool_call]
+            _trim_pending_assistant_calls(resume_calls)
         resumed_results: list[tuple[dict[str, Any], Any]] = []
         resumed_auto_tool_calls: list[dict[str, Any]] = []
         resumed_calls_allow_alternate_path = bool(resume_calls)
@@ -6768,6 +6928,10 @@ async def _agentic_loop(
         # as a stop, while best-effort chat observers retain their old policy.
         await _notify_round_end()
         checkpoint = None
+        if resource_failure:
+            tools = []
+            forced_tool_calls = None
+            max_rounds = rounds
 
     if (
         (seeded_transcript or resumed_checkpoint)
@@ -6799,9 +6963,30 @@ async def _agentic_loop(
             stop_reason="max_rounds",
         )
 
-    while rounds < max_rounds:
+    while rounds < max_rounds and not no_progress_stop:
+        file_visual_round_identities.clear()
         if await _cancel_requested():
             return _cancelled_result()
+        if incoming_updates is not None and rounds > 0:
+            try:
+                incoming = list(await incoming_updates() or [])
+            except Exception:  # noqa: BLE001 -- an unreadable update must not end the run
+                logger.warning("[agentic_loop] incoming update read failed", exc_info=True)
+                incoming = []
+            updates = [str(item).strip() for item in incoming if not isinstance(item, dict) and str(item).strip()]
+            for notice in (item for item in incoming if isinstance(item, dict)):
+                messages.append(runtime_host_feedback_message(notice))
+            if updates:
+                messages.append(runtime_host_feedback_message({
+                    "update": "The user changed this work after it started.",
+                    "changes": updates,
+                    "message": (
+                        "These override the brief and earlier Tasks' outputs. Redo what they "
+                        "affect before completing; do not deliver work based on what they replace. "
+                        "Re-read each deliverable in full: every figure derived from a changed value "
+                        "is recomputed, and no sentence keeps a replaced value."
+                    ),
+                }))
         if refreshed_capability_envelope is not None:
             # A search result earlier in the same batch may have contained an
             # old schema. Its observation stays in history, not in authority.
@@ -7218,6 +7403,8 @@ async def _agentic_loop(
         _llm_start = time.time()
         provider_started = False
         llm_request_bytes = 0
+        round_meter: _RoundStreamMeter | None = None
+        llm_messages = messages
         try:
             llm_messages = messages
             round_turn_context = turn_context
@@ -7245,6 +7432,8 @@ async def _agentic_loop(
                     window=model_window(metadata, MAX_CONTEXT_TOKENS, model=model),
                 ),
             ]
+            if answer_reminder and tool_calls_made:
+                llm_messages.append(runtime_host_feedback_message(answer_reminder))
             # Validate the actual outgoing request, including late language /
             # browser observations and lazy-loaded schemas, before reserving.
             if _estimate_request_tokens(llm_messages, request_tools) + output_reserve > model_window(metadata, MAX_CONTEXT_TOKENS, model=model):
@@ -7290,7 +7479,11 @@ async def _agentic_loop(
                     )
             # Estimated before the call so automatic billing can record it too.
             round_attribution = _estimate_context_attribution(messages, tools)
-            with llm_context_attribution_scope(round_attribution):
+            round_meter = _RoundStreamMeter(provider_stream_handler)
+            # The round's own call settles through on_llm_usage_settled; the
+            # scope keeps the automatic record off it, and only it.
+            with llm_context_attribution_scope(round_attribution), \
+                    llm_round_settled_by_callback_scope(on_llm_usage_settled is not None):
                 if force_output_schema_repair:
                     provider_started = True
                     content, usage = await _await_cancellable(
@@ -7298,7 +7491,7 @@ async def _agentic_loop(
                             llm_messages,
                             temperature=temperature,
                             model=model,
-                            stream_handler=provider_stream_handler,
+                            stream_handler=round_meter.handler,
                             metadata=metadata,
                             **({"response_format": final_response_contract.response_format}
                                if final_response_contract is not None else {}),
@@ -7316,7 +7509,7 @@ async def _agentic_loop(
                             tools,
                             temperature=temperature,
                             model=model,
-                            stream_handler=provider_stream_handler,
+                            stream_handler=round_meter.handler,
                             metadata=metadata,
                             **({"response_format": getattr(final_response_contract, "tool_response_format", final_response_contract.response_format)}
                                if final_response_contract is not None else {}),
@@ -7331,7 +7524,7 @@ async def _agentic_loop(
                             llm_messages,
                             temperature=temperature,
                             model=model,
-                            stream_handler=provider_stream_handler,
+                            stream_handler=round_meter.handler,
                             metadata=metadata,
                             **({"response_format": final_response_contract.response_format}
                                if final_response_contract is not None else {}),
@@ -7348,6 +7541,12 @@ async def _agentic_loop(
                     started_at=_llm_start,
                     request_bytes=llm_request_bytes,
                 )
+            # The credit gate refused before the provider was asked: nothing
+            # was billed, so the round's hold is released.
+            await _settle_abandoned_round(
+                on_llm_usage_settled, rounds, model=model, llm_messages=llm_messages,
+                meter=round_meter, billed=False,
+            )
             # Credits exhausted mid-loop — return partial result instead
             # of crashing. The caller (chat, worker, planner) sees the
             # error in result.error and can surface it to the user.
@@ -7367,6 +7566,12 @@ async def _agentic_loop(
                     started_at=_llm_start,
                     request_bytes=llm_request_bytes,
                 )
+            # A cancelled call the provider had started is billed for its
+            # input and whatever it streamed; the user is charged that part.
+            await _settle_abandoned_round(
+                on_llm_usage_settled, rounds, model=model, llm_messages=llm_messages,
+                meter=round_meter, billed=provider_started,
+            )
             return _cancelled_result()
         except Exception:
             if provider_started:
@@ -7376,6 +7581,12 @@ async def _agentic_loop(
                     started_at=_llm_start,
                     request_bytes=llm_request_bytes,
                 )
+            # Charged only when the provider visibly produced output; a
+            # refusal (rate limit, transport error) bills nothing.
+            await _settle_abandoned_round(
+                on_llm_usage_settled, rounds, model=model, llm_messages=llm_messages,
+                meter=round_meter, billed=provider_started and bool(round_meter and round_meter.text),
+            )
             raise
         _llm_duration_ms = (time.time() - _llm_start) * 1000
         usage_error = str((usage or {}).get("error") or "").strip()
@@ -7579,6 +7790,9 @@ async def _agentic_loop(
                     error="consecutive_truncations",
                 )
             # Skip executing the truncated tool calls — ask LLM to retry with smaller output
+            if round_text_processor is not None and stream_handler is not None:
+                # The processor never saw this call, so its text must not count.
+                await _emit_stream_event(stream_handler, "text_reset", {"discard_candidate": True})
             assistant_retry_msg: Dict[str, Any] = {
                 "role": "assistant",
                 "content": content or "",
@@ -7590,6 +7804,33 @@ async def _agentic_loop(
             continue
         else:
             consecutive_truncations = 0
+
+        round_text_feedback: str | None = None
+        context_text: str | None = None
+        if round_text_processor is not None and str(content or "").strip():
+            outcome = await round_text_processor(
+                content or "",
+                finish_reason=finish_reason,
+                has_tool_calls=bool(tool_calls),
+                messages=messages,
+            )
+            context_text = outcome.context_text
+            round_text_feedback = outcome.feedback
+            if stream_handler is not None:
+                if outcome.discard:
+                    await _emit_stream_event(stream_handler, "text_reset", {"discard_candidate": True})
+                elif outcome.accepted_operations or tool_calls or round_text_feedback:
+                    await _emit_stream_event(
+                        stream_handler, "text_commit", {"operations": list(outcome.accepted_operations)},
+                    )
+            if round_text_feedback and not tool_calls and rounds < max_rounds:
+                assistant_retry_msg = {"role": "assistant", "content": context_text}
+                _attach_reasoning_content(assistant_retry_msg, reasoning_content)
+                messages.append(assistant_retry_msg)
+                messages.append(runtime_host_feedback_message(round_text_feedback))
+                await _notify_round_end()
+                continue
+            content = outcome.reply_text if not tool_calls else context_text
 
         # -- No tool calls -> LLM is done --
         if not tool_calls:
@@ -8148,6 +8389,7 @@ async def _agentic_loop(
         for tc, full_result in results:
             _note_chrome_tabs_finalized(tc["name"], full_result)
         _drop_chrome_tools_after_finalize()
+        repeated_calls = 0
         for tc, full_result in results:
             tool_calls_made.append(tc["name"])
             result_str = str(full_result) if full_result is not None else ""
@@ -8359,6 +8601,7 @@ async def _agentic_loop(
                     result_str,
                     result_digest,
                 )
+                repeated_calls += 1
             else:
                 seen_tool_result_digests[dedupe_key] = result_digest
 
@@ -8368,6 +8611,30 @@ async def _agentic_loop(
                 "tool_call_id": tc["id"],
                 "content": result_str,
             })
+
+        if round_text_feedback:
+            messages.append(runtime_host_feedback_message(round_text_feedback))
+
+        # A round in which every call only returned what the same call returned
+        # before learned nothing; several in a row is a loop the model does not
+        # see from inside. Tell it once per streak, as a fact it can act on.
+        stalled_rounds = stalled_rounds + 1 if results and repeated_calls == len(results) else 0
+        if stalled_rounds == STALLED_ROUNDS_BEFORE_NOTICE:
+            messages.append(runtime_host_feedback_message({
+                "notice": "no_progress",
+                "message": (
+                    f"Your last {stalled_rounds} rounds only repeated calls whose results you "
+                    "already had, so nothing changed. Do not call them again. Use what you "
+                    "have, change the approach (other arguments, another tool), or finish "
+                    "and state what is still missing."
+                ),
+            }))
+        elif stalled_rounds >= STALLED_ROUNDS_BEFORE_STOP:
+            logger.warning(
+                "[agentic_loop] Round %d: %d rounds without progress; ending tool use",
+                rounds, stalled_rounds,
+            )
+            no_progress_stop = True
 
         _drop_chrome_tools_after_finalize()
         terminal_control = (
@@ -8432,14 +8699,32 @@ async def _agentic_loop(
             return messages
         await _notify_round_end()
 
-    # Exhausted max_rounds -- return whatever we have
+    if await _cancel_requested():
+        return _cancelled_result()
+
+    # Exhausted rounds or a host-finalized resource failure: explanation only.
     logger.warning(
-        "[agentic_loop] Hit max_rounds=%d with %d tool calls. Forcing final response.",
-        max_rounds, len(tool_calls_made),
+        "[agentic_loop] Final-only response reason=%s after %d rounds and %d tool calls.",
+        resource_failure or ("no_progress" if no_progress_stop else "max_rounds"), rounds, len(tool_calls_made),
     )
 
     # One last LLM call without tools to get a final summary
-    messages.append(runtime_host_feedback_message(runtime_agentic_max_rounds_final_prompt()))
+    final_prompt = (
+        "The required execution environment is unavailable and execution has stopped. "
+        "Use the original request, completed tool results and the final failure to write a concise "
+        "reply in the user's language. Explain what was completed, what could not be completed, "
+        "and a practical next step. Do not repeat sensitive form entries, expose internal codes "
+        "or logs, claim an unfinished file was delivered, or promise an automatic retry. "
+        "Do not ask the user to supply information already in this conversation. "
+        "This is a final explanation only; no further tools can run."
+        if resource_failure else (
+            "Your recent rounds only repeated calls whose results you already had, so tool use "
+            "has stopped. Write your final response from what you recorded. Do not claim a check "
+            "you did not complete; name what is still unverified."
+            if no_progress_stop else runtime_agentic_max_rounds_final_prompt()
+        )
+    )
+    messages.append(runtime_host_feedback_message(final_prompt))
     final_output_reserve = max_tokens if max_tokens is not None else runtime_agentic_output_tokens(
         final_metadata or metadata, model=final_model or model, tools=False,
     )
@@ -8477,6 +8762,8 @@ async def _agentic_loop(
             window=model_window(final_metadata or metadata, MAX_CONTEXT_TOKENS, model=final_model or model),
         ),
     ]
+    if answer_reminder:
+        final_llm_messages.append(runtime_host_feedback_message(answer_reminder))
     if _estimate_request_tokens(final_llm_messages, []) + output_reserve > model_window(final_metadata or metadata, MAX_CONTEXT_TOKENS, model=final_model or model):
         final_llm_messages = await compact_runtime_messages(
             final_llm_messages, final_model or model, temperature,
@@ -8523,7 +8810,8 @@ async def _agentic_loop(
             )
     final_attribution = _estimate_context_attribution(messages, [])
     try:
-        with llm_context_attribution_scope(final_attribution):
+        with llm_context_attribution_scope(final_attribution), \
+                llm_round_settled_by_callback_scope(on_llm_usage_settled is not None):
             final_content, final_usage = await runtime_execute_agentic_final_completion(
                 final_llm_messages,
                 temperature=temperature,
@@ -8539,6 +8827,12 @@ async def _agentic_loop(
             outcome="failure",
             started_at=_llm_start,
             request_bytes=final_request_bytes,
+        )
+        # Provider failures come back as usage, so an exception here never
+        # produced a billed answer: release the final round's hold.
+        await _settle_abandoned_round(
+            on_llm_usage_settled, rounds + 1, model=final_model or model,
+            llm_messages=final_llm_messages, meter=None, billed=False,
         )
         raise
     _llm_duration_ms = (time.time() - _llm_start) * 1000
@@ -8605,7 +8899,7 @@ async def _agentic_loop(
     if final_response_contract is not None:
         decision = await validate_final_response(
             final_response_contract, final_content or "",
-            FinalResponseContext(allow_execution=False, stop_reason="max_rounds", budget_exhausted=True),
+            FinalResponseContext(allow_execution=False, stop_reason="error" if resource_failure else "max_rounds", budget_exhausted=not resource_failure),
         )
         if decision.action is not FinalResponseAction.ACCEPT:
             return AgenticResult(
@@ -8646,8 +8940,13 @@ async def _agentic_loop(
         usage=total_usage,
         rounds=rounds + 1,
         tool_calls_made=tool_calls_made,
-        **pseudo_markup_fields,
-        stop_reason="max_rounds",
+        **{
+            **({"error": resource_failure} if resource_failure else {}),
+            # Still a spent budget for callers, but not one more rounds would fix.
+            **({"error_detail": {"stop": NO_PROGRESS_STOP}} if no_progress_stop else {}),
+            **pseudo_markup_fields,
+        },
+        stop_reason="error" if resource_failure else "max_rounds",
         control={"execution_evidence": list(final_evidence)} if final_evidence else None,
         outcome=final_outcome,
     )

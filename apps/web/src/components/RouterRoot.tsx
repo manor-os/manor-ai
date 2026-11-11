@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { Outlet, useNavigate } from "react-router-dom";
 import DetailDrawer from "./ui/DetailDrawer";
+import IntegrationConnectHost from "./integrations/IntegrationConnectHost";
 import { COLLABORATION_ENDED_EVENT, takeCollaborationEnded } from "../lib/persistentSession";
 import { t } from "../lib/i18n";
 import { useToastStore } from "../stores/toast";
@@ -29,6 +30,7 @@ export default function RouterRoot() {
     <>
       <Outlet />
       <DetailDrawer />
+      <IntegrationConnectHost />
     </>
   );
 }

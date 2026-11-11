@@ -101,8 +101,7 @@ test("a direct Workflow Automation link respects the disabled Workflow surface",
 test("a generic Automation result is immediately visible without linked Agent or Workflow output", async ({ page }) => {
   await openFixture(page, 390, "generic");
   await expect(page.getByText("Daily automation report", { exact: true })).toBeVisible();
-  await expect(page.getByText("Message: The generic automation result is ready.", { exact: true })).toBeVisible();
-  await expect(page.locator("details").filter({ hasText: "The generic automation result is ready." })).toHaveAttribute("open", "");
+  await expect(page.getByText("The generic automation result is ready.", { exact: true })).toBeVisible();
   await expect(page.getByRole("status", { name: "Run detail reads" })).not.toHaveText("0");
   await expect(page.getByRole("status", { name: "Workflow reads" })).toHaveText("0");
   await expect(page.getByRole("status", { name: "Dispatch requests" })).toHaveText("0");

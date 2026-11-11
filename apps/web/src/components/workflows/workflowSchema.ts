@@ -66,7 +66,13 @@ export interface WorkflowInputSchema {
      * the audio chosen in ``audio_field``.
      */
     control?: "textarea" | "line_list" | "workflow_project_select" | "documents" | "knowledge_file" | "timezone" | "record_select"
-      | "range" | "segmented" | "aspect" | "audio_clip";
+      | "range" | "segmented" | "aspect" | "audio_clip"
+      | "date_range" | "tags" | "color" | "rating" | "rich_text" | "address" | "signature" | "line_items";
+    /**
+     * "documents": open the phone's camera ("environment" back, "user" front)
+     * or microphone (with ``accept:['audio']``) instead of the file chooser first.
+     */
+    capture?: "environment" | "user" | boolean;
     /** "audio_clip": the sibling input (``documents`` or ``knowledge_file``) that holds the audio. */
     audio_field?: string;
     /** "audio_clip": the window's length when nothing is picked yet, in seconds. */
@@ -76,6 +82,15 @@ export interface WorkflowInputSchema {
     max_seconds?: number;
     /** "audio_clip": also offer letting the AI pick the part; the value then holds ``auto: true``. */
     allow_auto?: boolean;
+    /**
+     * Ask this input only while a sibling input holds ``equals`` (one value or
+     * a list of values), e.g. the settings shown once "Set it myself" is picked
+     * instead of letting the AI decide; or, with ``filled``, only while the
+     * sibling has an answer (``true``) or none (``false``), e.g. the styles
+     * hidden once the user uploads their own video. A hidden input goes back
+     * to its default.
+     */
+    visible_when?: { field: string; equals?: unknown; filled?: boolean };
     /** A yes/no choice that stands for a service ("youtube"): its logo is shown beside the label. */
     provider?: string;
     /** "range": the slider's step. */
@@ -135,12 +150,151 @@ export interface WorkflowSchemaValidationMessages {
   exclusiveMaximum: (maximum: number) => string;
   /** Names the fields one of which must be filled (an ``anyOf`` of required fields). */
   anyOfRequired: (fields: string[]) => string;
+  /** Format-specific messages; ``invalidFormat`` when a caller gives none. */
+  invalidEmail?: string;
+  invalidPhone?: string;
+  invalidColor?: string;
+  /** A date range whose end is before its start. */
+  dateRangeOrder?: string;
 }
 
 export interface WorkflowSchemaFieldIdSet {
   fieldId: string;
   helpId: string;
   errorId: string;
+}
+
+/* ── Form control value rules (format / x-ui.control); the server checks the same
+ * rules in packages/core/contracts/json_schema.py. Kept in this module so it stays
+ * free of imports. ── */
+
+/** A phone number as people write it: digits, spaces, dashes, dots, brackets, an optional leading +. */
+export function isValidPhone(value: string): boolean {
+  const text = value.trim();
+  const digits = text.replace(/\D/g, "").length;
+  return /^\+?[0-9 ()./-]{6,24}$/.test(text) && digits >= 6 && digits <= 15;
+}
+
+export function isValidEmail(value: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
+}
+
+/** A colour as the picker stores it: ``#RRGGBB``. */
+export function isValidHexColor(value: string): boolean {
+  return /^#[0-9A-Fa-f]{6}$/.test(value.trim());
+}
+
+/** ``#abc`` / ``abc`` / ``#AABBCC`` as ``#aabbcc``; anything else unchanged. */
+export function normalizeHexColor(value: string): string {
+  const text = value.trim().replace(/^#?/, "#");
+  if (/^#[0-9A-Fa-f]{3}$/.test(text)) {
+    return `#${text.slice(1).split("").map((char) => char + char).join("")}`.toLowerCase();
+  }
+  return isValidHexColor(text) ? text.toLowerCase() : value;
+}
+
+/** The steps of a rating control: ``minimum``..``maximum``, 1..5 when unset. */
+export function ratingScale(schema: { minimum?: number; maximum?: number } | undefined): number[] {
+  const low = Math.max(0, Math.round(schema?.minimum ?? 1));
+  const high = Math.min(10, Math.round(schema?.maximum ?? 5));
+  return high >= low ? Array.from({ length: high - low + 1 }, (_, index) => low + index) : [];
+}
+
+/** The chips of a tag control, from its line-list draft. */
+export function tagList(draft: unknown): string[] {
+  const values = Array.isArray(draft) ? draft : String(draft ?? "").split(/\r?\n/);
+  const seen = new Set<string>();
+  return values.map((value) => String(value ?? "").trim()).filter((value) => {
+    if (!value || seen.has(value.toLowerCase())) return false;
+    seen.add(value.toLowerCase());
+    return true;
+  });
+}
+
+/**
+ * Text typed into a tag box becomes tags at each comma or line break (also
+ * the Chinese comma and enumeration mark); ``rest`` is what stays in the box.
+ */
+export function splitTagText(text: string, commit = false): { tags: string[]; rest: string } {
+  const parts = text.split(/[,，、\n]/);
+  const rest = commit ? "" : parts.pop() ?? "";
+  return { tags: parts.map((part) => part.trim()).filter(Boolean), rest };
+}
+
+/** Add tags to a line-list draft, keeping the first spelling of each. */
+export function addTags(draft: unknown, tags: string[]): string {
+  return tagList([...tagList(draft), ...tags]).join("\n");
+}
+
+export function removeTag(draft: unknown, tag: string): string {
+  return tagList(draft).filter((value) => value !== tag).join("\n");
+}
+
+/** Where an address opens on a map (no map picking: Manor has no maps service). */
+export function mapsSearchUrl(address: string): string | null {
+  const query = address.trim().replace(/\s+/g, " ");
+  return query ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}` : null;
+}
+
+/** Whether a date range's end comes before its start (ISO dates or moments). */
+export function dateRangeReversed(start: unknown, end: unknown): boolean {
+  if (typeof start !== "string" || typeof end !== "string" || !start || !end) return false;
+  if (start.length === 10 && end.length === 10) return end < start;
+  const startTime = Date.parse(start);
+  const endTime = Date.parse(end);
+  return Number.isFinite(startTime) && Number.isFinite(endTime) && endTime < startTime;
+}
+
+/** A line-item column as the row editor draws it. */
+export interface LineItemColumn {
+  key: string;
+  label: string;
+  kind: "text" | "number" | "integer" | "select";
+  options?: string[];
+}
+
+interface ColumnSchema {
+  type?: string | string[];
+  title?: string;
+  enum?: unknown[];
+  properties?: Record<string, ColumnSchema>;
+  "x-ui"?: { order?: string[] };
+}
+
+/** The columns of a ``line_items`` control: its row object's properties, in declared order. */
+export function lineItemColumns(items: ColumnSchema | undefined): LineItemColumn[] {
+  const properties = items?.properties || {};
+  const order = items?.["x-ui"]?.order || [];
+  const keys = [...order.filter((key) => key in properties), ...Object.keys(properties).filter((key) => !order.includes(key))];
+  return keys.map((key) => {
+    const cell = properties[key] || {};
+    const declared = Array.isArray(cell.type) ? cell.type.find((type) => type !== "null") : cell.type;
+    const kind: LineItemColumn["kind"] = Array.isArray(cell.enum) && cell.enum.length
+      ? "select" : declared === "number" || declared === "integer" ? declared : "text";
+    return { key, label: cell.title || key, kind, ...(kind === "select" ? { options: (cell.enum || []).map(String) } : {}) };
+  });
+}
+
+/** A row draft with nothing typed in any cell; such rows are dropped on submit. */
+export function lineItemRowBlank(row: unknown): boolean {
+  if (!row || typeof row !== "object") return true;
+  return Object.values(row as Record<string, unknown>).every((cell) => cell === undefined || cell === null || String(cell).trim() === "");
+}
+
+/** The running total of a numeric column, or null when no row has a number there. */
+export function lineItemTotal(rows: unknown, key: string): number | null {
+  if (!Array.isArray(rows)) return null;
+  let total = 0;
+  let counted = false;
+  for (const row of rows) {
+    const raw = row && typeof row === "object" ? (row as Record<string, unknown>)[key] : undefined;
+    const number = typeof raw === "number" ? raw : raw === undefined || raw === null || String(raw).trim() === "" ? NaN : Number(raw);
+    if (Number.isFinite(number)) {
+      total += number;
+      counted = true;
+    }
+  }
+  return counted ? Math.round(total * 100) / 100 : null;
 }
 
 /** The blanks a preset leaves for the person to fill, e.g. "[audience]". */
@@ -274,7 +428,13 @@ export function workflowSchemaDraft(
     // The documents control owns structured document references rather than a
     // JSON text draft. Keep prefilled references as an array so the picker can
     // render and submit them without a lossy stringify/parse round trip.
-    if (schema["x-ui"]?.control === "documents" && Array.isArray(source)) {
+    // Rows of an order or quote are drafted row by row, each cell as the person types it.
+    if (schema["x-ui"]?.control === "line_items" && schema.items && workflowSchemaType(schema.items) === "object") {
+      return Array.isArray(source) ? source.map((row) => workflowSchemaDraft(schema.items!, row, timeZone)) : [];
+    }
+    if (schema["x-ui"]?.control === "documents" || schema["x-ui"]?.control === "signature") {
+      // Nothing picked yet is an empty list, so it reads as unanswered (x-ui.visible_when filled).
+      if (!Array.isArray(source)) return [];
       // A prefill may name one file several times (e.g. search excerpts).
       const seen = new Set<string>();
       return source.filter((item) => {
@@ -457,6 +617,45 @@ export function workflowSchemaPreset(schema: WorkflowInputSchema | undefined, va
   return preset && typeof preset === "object" && !Array.isArray(preset) ? preset as Record<string, unknown> : {};
 }
 
+/** Whether a draft answer is given: a picked file or list, or text that is not blank. */
+function answerGiven(value: unknown): boolean {
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "string") return value.trim() !== "";
+  return value !== null && value !== undefined;
+}
+
+function visibleWhenHolds(rule: { field: string; equals?: unknown; filled?: boolean }, value: unknown): boolean {
+  if (typeof rule.filled === "boolean") return answerGiven(value) === rule.filled;
+  const wanted = Array.isArray(rule.equals) ? rule.equals : [rule.equals];
+  // Drafts hold text and checkboxes; "true" and true are the same answer.
+  return wanted.some((option) => String(option ?? "") === String(value ?? ""));
+}
+
+/** Whether an input is asked, given the values of its level (``x-ui.visible_when``). */
+export function workflowSchemaFieldShown(schema: WorkflowInputSchema | undefined, siblings: unknown): boolean {
+  const rule = schema?.["x-ui"]?.visible_when;
+  if (!rule?.field) return true;
+  return visibleWhenHolds(rule, asRecord(siblings)?.[rule.field]);
+}
+
+/**
+ * The inputs a new value of ``key`` hides, each with its default draft: an
+ * input that is no longer asked must not carry an answer nobody can see.
+ */
+export function workflowSchemaHiddenResets(
+  schema: WorkflowInputSchema,
+  key: string,
+  value: unknown,
+  timeZone?: string,
+): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(schema.properties || {}).flatMap(([field, child]) => {
+    const rule = child["x-ui"]?.visible_when;
+    return rule?.field === key && !visibleWhenHolds(rule, value)
+      ? [[field, workflowSchemaDraft(child, undefined, timeZone)]]
+      : [];
+  }));
+}
+
 /** "9:16" as width and height, or null for an option that is not a ratio ("auto"). */
 export function workflowAspectRatio(value: string): [number, number] | null {
   const match = /^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/.exec(value.trim());
@@ -486,6 +685,91 @@ export function workflowSchemaRecordSelect(
   const schemaType = workflowSchemaType(schema);
   if (schemaType === "array" && workflowSchemaType(schema?.items) === "string") return { multiple: true };
   return schemaType === "string" ? { multiple: false } : null;
+}
+
+/**
+ * A `workflow_project_select` field: Workspace records of one `project_type`,
+ * one (a string) or several (an array of strings), stored as project ids.
+ */
+export function workflowSchemaProjectSelect(
+  schema: WorkflowInputSchema | undefined,
+): { multiple: boolean } | null {
+  const ui = schema?.["x-ui"];
+  if (ui?.control !== "workflow_project_select" || !String(ui.project_type || "").trim()) return null;
+  const schemaType = workflowSchemaType(schema);
+  if (schemaType === "array" && workflowSchemaType(schema?.items) === "string") return { multiple: true };
+  return schemaType === "string" ? { multiple: false } : null;
+}
+
+/**
+ * The control a field gets. One vocabulary for every form (Workflow run
+ * inputs, input waits, chat questions, retry variables) on web and phone:
+ *
+ * | schema | control |
+ * |---|---|
+ * | object (other than below) | ``group`` of its fields |
+ * | ``x-ui.control`` knowledge_file / audio_clip / documents / signature / timezone | that control |
+ * | ``enum`` with ``x-enum-images`` | ``picture_choice`` |
+ * | ``enum`` + control segmented / aspect | ``segmented`` / ``aspect`` |
+ * | control workflow_project_select (string / string array) | ``project`` / ``project_multi`` |
+ * | control record_select (string / string array) | ``record`` / ``record_multi`` |
+ * | array of ``enum`` strings | ``multi_select`` |
+ * | string array + control tags | ``tags`` |
+ * | object array + control line_items | ``line_items`` |
+ * | object + control date_range | ``date_range`` (``{start, end}``) |
+ * | boolean | ``boolean`` (a switch) |
+ * | format date / date-time | ``date`` / ``date_time`` |
+ * | ``enum`` | ``select`` |
+ * | integer/number + control rating | ``rating`` (1..5 unless min/max say) |
+ * | number + control range with min and max | ``range`` |
+ * | number / integer | ``number`` |
+ * | string + control color / rich_text / address | that control |
+ * | format email / phone / uri | ``email`` / ``phone`` / ``url`` |
+ * | string array, control textarea / line_list | ``list`` / ``textarea`` |
+ * | anything else | ``text`` |
+ */
+export type WorkflowSchemaControl =
+  | "group" | "knowledge_file" | "audio_clip" | "documents" | "signature" | "timezone" | "picture_choice"
+  | "segmented" | "aspect" | "project" | "project_multi" | "record" | "record_multi" | "multi_select"
+  | "tags" | "line_items" | "date_range" | "boolean" | "date" | "date_time" | "select" | "rating" | "range"
+  | "number" | "color" | "rich_text" | "address" | "email" | "phone" | "url" | "list" | "textarea" | "text";
+
+export function workflowSchemaControl(schema: WorkflowInputSchema | undefined): WorkflowSchemaControl {
+  const ui = schema?.["x-ui"] || {};
+  const control = ui.control;
+  const schemaType = workflowSchemaType(schema);
+  if (schemaType === "object") return control === "audio_clip" ? "audio_clip" : control === "date_range" ? "date_range" : "group";
+  // Drafted as JSON text whatever its shape.
+  if (schema?.["x-workflow-type"] === "json") return "textarea";
+  if (control === "knowledge_file" && ui.file_kind) return "knowledge_file";
+  if (control === "documents") return "documents";
+  if (control === "signature" && schemaType === "array") return "signature";
+  if (schema?.enum?.length && Array.isArray(schema["x-enum-images"])) return "picture_choice";
+  if ((control === "segmented" || control === "aspect") && schema?.enum?.length) return control;
+  const project = workflowSchemaProjectSelect(schema);
+  if (project) return project.multiple ? "project_multi" : "project";
+  const record = workflowSchemaRecordSelect(schema);
+  if (record) return record.multiple ? "record_multi" : "record";
+  if (workflowSchemaChoices(schema)) return "multi_select";
+  if (schemaType === "array" && control === "tags" && workflowSchemaType(schema?.items) === "string") return "tags";
+  if (schemaType === "array" && control === "line_items" && workflowSchemaType(schema?.items) === "object") return "line_items";
+  if (schemaType === "boolean" && !schema?.enum) return "boolean";
+  if (control === "timezone") return "timezone";
+  if (schema?.format === "date-time") return "date_time";
+  if (schema?.format === "date") return "date";
+  if (schema?.enum) return "select";
+  if (schemaType === "number" || schemaType === "integer") {
+    if (control === "rating") return "rating";
+    if (control === "range" && typeof schema?.minimum === "number" && typeof schema?.maximum === "number") return "range";
+    return "number";
+  }
+  if (schemaType === "array") return "list";
+  if (control === "color" || control === "rich_text" || control === "address") return control;
+  if (schema?.format === "email") return "email";
+  if (schema?.format === "phone") return "phone";
+  if (schema?.format === "uri") return "url";
+  if (control === "textarea" || control === "line_list") return "textarea";
+  return "text";
 }
 
 /** The chosen values of a multi-choice draft (a line list or an array). */
@@ -677,6 +961,37 @@ export function parseWorkflowSchemaDraft(
     }
   }
   const schemaType = workflowSchemaType(schema);
+  const control = schema["x-ui"]?.control;
+  if (schemaType === "object" && control === "date_range") {
+    // One answer, two dates: blank is unanswered, and the end never comes first.
+    if (draftIsBlank(draft)) {
+      if (required) errors[path] = messages.required;
+      return undefined;
+    }
+    const range = asRecord(draft) || {};
+    const parsed: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(schema.properties || {})) {
+      const value = parseWorkflowSchemaDraft(child, range[key], `${path}.${key}`, true, errors, messages);
+      if (value !== undefined) parsed[key] = value;
+    }
+    if (dateRangeReversed(parsed.start, parsed.end)) {
+      errors[path] = messages.dateRangeOrder || messages.invalidFormat;
+      return undefined;
+    }
+    return parsed;
+  }
+  if (schemaType === "array" && control === "line_items" && schema.items && workflowSchemaType(schema.items) === "object") {
+    // Rows nobody typed into are left out; each kept row is checked cell by cell.
+    const rows = (Array.isArray(draft) ? draft : []).filter((row) => !lineItemRowBlank(row));
+    const parsed = rows.map((row, index) => {
+      const value = asRecord(parseWorkflowSchemaDraft(schema.items!, row, `${path}.${index}`, true, errors, messages)) || {};
+      // An empty cell is absent, not an empty number.
+      return Object.fromEntries(Object.entries(value).filter(([, cell]) => cell !== ""));
+    });
+    validateArrayConstraints(schema, parsed, rows.length > 0, path, required, errors, messages);
+    if (required && rows.length === 0) errors[path] ??= messages.required;
+    return parsed;
+  }
   if (schemaType === "object") {
     // An optional group inside a form, left untouched, is absent: its own
     // required fields only apply once the person starts filling it in. The
@@ -760,6 +1075,21 @@ export function parseWorkflowSchemaDraft(
       return undefined;
     }
   }
+  if (schemaType === "string" && schema.format === "email" && !isValidEmail(raw)) {
+    errors[path] = messages.invalidEmail || messages.invalidFormat;
+    return undefined;
+  }
+  if (schemaType === "string" && schema.format === "phone" && !isValidPhone(raw)) {
+    errors[path] = messages.invalidPhone || messages.invalidFormat;
+    return undefined;
+  }
+  if (schemaType === "string" && control === "color") {
+    raw = normalizeHexColor(raw);
+    if (!isValidHexColor(raw)) {
+      errors[path] = messages.invalidColor || messages.invalidFormat;
+      return undefined;
+    }
+  }
   if (schemaType === "string" && schema.format === "uri") {
     raw = withUrlScheme(raw);
     try {
@@ -826,7 +1156,7 @@ export function parseWorkflowSchemaDraft(
 
 export function visibleWorkflowSchemaFieldCount(schema?: WorkflowInputSchema): number {
   if (!schema || schema["x-ui"]?.hidden) return 0;
-  if (workflowSchemaType(schema) !== "object") return 1;
+  if (workflowSchemaType(schema) !== "object" || workflowSchemaControl(schema) === "date_range") return 1;
   return Object.values(schema.properties || {}).reduce(
     (total, child) => total + visibleWorkflowSchemaFieldCount(child),
     0,

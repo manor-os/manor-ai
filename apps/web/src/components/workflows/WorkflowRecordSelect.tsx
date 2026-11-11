@@ -137,8 +137,54 @@ export default function WorkflowRecordSelect({
       />
     );
   }
-  // Several records: picked ones as removable chips, the rest behind one
-  // searchable dropdown, so a long Ledger never turns into a long form.
+  return (
+    <WorkflowRecordChoices
+      id={id}
+      options={listed}
+      value={value}
+      disabled={disabled}
+      required={required}
+      describedBy={describedBy}
+      invalid={invalid}
+      label={label}
+      onChange={onChange}
+    />
+  );
+}
+
+export interface WorkflowRecordOption {
+  value: string;
+  label: string;
+  description?: string | null;
+}
+
+/**
+ * Several records: picked ones as removable chips, the rest behind one
+ * searchable dropdown, so a long list never turns into a long form. The value
+ * is a line list of the picked values, in the options' order.
+ */
+export function WorkflowRecordChoices({
+  id,
+  options: listed,
+  value,
+  disabled,
+  required,
+  describedBy,
+  invalid,
+  label,
+  onChange,
+}: {
+  id: string;
+  options: WorkflowRecordOption[];
+  value: unknown;
+  disabled?: boolean;
+  required: boolean;
+  describedBy?: string;
+  invalid: boolean;
+  label: string;
+  onChange: (value: string) => void;
+}) {
+  const chosen = workflowSchemaChosen(value);
   const order = listed.map((item) => item.value);
   const picked = listed.filter((item) => chosen.has(item.value));
   const toggle = (option: string, checked: boolean) => onChange(

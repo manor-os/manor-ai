@@ -24,7 +24,7 @@ from packages.core.blueprints.freshness import (
     blueprint_upgrade_unsupported_fingerprint,
 )
 from packages.core.blueprints.upgrade import (
-    BlueprintUpgradePlanChangedError, LIVE_SETUP_STATE_KEYS,
+    BlueprintUpgradePlanChangedError, LIVE_SETUP_STATE_KEYS, legacy_restore_point,
 )
 from packages.core.blueprints.registry import PACKAGE_RECORD_KEY, sync_installed_package
 from packages.core.blueprints.upgrade_activity import active_runs
@@ -163,9 +163,10 @@ async def plan(db, *, workspace, payload, source_payload=None, current_version=N
         "workspace_id": workspace.id, "revision": state.revision if state else None,
         "items": items, "upstream": upstream, "version": current_version,
         "channels": channel_config_ids or {}, "record": _metadata(workspace),
+        "usage_guide": (payload.get("manifest") or {}).get("usage_guide"),
         "routing": await _routing_state(db, workspace=workspace),
     }
-    point = (state.restore_point if state else None) or record.get("restore_point")
+    point = state.restore_point if state else None
     return {
         "upgrade_protocol_version": PROTOCOL_VERSION,
         "blueprint_fingerprint": upstream, "plan_fingerprint": fingerprint(material),
@@ -188,14 +189,17 @@ def public_plan(value):
     return {key: item for key, item in value.items() if not key.startswith("_")}
 
 
-def _metadata(workspace):
+def _metadata(workspace, *, include_usage_guide=True):
     settings = workspace.settings or {}
     record = settings.get(BLUEPRINT_SETTINGS_KEY) or {}
-    return {
+    result = {
         "record": {key: deepcopy(record[key]) for key in RECORD_KEYS if key in record},
         "settings": {key: deepcopy(settings[key]) for key in ("blueprint_personalization",)
                      if key in settings},
     }
+    if include_usage_guide:
+        result["usage_guide"] = {key: deepcopy(record[key]) for key in ("usage_guide",) if key in record}
+    return result
 
 
 def _restore_metadata(workspace, before):
@@ -204,6 +208,9 @@ def _restore_metadata(workspace, before):
     for key in RECORD_KEYS:
         record.pop(key, None)
     record.update(deepcopy(before["record"]))
+    if "usage_guide" in before:
+        record.pop("usage_guide", None)
+        record.update(deepcopy(before["usage_guide"]))
     settings.pop("blueprint_personalization", None)
     settings.update(deepcopy(before["settings"]))
     workspace.settings = settings
@@ -339,6 +346,7 @@ async def apply(db, *, workspace, payload, source_payload, by_user_id, actor,
             "variable_declarations": deepcopy((source_payload.get("contract") or {}).get("variables", [])),
             "synchronization_status": "customized" if customized else "current",
             "upgrade_protocol_version": PROTOCOL_VERSION,
+            "usage_guide": (payload.get("manifest") or {}).get("usage_guide"),
         })
         for key in (LAST_PARTIAL_UPGRADE_FINGERPRINT_KEY, LAST_PARTIAL_UPGRADE_VERSION_KEY, "restore_point"):
             record.pop(key, None)
@@ -517,9 +525,9 @@ async def revert(db, *, workspace, by_user_id, actor):
         workspace = await _lock(db, workspace)
         state = await _state(db, workspace, lock=True)
         point = deepcopy(state.restore_point) if state else None
-        if not point:
+        if not point or legacy_restore_point(state):
             raise BlueprintUpgradePlanChangedError("There is no applied upgrade to undo.")
-        if _metadata(workspace) != point["metadata_after"]:
+        if _metadata(workspace, include_usage_guide="usage_guide" in point["metadata_after"]) != point["metadata_after"]:
             raise BlueprintUpgradePlanChangedError("Workspace setup changed after the upgrade; undo would overwrite it.")
         await validate_components_restore(db, workspace=workspace, restore=point["components"], actor=actor)
         await validate_configuration_restore(db, workspace=workspace, restore=point["configuration"], actor=actor)
@@ -546,7 +554,8 @@ async def revert(db, *, workspace, by_user_id, actor):
                 row.user_id = account.owner_user_id
                 preserve_channel_binding_route_order(row, before["updated_at"])
         _restore_metadata(workspace, point["metadata_before"])
-        # Do not resurrect a previous v2 restore point or an older v3 receipt.
+        # Do not resurrect an older v3 receipt, or a v2 restore point that
+        # receipts written before restore points left settings still carry.
         settings = deepcopy(workspace.settings)
         settings[BLUEPRINT_SETTINGS_KEY].pop("restore_point", None)
         workspace.settings = settings
@@ -574,7 +583,9 @@ async def invalidate_after_legacy_upgrade(db, *, workspace):
     if not isinstance(record.get("upgrade_runtime_contract"), dict) and isinstance(installed, dict):
         record["upgrade_runtime_contract"] = deepcopy(installed)
     if state is not None:
-        state.restore_point = None
+        # The legacy apply() keeps its own undo in this row; drop only a v3 one.
+        if not legacy_restore_point(state):
+            state.restore_point = None
         state.baseline = {}
         state.revision += 1
     record.pop("synchronization_status", None)

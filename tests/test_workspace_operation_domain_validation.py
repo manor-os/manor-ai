@@ -78,7 +78,8 @@ def test_generic_governance_patch_rejects_approval_before_draft_creation(field):
     {"capability_type": "mcp", "integration_key": "slack"},
     {"capability_type": "tool", "tool_name": "mcp__slack__send_message"},
 ])
-async def test_workspace_chat_integration_add_requires_existing_connection(monkeypatch, connected, binding):
+async def test_workspace_chat_integration_add_waits_for_a_missing_connection(monkeypatch, connected, binding):
+    """Not connected yet never blocks the change; it is a pending warning."""
     from packages.core.services import integration_resolution
 
     patch = {"op": "capability_binding.upsert", "payload": {"binding": {
@@ -100,9 +101,49 @@ async def test_workspace_chat_integration_add_requires_existing_connection(monke
         _NoDb(), draft, current_state=current, user_id="user",
     )
 
-    assert validation["valid"] is connected
-    assert any(error.get("code") == "integration_not_connected" for error in validation["errors"]) is not connected
+    assert validation["valid"] is True
+    pending = [w for w in validation["warnings"] if w.get("code") == "integration_pending_connection"]
+    assert [w["provider"] for w in pending] == ([] if connected else ["slack"])
     readiness.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_applied_pending_integration_is_flagged_asked_and_dropped_with_its_binding(monkeypatch):
+    from contextlib import asynccontextmanager
+
+    from packages.core.services import workspace_connection_status
+
+    @asynccontextmanager
+    async def nested():
+        yield
+
+    db = SimpleNamespace(flush=AsyncMock(), begin_nested=nested)
+    ask = AsyncMock(return_value=["slack"])
+    monkeypatch.setattr(workspace_connection_status, "ask_to_connect_pending_integrations", ask)
+    unrelated = {"provider": "github", "source": "agent_design"}
+    workspace = SimpleNamespace(id="workspace", settings={"flagged_integrations": [unrelated]})
+    state = {"capability_bindings": [{
+        "binding_key": "mcp:slack:content", "owner_scope": "service", "owner_service_key": "content",
+        "capability_type": "mcp", "integration_key": "slack",
+    }]}
+    validation = {"warnings": [{"code": "integration_pending_connection", "provider": "slack"}]}
+
+    assert await operations._wait_for_pending_integrations(
+        db, workspace, state, validation, user_id="user",
+    ) == ["slack"]
+    ask.assert_awaited_once_with(db, workspace=workspace, user_id="user")
+    assert workspace.settings["flagged_integrations"] == [unrelated, {
+        "provider": "slack", "required": True, "source": "workspace_operation",
+        "linked_service_keys": ["content"], "blocks_creation": False,
+    }]
+
+    # Removing the binding drops only the flag this path owns, and asks nothing.
+    ask.reset_mock()
+    assert await operations._wait_for_pending_integrations(
+        db, workspace, {"capability_bindings": []}, {"warnings": []}, user_id="user",
+    ) == []
+    ask.assert_not_awaited()
+    assert workspace.settings["flagged_integrations"] == [unrelated]
 
 
 def test_workspace_chat_integration_remove_and_enable_change_runtime_scope():

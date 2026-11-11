@@ -104,7 +104,7 @@ async def test_shared_catalog_contains_agents_automations_and_only_readable_save
     private = SimpleNamespace(id="private", entity_id="entity", name="Private", description="", steps=[], variables={})
     invalid = SimpleNamespace(id="invalid", entity_id="entity", name="Invalid", description="", steps=[], variables={})
     db = SimpleNamespace(execute=AsyncMock(side_effect=[
-        Rows([(SimpleNamespace(service_key="draft"), agent)]), Rows([job]), Rows([[]]), Rows([]),
+        Rows([(SimpleNamespace(service_key="draft"), agent)]), Rows([job]), Rows([]), Rows([]),
         Rows([saved, private, invalid]),
     ]))
     entries = AsyncMock(return_value=[flow()])
@@ -127,7 +127,7 @@ async def test_runtime_app_keeps_live_targets_without_querying_saved_workflow_ca
     job = SimpleNamespace(job_id="job", name="Daily", enabled=False, last_status=None,
                           execution_target={}, agent_initiative_id=None)
     db = SimpleNamespace(execute=AsyncMock(side_effect=[
-        Rows([(SimpleNamespace(service_key="draft"), agent)]), Rows([job]), Rows([[]]), Rows([]),
+        Rows([(SimpleNamespace(service_key="draft"), agent)]), Rows([job]), Rows([]), Rows([]),
     ]))
     entries = AsyncMock(return_value=[flow()])
     readable = AsyncMock()
@@ -153,7 +153,9 @@ async def test_app_loader_calls_real_workflow_catalog_with_unpublished_bindings(
     workflow = SimpleNamespace(id="workflow", name="Article Flow", description="Generate an article",
                                steps=[], variables={})
     db = SimpleNamespace(execute=AsyncMock(side_effect=[
-        Rows([(binding, workflow)]), Rows([]), Rows([]), Rows([[]]), Rows([]), Rows([]),
+        # The catalog reads the Flow's fields, its entry nodes standing in for steps.
+        Rows([(binding, workflow.id, workflow.name, workflow.description, workflow.variables, workflow.steps)]),
+        Rows([]), Rows([]), Rows([]), Rows([]), Rows([]),
     ]))
     monkeypatch.setattr("packages.core.services.workspace_access.user_can_write_workspace_artifacts",
                         AsyncMock(return_value=True))

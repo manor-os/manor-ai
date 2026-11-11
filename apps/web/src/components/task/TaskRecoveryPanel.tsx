@@ -165,18 +165,18 @@ export default function TaskRecoveryPanel({
         {hitlFields.map((field) => {
           const commonStyle = {
             width: "100%",
-            border: "1px solid rgba(28,25,23,0.06)",
+            border: "0.5px solid rgba(29, 29, 31,0.06)",
             borderRadius: compact ? 7 : 8,
             padding: compact ? "6px 8px" : "8px 10px",
             fontSize: compact ? 11 : 12,
-            color: "#1c1917",
-            background: "#fff",
+            color: "var(--text-strong)",
+            background: "var(--surface-panel)",
             outline: "none",
             boxSizing: "border-box" as const,
           };
           return (
             <label key={field.name} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              <span style={{ fontSize: compact ? 10 : 11, fontWeight: 750, color: "#57534e", textTransform: "capitalize" }}>
+              <span style={{ fontSize: compact ? 10 : 11, fontWeight: 750, color: "var(--text-muted)", textTransform: "capitalize" }}>
                 {fieldLabel(field)}
                 {field.required && <span style={{ color: "#c14a44" }}> *</span>}
               </span>
@@ -233,9 +233,9 @@ export default function TaskRecoveryPanel({
           <StatusIcon size={14} />
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div className="task-recovery-title" style={{ fontSize: 12, fontWeight: 750, color: "#1c1917" }}>{compactTitle}</div>
+          <div className="task-recovery-title" style={{ fontSize: 12, fontWeight: 750, color: "var(--text-strong)" }}>{compactTitle}</div>
           {showReasonInline && <p className="task-recovery-reason mt-1 break-words text-xs text-stone-600">{reason}</p>}
-          {expanded && <div className="task-recovery-helper" style={{ fontSize: 11, color: "#78716c", lineHeight: 1.45, marginTop: 2 }}>{helper}</div>}
+          {expanded && <div className="task-recovery-helper" style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.45, marginTop: 2 }}>{helper}</div>}
         </div>
         {hasDetails && (
           <button
@@ -243,8 +243,8 @@ export default function TaskRecoveryPanel({
             onClick={() => setExpanded((v) => !v)}
             title={expanded ? t("page.tasks.hide_details") : t("component.task_recovery_panel.show_details")}
             style={{
-              padding: "6px 8px", borderRadius: 8, border: "1px solid rgba(28,25,23,0.06)",
-              background: "#fff", color: "#57534e", cursor: "pointer",
+              padding: "6px 8px", borderRadius: 8, border: "0.5px solid rgba(29, 29, 31,0.06)",
+              background: "var(--surface-panel)", color: "var(--text-muted)", cursor: "pointer",
               fontSize: 11, fontWeight: 650, whiteSpace: "nowrap",
             }}
           >
@@ -259,7 +259,7 @@ export default function TaskRecoveryPanel({
           style={{
             display: "inline-flex", alignItems: "center", gap: 5,
             padding: "6px 10px", borderRadius: 8, border: "none",
-            background: actionDisabled ? "#a8a29e" : "#436b65", color: "#fff", cursor: actionDisabled ? "default" : "pointer",
+            background: actionDisabled ? "#aeaeb2" : "#436b65", color: "#fff", cursor: actionDisabled ? "default" : "pointer",
             fontSize: 11, fontWeight: 700, whiteSpace: "nowrap",
           }}
         >
@@ -269,11 +269,11 @@ export default function TaskRecoveryPanel({
         {expanded && (question || (reason && !showReasonInline)) && (
           <div className="task-recovery-details" style={{
             width: "100%", marginTop: 8, padding: "8px 10px", borderRadius: 8,
-            background: "rgba(255,255,255,0.72)", color: question ? "#292524" : "#78716c",
+            background: "rgba(255,255,255,0.72)", color: question ? "#2c2c2e" : "#8e8e93",
             fontSize: 11, lineHeight: 1.5,
           }}>
             {question || reason}
-            {question && reason && reason !== question && !showReasonInline && <div style={{ marginTop: 6, color: "#78716c" }}>{reason}</div>}
+            {question && reason && reason !== question && !showReasonInline && <div style={{ marginTop: 6, color: "var(--text-muted)" }}>{reason}</div>}
           </div>
         )}
         {expanded && renderStructuredFields(true)}
@@ -293,9 +293,9 @@ export default function TaskRecoveryPanel({
           <StatusIcon size={15} />
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div className="task-recovery-title" style={{ fontSize: 13, fontWeight: 750, color: "#1c1917" }}>{title}</div>
+          <div className="task-recovery-title" style={{ fontSize: 13, fontWeight: 750, color: "var(--text-strong)" }}>{title}</div>
           {showReasonInline && <p className="task-recovery-reason mt-1 break-words text-xs text-stone-600">{reason}</p>}
-          {expanded && <div className="task-recovery-helper" style={{ fontSize: 12, color: "#78716c", lineHeight: 1.5, marginTop: 2 }}>{helper}</div>}
+          {expanded && <div className="task-recovery-helper" style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.5, marginTop: 2 }}>{helper}</div>}
         </div>
         {hasDetails && (
           <button
@@ -319,8 +319,8 @@ export default function TaskRecoveryPanel({
       </div>
       {expanded && question && (
         <div className="task-recovery-details" style={{
-          fontSize: 14, color: "#292524", lineHeight: 1.55,
-          padding: "10px 12px", background: "#ffffff",
+          fontSize: 14, color: "var(--text-strong)", lineHeight: 1.55,
+          padding: "10px 12px", background: "var(--surface-panel)",
           borderRadius: 8, marginTop: 10, fontWeight: 500,
         }}>
           {question}

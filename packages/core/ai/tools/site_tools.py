@@ -71,7 +71,6 @@ async def _publish_site_handler(
     conversation_id: str = "",
     **kwargs: Any,
 ) -> str:
-    from packages.core.config import get_settings
     from packages.core.services import site_publisher as sp
 
     path = str(kwargs.get("path") or "").strip()
@@ -82,7 +81,7 @@ async def _publish_site_handler(
         return json.dumps({"published": False, "error": "no entity context"})
     if bool(path) == bool(project_id):
         return json.dumps({"published": False, "error": "give exactly one of project_id or path"})
-    if not (get_settings().MANOR_SITES_DOMAIN or "").strip():
+    if not sp.sites_domain():
         # No sites domain means nothing published here is reachable; say so
         # instead of reporting a success with an empty URL.
         return json.dumps({
@@ -252,11 +251,10 @@ async def _publish_site_handler(
     except (OSError, sp.SitePublishError, PermissionError) as e:
         return json.dumps({"published": False, "error": str(e)})
 
-    domain = (get_settings().MANOR_SITES_DOMAIN or "").strip().lower()
-    url = f"https://{result.site.slug}.{domain}" if domain else ""
     payload: dict[str, Any] = {
         "published": True,
-        "url": url,
+        "url": sp.site_public_url(result.site),
+        "name": result.site.name,
         "site_id": result.site.id,
         "slug": result.site.slug,
         "revision": result.site.revision,

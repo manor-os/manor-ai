@@ -455,6 +455,26 @@ def iter_workspace_channel_blocks(operating_model: dict[str, Any] | None) -> lis
     return out
 
 
+def workspace_declared_channels(workspace: Workspace) -> list[dict[str, Any]]:
+    """Channel declarations a Workspace must be routed to, whatever its origin.
+
+    Installed Blueprint requirements keep their required/optional policy and
+    requirement key; operating-model channels of another type or role follow.
+    """
+    blueprint = (workspace.settings or {}).get("_blueprint") or {}
+    channels = [
+        {**(todo.get("payload") or {}), "required": bool(todo.get("blocking", True))}
+        for todo in blueprint.get("live_setup_requirements") or []
+        if isinstance(todo, dict) and todo.get("kind") == BlueprintInstallTodoKind.CHANNEL.value
+    ]
+    declared = {(channel.get("channel_type"), channel.get("role") or "channel") for channel in channels}
+    for role, channel in iter_workspace_channel_blocks(workspace.operating_model):
+        if (channel.get("channel_type"), role) not in declared:
+            channels.append({**channel, "role": role})
+            declared.add((channel.get("channel_type"), role))
+    return channels
+
+
 def declared_channel_requirements(operating_model: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Return non-built-in channel declarations that need real config."""
     requirements: list[dict[str, Any]] = []
@@ -783,8 +803,14 @@ async def evaluate_workspace_blocking_setup(
     workspace: Workspace,
     *,
     check_keys: set[str] | None = None,
+    actor_user_id: str | None = None,
 ) -> WorkspaceReadinessPartStatus | None:
     """Evaluate the Blueprint-owned setup gate for one Workspace.
+
+    Integrations are personal: many people use one Workspace, each with the
+    connections in their own list (their own paired Chrome). ``actor_user_id``
+    is the person acting now, whose connections count; without one (background
+    readiness, the Strategist) the Workspace creator's do.
 
     Declarative checks live under ``Workspace.settings.blocking_setup`` and
     installed requirements under ``settings._blueprint.live_setup_requirements``.
@@ -876,10 +902,14 @@ async def evaluate_workspace_blocking_setup(
             integration_provider_readiness,
         )
 
+        # Setup is about connecting, not about being online this minute: a
+        # paired Chrome that is closed still counts, and the Chrome tools say
+        # "offline" (and wait for it) when a step actually needs the browser.
         integration_states = await integration_provider_readiness(
             db,
             entity_id=workspace.entity_id,
-            user_id=str((workspace.settings or {}).get("created_by_user_id") or "") or None,
+            user_id=(actor_user_id or str((workspace.settings or {}).get("created_by_user_id") or "") or None),
+            require_online=False,
             provider_keys=[
                 *[str(check["provider"]) for check in integration_checks],
                 *integration_todo_providers,
@@ -954,6 +984,8 @@ async def evaluate_workspace_blocking_setup(
         )
         else []
     )
+    # Todos of one Workspace share its Agent, Workflow and Skill reads.
+    reads: dict[str, Any] = {}
     used_channel_accounts: set[str] = set()
     for index, todo in enumerate(install_todos):
         # Keep the durable requirement's index stable for connection-status
@@ -1000,6 +1032,7 @@ async def evaluate_workspace_blocking_setup(
             todo,
             integration_states=integration_states,
             configured_channels=available_channels,
+            reads=reads,
         )
         if todo_kind == BlueprintInstallTodoKind.CHANNEL.value and result["ready"]:
             matches = matching_blueprint_channels(available_channels, todo_payload)
@@ -1058,6 +1091,68 @@ async def evaluate_workspace_blocking_setup(
     )
 
 
+_MCP_TOOL = re.compile(r"\bmcp__([A-Za-z0-9_-]+?)__")
+# Steps whose reach is decided at run time: an Agent with no tool list may
+# pick any tool, and a sub-Workflow runs whatever its Workflow holds.
+_OPEN_ENDED_STEP_TYPES = frozenset({"agent", "subagent"})
+_SUB_WORKFLOW_STEP_TYPES = frozenset({"subworkflow", "foreach_subworkflow", "workflow"})
+
+
+def _workflow_tool_names(steps: Any) -> list[str] | None:
+    """Every tool a Workflow's steps can call, or None when a step's reach is open-ended."""
+    if not isinstance(steps, list):
+        return None  # An unknown Workflow could reach anything.
+    names: list[str] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        kind = str(step.get("type") or "").strip().lower()
+        config = step.get("config") if isinstance(step.get("config"), dict) else {}
+        if kind in _SUB_WORKFLOW_STEP_TYPES:
+            return None
+        if kind in _OPEN_ENDED_STEP_TYPES and not isinstance(config.get("tools"), list):
+            return None
+        names.extend(str(name) for name in config.get("tools") or [] if str(name or "").strip())
+        if str(config.get("tool") or "").strip():
+            names.append(str(config["tool"]))
+    return names
+
+
+def _tool_uses_provider(tool_name: str, provider: str) -> bool:
+    from packages.core.services.provider_keys import canonical_provider_key
+
+    match = _MCP_TOOL.match(tool_name)
+    if match:
+        return canonical_provider_key(match.group(1)) == provider
+    # A built-in integration tool is named after its provider (youtube_upload_video).
+    return canonical_provider_key(tool_name.split("_", 1)[0]) == provider or tool_name.startswith(f"{provider}_")
+
+
+def blocking_setup_blocks_workflow(status: WorkspaceReadinessPartStatus | None, steps: Any) -> bool:
+    """Whether a Workspace's incomplete blocking setup stops this Workflow.
+
+    A missing integration stops only the Workflows that can reach it: one whose
+    steps never call that provider's tools (and whose Agents and sub-Workflows
+    are bounded) still runs, so a song or a video is not held up by a publishing
+    connection it never uses. Every other kind of setup stops every Workflow.
+    """
+    if status is None or not status.blocks_work:
+        return False
+    from packages.core.services.provider_keys import canonical_provider_key
+
+    tool_names = _workflow_tool_names(steps)
+    for check in status.details.get("incomplete_checks") or [{"ready": False}]:
+        provider = canonical_provider_key(check.get("provider")) if check.get("provider") else ""
+        integration = check.get("kind") == "integration_provider" or (
+            check.get("kind") == "blueprint_install_todo" and check.get("todo_kind") == "missing_integration"
+        )
+        if not (integration and provider and tool_names is not None):
+            return True
+        if any(_tool_uses_provider(name, provider) for name in tool_names):
+            return True
+    return False
+
+
 async def _blueprint_install_todo_result(
     db: AsyncSession,
     workspace: Workspace,
@@ -1065,8 +1160,15 @@ async def _blueprint_install_todo_result(
     *,
     integration_states: dict[str, Any],
     configured_channels: list[dict[str, Any]],
+    reads: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Re-evaluate one durable Blueprint install blocker from live state."""
+    """Re-evaluate one durable Blueprint install blocker from live state.
+
+    ``reads`` is shared by the todos of one evaluation: the Workspace's Agent
+    deployments, Workflow bindings and Skill bindings are read once for all
+    of them instead of once per todo.
+    """
+    reads = {} if reads is None else reads
 
     kind = str(todo.get("kind") or "").strip()
     payload = todo.get("payload")
@@ -1117,20 +1219,23 @@ async def _blueprint_install_todo_result(
             or payload.get("placeholder_agent_id")
             or ""
         ).strip()
-        stmt = (
-            select(AgentSubscription, Agent)
-            .join(Agent, Agent.id == AgentSubscription.agent_id)
-            .where(
-                AgentSubscription.workspace_id == workspace.id,
-                AgentSubscription.entity_id == workspace.entity_id,
-                AgentSubscription.status == "active",
-                Agent.status == "active",
-                Agent.deleted_at.is_(None),
-            )
-        )
-        if service_key:
-            stmt = stmt.where(AgentSubscription.service_key == service_key)
-        rows = list((await db.execute(stmt)).all())
+        if "agent_deployments" not in reads:
+            reads["agent_deployments"] = list((await db.execute(
+                select(AgentSubscription, Agent)
+                .join(Agent, Agent.id == AgentSubscription.agent_id)
+                .where(
+                    AgentSubscription.workspace_id == workspace.id,
+                    AgentSubscription.entity_id == workspace.entity_id,
+                    AgentSubscription.status == "active",
+                    Agent.status == "active",
+                    Agent.deleted_at.is_(None),
+                )
+            )).all())
+        rows = [
+            (subscription, agent)
+            for subscription, agent in reads["agent_deployments"]
+            if not service_key or subscription.service_key == service_key
+        ]
         matching_subscriptions: list[AgentSubscription] = []
         for subscription, agent in rows:
             source_agent_id = str(
@@ -1194,6 +1299,7 @@ async def _blueprint_install_todo_result(
                 },
                 integration_states=integration_states,
                 configured_channels=configured_channels,
+                reads=reads,
             )
         if check_kind == "session_alive":
             return await _blueprint_install_todo_result(
@@ -1209,6 +1315,7 @@ async def _blueprint_install_todo_result(
                 },
                 integration_states=integration_states,
                 configured_channels=configured_channels,
+                reads=reads,
             )
         if check_kind == "cron_scheduled":
             from packages.core.models.scheduler import ScheduledJob
@@ -1234,26 +1341,27 @@ async def _blueprint_install_todo_result(
             )
 
             workflow_slug = str(check.get("workflow_slug") or "").strip()
-            bindings = list((await db.execute(
-                select(WorkflowBinding)
-                .join(
-                    WorkflowDefinition,
-                    WorkflowDefinition.id == WorkflowBinding.workflow_id,
-                )
-                .where(
-                    WorkflowBinding.workspace_id == workspace.id,
-                    WorkflowBinding.entity_id == workspace.entity_id,
-                    WorkflowBinding.enabled.is_(True),
-                    WorkflowBinding.status == "active",
-                    WorkflowDefinition.entity_id == workspace.entity_id,
-                    WorkflowDefinition.is_active.is_(True),
-                    WorkflowDefinition.status == "active",
-                )
-            )).scalars().all())
+            if "workflow_bindings" not in reads:
+                reads["workflow_bindings"] = list((await db.execute(
+                    select(WorkflowBinding)
+                    .join(
+                        WorkflowDefinition,
+                        WorkflowDefinition.id == WorkflowBinding.workflow_id,
+                    )
+                    .where(
+                        WorkflowBinding.workspace_id == workspace.id,
+                        WorkflowBinding.entity_id == workspace.entity_id,
+                        WorkflowBinding.enabled.is_(True),
+                        WorkflowBinding.status == "active",
+                        WorkflowDefinition.entity_id == workspace.entity_id,
+                        WorkflowDefinition.is_active.is_(True),
+                        WorkflowDefinition.status == "active",
+                    )
+                )).scalars().all())
             ready = any(
                 str((binding.config or {}).get("workspace_blueprint_workflow_slug") or "").strip()
                 == workflow_slug
-                for binding in bindings
+                for binding in reads["workflow_bindings"]
             )
             return {"ready": ready, "reason": "Workflow is installed." if ready else detail}
 
@@ -1363,24 +1471,26 @@ async def _blueprint_install_todo_result(
             AgentSubscription.entity_id == workspace.entity_id,
             AgentSubscription.status == "active",
         )
-        rows = list((await db.execute(
-            select(AgentSkillBinding, Agent, Skill)
-            .join(Agent, Agent.id == AgentSkillBinding.agent_id)
-            .join(Skill, Skill.id == AgentSkillBinding.skill_id)
-            .where(
-                Agent.entity_id == workspace.entity_id,
-                Agent.status == "active",
-                Agent.deleted_at.is_(None),
-                or_(
-                    Agent.workspace_id == workspace.id,
-                    Agent.id.in_(deployed_agent_ids),
-                ),
-                AgentSkillBinding.status == "active",
-                Skill.status == "active",
-                or_(Skill.entity_id == workspace.entity_id,
-                    and_(Skill.entity_id.is_(None), Skill.is_public.is_(True))),
-            )
-        )).all())
+        if "skill_bindings" not in reads:
+            reads["skill_bindings"] = list((await db.execute(
+                select(AgentSkillBinding, Agent, Skill)
+                .join(Agent, Agent.id == AgentSkillBinding.agent_id)
+                .join(Skill, Skill.id == AgentSkillBinding.skill_id)
+                .where(
+                    Agent.entity_id == workspace.entity_id,
+                    Agent.status == "active",
+                    Agent.deleted_at.is_(None),
+                    or_(
+                        Agent.workspace_id == workspace.id,
+                        Agent.id.in_(deployed_agent_ids),
+                    ),
+                    AgentSkillBinding.status == "active",
+                    Skill.status == "active",
+                    or_(Skill.entity_id == workspace.entity_id,
+                        and_(Skill.entity_id.is_(None), Skill.is_public.is_(True))),
+                )
+            )).all())
+        rows = reads["skill_bindings"]
         candidates = []
         for _binding, agent, skill in rows:
             if installed_agent_id:

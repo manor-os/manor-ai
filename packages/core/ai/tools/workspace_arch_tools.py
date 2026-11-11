@@ -17,7 +17,9 @@ call before it reaches the handler.
 """
 from __future__ import annotations
 
+import contextlib
 import copy
+import dataclasses
 import hashlib
 import json
 import logging
@@ -34,10 +36,18 @@ from packages.core.constants.blueprints import BlueprintStatus
 from packages.core.constants.plans import is_cloud
 from packages.core.constants.workspace_drafts import (
     CREATION_PREFERENCES_FIELD,
+    STAFF_REQUEST_TEXT_FIELD,
     WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD,
     uses_ui_runtime_mode,
 )
+from packages.core.blueprints.workflow_patterns import (
+    RECORD_COLLECTION_PARAMETERS as _RECORD_COLLECTION_PARAMETERS,
+    RECORD_COLLECTION_REQUIRED as _RECORD_COLLECTION_REQUIRED,
+    SOURCE_WATCH_PARAMETERS as _SOURCE_WATCH_PARAMETERS,
+    SOURCE_WATCH_REQUIRED as _SOURCE_WATCH_REQUIRED,
+)
 from packages.core.cron import validate_cron_expression
+from packages.core.services.workflow_contracts import workflow_wait_is_confirmation, workflow_wait_options
 from packages.core.services.workspace_goal_measurements import (
     GOAL_MEASUREMENT_SCHEMA,
     measurement_stat_definition,
@@ -110,6 +120,21 @@ COMMIT_BASICS_SCHEMA = {
 }
 
 
+def _required_capability_meanings() -> str:
+    """What each requirable capability id grants, from the runtime catalog itself."""
+    from packages.core.ai.runtime.capabilities import capability_for_id
+
+    parts = []
+    for capability_id in STRATEGIST_TASK_CAPABILITY_IDS:
+        capability = capability_for_id(capability_id)
+        if capability is not None:
+            parts.append(f"{capability_id} = {capability.description.rstrip('.')}")
+    return "; ".join(parts) + ". Reading Knowledge is workspace.search, not workspace.knowledge."
+
+
+_REQUIRED_CAPABILITY_MEANINGS = _required_capability_meanings()
+
+
 PROPOSE_SERVICE_SCHEMA = {
     "type": "function",
     "function": {
@@ -149,7 +174,26 @@ PROPOSE_SERVICE_SCHEMA = {
                     "description": (
                         "Exact runtime capability ids Tasks owned by this service may require. "
                         "This declares needs only; it never grants tools to the Agent. Use [] "
-                        "when the service has no capability requirement beyond its work contract."
+                        "when the service has no capability requirement beyond its work contract. "
+                        "Each id means: " + _REQUIRED_CAPABILITY_MEANINGS
+                    ),
+                },
+                "handoff_to": {
+                    "type": "array",
+                    "uniqueItems": True,
+                    "items": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+                    "description": (
+                        "service_keys of the roles that take this service's result next, when the user "
+                        "described a hand-off between roles (researcher → writer → editor). A hand-off is "
+                        "run by a Workflow with one agent step per service; omit for independent services."
+                    ),
+                },
+                "human_review": {
+                    "type": "boolean",
+                    "description": (
+                        "True when the user wants a person to review or approve this service's result before "
+                        "the work moves on. The Workflow that runs this service then needs an approval wait "
+                        "after its step."
                     ),
                 },
                 "rationale": {"type": "string", "description": "Why this service is needed (links to primary_work)."},
@@ -179,7 +223,8 @@ DESIGN_APP_VIEW_SCHEMA = {
                     "What the person wants to do from the App, in their words: the main job, the kinds of work "
                     "they start, what they want to see (progress, results, numbers).")},
                 "feedback": {"type": "string", "maxLength": 4000, "description": (
-                    "Why the last candidate was not accepted and what to change.")},
+                    "Why the last candidate was not accepted and what to change. The designer revises that "
+                    "candidate and sees the brief it answered, so name every change it must make.")},
             },
         },
     },
@@ -198,27 +243,262 @@ ACCEPT_APP_VIEW_SCHEMA = {
     },
 }
 
+ACCEPT_PARTS_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "ws_accept_parts",
+        "description": (
+            "Accept the waiting candidates of these parts (e.g. ['app']) in order. Each is checked again against "
+            "the Draft as the parts before it left it, then written; the first that fails stops the rest and is "
+            "returned with its errors, so command a new design for it. Accept only candidates that fit the brief."
+        ),
+        "parameters": {
+            "type": "object",
+            "required": ["draft_id", "parts"],
+            "properties": {
+                "draft_id": {"type": "string"},
+                "parts": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+            },
+        },
+    },
+}
+
+DESIGN_WORKFLOWS_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "ws_design_workflows",
+        "description": (
+            "Command the Workflows designer to design this Draft's Workflows and tracked numbers (Stats) from the "
+            "saved services. It composes them from checked patterns (a confirmed plan of dated content, scheduling "
+            "each item, approved publishing with a verified receipt, a report that records Stats, a parent project "
+            "and its parts) and returns a checked candidate with the Automations its Workflows need; the candidate "
+            "changes nothing until you accept it with ws_accept_parts(parts=['workflows']). To send it back, call "
+            "this again with feedback."
+        ),
+        "parameters": {
+            "type": "object",
+            "required": ["draft_id", "brief"],
+            "properties": {
+                "draft_id": {"type": "string"},
+                "brief": {"type": "string", "minLength": 1, "maxLength": 6000, "description": (
+                    "The work in the person's words: what repeats, which service does each stage, what the person "
+                    "approves before it moves on, what is planned for dates or published where, which numbers they "
+                    "track and how often, and their time zone.")},
+                "feedback": {"type": "string", "maxLength": 4000, "description": (
+                    "Why the last candidate was not accepted and what to change.")},
+            },
+        },
+    },
+}
+
+_SPEC_KEYS = {"type": "array", "items": {"type": "string"}}
+COMMIT_BUILD_SPEC_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "ws_commit_build_spec",
+        "description": (
+            "Commit the build spec after the services and rules are saved: the names every part shares (each "
+            "service's Agent, Workflow slugs, Stat keys, Automation keys, Knowledge nets) and a brief per part. "
+            "It is checked, without guessing: every reference resolves, a service with 3+ stages or a hand-off "
+            "has a Workflow, and every routine the person named has an Automation. Returns mode: solo (a small "
+            "Workspace you build yourself) or team (command ws_design_parts), and the parts to design. Commit it "
+            "again after a change; only the parts it touches are designed again."
+        ),
+        "parameters": {
+            "type": "object",
+            "required": ["draft_id", "services", "agents", "briefs"],
+            "properties": {
+                "draft_id": {"type": "string"},
+                "language": {"type": "string", "description": "The person's language, e.g. zh-CN"},
+                "timezone": {"type": "string", "description": "IANA zone: <user_timezone> unless they named a place"},
+                "business": {"type": "object", "properties": {
+                    "summary": {"type": "string"}, "audience": {"type": "string"},
+                    "success_signal": {"type": "string"}}},
+                "services": {"type": "array", "items": {"type": "object", "required": ["key"], "properties": {
+                    "key": {"type": "string"},
+                    "stages": {**_SPEC_KEYS, "description": "The stages of the work this service runs, in order"}}}},
+                "agents": {"type": "array", "description": "One per service", "items": {
+                    "type": "object", "required": ["service_key", "role"], "properties": {
+                        "service_key": {"type": "string"}, "role": {"type": "string"},
+                        "deliverables": {"type": "array", "items": {"enum": [
+                            "docx", "pptx", "xlsx", "pdf", "image", "video", "audio", "website"]},
+                            "description": "File kinds this Agent must make"},
+                        "integrations": {**_SPEC_KEYS, "description": "Platforms it works on, e.g. instagram"},
+                        "reuse_agent_id": {"type": "string"}}}},
+                "workflows": {"type": "array", "items": {"type": "object", "required": ["slug", "service_key"], "properties": {
+                    "slug": {"type": "string", "description": "snake_case; a pattern's Workflows share it as prefix"},
+                    "service_key": {"type": "string"}, "purpose": {"type": "string"},
+                    "stages": {"type": "array", "items": {"type": "object", "properties": {
+                        "id": {"type": "string"}, "kind": {"enum": ["agent", "approval"]},
+                        "service_key": {"type": "string"}}}},
+                    "run_inputs": {"type": "array", "items": {"type": "object"}},
+                    "stat_keys": _SPEC_KEYS, "publishes_to": _SPEC_KEYS,
+                    "dated": {"type": "boolean", "description": (
+                        "Items on dates a plan sets, which the person confirms; a fixed rhythm (every Monday) is not dated")}}}},
+                "stats": {"type": "array", "items": {"type": "object", "required": ["key"], "properties": {
+                    "key": {"type": "string"}, "name": {"type": "string"},
+                    "workflow": {"type": "string", "description": "The Workflow that records it"}}}},
+                "automations": {"type": "array", "items": {"type": "object", "required": ["key", "cadence"], "properties": {
+                    "key": {"type": "string"}, "workflow": {"type": "string"}, "service_key": {"type": "string"},
+                    "cadence": {"type": "string", "description": "When it runs, in the person's words"},
+                    "timezone": {"type": "string"}, "why": {"type": "string"}}}},
+                "routines": {"type": "array", "description": "Every recurring thing the person named", "items": {
+                    "type": "object", "required": ["said"], "properties": {
+                        "said": {"type": "string", "description": "Their words, e.g. 每月1号复盘"},
+                        "automation": {"type": "string", "description": "The automation key that runs it"}}}},
+                "knowledge": {"type": "array", "items": {"type": "object", "required": ["key"], "properties": {
+                    "key": {"type": "string"}, "name": {"type": "string"}, "purpose": {"type": "string"},
+                    "for_services": _SPEC_KEYS, "source_ids": _SPEC_KEYS}}},
+                "integrations": {"type": "array", "items": {"type": "object", "properties": {
+                    "provider": {"type": "string"}, "required_by": _SPEC_KEYS}}},
+                "briefs": {"type": "object", "description": (
+                    "A brief per planned part (agents, knowledge, workflows, automations, app) in the person's "
+                    "words: what it must do and what they asked for, nothing invented."), "properties": {
+                    part: {"type": "string", "maxLength": 6000}
+                    for part in ("agents", "knowledge", "workflows", "automations", "app")}},
+            },
+        },
+    },
+}
+
+DESIGN_PARTS_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "ws_design_parts",
+        "description": (
+            "Command the part designers of the next wave at once (agents, knowledge and workflows first; "
+            "automations and app once the Workflows are accepted). Each reads the committed build spec and its "
+            "brief and returns a checked candidate that changes nothing until you accept it with ws_accept_parts. "
+            "Omit parts to run the next wave. To send a candidate back, name its part with feedback (at most twice). "
+            "A part whose designer could not run comes back as status lead: build that part yourself with the "
+            "tools its next names, and do not mention it to the person."
+        ),
+        "parameters": {
+            "type": "object",
+            "required": ["draft_id"],
+            "properties": {
+                "draft_id": {"type": "string"},
+                "parts": {"type": "array", "items": {"type": "object", "required": ["part"], "properties": {
+                    "part": {"enum": ["agents", "knowledge", "workflows", "automations", "app"]},
+                    "brief": {"type": "string", "maxLength": 6000,
+                              "description": "Replaces the spec's brief for this run"},
+                    "feedback": {"type": "string", "maxLength": 4000,
+                                 "description": "Why its last candidate was not accepted and what to change"}}}},
+            },
+        },
+    },
+}
+
 PROPOSE_WORKFLOW_SCHEMA = {
     "type": "function",
     "function": {
         "name": "ws_propose_workflow",
-        "description": "Add or replace a portable native Workflow definition in this draft. Use stable snake_case slug and structured steps; this creates no run.",
+        "description": (
+            "Add or replace a portable native Workflow definition in this draft. Use stable snake_case slug and "
+            "structured steps; this creates no run. The start node is added for you: list the first step without "
+            "a predecessor and route the rest with next. References are {{name}} for a run input or variable and "
+            "{{step_id}} / {{step_id.field}} for an earlier step's result; there is no inputs./steps./vars. prefix. "
+            "An agent step whose fields a later step reads ({{edit.deliverable_document_id}}) returns those fields, "
+            "unless it sets its own output_schema: then it needs output_format:'json' and its schema must list every "
+            "field read, or the graph is rejected. "
+            "The same validator that runs at creation checks the graph and returns its errors here."
+        ),
         "parameters": {"type": "object", "required": ["draft_id", "slug", "name", "steps"], "properties": {
             "draft_id": {"type": "string"}, "slug": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
-            "name": {"type": "string", "minLength": 1}, "steps": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["id", "type", "config"], "properties": {
-                "id": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"}, "name": {"type": "string"},
-                "type": {"type": "string", "description": "Native Workflow node type. For a project use exactly workflow_project, never tool/manor."},
+            "name": {"type": "string", "minLength": 1}, "description": {"type": "string"},
+            "steps": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["id", "type", "config"], "properties": {
+                "id": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+                "name": {"type": "string", "description": "What the step does, as the person sees it in progress and approvals (e.g. 'Owner approval')."},
+                "type": {"type": "string", "description": (
+                    "Native Workflow node type: agent (one role's stage of work), wait (a person approves or answers), "
+                    "workflow_project (durable project record; never tool/manor), condition ({expression:'plan_approval.choice "
+                    "== \"approve\"'} routed by true_next/false_next), switch, code ({language:'python',code,output_var,"
+                    "output_format:'json'}; reads the global inputs dict, prints its result), transform, datetime "
+                    "({operation:now|add|subtract|format, value?, amount?, unit?, timezone?}), subworkflow ({workflow_id:'<slug of "
+                    "another Workflow of this draft>', inputs:[{key,value}]}), foreach_subworkflow ({workflow_id, "
+                    "over:'{{plan.items}}', item_key:'id', item_var:'item'}: one child run per item), "
+                    "workflow_action_grant (create after an approval: {approval_step_id, project_id, grant_type, scope, "
+                    "scope_schema}), workflow_effect_deadline ({deadline_at, action_keys}), publication_receipt "
+                    "({receipt:'{{publish.receipt}}', payload, require_verified:true}), notify, stop, merge, end. "
+                    "Propose a sub-Flow's Workflow first; a Flow only other Flows run sets internal:true and "
+                    "trigger_type:'internal'.")},
                 "next": {"type": "array", "items": {"type": "string"}},
-                "config": {"type": "object", "description": "For workflow_project create: {operation:'create',project_type:'...',project_key:'...',schema_version:1,state_schema:{type:'object',properties:{status:{type:'string'},deliverable_document_id:{type:'string'}}},state:{},current_stage:'new'}. State fields used by App must appear in state_schema.properties."}
+                "config": {"type": "object", "description": (
+                    "agent: {service_key:'<a draft service>', prompt:'... {{topic}} ... {{research}}', expects?:['files'|'effects']}; "
+                    "expects says what the stage must leave behind (a saved file, a completed action) so a stage that saves "
+                    "nothing never counts as done. notify: {channel:'workspace_chat', message:'Weekly report: {{write.report_document_id}}'} tells "
+                    "the Workspace's people in its chat; an agent step cannot post to chat. wait approval: {wait_type:'approval', message:'Approve the final draft?', "
+                    "options:['approve','revise'], approval_values:['approve'], revise_from:'<earlier step id>', "
+                    "response_variable:'final_approval'} (later steps read {{final_approval.choice}}). What the person approves "
+                    "is delivered as it is, so the step before it saves the deliverable finished and puts notes for the reviewer "
+                    "in a separate file. The person sees the "
+                    "files earlier steps saved since they last answered; review:{files:['<document id or {{reference}}>']} names "
+                    "them instead. A wait where the person confirms something they did themselves (delivered the file, signed): "
+                    "{wait_type:'approval', message:'Confirm once the Word file is delivered.', options:['confirm']}. "
+                    "workflow_project create: {operation:'create',project_type:'...',schema_version:1,"
+                    "state_schema:{type:'object',properties:{status:{type:'string'},deliverable_document_id:{type:'string'}}},"
+                    "state:{},current_stage:'new', folder?:{name:'{{topic}}'}}; each run creates its own project; add project_key only "
+                    "so a repeat finds the same one, built from a short id, code or period ('{{order_id}}'), never a brief, "
+                    "message or fixed word; folder.under is only for a parent project's "
+                    "own folder ({{parent.state.project_root}}); a folder sets state.project_root, so declare project_root:{type:'string'} "
+                    "in state_schema when the App lists the project's files. State fields used by App must appear in state_schema.properties. "
+                    "workflow_project patch (advance a stage): {operation:'patch',project_id:'{{create_article.project_id}}',"
+                    "project_type:'...',schema_version:1,expected_revision:'{{<previous project step>.revision}}',"
+                    "patch:{status:'writing',draft_document_id:'{{write.draft_document_id}}'},current_stage:'writing',"
+                    "state_schema:<same as create>}; after an approval add history_event:{kind:'review',"
+                    "decision:'{{final_approval.choice}}',note:'{{final_approval.note}}'} (appended to state.history with "
+                    "a timestamp; declare history:{type:'array'}). An approval wait's own id has no fields. list_appends:"
+                    "[{path,key,items}], list_upserts and history_event apply only on a patch. Operations are only "
+                    "create, claim, get, list, lease_due, complete_lease, patch; a project step outputs project_id, revision, "
+                    "current_stage and state (no 'id'); there is no 'update' operation."
+                )}
             }}},
             "internal": {"type": "boolean"}, "trigger_type": {"type": "string"}, "binding_config": {"type": "object"},
             "variables": {"type": "array"},
             "run_inputs": {"type": "array", "items": {"type": "object"}, "description": (
-                "The inputs a run asks for: {key,label,type,required,hidden,description,schema}. A hidden input "
-                "an App entry fills: schema {type:'string','x-ui':{control:'workflow_project_select',"
-                "project_type:'<type>'}} picks a project; a plain string takes a planned code.")},
+                "The inputs a run asks for: {key,label,type,required,hidden,description,schema}; the schema picks "
+                "the control. A file is an upload (type:'json', schema {type:'array',items:{type:'object',"
+                "required:['document_id'],properties:{document_id:{type:'string'}}},'x-ui':{control:'documents',"
+                "accept:['image']}}), a few fixed values an enum, a day format:'date' (a period: an object "
+                "{start,end} with 'x-ui':{control:'date_range'}), format:'email'/'phone', 'x-ui' control color, "
+                "rating, tags, rich_text, address, signature or line_items, a record of this Workspace schema {type:'string','x-ui':{control:'workflow_project_select',"
+                "project_type:'<type>'}} (several records: type:'json', schema {type:'array',items:{type:'string'},"
+                "minItems:1,'x-ui':{control:'workflow_project_select',project_type:'<type>'}}); a plain string is only for words the person writes, or a planned code a "
+                "hidden input takes. A Flow that changes a record takes only its picker and asks the changes in an "
+                "input wait whose defaults are the record's current values ({{<get step>.state.<field>}}).")},
             "output_schema": {"type": "object"}, "enabled": {"type": "boolean"}
         }}
+    }
+}
+
+PROPOSE_RECORD_COLLECTION_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "ws_propose_record_collection",
+        "description": (
+            "Add the Workflows for a collection people keep by hand and change from the App (a menu's dishes, a "
+            "catalogue's products, a list of offers): <slug>_add, <slug>_edit (picks a record and opens a form "
+            "holding its values; a field left out keeps its value) and <slug>_take_off (moves it to off_stage). "
+            "No step runs a model. Use this instead of writing those Flows with ws_propose_workflow."
+        ),
+        "parameters": {"type": "object", "required": ["draft_id", *_RECORD_COLLECTION_REQUIRED],
+                       "properties": {"draft_id": {"type": "string"}, **_RECORD_COLLECTION_PARAMETERS}},
+    }
+}
+
+PROPOSE_SOURCE_WATCH_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "ws_propose_source_watch",
+        "description": (
+            "Add the Workflows for work that starts when something new arrives in an account (a customer's DM or "
+            "email, a comment on a post): <slug>_watch looks for what is new on a schedule and starts run_workflow "
+            "once for each new thing, passing its id as run_input. Write run_workflow first with ws_propose_workflow. "
+            "The watch's Automation is added with it. No channel hands such a message to a Workflow, so use this "
+            "instead of a Flow that only takes text the person pastes in."
+        ),
+        "parameters": {"type": "object", "required": ["draft_id", *_SOURCE_WATCH_REQUIRED],
+                       "properties": {"draft_id": {"type": "string"}, **_SOURCE_WATCH_PARAMETERS}},
     }
 }
 
@@ -390,8 +670,8 @@ ASSIGN_STAFF_SCHEMA = {
     "function": {
         "name": "ws_assign_staff",
         "description": (
-            "Assign a real staff member from the entity's roster to the "
-            "workspace, optionally bound to a specific service. Call "
+            "Assign a staff member the person named to the workspace, "
+            "optionally bound to a specific service. Call "
             "ws_search_capabilities first so you have valid staff_ids. "
             "Re-calling with the same staff_id replaces the prior role."
         ),
@@ -482,10 +762,13 @@ FLAG_MISSING_INTEGRATION_SCHEMA = {
     "function": {
         "name": "ws_flag_missing_integration",
         "description": (
-            "Explicitly flag an integration the workspace needs but the "
-            "entity hasn't set up yet. Use independent of agent creation "
-            "when an integration is workspace-wide (e.g. an analytics "
-            "platform multiple services consume)."
+            "Record an integration the user asked for that is not connected "
+            "yet, when no Agent binding already records it (e.g. an analytics "
+            "platform several services read). It never blocks creation: the "
+            "Workspace is created with the requirement waiting for connection, "
+            "the user is asked to connect it in Workspace chat, and the work "
+            "that needs it starts once it is connected. Agent integrations "
+            "chosen by ws_search_capabilities are recorded automatically."
         ),
         "parameters": {
             "type": "object",
@@ -494,11 +777,17 @@ FLAG_MISSING_INTEGRATION_SCHEMA = {
                 "draft_id": {"type": "string"},
                 "provider": {"type": "string"},
                 "purpose": {"type": "string", "minLength": 5},
-                "required": {"type": "boolean"},
+                "required": {
+                    "type": "boolean",
+                    "description": (
+                        "Whether the linked work needs it to run (default true). "
+                        "Either way creation is not blocked."
+                    ),
+                },
                 "linked_service_keys": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Which workspace services this gap blocks.",
+                    "description": "Which workspace services wait for this connection.",
                 },
             },
         },
@@ -517,7 +806,9 @@ SEARCH_CAPABILITIES_SCHEMA = {
             "returns a compact least-privilege plan with exact ids, plus the "
             "entity's staff and knowledge resources. Call once for each custom "
             "service, then call ws_request_custom_agent with the same service_key. "
-            "The server reuses the stored validated plan; do not transcribe ids."
+            "The server reuses the stored validated plan; do not transcribe ids. "
+            "Repeating the call for an unchanged service, agent_name, and intent "
+            "returns that stored plan without matching again."
         ),
         "parameters": {
             "type": "object",
@@ -689,8 +980,11 @@ PROPOSE_AUTOMATION_SCHEMA = {
     "function": {
         "name": "ws_propose_automation",
         "description": (
-            "Schedule a recurring or triggered automation. Only call this "
-            "when the user described a schedule or event-based trigger."
+            "Schedule a recurring clock automation. Only call this when the "
+            "user described a schedule. Pass cron_expr (or every_seconds) and "
+            "timezone for the exact cadence; the result echoes the schedule "
+            "that will run. Event triggers (on new message, when X happens) "
+            "are not schedules and are rejected."
         ),
         "parameters": {
             "type": "object",
@@ -699,7 +993,10 @@ PROPOSE_AUTOMATION_SCHEMA = {
                 "draft_id": {"type": "string"},
                 "automation_key": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
                 "description": {"type": "string", "minLength": 10},
-                "trigger": {"type": "string", "description": "e.g. 'daily 08:00', 'on_message_received', 'weekly mon 09:00'"},
+                "trigger": {"type": "string", "description": "The cadence in the user's words, shown to them, e.g. '每周一上午9点', 'weekdays 08:30'. Used to derive the schedule only when cron_expr/every_seconds is absent."},
+                "cron_expr": {"type": "string", "description": "5-field cron in `timezone`: minute hour day-of-month month day-of-week (0=Sunday). E.g. '0 9 * * 1' every Monday 09:00, '0 9 1 * *' the 1st of each month, '30 8 * * 1-5' weekdays."},
+                "every_seconds": {"type": "number", "exclusiveMinimum": 0, "description": "Fixed interval instead of cron, e.g. 7200 for every 2 hours."},
+                "timezone": {"type": "string", "description": "IANA timezone of the cadence, e.g. 'Asia/Shanghai' when the user says Beijing time. Omit to use the user's own timezone."},
                 "service_key": {"type": "string"},
                 "scheduled_job": {"type": "object", "description": "Optional native scheduled-job declaration. Include job_id, schedule and execution_target; workflow targets use workflow_slug from ws_propose_workflow."},
             },
@@ -880,17 +1177,26 @@ SEARCH_BLUEPRINTS_SCHEMA = {
     "function": {
         "name": "ws_search_blueprints",
         "description": (
-            "List the workspace blueprint marketplace for semantic selection. Use early in the "
-            "conversation: if a published blueprint clearly matches the "
-            "user's intent, suggest it instead of building from scratch. "
-            "The architect LLM evaluates the returned candidates; this tool "
-            "does not score keywords."
+            "List every published Blueprint, most relevant to the user's need first. "
+            "Call it before building from scratch. Each result has match.level "
+            "(high/medium/low/none), match.score (share of the need it covers) and "
+            "match.reasons (which catalog fields matched which terms). The level is a "
+            "lexical hint: confirm the fit yourself from use_when and outcome_summary."
         ),
         "parameters": {
             "type": "object",
             "required": ["draft_id"],
             "properties": {
                 "draft_id": {"type": "string"},
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "The user's need in keywords: domain, audience, outcomes, channels, "
+                        "deliverables and cadence. Write it in English, the catalog's "
+                        "language, and add the user's own key terms if they wrote in "
+                        "another language. Draft basics and services are added automatically."
+                    ),
+                },
             },
         },
     },
@@ -902,9 +1208,9 @@ SUGGEST_BLUEPRINT_SCHEMA = {
     "function": {
         "name": "ws_suggest_blueprint",
         "description": (
-            "Record the single published blueprint you selected after semantic "
-            "comparison of the complete ws_search_blueprints inventory. Use only "
-            "for a strong capability/workflow fit; never choose by keyword overlap."
+            "Record the single published Blueprint you recommend, so the draft panel "
+            "shows it. Use only when its use_when and outcome_summary cover the user's "
+            "core outcome; matching terms alone are not a fit."
         ),
         "parameters": {
             "type": "object",
@@ -913,6 +1219,29 @@ SUGGEST_BLUEPRINT_SCHEMA = {
                 "draft_id": {"type": "string"},
                 "blueprint_id": {"type": "string"},
                 "rationale": {"type": "string", "minLength": 10},
+            },
+        },
+    },
+}
+
+
+APPLY_BLUEPRINT_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "ws_apply_blueprint",
+        "description": (
+            "Fill the draft from a published Blueprint: its services, Agents, Workflows, "
+            "metrics, Goals, rules, automations, App and knowledge replace what the draft "
+            "has. Call it only once the user chose to install the Blueprint or to "
+            "customize from it. To customize, keep its parts and add or change only what "
+            "the user's brief asks for and it lacks, then lint and mark ready."
+        ),
+        "parameters": {
+            "type": "object",
+            "required": ["draft_id", "blueprint_id"],
+            "properties": {
+                "draft_id": {"type": "string"},
+                "blueprint_id": {"type": "string"},
             },
         },
     },
@@ -1001,12 +1330,44 @@ MARK_READY_SCHEMA = {
 }
 
 
+ASK_USER_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "ws_ask_user",
+        "description": (
+            "Attach answer buttons to the question you are asking the user in this "
+            "reply. Call it for every question: give up to 3 short options and the "
+            "one you recommend with a one-sentence reason, in the user's language. "
+            "The user can still answer in their own words."
+        ),
+        "parameters": {
+            "type": "object",
+            "required": ["draft_id", "question", "options", "recommended", "recommendation_reason"],
+            "properties": {
+                "draft_id": {"type": "string"},
+                "question": {"type": "string", "minLength": 1},
+                "options": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
+                "recommended": {"type": "string", "minLength": 1},
+                "recommendation_reason": {"type": "string", "minLength": 1, "maxLength": 280},
+            },
+        },
+    },
+}
+
+
 ALL_TOOL_SCHEMAS = [
+    ASK_USER_SCHEMA,
     COMMIT_BASICS_SCHEMA,
     PROPOSE_SERVICE_SCHEMA,
     DESIGN_APP_VIEW_SCHEMA,
     ACCEPT_APP_VIEW_SCHEMA,
+    ACCEPT_PARTS_SCHEMA,
+    DESIGN_WORKFLOWS_SCHEMA,
+    COMMIT_BUILD_SPEC_SCHEMA,
+    DESIGN_PARTS_SCHEMA,
     PROPOSE_WORKFLOW_SCHEMA,
+    PROPOSE_RECORD_COLLECTION_SCHEMA,
+    PROPOSE_SOURCE_WATCH_SCHEMA,
     PROPOSE_STAT_SCHEMA,
     PROPOSE_GOAL_SCHEMA,
     PROPOSE_AGENT_MAPPING_SCHEMA,
@@ -1015,6 +1376,7 @@ ALL_TOOL_SCHEMAS = [
     ATTACH_KNOWLEDGE_SCHEMA,
     SEARCH_CAPABILITIES_SCHEMA,
     PROPOSE_CHANNEL_SCHEMA,
+    FLAG_MISSING_INTEGRATION_SCHEMA,
     PROPOSE_RULE_SCHEMA,
     PROPOSE_AUTOMATION_SCHEMA,
     SET_EVALUATION_SCHEMA,
@@ -1025,6 +1387,7 @@ ALL_TOOL_SCHEMAS = [
     SEARCH_ENTITY_AGENTS_SCHEMA,
     SEARCH_BLUEPRINTS_SCHEMA,
     SUGGEST_BLUEPRINT_SCHEMA,
+    APPLY_BLUEPRINT_SCHEMA,
     GET_DRAFT_SCHEMA,
     READ_SOURCE_SCHEMA,
     LINT_DRAFT_SCHEMA,
@@ -1045,7 +1408,13 @@ _CHANNEL_ACTION_PATTERNS = {
 _CHANNEL_BINDING_ALIASES = {
     "email": {"email", "gmail", "outlook", "smtp", "sendgrid"},
 }
+# Rules and the governance policy compiled from them are the user's stated
+# limits. Every draft rule type (approval_required, deny, draft_only, notice)
+# only restricts, so dropping a pattern or rewording a rule because a channel
+# went away (or was never connected) can only weaken what the user asked for.
+_CHANNEL_SCRUB_PRESERVED_KEYS = {"rules", "governance_policy", "governance"}
 _CHANNEL_TEXT_SCRUB_SKIP_KEYS = {
+    *_CHANNEL_SCRUB_PRESERVED_KEYS,
     "_removed_channels",
     "agent_id",
     "automation_key",
@@ -1075,6 +1444,21 @@ def _ok(payload: Dict[str, Any]) -> str:
 
 def _err(message: str, **extra: Any) -> str:
     return json.dumps({"ok": False, "error": message, **extra}, ensure_ascii=False)
+
+
+def _tool_failed(exc: Exception) -> str:
+    """A crash as the model should see it: our own checks say what to change, faults stay in the logs."""
+    if isinstance(exc, ValueError):
+        return _err(str(exc))
+    return _err(
+        "this step failed on our side",
+        hint="check the draft, try the step once more, and if it still fails carry on with the rest",
+    )
+
+
+def _refused(detail: Dict[str, Any]) -> str:
+    """A refusal already shaped as ``{"error": ..., **extra}``."""
+    return json.dumps({"ok": False, **detail}, ensure_ascii=False)
 
 
 async def _load_draft(db, draft_id: str, entity_id: str, user_id: str):
@@ -1294,50 +1678,22 @@ def _dedupe_by_string_field(items: List[Any], field_name: str) -> tuple[List[Any
 
 
 def _cleanup_removed_channel_references(fields: Dict[str, Any], key: str) -> Dict[str, Any]:
-    """Remove rule/automation references to a channel the user removed.
+    """Remove automation/binding references to a channel the user removed.
 
     ``ws_remove(kind="channel")`` is a semantic operation, not just a list
-    edit. If a channel disappears, action keys and automation text that
-    still reference it would make the draft preview lie to the user.
+    edit. If a channel disappears, automation text and bindings that still
+    reference it would make the draft preview lie to the user. Rules are
+    left exactly as written: an approval or ban on an action that cannot run
+    yet costs nothing, and it must still hold once the channel comes back.
     """
     key = _channel_key(key)
     if not key:
-        return {"rules": 0, "automations": 0, "action_patterns": 0}
+        return {"automations": 0}
 
     removed = list(fields.get("_removed_channels") or [])
     if key not in removed:
         removed.append(key)
     fields["_removed_channels"] = removed
-
-    removed_patterns = _CHANNEL_ACTION_PATTERNS.get(key, set())
-    rule_changes = 0
-    pattern_changes = 0
-    rules: List[Dict[str, Any]] = []
-    for raw in fields.get("rules") or []:
-        if not isinstance(raw, dict):
-            rules.append(raw)
-            continue
-        rule = dict(raw)
-        before_patterns = list(rule.get("action_patterns") or [])
-        if before_patterns and removed_patterns:
-            after_patterns = [
-                p for p in before_patterns
-                if _as_nonempty_str(p).lower() not in removed_patterns
-            ]
-            if after_patterns != before_patterns:
-                pattern_changes += len(before_patterns) - len(after_patterns)
-                if after_patterns:
-                    rule["action_patterns"] = after_patterns
-                else:
-                    rule.pop("action_patterns", None)
-                rule_changes += 1
-        for field_name in ("description", "scope", "notes"):
-            scrubbed = _scrub_removed_channel_text(rule.get(field_name), key)
-            if scrubbed != rule.get(field_name):
-                rule[field_name] = scrubbed
-                rule_changes += 1
-        rules.append(rule)
-    fields["rules"] = rules
 
     automation_changes = 0
     automations: List[Dict[str, Any]] = []
@@ -1367,9 +1723,7 @@ def _cleanup_removed_channel_references(fields: Dict[str, Any], key: str) -> Dic
         fields["knowledge_attachments"] = deduped_knowledge
 
     return {
-        "rules": rule_changes,
         "automations": automation_changes,
-        "action_patterns": pattern_changes,
         "text_fields": text_changes,
         "knowledge_attachments": knowledge_removed,
     }
@@ -1377,9 +1731,7 @@ def _cleanup_removed_channel_references(fields: Dict[str, Any], key: str) -> Dic
 
 def _reconcile_removed_channel_references(fields: Dict[str, Any]) -> Dict[str, Any]:
     summary = {
-        "rules": 0,
         "automations": 0,
-        "action_patterns": 0,
         "text_fields": 0,
         "knowledge_attachments": 0,
     }
@@ -1479,7 +1831,11 @@ def _agent_capability_prompt(
         f"Service outputs: {service.get('outputs') or []}",
         f"Service autonomy: {service.get('autonomy_level') or ''}",
         (
-            "Service required runtime capabilities (requirements, not grants): "
+            # Listing a requirement grants nothing, so the selection itself
+            # has to cover it or the Agent fails the draft's readiness check.
+            "Service required runtime capabilities (the selected ids must cover "
+            "every one; the candidate capability:<id> covers <id>, and so does "
+            "any one of the tools it lists, which grants less): "
             f"{service.get('required_capabilities') or []}"
         ),
     ]
@@ -1492,9 +1848,49 @@ def _agent_capability_prompt(
             "remove that action's capabilities or recreate a hard block from "
             "default prose. Explicit user-confirmed deny rules remain bans."
         )
+    prompt_parts.append(
+        # Staging 2026-11-09, 3 of 3 candle shop drafts: every Agent got
+        # scheduling, one the whole Flow-authoring set, one a store platform
+        # nobody named, and the support Agent could publish and delete posts.
+        "This Agent does this service's work inside a Workspace whose Flows and schedules are already "
+        "set up: starting and following a Flow is workflow.run. Select a platform only when the text "
+        "above names it or it is connected; when it only says 'my store' or 'orders', select no store "
+        "platform. Of a platform's actions keep only those this service does: one that answers "
+        "messages reads and replies, it does not publish or delete posts."
+    )
     if context["intent"]:
         prompt_parts.append(f"Additional user requirements: {context['intent']}")
     return "\n".join(prompt_parts)
+
+
+def _workspace_service_plan(catalog: Any, plan: Any, service: Dict[str, Any]) -> Any:
+    """``plan`` without the Workspace-building capabilities its service did not ask for.
+
+    Creating, scheduling or deleting Flows, scheduled jobs and Initiatives is
+    how a Workspace is built, not the work a service's Agent does. A service
+    that manages them lists the capability in ``required_capabilities``. A
+    Skill brings the tools it declares, so one that declares them goes too
+    (staging 2026-11-09: workspace-workflows gave a support Agent every
+    Flow-authoring tool).
+    """
+    from packages.core.ai.runtime.capabilities import CORE_CAPABILITIES
+    from packages.core.services.agent_capability_catalog import AgentCapabilityKind
+
+    required = {str(item) for item in service.get("required_capabilities") or []}
+    unasked = {cap_id for cap_id, cap in CORE_CAPABILITIES.items()
+               if cap.risk_level == "admin" and cap_id not in required}
+    kept_tools = {name for cap_id, cap in CORE_CAPABILITIES.items() if cap_id not in unasked for name in cap.tool_names}
+    building_tools = {name for cap_id in unasked for name in CORE_CAPABILITIES[cap_id].tool_names} - kept_tools
+    by_id = {candidate.catalog_id: candidate for candidate in catalog.candidates}
+    kept = [
+        catalog_id for catalog_id in plan.selected_catalog_ids
+        if (candidate := by_id.get(catalog_id)) is None
+        or not (candidate.kind is AgentCapabilityKind.BUSINESS_CAPABILITY and candidate.ref in unasked)
+        and not (candidate.kind is AgentCapabilityKind.TOOL and candidate.ref in building_tools)
+        and not (candidate.kind is AgentCapabilityKind.SKILL
+                 and building_tools & set(candidate.metadata.get("declared_tools") or ()))
+    ]
+    return plan if len(kept) == len(plan.selected_catalog_ids) else catalog.resolve(kept)
 
 
 def _agent_capability_catalog_fingerprint(agent_catalog: Any) -> str:
@@ -1507,35 +1903,6 @@ def _agent_capability_catalog_fingerprint(agent_catalog: Any) -> str:
         semantic_candidates.append(item)
     semantic_candidates.sort(key=lambda item: _as_nonempty_str(item.get("id")))
     return _stable_fingerprint(semantic_candidates)
-
-
-def _workspace_existing_integration_catalog(catalog: Any) -> Any:
-    """Offer only usable MCP integrations during conversational creation."""
-    from dataclasses import replace
-
-    from packages.core.services.agent_capability_catalog import (
-        AgentCapabilityKind,
-        AgentCapabilityPlanStatus,
-    )
-
-    available = {
-        str(candidate.metadata.get("server_key") or candidate.ref)
-        for candidate in catalog.candidates
-        if candidate.kind is AgentCapabilityKind.MCP_ACTION
-        and candidate.readiness is AgentCapabilityPlanStatus.READY
-    }
-    candidates = tuple(
-        candidate for candidate in catalog.candidates
-        if candidate.kind is not AgentCapabilityKind.MCP_ACTION
-        or candidate.readiness is AgentCapabilityPlanStatus.READY
-    )
-    integrations = tuple(
-        item for item in catalog.integrations
-        if str(item.get("mcp_server_key") or item.get("provider") or "") in available
-    )
-    if len(candidates) == len(catalog.candidates) and len(integrations) == len(catalog.integrations):
-        return catalog
-    return replace(catalog, candidates=candidates, integrations=integrations)
 
 
 def _clear_agent_capability_plans(
@@ -2008,6 +2375,33 @@ async def _commit_basics(db, *, entity_id: str, user_id: str = "", **kwargs):
     return _ok({"committed": ["name", "kind", "operating_context", "primary_work"]})
 
 
+# ── ws_ask_user ─────────────────────────────────────────────────────────────
+
+#: Draft field holding this turn's question until the transcript records it on
+#: the architect's reply (``workspace_draft_service._record_visible_messages``).
+PENDING_QUESTION_FIELD = "_pending_question"
+
+
+async def _ask_user(db, *, entity_id: str, user_id: str = "", **kwargs):
+    from packages.core.services.decision_recommendation import RecommendationError, reply_question
+
+    draft = await _load_draft(db, kwargs.get("draft_id", ""), entity_id, user_id)
+    if draft is None:
+        return _err("draft not found")
+    try:
+        question = reply_question(
+            kwargs.get("question"), kwargs.get("options"),
+            kwargs.get("recommended"), kwargs.get("recommendation_reason"),
+        )
+    except RecommendationError as exc:
+        return _err(str(exc))
+    fields = dict(draft.fields or {})
+    fields[PENDING_QUESTION_FIELD] = question
+    draft.fields = fields
+    await _persist(db, draft)
+    return _ok({"options": question["options"], "recommended": question["recommendation"]["option"]})
+
+
 # ── ws_propose_service ──────────────────────────────────────────────────────
 
 async def _propose_service(db, *, entity_id: str, user_id: str = "", **kwargs):
@@ -2048,6 +2442,16 @@ async def _propose_service(db, *, entity_id: str, user_id: str = "", **kwargs):
     }
     if kwargs.get("rationale"):
         new_service["rationale"] = kwargs["rationale"]
+    handoff_to = kwargs.get("handoff_to")
+    if handoff_to is not None:
+        if not isinstance(handoff_to, list) or not all(
+            isinstance(key, str) and _SLUG_RE.match(key) and key != service_key for key in handoff_to
+        ):
+            return _err("handoff_to must list other services' snake_case service_keys")
+        if handoff_to:
+            new_service["handoff_to"] = list(dict.fromkeys(handoff_to))
+    if kwargs.get("human_review") is True:
+        new_service["human_review"] = True
 
     fields = dict(draft.fields or {})
     new_service = _scrub_new_item_for_removed_channels(new_service, fields)
@@ -2194,13 +2598,62 @@ async def _propose_agent_mapping(db, *, entity_id: str, user_id: str = "", **kwa
 
 # ── ws_request_custom_agent ─────────────────────────────────────────────────
 
-async def _request_custom_agent(db, *, entity_id: str, user_id: str = "", **kwargs):
+@dataclasses.dataclass(frozen=True)
+class _SkillsToAcquire:
+    """The lease a first ``draft_phase`` took to find a service's Skills."""
+    token: str
+    request_key: str
+    specs: list
+    catalog: Any
+    mapping: Optional[dict]
+
+
+def _agent_mapping(fields: Dict[str, Any], service_key: str) -> Optional[dict]:
+    return next(
+        (
+            item for item in (fields.get("agent_mappings") or [])
+            if (item or {}).get("service_key") == service_key
+        ),
+        None,
+    )
+
+
+async def _request_custom_agent(db, *, entity_id: str, user_id: str = "", draft_phase=None, **kwargs):
+    """Save a custom Agent design for one service.
+
+    ``draft_phase`` (from an Architect turn) opens a short locked transaction;
+    finding missing Skills runs between the read and the save, holding none.
+    """
+    if draft_phase is None:
+        return await _request_custom_agent_in_draft(db, entity_id=entity_id, user_id=user_id, **kwargs)
+    async with draft_phase():
+        outcome = await _request_custom_agent_in_draft(
+            db, entity_id=entity_id, user_id=user_id, staged=True, **kwargs,
+        )
+    return outcome
+
+
+async def _request_custom_agent_in_draft(
+    db, *, entity_id: str, user_id: str = "", staged: bool = False,
+    acquired: Optional[_SkillsToAcquire] = None, **kwargs,
+):
+    """The locked part of ``_request_custom_agent``.
+
+    ``staged`` returns a ``_SkillsToAcquire`` lease instead of finding missing
+    Skills in this transaction; ``acquired`` is that lease, now recorded.
+    """
     draft_id = kwargs.get("draft_id", "")
     draft = await _load_draft(db, draft_id, entity_id, user_id)
     if draft is None:
         return _err("draft not found")
 
     service_key = kwargs.get("service_key", "")
+    if acquired is not None and _agent_mapping(draft.fields or {}, service_key) != acquired.mapping:
+        return _err(
+            "the Agent for this service changed while its Skills were found",
+            hint="review the current Agent, then call ws_request_custom_agent again",
+            service_key=service_key,
+        )
     # Accept both new richer fields and the old "system_prompt_seed" name
     # so older calls keep working while the architect upgrades.
     system_prompt = kwargs.get("system_prompt") or kwargs.get("system_prompt_seed", "")
@@ -2270,7 +2723,6 @@ async def _request_custom_agent(db, *, entity_id: str, user_id: str = "", **kwar
                 entity_id=entity_id,
                 user_id=user_id,
             )
-            capability_catalog = _workspace_existing_integration_catalog(capability_catalog)
             if stored_plan is not None:
                 service = _agent_capability_service(fields, service_key)
                 if service is None:
@@ -2357,11 +2809,19 @@ async def _request_custom_agent(db, *, entity_id: str, user_id: str = "", **kwar
 
     acquisition_receipts = []
 
-    if capability_plan is not None and capability_plan.setup_required:
+    # A connection the user has not made yet is recorded as a pending
+    # requirement (missing_integrations below), never a reason to drop the
+    # capability: the binding works as soon as the account is connected.
+    # Only a dependency no account can satisfy stops the Agent here.
+    unavailable_dependencies = [
+        dict(item) for item in (capability_plan.setup_required if capability_plan is not None else ())
+        if item.get("setup_kind") == "skill_dependency_unavailable"
+    ]
+    if unavailable_dependencies:
         return _err(
             "Agent dependencies are not available",
-            setup_required=list(capability_plan.setup_required),
-            hint="Connect the required integration or select an available alternative, then search again.",
+            setup_required=unavailable_dependencies,
+            hint="Select an available alternative, then search again.",
         )
 
     create_draft = {
@@ -2508,6 +2968,26 @@ async def _assign_staff(db, *, entity_id: str, user_id: str = "", **kwargs):
     if staff.entity_id != entity_id:
         return _err("staff belongs to another entity", got=staff_id)
 
+    names = {name.strip() for name in (staff.name, staff.display_name) if name and name.strip()}
+    said = [str((draft.fields or {}).get(STAFF_REQUEST_TEXT_FIELD) or "").casefold()]
+    said.extend(
+        str(message.get(STAFF_REQUEST_TEXT_FIELD) or "").casefold()
+        for message in draft.messages or []
+        if isinstance(message, dict) and message.get("role") == "user"
+    )
+    # Han text does not require spaces around a name, as in 让Amy审稿.
+    word = r"[^\W㐀-鿿豈-﫿]"
+    if not any(
+        re.search(rf"(?<!{word}){re.escape(name.casefold())}(?!{word})", text)
+        for name in names for text in said
+    ):
+        return _err(
+            "the person did not name this staff member",
+            staff_name=sorted(names)[0] if names else staff_id,
+            hint=("Assign only people named in the user's own messages. Ask the user to name the person "
+                  "if needed. Work the user approves themselves needs no assignment."),
+        )
+
     role = (kwargs.get("role") or "").strip() or "member"
     assignment = {
         "staff_id": staff_id,
@@ -2617,18 +3097,25 @@ async def _flag_missing_integration(db, *, entity_id: str, user_id: str = "", **
     provider = resolved.provider
 
     fields = dict(draft.fields or {})
+    linked_service_keys = _service_key_list(kwargs.get("linked_service_keys"))
     flagged = list(fields.get("flagged_integrations") or [])
-    # Replace if already flagged (e.g. add more linked_service_keys).
-    flagged = [f for f in flagged if (f or {}).get("provider") != provider]
-    flagged.append({
-        "provider": provider,
-        "purpose": kwargs.get("purpose", ""),
-        "required": bool(kwargs.get("required", True)),
-        "linked_service_keys": list(kwargs.get("linked_service_keys") or []),
-        "source": "explicit",
-    })
+    # One requirement per provider. An Agent design that already records it
+    # keeps its own entry; this call only widens which services wait for it.
+    existing = next(
+        (f for f in flagged if isinstance(f, dict) and _as_nonempty_str(f.get("provider")) == provider),
+        None,
+    )
+    if existing is None:
+        existing = {"provider": provider, "source": "explicit", "linked_service_keys": []}
+        flagged.append(existing)
+    existing["purpose"] = existing.get("purpose") or kwargs.get("purpose", "")
+    existing["required"] = bool(existing.get("required", False) or kwargs.get("required", True))
+    existing["linked_service_keys"] = list(dict.fromkeys(
+        [*_service_key_list(existing.get("linked_service_keys")), *linked_service_keys]
+    ))
+    existing["blocks_creation"] = False
     if resolved.covered_provider:
-        flagged[-1]["covered_provider"] = resolved.covered_provider
+        existing.setdefault("covered_provider", resolved.covered_provider)
     fields["flagged_integrations"] = flagged
     draft.fields = fields
     await _persist(db, draft)
@@ -2640,12 +3127,15 @@ async def _flag_missing_integration(db, *, entity_id: str, user_id: str = "", **
     })
 
 
-async def _search_capabilities(db, *, entity_id: str, user_id: str = "", **kwargs):
+async def _search_capabilities(db, *, entity_id: str, user_id: str = "", draft_phase=None, **kwargs):
     """Match one service semantically, plus return Workspace-only resources.
 
     Direct callers that omit ``service_key`` retain the full legacy inventory.
     The Architect schema requires it, keeping the large actor catalog inside
     the bounded matcher instead of truncating it in the outer chat context.
+
+    ``draft_phase`` (from an Architect turn) opens a short locked transaction;
+    the semantic matcher runs between the read and the save, holding none.
     """
     from sqlalchemy import select
 
@@ -2657,105 +3147,129 @@ async def _search_capabilities(db, *, entity_id: str, user_id: str = "", **kwarg
     )
 
     draft_id = kwargs.get("draft_id", "")
-    draft = None
-    if draft_id:
-        draft = await _load_draft(db, draft_id, entity_id, user_id)
+    phase = draft_phase or contextlib.nullcontext
+    async with phase():
+        draft = None
+        if draft_id:
+            draft = await _load_draft(db, draft_id, entity_id, user_id)
+            if draft is None:
+                return _err("draft not found")
+
+        agent_catalog = await AgentCapabilityCatalogFactory.create(
+            db,
+            entity_id=entity_id,
+            user_id=user_id,
+        )
+        shared_payload = agent_catalog.workspace_payload()
+        integrations_out = shared_payload["integrations"]
+
+        # Nango is an aggregator rather than a bindable MCP server, so it stays a
+        # Workspace-only companion block outside the exact Agent catalog.
+        # Aggregators and catalog-only providers are not existing actor connections.
+
+        staff_rows = (await db.execute(
+            select(Staff).where(
+                Staff.entity_id == entity_id,
+                Staff.deleted_at.is_(None),
+            )
+        )).scalars().all()
+        staff_out = [
+            {
+                "id": staff.id,
+                "name": getattr(staff, "display_name", None) or staff.name,
+                "email": staff.email,
+                "role": getattr(staff, "role", None) or getattr(staff, "title", None),
+            }
+            for staff in staff_rows
+        ]
+
+        knowledge_rows = (await db.execute(
+            select(DocumentGroup).where(DocumentGroup.entity_id == entity_id)
+        )).scalars().all()
+        knowledge_out = [
+            {
+                "id": group.id,
+                "name": group.name,
+                "workspace_id": group.workspace_id,
+                "indexed": bool(group.vector_store_id),
+            }
+            for group in knowledge_rows
+        ]
+
+        payload = {
+            "business_capabilities": shared_payload["business_capabilities"],
+            "tools": shared_payload["tools"],
+            "skills": shared_payload["skills"],
+            "integrations": integrations_out,
+            "agent_capability_catalog": agent_catalog.prompt_payload(),
+            "staff": staff_out,
+            "knowledge": knowledge_out,
+        }
+
+        service_key = str(kwargs.get("service_key") or "").strip()
+        if not service_key:
+            return _ok(payload)
         if draft is None:
-            return _err("draft not found")
+            return _err("draft_id is required for service capability matching")
 
-    agent_catalog = await AgentCapabilityCatalogFactory.create(
-        db,
-        entity_id=entity_id,
-        user_id=user_id,
-    )
-    agent_catalog = _workspace_existing_integration_catalog(agent_catalog)
-    shared_payload = agent_catalog.workspace_payload()
-    integrations_out = shared_payload["integrations"]
+        fields = dict(draft.fields or {})
+        service = _agent_capability_service(fields, service_key)
+        if service is None:
+            return _err(
+                "service_key does not exist in this draft",
+                got=service_key,
+                available_service_keys=[
+                    str(item.get("service_key") or "")
+                    for item in (fields.get("services") or [])
+                    if isinstance(item, dict)
+                ],
+            )
 
-    # Nango is an aggregator rather than a bindable MCP server, so it stays a
-    # Workspace-only companion block outside the exact Agent catalog.
-    # Aggregators and catalog-only providers are not existing actor connections.
+        from packages.core.services.agent_generator import match_agent_capabilities
 
-    staff_rows = (await db.execute(
-        select(Staff).where(
-            Staff.entity_id == entity_id,
-            Staff.deleted_at.is_(None),
-        )
-    )).scalars().all()
-    staff_out = [
-        {
-            "id": staff.id,
-            "name": getattr(staff, "display_name", None) or staff.name,
-            "email": staff.email,
-            "role": getattr(staff, "role", None) or getattr(staff, "title", None),
-        }
-        for staff in staff_rows
-    ]
-
-    knowledge_rows = (await db.execute(
-        select(DocumentGroup).where(DocumentGroup.entity_id == entity_id)
-    )).scalars().all()
-    knowledge_out = [
-        {
-            "id": group.id,
-            "name": group.name,
-            "workspace_id": group.workspace_id,
-            "indexed": bool(group.vector_store_id),
-        }
-        for group in knowledge_rows
-    ]
-
-    payload = {
-        "business_capabilities": shared_payload["business_capabilities"],
-        "tools": shared_payload["tools"],
-        "skills": shared_payload["skills"],
-        "integrations": integrations_out,
-        "agent_capability_catalog": agent_catalog.prompt_payload(),
-        "staff": staff_out,
-        "knowledge": knowledge_out,
-    }
-
-    service_key = str(kwargs.get("service_key") or "").strip()
-    if not service_key:
-        return _ok(payload)
-    if draft is None:
-        return _err("draft_id is required for service capability matching")
-
-    fields = dict(draft.fields or {})
-    service = _agent_capability_service(fields, service_key)
-    if service is None:
-        return _err(
-            "service_key does not exist in this draft",
-            got=service_key,
-            available_service_keys=[
-                str(item.get("service_key") or "")
-                for item in (fields.get("services") or [])
-                if isinstance(item, dict)
-            ],
+        extra_intent = str(kwargs.get("intent") or "").strip()
+        context = _agent_capability_context(
+            fields,
+            service=service,
+            service_key=service_key,
+            intent=extra_intent,
         )
 
-    from packages.core.services.agent_generator import match_agent_capabilities
+        agent_name = str(kwargs.get("agent_name") or "").strip()
+        if not agent_name:
+            agent_name = f"{service.get('name') or service_key} Agent"
 
-    extra_intent = str(kwargs.get("intent") or "").strip()
-    context = _agent_capability_context(
-        fields,
-        service=service,
-        service_key=service_key,
-        intent=extra_intent,
-    )
+        stored_plan = _current_agent_capability_plan(
+            fields,
+            service_key=service_key,
+            agent_name=agent_name,
+            intent=extra_intent,
+            context=context,
+            agent_catalog=agent_catalog,
+        )
+        if stored_plan is not None:
+            # Matching the same request against the same catalog again only
+            # costs provider calls; the stored ids are what it selected.
+            return _ok(_capability_search_result(
+                payload,
+                shared_payload=shared_payload,
+                agent_catalog=agent_catalog,
+                plan=agent_catalog.resolve(stored_plan.get("capability_ids") or []),
+                service_key=service_key,
+                agent_name=agent_name,
+                reused=True,
+            ))
 
-    agent_name = str(kwargs.get("agent_name") or "").strip()
-    if not agent_name:
-        agent_name = f"{service.get('name') or service_key} Agent"
+        if draft_phase is None:
+            # The semantic matcher can make several provider calls.  Do not keep the
+            # Architect's draft lock (or any pooled connection) checked out while that
+            # external work runs.  Re-lock and compare the complete editable state
+            # afterwards so a concurrent turn cannot be overwritten by a stale plan.
+            baseline = _stable_fingerprint({
+                "status": draft.status, "fields": fields, "messages": draft.messages,
+            })
+            await db.commit()
 
-    # The semantic matcher can make several provider calls.  Do not keep the
-    # Architect's draft lock (or any pooled connection) checked out while that
-    # external work runs.  Re-lock and compare the complete editable state
-    # afterwards so a concurrent turn cannot be overwritten by a stale plan.
-    baseline = _stable_fingerprint({
-        "status": draft.status, "fields": fields, "messages": draft.messages,
-    })
-    await db.commit()
     match_error = None
     try:
         plan = await match_agent_capabilities(
@@ -2768,64 +3282,136 @@ async def _search_capabilities(db, *, entity_id: str, user_id: str = "", **kwarg
             entity_id=entity_id,
             capability_catalog=agent_catalog,
         )
+        plan = _workspace_service_plan(agent_catalog, plan, service)
     except Exception as exc:
         # Even a recoverable provider failure must re-establish the turn lock
         # before the model can retry or execute another Draft mutation.
         match_error = exc
 
-    try:
-        draft = (await db.execute(
-            select(WorkspaceDraft)
-            .where(
-                WorkspaceDraft.id == draft_id,
-                WorkspaceDraft.entity_id == entity_id,
-                WorkspaceDraft.user_id == (user_id or None),
-            )
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )).scalar_one_or_none()
-    except Exception as exc:
-        raise RuntimeTurnAborted(
-            "draft state could not be revalidated after capability matching; retry this turn"
-        ) from exc
-    if draft is None:
-        await db.rollback()
-        raise RuntimeTurnAborted("draft not found after capability matching")
-    current_fields = dict(draft.fields or {})
-    current = _stable_fingerprint({
-        "status": draft.status,
-        "fields": current_fields,
-        "messages": draft.messages,
-    })
-    if current != baseline or draft.status not in {"active", "ready"}:
-        await db.rollback()
-        raise RuntimeTurnAborted(
-            "draft changed while capabilities were being matched; retry this turn",
-        )
-    if match_error is not None:
+    if draft_phase is not None and match_error is not None:
         raise match_error
-    fields = current_fields
-    fields[_AGENT_CAPABILITY_PLANS_FIELD] = _replace_in_list(
-        fields.get(_AGENT_CAPABILITY_PLANS_FIELD) or [],
-        "service_key",
-        service_key,
-        {
-            "service_key": service_key,
-            "agent_name": agent_name,
-            "intent": extra_intent,
-            "capability_ids": list(plan.selected_catalog_ids),
-            "status": plan.status.value,
-            "setup_required": [dict(item) for item in plan.setup_required],
-            "context_fingerprint": _stable_fingerprint(context),
-            "catalog_fingerprint": _agent_capability_catalog_fingerprint(
-                agent_catalog
-            ),
-        },
+    async with phase():
+        if draft_phase is None:
+            try:
+                draft = (await db.execute(
+                    select(WorkspaceDraft)
+                    .where(
+                        WorkspaceDraft.id == draft_id,
+                        WorkspaceDraft.entity_id == entity_id,
+                        WorkspaceDraft.user_id == (user_id or None),
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )).scalar_one_or_none()
+            except Exception as exc:
+                raise RuntimeTurnAborted(
+                    "draft state could not be revalidated after capability matching; retry this turn"
+                ) from exc
+            if draft is None:
+                await db.rollback()
+                raise RuntimeTurnAborted("draft not found after capability matching")
+            current_fields = dict(draft.fields or {})
+            current = _stable_fingerprint({
+                "status": draft.status,
+                "fields": current_fields,
+                "messages": draft.messages,
+            })
+            if current != baseline or draft.status not in {"active", "ready"}:
+                await db.rollback()
+                raise RuntimeTurnAborted(
+                    "draft changed while capabilities were being matched; retry this turn",
+                )
+            if match_error is not None:
+                raise match_error
+            fields = current_fields
+        else:
+            # Re-read: the person or the Architect may have edited the Draft
+            # meanwhile. Only this service's plan is written, and only while
+            # the service still matches what was matched.
+            draft = await _load_draft(db, draft_id, entity_id, user_id)
+            if draft is None:
+                return _err("draft not found")
+            fields = dict(draft.fields or {})
+            service = _agent_capability_service(fields, service_key)
+            if service is None or _stable_fingerprint(_agent_capability_context(
+                fields, service=service, service_key=service_key, intent=extra_intent,
+            )) != _stable_fingerprint(context):
+                return _err(
+                    "the service changed while its capabilities were matched",
+                    hint="call ws_search_capabilities again for this service_key",
+                    service_key=service_key,
+                )
+        fields[_AGENT_CAPABILITY_PLANS_FIELD] = _replace_in_list(
+            fields.get(_AGENT_CAPABILITY_PLANS_FIELD) or [],
+            "service_key",
+            service_key,
+            {
+                "service_key": service_key,
+                "agent_name": agent_name,
+                "intent": extra_intent,
+                "capability_ids": list(plan.selected_catalog_ids),
+                "status": plan.status.value,
+                "setup_required": [dict(item) for item in plan.setup_required],
+                "context_fingerprint": _stable_fingerprint(context),
+                "catalog_fingerprint": _agent_capability_catalog_fingerprint(
+                    agent_catalog
+                ),
+            },
+        )
+        draft.fields = fields
+        await _persist(db, draft)
+    # Without a turn, keep the re-acquired row lock through the rest of the
+    # Architect turn; the caller owns the final commit.
+    return _ok(_capability_search_result(
+        payload,
+        shared_payload=shared_payload,
+        agent_catalog=agent_catalog,
+        plan=plan,
+        service_key=service_key,
+        agent_name=agent_name,
+    ))
+
+
+def _current_agent_capability_plan(
+    fields: Dict[str, Any],
+    *,
+    service_key: str,
+    agent_name: str,
+    intent: str,
+    context: Dict[str, Any],
+    agent_catalog: Any,
+) -> Optional[Dict[str, Any]]:
+    """The stored plan for this exact request, while service and catalog are unchanged."""
+    stored_plan = next(
+        (
+            item for item in (fields.get(_AGENT_CAPABILITY_PLANS_FIELD) or [])
+            if isinstance(item, dict) and item.get("service_key") == service_key
+        ),
+        None,
     )
-    draft.fields = fields
-    await _persist(db, draft)
-    # Keep the re-acquired row lock through the rest of the Architect turn.
-    # The caller owns the final commit, including the visible conversation.
+    if (
+        stored_plan is None
+        or _as_nonempty_str(stored_plan.get("agent_name")) != agent_name
+        or _as_nonempty_str(stored_plan.get("intent")) != intent
+        or stored_plan.get("context_fingerprint") != _stable_fingerprint(context)
+        or stored_plan.get("catalog_fingerprint")
+        != _agent_capability_catalog_fingerprint(agent_catalog)
+    ):
+        return None
+    return stored_plan
+
+
+def _capability_search_result(
+    payload: Dict[str, Any],
+    *,
+    shared_payload: Dict[str, Any],
+    agent_catalog: Any,
+    plan: Any,
+    service_key: str,
+    agent_name: str,
+    reused: bool = False,
+) -> Dict[str, Any]:
+    integrations_out = shared_payload["integrations"]
     selected_ids = set(plan.selected_catalog_ids)
     payload.update({
         "business_capabilities": [
@@ -2858,8 +3444,9 @@ async def _search_capabilities(db, *, entity_id: str, user_id: str = "", **kwarg
             "selection_limit": AGENT_CAPABILITY_SELECTION_LIMIT,
         },
         "selection_scope": {"service_key": service_key, "agent_name": agent_name},
+        "plan_reused": reused,
     })
-    return _ok(payload)
+    return payload
 
 
 # ── ws_propose_channel ──────────────────────────────────────────────────────
@@ -2938,16 +3525,12 @@ async def _propose_rule(db, *, entity_id: str, user_id: str = "", **kwargs):
     if not _SLUG_RE.match(rule_key):
         return _err("rule_key must be snake_case", got=rule_key)
     fields = dict(draft.fields or {})
-    removed_channels = {_channel_key(v) for v in fields.get("_removed_channels") or []}
     rule = {
         "rule_key": rule_key,
         "description": kwargs.get("description", ""),
         "scope": kwargs.get("scope", "all"),
         "severity": kwargs.get("severity", "warn"),
     }
-    for removed_channel in removed_channels:
-        for field_name in ("description", "scope"):
-            rule[field_name] = _scrub_removed_channel_text(rule.get(field_name), removed_channel)
     rule_type = str(kwargs.get("rule_type") or "").strip().lower()
     enforcement_scope = str(kwargs.get("enforcement_scope") or "").strip().lower()
     downgraded_from = ""
@@ -2982,14 +3565,6 @@ async def _propose_rule(db, *, entity_id: str, user_id: str = "", **kwargs):
         str(p).strip() for p in (kwargs.get("action_patterns") or [])
         if str(p or "").strip()
     ]
-    if removed_channels:
-        removed_patterns = set().union(*(
-            _CHANNEL_ACTION_PATTERNS.get(ch, set()) for ch in removed_channels
-        ))
-        action_patterns = [
-            p for p in action_patterns
-            if _as_nonempty_str(p).lower() not in removed_patterns
-        ]
     if action_patterns:
         rule["action_patterns"] = list(dict.fromkeys(action_patterns))
     fields["rules"] = _replace_in_list(
@@ -3061,103 +3636,525 @@ def _hard_block_request_problem(draft, *, flagged: bool, quote: str) -> str:
     return ""
 
 
-# ── ws_design_app_view / ws_accept_app_view ─────────────────────────────────
+# ── Part designers: ws_design_<part> / ws_accept_parts ───────────────────────
 
-async def _design_app_view(db, *, entity_id: str, user_id: str = "", **kwargs):
-    """Run the App design sub-agent and keep its candidate beside the App."""
+async def _design_part(db, *, entity_id: str, user_id: str = "", part: str, draft_phase=None, **kwargs):
+    """Run ``part``'s designer and keep its candidate in ``_candidates``.
+
+    ``draft_phase`` (from an Architect turn) opens a short locked transaction;
+    the sub-agent runs between the read and the save, holding none.
+    """
     from packages.core.ai.runtime.surfaces import ChatSurface
-    from packages.core.services.workspace_app_designer import (
-        AppDesignContext,
-        app_view_candidate_summary,
-        project_structure_issues,
-        run_app_designer,
+    from packages.core.services.workspace_part_designers import (
+        candidate_reply,
+        keep_candidate,
+        part_designers,
+        pending_candidates,
     )
+
+    from packages.core.services.workspace_build_spec import set_progress
+    from packages.core.services.workspace_part_designers import DesignJob, design_wave, note_design_failure
+
+    designer = part_designers()[part]
+    phase = draft_phase or contextlib.nullcontext
+    brief = str(kwargs.get("brief") or "").strip()
+    async with phase():
+        draft = await _load_draft(db, kwargs.get("draft_id", ""), entity_id, user_id)
+        if draft is None:
+            return _err("draft not found")
+        if not brief:
+            return _err(f"brief is required: {designer.brief_hint}")
+        context = designer.context_from_draft(dict(draft.fields or {}))
+        # Feedback is about the candidate still waiting; the designer revises it.
+        sent_back = pending_candidates(dict(draft.fields or {})).get(part) if kwargs.get("feedback") else None
+    blocked = designer.blockers(context)
+    if blocked:
+        return _refused(blocked)
+    outcome = (await design_wave(
+        [DesignJob(designer, context, brief, kwargs.get("feedback"), sent_back)], entity_id=entity_id,
+        user_id=user_id or None, workspace_id=None, surface=ChatSurface.WORKSPACE_DRAFT_ARCHITECT,
+        keepalive=_draft_keepalive(draft_phase),
+    ))[0]
+    if outcome.error is not None or outcome.result.candidate is None:
+        async with phase():
+            draft = await _load_draft(db, kwargs.get("draft_id", ""), entity_id, user_id)
+            if draft is None:
+                return _err("draft not found")
+            fields = dict(draft.fields or {})
+            note_design_failure(fields, part)
+            draft.fields = fields
+            await _persist(db, draft)
+    if outcome.error is not None:
+        # Technical: reported to operators; the lead builds the part, the person hears nothing of it.
+        return _err(f"the {designer.title} design is not available right now",
+                    **({"next": f"{designer.fallback} Do not mention this to the person."} if designer.fallback else {}))
+    result = outcome.result
+    if result.candidate is None:
+        return _err(f"the {designer.title} designer did not produce a candidate that passes its checks",
+                    design_notes=result.notes, attempts=result.attempts,
+                    **({"next": designer.fallback} if designer.fallback else {}))
+    async with phase():
+        # Re-read: the person or the Architect may have edited the Draft meanwhile.
+        draft = await _load_draft(db, kwargs.get("draft_id", ""), entity_id, user_id)
+        if draft is None:
+            return _err("draft not found")
+        fields = dict(draft.fields or {})
+        _, errors, _ = designer.check(designer.context_from_draft(fields), result.candidate)
+        if errors:
+            return _err(f"the Draft changed while the {designer.title} was designed; command a new design",
+                        errors=errors)
+        keep_candidate(fields, part, {
+            "value": result.candidate, "brief": brief, **result.details,
+            "warnings": result.warnings, "design_notes": result.notes,
+        })
+        set_progress(fields, part, "candidate")
+        draft.fields = fields
+        await _persist(db, draft)
+    return _ok(candidate_reply(designer, result))
+
+
+def _draft_keepalive(draft_phase):
+    """Renews the turn's hold on the Draft while designers run; None outside a turn."""
+    if draft_phase is None:
+        return None
+
+    async def keepalive() -> None:
+        async with draft_phase():
+            pass
+
+    return keepalive
+
+
+async def _accept_parts(db, *, entity_id: str, user_id: str = "", draft_phase=None, **kwargs):
+    """Accept each named part's candidate in order; stop at the first that fails.
+
+    Each part is checked again and written in its own short locked transaction;
+    a part that writes through the lead's tools (``PartDesigner.apply``) runs
+    them, and any long work they do holds no lock.
+    """
+    from packages.core.services.workspace_build_spec import set_progress
+    from packages.core.services.workspace_part_designers import accept_candidate, part_designers, pending_candidates
+
+    parts = list(dict.fromkeys(str(part) for part in kwargs.get("parts") or []))
+    if not parts:
+        return _err("parts is required: name the parts whose candidates to accept")
+    phase = draft_phase or contextlib.nullcontext
+    draft_id = kwargs.get("draft_id", "")
+    accepted: dict[str, Any] = {}
+    failed = None
+    for part in parts:
+        designer = part_designers().get(part)
+        if designer is not None and designer.apply is not None:
+            async with phase():
+                draft = await _load_draft(db, draft_id, entity_id, user_id)
+                if draft is None:
+                    return _err("draft not found")
+                record = pending_candidates(dict(draft.fields or {})).get(part)
+            if record is None:
+                failed = {"part": part, "error": f"no {designer.title} design is waiting; command one with "
+                                                 "ws_design_parts"}
+                break
+            summary, error = await designer.apply(db, record, entity_id=entity_id, user_id=user_id,
+                                                  draft_id=draft_id, draft_phase=phase)
+            if error is not None:
+                failed = {"part": part, **error}
+                break
+        else:
+            async with phase():
+                draft = await _load_draft(db, draft_id, entity_id, user_id)
+                if draft is None:
+                    return _err("draft not found")
+                fields = dict(draft.fields or {})
+                # Checked against the Draft as the parts before it left it.
+                summary, error = accept_candidate(fields, part)
+                if error is not None:
+                    failed = {"part": part, **error}
+                    break
+                draft.fields = fields
+                await _persist(db, draft)
+        async with phase():
+            draft = await _load_draft(db, draft_id, entity_id, user_id)
+            if draft is not None:
+                fields = dict(draft.fields or {})
+                set_progress(fields, part, "accepted")
+                draft.fields = fields
+                await _persist(db, draft)
+        accepted[part] = summary
+    if failed is not None:
+        return _err(f"{failed['part']} was not accepted: {failed['error']}", accepted=accepted, failed=failed,
+                    not_tried=parts[len(accepted) + 1:])
+    return _ok({"accepted": accepted})
+
+
+async def _commit_build_spec(db, *, entity_id: str, user_id: str = "", **kwargs):
+    """Check the lead's build spec and keep it; dirty parts are designed again."""
+    from packages.core.services.workspace_build_spec import (
+        MULTI_STAGE_STAGES,
+        SOLO_MAX_WORK_UNITS,
+        commit_spec,
+        next_wave,
+        validate_build_spec,
+        work_units,
+    )
+    from packages.core.services.workspace_part_designers import designer_dependencies
 
     draft = await _load_draft(db, kwargs.get("draft_id", ""), entity_id, user_id)
     if draft is None:
         return _err("draft not found")
-    brief = str(kwargs.get("brief") or "").strip()
-    if not brief:
-        return _err("brief is required: say what the person wants to do from the App")
     fields = dict(draft.fields or {})
-    context = AppDesignContext.from_draft_fields(fields)
-    if not context.services and not context.workflows:
-        return _err("save the services and Workflows before commanding the App design")
-    blocking = [issue for issue in project_structure_issues(context.workflows) if issue["severity"] == "P0"]
-    if blocking:
-        return _err("fix these Workflows with ws_propose_workflow before commanding the App design",
-                    issues=blocking)
-    result = await run_app_designer(
-        context, brief=brief, feedback=kwargs.get("feedback"), entity_id=entity_id, user_id=user_id or None,
-        workspace_id=None, surface=ChatSurface.WORKSPACE_DRAFT_ARCHITECT,
-    )
-    if result.app_view is None:
-        return _err("the App designer did not produce a page that passes its checks",
-                    design_notes=result.notes, attempts=result.attempts)
-    fields["app_view_candidate"] = {
-        "app_view": result.app_view, "brief": brief, "recipes": result.recipes,
-        "warnings": result.warnings, "design_notes": result.notes,
-    }
+    proposed = {key: value for key, value in kwargs.items() if key != "draft_id" and not key.startswith("_")}
+    spec, errors = validate_build_spec(proposed, fields)
+    if errors:
+        return _err("the build spec has problems; fix them and commit it again", errors=errors)
+    stored = commit_spec(fields, spec, designer_dependencies())
     draft.fields = fields
     await _persist(db, draft)
+    if stored["mode"] == "solo":
+        return _ok({"mode": "solo", "work_units": work_units(stored), "next": (
+            f"Small Workspace (at most {SOLO_MAX_WORK_UNITS} Agents, Workflows, Automations and Knowledge nets, "
+            f"none with {MULTI_STAGE_STAGES}+ stages): build them yourself with the write tools, then command the "
+            "App with ws_design_app_view.")})
+    wave = next_wave(stored, designer_dependencies())
+    return _ok({"mode": "team", "progress": stored["progress"], "redesign": stored["dirty"], "next_wave": wave,
+                "next": f"Call ws_design_parts to design {', '.join(wave) or 'nothing'}." if wave
+                else "Every part is designed; ws_lint_draft next."})
+
+
+async def _design_parts(db, *, entity_id: str, user_id: str = "", draft_phase=None, **kwargs):
+    """Run one wave of part designers at once and keep each candidate.
+
+    ``draft_phase`` (from an Architect turn) opens a short locked transaction;
+    the designers run between the read and the save, holding none.
+    """
+    from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.services.workspace_build_spec import (
+        DONE,
+        MAX_SENDBACKS,
+        SPEC_PARTS,
+        build_spec,
+        count_sendback,
+        next_wave,
+        set_progress,
+        waiting_on,
+    )
+    from packages.core.services.workspace_part_designers import (
+        DesignJob,
+        candidate_reply,
+        design_wave,
+        designer_dependencies,
+        keep_candidate,
+        note_design_failure,
+        part_designers,
+        pending_candidates,
+    )
+
+    phase = draft_phase or contextlib.nullcontext
+    draft_id = kwargs.get("draft_id", "")
+    asked = {str(row.get("part")): row for row in kwargs.get("parts") or [] if isinstance(row, dict) and row.get("part")}
+    deps = designer_dependencies()
+    results: dict[str, Any] = {}
+    jobs: list = []
+    async with phase():
+        draft = await _load_draft(db, draft_id, entity_id, user_id)
+        if draft is None:
+            return _err("draft not found")
+        fields = dict(draft.fields or {})
+        spec = build_spec(fields)
+        if spec is None:
+            return _err("commit the build spec with ws_commit_build_spec first")
+        if spec.get("mode") == "solo":
+            return _refused({"error": "this Workspace is built in solo mode: build its parts yourself with the "
+                                      "write tools, and the App with ws_design_app_view"})
+        unknown = [part for part in asked if part not in spec.get("progress", {})]
+        if unknown:
+            return _refused({"error": f"the build spec plans no {unknown}; plan them in ws_commit_build_spec",
+                             "planned": sorted(spec.get("progress", {}))})
+        progress = spec.get("progress") or {}
+        # A part whose candidate waits for review is designed again only when named.
+        wave = list(asked) or [part for part in next_wave(spec, deps) if progress.get(part) == "pending"]
+        waiting = [part for part, state in progress.items() if state == "candidate"]
+        if not wave and waiting:
+            return _ok({"parts": {}, "progress": progress, "next": (
+                f"Review the waiting {waiting}: accept with ws_accept_parts, or name a part with feedback to "
+                "send it back.")})
+        for part in wave:
+            blocked_by = waiting_on(spec, part, deps)
+            if blocked_by:
+                results[part] = {"status": "waiting", "next": f"accept {blocked_by} first"}
+                continue
+            designer = part_designers()[part]
+            row = asked.get(part, {})
+            feedback = str(row.get("feedback") or "").strip() or None
+            if feedback and int((spec.get("sendbacks") or {}).get(part) or 0) >= MAX_SENDBACKS:
+                set_progress(fields, part, "lead")
+                results[part] = {"status": "lead", "next": (
+                    f"It was sent back {MAX_SENDBACKS} times. If the person must decide, ask with ws_ask_user; "
+                    f"otherwise {designer.fallback or 'build it yourself'} Never drop what the person asked for.")}
+                continue
+            context = designer.context_from_draft(fields)
+            blocked = designer.blockers(context)
+            if blocked:
+                results[part] = {"status": "blocked", **blocked}
+                continue
+            if not designer.needed(context):
+                set_progress(fields, part, "skipped")
+                results[part] = {"status": "skipped", "next": "nothing to design for it"}
+                continue
+            brief = str(row.get("brief") or (spec.get("briefs") or {}).get(part) or "").strip()
+            if not brief:
+                results[part] = {"status": "blocked", "error": f"give it a brief: {designer.brief_hint}"}
+                continue
+            if feedback:
+                count_sendback(fields, part)
+            sent_back = pending_candidates(fields).get(part) if feedback else None
+            jobs.append(DesignJob(designer, context, brief, feedback, sent_back))
+        draft.fields = fields
+        await _persist(db, draft)
+    outcomes = await design_wave(jobs, entity_id=entity_id, user_id=user_id or None, workspace_id=None,
+                                 surface=ChatSurface.WORKSPACE_DRAFT_ARCHITECT, keepalive=_draft_keepalive(draft_phase))
+    async with phase():
+        # Re-read: the person or the Architect may have edited the Draft meanwhile.
+        draft = await _load_draft(db, draft_id, entity_id, user_id)
+        if draft is None:
+            return _err("draft not found")
+        fields = dict(draft.fields or {})
+        for outcome in outcomes:
+            designer = outcome.job.designer
+            part = designer.part
+            if outcome.error is not None:
+                # Technical: reported to operators; the person hears nothing of it.
+                note_design_failure(fields, part)
+                set_progress(fields, part, "lead")
+                results[part] = {"status": "lead", "next": (
+                    f"{designer.fallback or 'Build it yourself.'} Do not mention this to the person.")}
+                continue
+            result = outcome.result
+            if result.candidate is None:
+                note_design_failure(fields, part)
+                results[part] = {"status": "no_design", "design_notes": result.notes, "attempts": result.attempts,
+                                 "next": f"Send it back with feedback, or: {designer.fallback or 'build it yourself'}"}
+                continue
+            _, errors, _ = designer.check(designer.context_from_draft(fields), result.candidate)
+            if errors:
+                results[part] = {"status": "stale", "errors": errors,
+                                 "next": "The Draft changed while it was designed; command it again."}
+                continue
+            keep_candidate(fields, part, {"value": result.candidate, "brief": outcome.job.brief, **result.details,
+                                          "warnings": result.warnings, "design_notes": result.notes})
+            set_progress(fields, part, "candidate")
+            results[part] = {"status": "candidate", **candidate_reply(designer, result)}
+        draft.fields = fields
+        await _persist(db, draft)
+        spec = build_spec(fields) or {}
+    progress = spec.get("progress") or {}
+    ready = [part for part, row in results.items() if row.get("status") == "candidate"]
+    later = [part for part in progress if progress[part] not in DONE and part not in results]
     return _ok({
-        "candidate": app_view_candidate_summary(result.app_view), "recipes": result.recipes,
-        "warnings": result.warnings, "design_notes": result.notes,
-        "next": "Accept with ws_accept_app_view, or call ws_design_app_view again with feedback.",
+        "parts": {part: results[part] for part in SPEC_PARTS if part in results},
+        "progress": progress,
+        "next": (f"Review {ready}: accept with ws_accept_parts or send back with feedback. " if ready else "")
+                + (f"Then ws_design_parts for {later}." if later else "Then ws_lint_draft."),
     })
 
 
+async def _design_app_view(db, *, entity_id: str, user_id: str = "", **kwargs):
+    kwargs.pop("part", None)
+    return await _design_part(db, entity_id=entity_id, user_id=user_id, part="app", **kwargs)
+
+
+async def _design_workflows(db, *, entity_id: str, user_id: str = "", **kwargs):
+    kwargs.pop("part", None)
+    return await _design_part(db, entity_id=entity_id, user_id=user_id, part="workflows", **kwargs)
+
+
 async def _accept_app_view(db, *, entity_id: str, user_id: str = "", **kwargs):
-    from packages.core.services.workspace_app_designer import AppDesignContext
+    from packages.core.services.workspace_part_designers import accept_candidate
 
     draft = await _load_draft(db, kwargs.get("draft_id", ""), entity_id, user_id)
     if draft is None:
         return _err("draft not found")
+    from packages.core.services.workspace_build_spec import set_progress
+
     fields = dict(draft.fields or {})
-    candidate = fields.get("app_view_candidate")
-    if not isinstance(candidate, dict):
-        return _err("no App design is waiting; command one with ws_design_app_view")
-    # The Draft may have changed since the design was checked.
-    config, errors, _ = AppDesignContext.from_draft_fields(fields).check(candidate.get("app_view"))
-    if errors:
-        return _err("the Draft changed since this design was checked; command a new design", errors=errors)
-    fields["app_view"] = config
-    fields.pop("app_view_candidate", None)
+    summary, failed = accept_candidate(fields, "app")
+    if failed is not None:
+        return _refused(failed)
+    set_progress(fields, "app", "accepted")
     draft.fields = fields
     await _persist(db, draft)
-    return _ok({"accepted": True, "hero": config["hero"], "entry_count": len(config["entries"]),
-                "component_count": len(config["components"])})
+    return _ok({"accepted": True, **summary})
+
+
+class DraftWorkflowError(ValueError):
+    """A proposed Workflow the Draft cannot keep, with what is wrong."""
+
+    def __init__(self, message: str, **details: Any):
+        super().__init__(message)
+        self.details = details
+
+
+def _review_asked_as_confirmation(steps: list[dict[str, Any]]) -> str | None:
+    """Why a Confirm-only wait between an Agent's draft and its outside action is a review, if one is.
+
+    Staging 2026-11-09, 5 of 6 drafts: "confirm this reply before it is sent"
+    offered one Confirm, so the person could not send the reply back.
+    """
+    by_id = {str(step.get("id")): step for step in steps if step.get("id")}
+
+    def config(step: dict[str, Any]) -> dict[str, Any]:
+        return step.get("config") if isinstance(step.get("config"), dict) else {}
+
+    def walk(start: str, links: dict[str, list[str]]) -> list[dict[str, Any]]:
+        """The steps reached from ``start`` along ``links`` before another wait."""
+        seen, queue, reached = {start}, list(links.get(start, [])), []
+        while queue:
+            step_id = queue.pop(0)
+            step = by_id.get(step_id)
+            if step_id in seen or step is None:
+                continue
+            seen.add(step_id)
+            reached.append(step)
+            if step.get("type") != "wait":
+                queue.extend(links.get(step_id, []))
+        return reached
+
+    after = {step_id: [str(item) for item in step.get("next") or []] for step_id, step in by_id.items()}
+    before: dict[str, list[str]] = {}
+    for step_id, targets in after.items():
+        for target in targets:
+            before.setdefault(target, []).append(step_id)
+    for step_id, step in by_id.items():
+        if step.get("type") != "wait" or not workflow_wait_is_confirmation(config(step)):
+            continue
+        makers = [item for item in walk(step_id, before) if item.get("type") == "agent"]
+        actors = [item for item in walk(step_id, after) if item.get("type") == "agent"
+                  and "effects" in (config(item).get("expects") or [])]
+        if makers and actors:
+            maker = makers[0]["id"]
+            return (f"wait {step_id} asks the person to confirm what {maker} made before {actors[0]['id']} acts on "
+                    f"it: that is an approval, so they can send it back -- a message that asks to approve it, options "
+                    f"['approve','revise'], approval_values ['approve'], revise_from '{maker}'")
+    return None
+
+
+#: Words in a Flow's slug or name that say it runs on a cadence.
+_ROUTINE_WORDS = frozenset({"hourly", "daily", "nightly", "weekly", "biweekly", "monthly", "quarterly"})
+_ROUTINE_NAME = r"每天|每日|每周|每月|每季度|日报|周报|月报"
+
+
+#: Result fields by which a step says whether a person must approve its work.
+_APPROVAL_FLAG = re.compile(r"\b(?:needs|requires|require)_(?:approval|review|confirmation)\b|\bapproval_required\b")
+
+
+def _approval_that_resends(steps: list[dict[str, Any]]) -> str | None:
+    """Why an approval could send or publish twice, if it could.
+
+    Staging 2026-11-09, a candle shop reply Flow: the drafting step sent routine replies itself and
+    returned needs_approval, yet every message waited for approval, and revise re-ran that step.
+    """
+    def config(step: dict[str, Any]) -> dict[str, Any]:
+        return step.get("config") if isinstance(step.get("config"), dict) else {}
+
+    by_id = {str(step.get("id")): step for step in steps if step.get("id")}
+    waits = [step for step in steps if step.get("type") == "wait"
+             and str(config(step).get("wait_type") or "approval") == "approval"]
+    for wait in waits:
+        redo = by_id.get(str(config(wait).get("revise_from") or ""))
+        if redo is not None and "effects" in (config(redo).get("expects") or []):
+            return (f"revise at {wait['id']} re-runs {redo['id']}, which acts outside (sends or publishes), so a "
+                    f"revision could do it twice: revise from the step that drafts, and act only after the approval")
+    if not waits:
+        return None
+    branched = " ".join(str(config(step).get("expression") or "") + json.dumps(step.get("cases") or config(step).get("cases") or [])
+                        for step in steps if step.get("type") in {"condition", "switch"})
+    for step in steps:
+        if step.get("type") != "agent":
+            continue
+        flags = set(_APPROVAL_FLAG.findall(json.dumps(config(step), ensure_ascii=False)))
+        if flags and not any(flag in branched for flag in flags):
+            flag = sorted(flags)[0]
+            return (f"{step['id']} decides whether a person must approve ({flag}), yet every run waits at "
+                    f"{waits[0]['id']}: add a condition step on {{{{{step['id']}.{flag}}}}} before the wait, so the "
+                    f"ones that need no approval skip it")
+    return None
+
+
+def draft_workflow(proposed: dict[str, Any], *, workflows: list[dict[str, Any]],
+                   service_keys: set[str]) -> dict[str, Any]:
+    """One portable Workflow as a Draft keeps it, checked as creation checks it.
+
+    ``workflows`` are the Draft's others, which its sub-Flow steps may run.
+    Raises ``DraftWorkflowError`` with what to fix.
+    """
+    slug = str(proposed.get("slug") or "").strip()
+    if not _SLUG_RE.match(slug):
+        raise DraftWorkflowError("workflow slug must be snake_case", got=slug)
+    steps = copy.deepcopy(proposed.get("steps"))
+    if not isinstance(steps, list) or not steps or not all(isinstance(step, dict) for step in steps):
+        raise DraftWorkflowError("workflow steps must be a non-empty array of objects")
+    if str(proposed.get("trigger_type") or "") == "schedule":
+        # Creation binds no Workflow of this trigger, so it would never run.
+        raise DraftWorkflowError("a Workflow runs on a clock through an Automation, not its trigger: omit "
+                                 "trigger_type (or use manual) and schedule it with an Automation", got="schedule")
+    review = _review_asked_as_confirmation(steps) or _approval_that_resends(steps)
+    if review:
+        raise DraftWorkflowError(review)
+    for step in steps:
+        config = step.get("config") if isinstance(step.get("config"), dict) else {}
+        if step.get("type") == "tool" and str(config.get("tool") or "") == "manor":
+            raise DraftWorkflowError("use the native workflow_project node for project creation; tool/manor wrappers cannot declare App-readable project state")
+        if step.get("type") == "workflow_project" and str(config.get("operation") or "") in {"create", "claim"}:
+            schema = config.get("state_schema")
+            if not isinstance(schema, dict) or not isinstance(schema.get("properties"), dict):
+                raise DraftWorkflowError("workflow_project create requires state_schema.properties for every App-readable state field")
+        if step.get("type") == "wait" and workflow_wait_is_confirmation(config):
+            # The person reports what they did themselves: one Confirm, nothing to send back.
+            step["config"] = {
+                **{key: value for key, value in config.items() if key not in {"revise_from", "approval_values"}},
+                "options": workflow_wait_options(config),
+            }
+    workflow = {key: copy.deepcopy(proposed[key]) for key in (
+        "slug", "name", "description", "run_inputs", "internal", "trigger_type", "binding_config",
+        "variables", "output_schema", "enabled",
+    ) if key in proposed}
+    workflow.update(slug=slug, steps=steps)
+    from packages.core.blueprints.installer import _blueprint_workflow_definition_values
+    from packages.core.blueprints.payload import _validate_workflows
+    from packages.core.services.workflow_service import workflow_service_keys
+
+    try:
+        runtime_steps = _blueprint_workflow_definition_values(workflow)["steps"]
+        # A sub-Flow step runs another Workflow of this Draft, by its slug.
+        _validate_workflows({"workflows": [*(item for item in workflows if item.get("slug") != slug), workflow]})
+    except Exception as exc:
+        raise DraftWorkflowError(f"workflow is invalid: {exc}") from exc
+    unknown = sorted(workflow_service_keys(runtime_steps) - service_keys)
+    if unknown:
+        raise DraftWorkflowError(
+            "workflow agent steps must run services already in this draft; add them with ws_propose_service first",
+            unknown_service_keys=unknown,
+        )
+    return workflow
 
 
 async def _propose_workflow(db, *, entity_id: str, user_id: str = "", **kwargs):
     draft = await _load_draft(db, kwargs.get("draft_id", ""), entity_id, user_id)
     if draft is None:
         return _err("draft not found")
-    slug = str(kwargs.get("slug") or "").strip()
-    if not _SLUG_RE.match(slug):
-        return _err("workflow slug must be snake_case", got=slug)
-    steps = kwargs.get("steps")
-    if not isinstance(steps, list) or not steps or not all(isinstance(step, dict) for step in steps):
-        return _err("workflow steps must be a non-empty array of objects")
-    for step in steps:
-        config = step.get("config") if isinstance(step.get("config"), dict) else {}
-        if step.get("type") == "tool" and str(config.get("tool") or "") == "manor":
-            return _err("use the native workflow_project node for project creation; tool/manor wrappers cannot declare App-readable project state")
-        if step.get("type") == "workflow_project" and str(config.get("operation") or "") in {"create", "claim"}:
-            schema = config.get("state_schema")
-            if not isinstance(schema, dict) or not isinstance(schema.get("properties"), dict):
-                return _err("workflow_project create requires state_schema.properties for every App-readable state field")
-    workflow = {key: copy.deepcopy(kwargs[key]) for key in (
-        "slug", "name", "steps", "internal", "trigger_type", "binding_config", "variables", "run_inputs",
-        "output_schema", "enabled",
-    ) if key in kwargs}
-    workflow["slug"] = slug
-    try:
-        from packages.core.blueprints.installer import _blueprint_workflow_definition_values
-        _blueprint_workflow_definition_values(workflow)
-    except Exception as exc:
-        return _err(f"workflow is invalid: {exc}")
     fields = dict(draft.fields or {})
+    others = [item for item in fields.get("workflows") or [] if isinstance(item, dict)]
+    service_keys = {str((service or {}).get("service_key") or "") for service in fields.get("services") or []}
+    try:
+        workflow = draft_workflow(kwargs, workflows=others, service_keys=service_keys)
+    except DraftWorkflowError as exc:
+        return _err(str(exc), **exc.details)
+    from packages.core.services.workflow_run_input_guidance import run_input_issues
+
+    inputs = run_input_issues([*(item for item in others if item.get("slug") != workflow["slug"]), workflow],
+                              checked={workflow["slug"]})
+    if inputs:
+        return _err("run inputs ask the person to type what they could upload or pick", issues=inputs)
+    slug = workflow["slug"]
     fields["workflows"] = _replace_in_list(
         [item for item in fields.get("workflows") or [] if isinstance(item, dict)],
         "slug", slug, workflow,
@@ -3165,6 +4162,93 @@ async def _propose_workflow(db, *, entity_id: str, user_id: str = "", **kwargs):
     draft.fields = fields
     await _persist(db, draft)
     return _ok({"slug": slug, "internal": bool(workflow.get("internal"))})
+
+
+async def _propose_record_collection(db, *, entity_id: str, user_id: str = "", **kwargs):
+    """A kept-by-hand collection's add, change and take-off Flows, built by the record-collection pattern."""
+    from packages.core.blueprints.workflow_patterns import record_collection_flows_from_args
+    from packages.core.services.workflow_run_input_guidance import run_input_issues
+
+    draft = await _load_draft(db, kwargs.get("draft_id", ""), entity_id, user_id)
+    if draft is None:
+        return _err("draft not found")
+    if not _SLUG_RE.match(str(kwargs.get("slug") or "")):
+        return _err("slug must be snake_case", got=kwargs.get("slug"))
+    try:
+        built = record_collection_flows_from_args(kwargs)["workflows"]
+    except (KeyError, TypeError, ValueError) as exc:
+        return _err(f"the collection could not be built: {exc}")
+    fields = dict(draft.fields or {})
+    service_keys = {str((service or {}).get("service_key") or "") for service in fields.get("services") or []}
+    workflows = [item for item in fields.get("workflows") or [] if isinstance(item, dict)]
+    for proposed in built:
+        others = [item for item in workflows if item.get("slug") != proposed["slug"]]
+        try:
+            workflows = _replace_in_list(workflows, "slug", proposed["slug"],
+                                         draft_workflow(proposed, workflows=others, service_keys=service_keys))
+        except DraftWorkflowError as exc:
+            return _err(f"{proposed['slug']}: {exc}", **exc.details)
+    slugs = [proposed["slug"] for proposed in built]
+    inputs = run_input_issues(workflows, checked=set(slugs))
+    if inputs:
+        return _err("run inputs ask the person to type what they could upload or pick", issues=inputs)
+    fields["workflows"] = workflows
+    draft.fields = fields
+    await _persist(db, draft)
+    return _ok({"slugs": slugs, "item_project_type": str(kwargs.get("item_project_type") or "")})
+
+
+async def _propose_source_watch(db, *, entity_id: str, user_id: str = "", **kwargs):
+    """A watch that starts a Flow for each new thing in an account, built by the source-watch pattern."""
+    from packages.core.blueprints.workflow_patterns import source_watch_flows_from_args
+
+    draft = await _load_draft(db, kwargs.get("draft_id", ""), entity_id, user_id)
+    if draft is None:
+        return _err("draft not found")
+    if not _SLUG_RE.match(str(kwargs.get("slug") or "")):
+        return _err("slug must be snake_case", got=kwargs.get("slug"))
+    try:
+        built = source_watch_flows_from_args(kwargs)
+    except (KeyError, TypeError, ValueError) as exc:
+        return _err(f"the watch could not be built: {exc}")
+    schedules = []
+    for row in built["automations"]:
+        request = {
+            "automation_key": row["workflow"],
+            "description": f"Run {row['workflow']}: {row['why']}.",
+            "trigger": row["cron_expr"],
+            "cron_expr": row["cron_expr"],
+            "timezone": row["timezone"],
+            "service_key": str(kwargs.get("service_key") or ""),
+            "scheduled_job": {"job_id": row["workflow"],
+                              "execution_target": {"type": "workflow", "workflow_slug": row["workflow"]}},
+        }
+        schedule, error = await _resolve_automation_schedule(db, user_id=user_id, kwargs=request)
+        if error is not None:
+            return error
+        schedules.append((request, schedule))
+    fields = dict(draft.fields or {})
+    service_keys = {str((service or {}).get("service_key") or "") for service in fields.get("services") or []}
+    workflows = [item for item in fields.get("workflows") or [] if isinstance(item, dict)]
+    # The internal one-item Flow first: the watch runs it.
+    for proposed in reversed(built["workflows"]):
+        others = [item for item in workflows if item.get("slug") != proposed["slug"]]
+        try:
+            workflows = _replace_in_list(workflows, "slug", proposed["slug"],
+                                         draft_workflow(proposed, workflows=others, service_keys=service_keys))
+        except DraftWorkflowError as exc:
+            return _err(f"{proposed['slug']}: {exc}", **exc.details)
+    fields["workflows"] = workflows
+    scheduled = []
+    for request, schedule in schedules:
+        error = _stage_automation(fields, schedule=schedule, kwargs=request)
+        if error is not None:
+            return error
+        scheduled.append({"automation_key": request["automation_key"], "schedule": schedule})
+    _reconcile_removed_channel_references(fields)
+    draft.fields = fields
+    await _persist(db, draft)
+    return _ok({"slugs": [row["slug"] for row in built["workflows"]], "automations": scheduled})
 
 
 async def _propose_stat(db, *, entity_id: str, user_id: str = "", **kwargs):
@@ -3215,13 +4299,31 @@ async def _propose_automation(db, *, entity_id: str, user_id: str = "", **kwargs
     automation_key = kwargs.get("automation_key", "")
     if not _SLUG_RE.match(automation_key):
         return _err("automation_key must be snake_case", got=automation_key)
+    schedule, schedule_error = await _resolve_automation_schedule(
+        db, user_id=user_id, kwargs=kwargs,
+    )
+    if schedule_error is not None:
+        return schedule_error
+    fields = dict(draft.fields or {})
+    error = _stage_automation(fields, schedule=schedule, kwargs=kwargs)
+    if error is not None:
+        return error
+    _reconcile_removed_channel_references(fields)
+    draft.fields = fields
+    await _persist(db, draft)
+    return _ok({"automation_key": automation_key, "schedule": schedule})
+
+
+def _stage_automation(fields: dict, *, schedule: dict, kwargs: dict) -> str | None:
+    """Stage a validated schedule in a local copy of the draft fields."""
+    automation_key = kwargs["automation_key"]
     automation = {
         "automation_key": automation_key,
         "description": kwargs.get("description", ""),
         "trigger": kwargs.get("trigger", ""),
         "service_key": kwargs.get("service_key", ""),
     }
-    fields = dict(draft.fields or {})
+    automation.update(schedule)
     for removed_channel in fields.get("_removed_channels") or []:
         automation["description"] = _scrub_removed_channel_text(automation.get("description"), _channel_key(removed_channel))
         automation["trigger"] = _scrub_removed_channel_text(automation.get("trigger"), _channel_key(removed_channel))
@@ -3237,16 +4339,111 @@ async def _propose_automation(db, *, entity_id: str, user_id: str = "", **kwargs
         job_id = str(scheduled_job.get("job_id") or automation_key).strip()
         if not _SLUG_RE.match(job_id):
             return _err("scheduled_job.job_id must be snake_case")
-        native_job = copy.deepcopy(scheduled_job)
-        native_job["job_id"] = job_id
+        from packages.core.blueprints.installer import validate_portable_recipe_resources
+
+        native_job = _native_scheduled_job(scheduled_job, job_id, schedule, automation["service_key"])
+        try:
+            validate_portable_recipe_resources({
+                "workflows": [item for item in fields.get("workflows") or [] if isinstance(item, dict)],
+                "scheduled_jobs": [native_job],
+            })
+        except Exception as exc:
+            return _err(
+                f"scheduled_job is invalid: {exc}. A workflow target must name a workflow already "
+                "proposed with ws_propose_workflow; otherwise omit scheduled_job and the automation "
+                "runs its service's agent.",
+                code="invalid_scheduled_job",
+            )
         fields["scheduled_jobs"] = _replace_in_list(
             [item for item in fields.get("scheduled_jobs") or [] if isinstance(item, dict)],
             "job_id", job_id, native_job,
         )
-    _reconcile_removed_channel_references(fields)
-    draft.fields = fields
-    await _persist(db, draft)
-    return _ok({"automation_key": automation_key})
+        # The job may be named differently; finalize reads this to create only the job.
+        fields["automations"] = _replace_in_list(
+            fields["automations"], "automation_key", automation_key, {**automation, "job_id": job_id},
+        )
+    return None
+
+
+def _native_scheduled_job(declared: dict, job_id: str, schedule: dict, service_key: str) -> dict:
+    """The declared native Job, completed with the automation's resolved clock and target."""
+    job = copy.deepcopy(declared)
+    job["job_id"] = job_id
+    if not str(job.get("name") or "").strip():
+        job["name"] = job_id.replace("_", " ").strip().capitalize()
+    job.pop("schedule", None)
+    if not job.get("schedule_kind") and job.get("job_type") != "manual":
+        for key in ("schedule_kind", "cron_expr", "every_seconds"):
+            if key in schedule:
+                job[key] = schedule[key]
+        job.setdefault("job_type", "cron" if schedule["schedule_kind"] == "cron" else "interval")
+    job.setdefault("timezone", schedule["timezone"])
+    target = dict(job.get("execution_target") or {})
+    if not job.get("execution_type"):
+        job["execution_type"] = "workflow" if target.get("workflow_slug") else "agent"
+    if job["execution_type"] in {"agent", "agent_message"} and service_key:
+        target.setdefault("service_key", service_key)
+    job["execution_target"] = target
+    return job
+
+
+async def _resolve_automation_schedule(db, *, user_id: str, kwargs: dict) -> tuple[dict, str | None]:
+    """Exact scheduler fields for a proposed automation, or a tool error.
+
+    An unreadable cadence is an error back to the architect, never a daily
+    guess, and an event trigger is refused so the user hears it cannot run
+    on a clock instead of getting a schedule they did not ask for.
+    """
+    from packages.core.schedule_cadence import (
+        automation_cadence,
+        automation_timezone,
+        looks_like_event_trigger,
+    )
+
+    request = {
+        key: kwargs.get(key)
+        for key in ("trigger", "cron_expr", "every_seconds", "timezone")
+        if kwargs.get(key) not in (None, "")
+    }
+    try:
+        cadence = automation_cadence(request)
+    except (TypeError, ValueError) as exc:
+        return {}, _err(f"invalid schedule: {exc}", code="invalid_automation_schedule")
+    if cadence is None:
+        trigger = str(kwargs.get("trigger") or "")
+        if looks_like_event_trigger(trigger):
+            return {}, _err(
+                "Automations run on a clock; this trigger is an event. Messages arriving on a "
+                "connected channel are already answered by that service's agent, so no automation "
+                "is needed for them. For any other event, tell the user it cannot start work "
+                "automatically yet and offer a schedule instead.",
+                code="event_trigger_unsupported",
+                trigger=trigger,
+            )
+        return {}, _err(
+            "Could not read a schedule from trigger. Pass cron_expr (5 fields, 0=Sunday) or "
+            "every_seconds. Cadences such as every two weeks or the last day of the month have "
+            "no cron form: confirm a supported cadence with the user.",
+            code="invalid_automation_schedule",
+            trigger=str(kwargs.get("trigger") or ""),
+        )
+    default_timezone = "UTC"
+    if user_id:
+        from sqlalchemy import select
+
+        from packages.core.models.user import User
+
+        default_timezone = str(await db.scalar(select(User.timezone).where(User.id == user_id)) or "UTC")
+    try:
+        timezone_name = automation_timezone(request, default=default_timezone)
+    except ValueError as exc:
+        return {}, _err(str(exc), code="invalid_automation_timezone")
+    schedule: dict[str, Any] = {"schedule_kind": cadence.schedule_kind, "timezone": timezone_name}
+    if cadence.cron_expr:
+        schedule["cron_expr"] = cadence.cron_expr
+    else:
+        schedule["every_seconds"] = cadence.every_seconds
+    return schedule, None
 
 
 # ── ws_set_evaluation ───────────────────────────────────────────────────────
@@ -3655,15 +4852,180 @@ async def _search_entity_agents(db, *, entity_id: str, user_id: str = "", **kwar
 
 # ── ws_search_blueprints ────────────────────────────────────────────────────
 
+# Catalog fields a need is matched against, with the weight of a hit in each.
+# The Blueprint's identity (title, tags, when to use it, what it delivers)
+# outweighs its long-form description.
+_BLUEPRINT_MATCH_FIELDS = (
+    ("title", 3.0),
+    ("tags", 3.0),
+    ("use_when", 2.0),
+    ("outcome_summary", 2.0),
+    ("summary", 2.0),
+    ("description", 1.0),
+)
+_BLUEPRINT_IDENTITY_FIELDS = frozenset({"title", "tags", "use_when", "outcome_summary", "summary"})
+_BLUEPRINT_MATCH_STOPWORDS = frozenset("""
+    about across after all also and any are before being between both but can
+    could did does done each every for from get give gives had has have help
+    helps her here his how into its just keep keeps let lets like made make
+    makes manor many may might more most much must need needs not one only
+    other our out over own per run runs set sets she should some start starts
+    such than that the their them then there these they this those through
+    under use used user users using very via want wants was were what when
+    where which while who why will with within without would you your
+    workspace workspaces
+""".split())
+_CJK_RUN_RE = re.compile(r"[㐀-鿿豈-﫿]+")
+_LATIN_WORD_RE = re.compile(r"[a-z0-9]+")
+# idf-weighted share of the need that a Blueprint covers.
+_BLUEPRINT_MATCH_HIGH = 0.35
+_BLUEPRINT_MATCH_MEDIUM = 0.2
+_BLUEPRINT_MATCH_LEVELS = ("high", "medium", "low", "none")
+
+
+def _blueprint_match_stem(word: str) -> str:
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"
+    if len(word) > 5 and word.endswith("ing"):
+        return word[:-3]
+    if len(word) > 4 and word.endswith("ed"):
+        return word[:-2]
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
+
+
+def _blueprint_match_terms(text: str) -> Dict[str, str]:
+    """Map each comparable term in ``text`` to the first word it came from.
+
+    Latin words are lowercased and lightly stemmed; CJK text, which has no
+    word boundaries, is compared by character bigrams.
+    """
+    lowered = str(text or "").lower()
+    out: Dict[str, str] = {}
+    for word in _LATIN_WORD_RE.findall(lowered):
+        if len(word) < 3 or word.isdigit() or word in _BLUEPRINT_MATCH_STOPWORDS:
+            continue
+        out.setdefault(_blueprint_match_stem(word), word)
+    for run in _CJK_RUN_RE.findall(lowered):
+        for index in range(len(run) - 1):
+            out.setdefault(run[index:index + 2], run[index:index + 2])
+    return out
+
+
+def _blueprint_catalog_text(bp, manifest: Dict[str, Any], field: str) -> str:
+    """One catalog field's text, including its translated overlays."""
+    if field == "tags":
+        values: List[Any] = [str(tag).replace("-", " ") for tag in bp.tags or manifest.get("tags") or []]
+    else:
+        values = [getattr(bp, field, None) or manifest.get(field)]
+    for overlay in (manifest.get("i18n") or {}).values():
+        if isinstance(overlay, dict):
+            value = overlay.get(field)
+            values.extend(value if isinstance(value, list) else [value])
+    return " ".join(str(value) for value in values if value)
+
+
+def _draft_need_text(draft) -> str:
+    fields = dict(getattr(draft, "fields", None) or {})
+    parts = [fields.get(key) for key in ("name", "kind", "operating_context", "primary_work")]
+    for service in fields.get("services") or []:
+        if isinstance(service, dict):
+            parts.extend([service.get("name"), service.get("description")])
+    return " ".join(str(part) for part in parts if isinstance(part, str) and part.strip())
+
+
+def _rank_blueprints(need_text: str, blueprints: List[Any]) -> List[Dict[str, Any]]:
+    """Order published Blueprints by how much of the need each one covers.
+
+    The score is the idf-weighted share of the need's terms found in a
+    Blueprint's catalog text, so words most Blueprints share count little.
+    The level is a hint for the architect, who still judges the fit.
+    """
+    import math
+
+    need = _blueprint_match_terms(need_text)
+    catalog = []
+    document_frequency: Dict[str, int] = {}
+    for bp in blueprints:
+        manifest = dict((bp.payload or {}).get("manifest") or {}) if isinstance(bp.payload, dict) else {}
+        field_terms = {
+            field: set(_blueprint_match_terms(_blueprint_catalog_text(bp, manifest, field)))
+            for field, _ in _BLUEPRINT_MATCH_FIELDS
+        }
+        for term in set().union(*field_terms.values()):
+            document_frequency[term] = document_frequency.get(term, 0) + 1
+        catalog.append((bp, manifest, field_terms))
+
+    total = max(len(catalog), 1)
+
+    def idf(term: str) -> float:
+        # A term no Blueprint mentions still counts toward the need it leaves uncovered.
+        return math.log(1 + total / document_frequency.get(term, 0.5))
+
+    need_weight = sum(idf(term) for term in need) or 1.0
+    ranked = []
+    for bp, manifest, field_terms in catalog:
+        matched: Dict[str, List[str]] = {}
+        covered = 0.0
+        identity_hits = 0
+        for term, word in need.items():
+            field = next((name for name, _ in _BLUEPRINT_MATCH_FIELDS if term in field_terms[name]), None)
+            if field is None:
+                continue
+            matched.setdefault(field, []).append(word)
+            covered += idf(term)
+            identity_hits += field in _BLUEPRINT_IDENTITY_FIELDS
+        score = covered / need_weight
+        if score >= _BLUEPRINT_MATCH_HIGH and identity_hits >= 4:
+            level = "high"
+        elif score >= _BLUEPRINT_MATCH_MEDIUM:
+            level = "medium"
+        else:
+            level = "low" if matched else "none"
+        reasons = [
+            f"{field.replace('_', ' ')} matches: {', '.join(sorted(matched[field]))}"
+            for field, _ in _BLUEPRINT_MATCH_FIELDS
+            if field in matched
+        ]
+        row = {
+            "id": bp.id,
+            "title": bp.title,
+            "summary": bp.summary,
+            "tags": list(bp.tags or []),
+            "use_when": str(manifest.get("use_when") or "")[:400] or None,
+            "outcome_summary": str(manifest.get("outcome_summary") or "")[:400] or None,
+            "install_count": int(bp.install_count or 0),
+            "match": {"level": level, "score": round(score, 2), "reasons": reasons},
+        }
+        if bp.price_cents:
+            row["price"] = {"cents": int(bp.price_cents), "currency": bp.currency}
+        ranked.append(row)
+    ranked.sort(key=lambda row: (
+        _BLUEPRINT_MATCH_LEVELS.index(row["match"]["level"]),
+        -row["match"]["score"],
+        -row["install_count"],
+    ))
+    return ranked
+
+
 async def _search_blueprints(db, *, entity_id: str, user_id: str = "", **kwargs):
     from sqlalchemy import select
     from packages.core.models.blueprint import WorkspaceBlueprint
 
+    draft = None
     draft_id = kwargs.get("draft_id", "")
     if draft_id:
         draft = await _load_draft(db, draft_id, entity_id, user_id)
         if draft is None:
             return _err("draft not found")
+
+    query = str(kwargs.get("query") or "").strip()
+    need_text = " ".join(part for part in (query, _draft_need_text(draft) if draft else "") if part)
+    if not need_text:
+        return _err(
+            "describe the need: pass query with the user's domain, outcomes, channels and deliverables",
+        )
 
     stmt = (
         select(WorkspaceBlueprint)
@@ -3671,16 +5033,7 @@ async def _search_blueprints(db, *, entity_id: str, user_id: str = "", **kwargs)
         .order_by(WorkspaceBlueprint.install_count.desc())
     )
     rows = (await db.execute(stmt)).scalars().all()
-    out = [
-        {
-            "id": bp.id,
-            "title": bp.title,
-            "summary": bp.summary,
-            "tags": list(bp.tags or []),
-            "install_count": int(bp.install_count or 0),
-        }
-        for bp in rows
-    ]
+    out = _rank_blueprints(need_text, list(rows))
     return _ok({"blueprints": out, "total": len(out)})
 
 
@@ -3709,6 +5062,41 @@ async def _suggest_blueprint(db, *, entity_id: str, user_id: str = "", **kwargs)
         "blueprint_id": blueprint.id,
         "title": blueprint.title,
         "rationale": str(kwargs.get("rationale") or "").strip(),
+    })
+
+
+async def _apply_blueprint(db, *, entity_id: str, user_id: str = "", **kwargs):
+    from packages.core.services.workspace_draft_service import apply_blueprint
+
+    draft_id = str(kwargs.get("draft_id") or "").strip()
+    blueprint_id = str(kwargs.get("blueprint_id") or "").strip()
+    try:
+        draft = await apply_blueprint(
+            db,
+            draft_id=draft_id,
+            entity_id=entity_id,
+            user_id=user_id,
+            blueprint_id=blueprint_id,
+        )
+    except PermissionError as exc:
+        return _err(str(exc), blueprint_id=blueprint_id, purchase_required=True)
+    except ValueError as exc:
+        return _err(str(exc), blueprint_id=blueprint_id)
+    fields = dict(draft.fields or {})
+    return _ok({
+        "blueprint_id": draft.applied_blueprint_id,
+        "name": fields.get("name"),
+        "services": [
+            str(service.get("name") or service.get("service_key") or "")
+            for service in fields.get("services") or []
+            if isinstance(service, dict)
+        ],
+        "workflows": [
+            str(workflow.get("name") or workflow.get("slug") or "")
+            for workflow in fields.get("workflows") or []
+            if isinstance(workflow, dict)
+        ],
+        "missing": list(draft.missing or []),
     })
 
 
@@ -3788,6 +5176,8 @@ async def _get_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
             "status": draft.status,
             "ready": bool(draft.ready),
             "missing": list(draft.missing or []),
+            "suggested_blueprint_id": draft.suggested_blueprint_id,
+            "applied_blueprint_id": draft.applied_blueprint_id,
             # Source text is paged through ws_read_source; never dump it here.
             "fields": strip_source_text(fields),
         },
@@ -3823,7 +5213,7 @@ async def _binding_vocabulary(
     from packages.core.models.mcp import MCPServer
     from packages.core.models.skill import Skill
     from packages.core.models.workspace import ToolDefinition
-    from packages.core.services.integration_resolution import supported_integration_provider_keys
+    from packages.core.services.integration_resolution import bindable_mcp_provider_keys
     from packages.core.services.provider_keys import canonical_provider_key
 
     tool_rows = set((await db.execute(
@@ -3867,11 +5257,13 @@ async def _binding_vocabulary(
             (MCPServer.id.in_(mcp_refs)) | (MCPServer.server_key.in_(mcp_refs)),
         )
     )).scalars().all()) if mcp_refs else []
-    supported_provider_keys = await supported_integration_provider_keys(db)
+    # Validation asks whether the binding can run, not whether it is an
+    # integration the user connects: internal bridges are bindable too.
+    bindable_provider_keys = await bindable_mcp_provider_keys(db)
     available_mcp_refs = {
         ref
         for server in mcp_rows
-        if canonical_provider_key(server.server_key) in supported_provider_keys
+        if canonical_provider_key(server.server_key) in bindable_provider_keys
         for ref in (server.id, server.server_key)
         if ref
     }
@@ -3965,6 +5357,190 @@ def _custom_agent_runtime_capability_ids(
     return frozenset(entry.capability_id for entry in entries)
 
 
+def workflow_process_issues(fields: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Hand-offs and human reviews the draft declares must be run by a Workflow.
+
+    A service's ``handoff_to`` is only real when one Workflow runs both roles'
+    agent steps with the hand-off in between, and ``human_review`` only when
+    an approval wait follows that service's step. Graph checks only: each
+    Workflow's own validity is reported by the shared validator.
+    """
+    from packages.core.blueprints.installer import _blueprint_workflow_definition_values
+
+    services = [service for service in fields.get("services") or [] if isinstance(service, dict)]
+    service_keys = {str(service.get("service_key") or "") for service in services}
+    graphs: list[tuple[str, list[dict]]] = []
+    for workflow in fields.get("workflows") or []:
+        if not isinstance(workflow, dict):
+            continue
+        try:
+            graphs.append((str(workflow.get("slug") or ""), _blueprint_workflow_definition_values(workflow)["steps"]))
+        except Exception:
+            continue
+
+    def downstream(steps: list[dict], start: str) -> set[str]:
+        edges = {
+            str(step.get("id")): [
+                *(step.get("next") or []), *(step.get("true_next") or []), *(step.get("false_next") or []),
+            ]
+            for step in steps
+        }
+        seen: set[str] = set()
+        pending = list(edges.get(start, []))
+        while pending:
+            current = pending.pop()
+            if isinstance(current, str) and current and current not in seen:
+                seen.add(current)
+                pending.extend(edges.get(current, []))
+        return seen
+
+    def service_steps(steps: list[dict], service_key: str) -> list[str]:
+        return [
+            str(step.get("id")) for step in steps
+            if step.get("type") == "agent"
+            and str((step.get("config") or {}).get("service_key") or "") == service_key
+        ]
+
+    issues: List[Dict[str, Any]] = []
+    for slug, steps in graphs:
+        for step in steps:
+            key = str((step.get("config") or {}).get("service_key") or "")
+            if step.get("type") == "agent" and key and key not in service_keys:
+                issues.append({
+                    "severity": "P0",
+                    "where": f"workflows.{slug}.{step.get('id')}",
+                    "message": f"Workflow step runs service '{key}', which this draft does not define.",
+                })
+    for service in services:
+        key = str(service.get("service_key") or "")
+        for target in service.get("handoff_to") or []:
+            if target not in service_keys:
+                issues.append({
+                    "severity": "P0",
+                    "where": f"services.{key}.handoff_to",
+                    "message": f"service '{key}' hands off to '{target}', which this draft does not define.",
+                })
+                continue
+            if not any(
+                any(
+                    set(service_steps(steps, target)) & downstream(steps, source)
+                    for source in service_steps(steps, key)
+                )
+                for _slug, steps in graphs
+            ):
+                issues.append({
+                    "severity": "P0",
+                    "where": f"services.{key}.handoff_to",
+                    "message": (
+                        f"service '{key}' hands its result to '{target}', but no Workflow runs that hand-off. "
+                        "Call ws_propose_workflow with one agent step per service (config.service_key), "
+                        f"routing '{key}' to '{target}' with next."
+                    ),
+                })
+        if service.get("human_review") is True and not any(
+            any(
+                any(
+                    step.get("type") == "wait"
+                    and str((step.get("config") or {}).get("wait_type") or "approval") == "approval"
+                    for step in steps if str(step.get("id")) in downstream(steps, source)
+                )
+                for source in service_steps(steps, key)
+            )
+            # The approval a publishing grant is made from reviews what that service then publishes.
+            or any(
+                set(service_steps(steps, key)) & downstream(steps, str((step.get("config") or {}).get("approval_step_id")))
+                for step in steps if step.get("type") == "workflow_action_grant"
+            )
+            for _slug, steps in graphs
+        ):
+            issues.append({
+                "severity": "P0",
+                "where": f"services.{key}.human_review",
+                "message": (
+                    f"the user reviews '{key}' results, but no Workflow waits for that approval. Add a wait step "
+                    "with config.wait_type='approval' after this service's agent step."
+                ),
+            })
+    return issues
+
+
+def _unscheduled_workflow_issues(fields: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Workflows that do nothing unless an Automation runs them.
+
+    One that records assessed Stats, or one that leases due projects (a
+    schedule worker), runs on a schedule.
+    """
+    scheduled = {str((job.get("execution_target") or {}).get("workflow_slug") or "")
+                 for job in fields.get("scheduled_jobs") or [] if isinstance(job, dict)}
+    reviewed = {str((stat.get("collector_config") or {}).get("workflow_slug") or "")
+                for stat in fields.get("stats") or []
+                if isinstance(stat, dict) and stat.get("collector_type") == "agent_review"}
+    issues = []
+    for workflow in fields.get("workflows") or []:
+        slug = str((workflow or {}).get("slug") or "") if isinstance(workflow, dict) else ""
+        leases = any(step.get("type") == "workflow_project" and (step.get("config") or {}).get("operation") == "lease_due"
+                     for step in workflow.get("steps") or [] if isinstance(step, dict)) if slug else False
+        if slug and slug not in scheduled and (slug in reviewed or leases):
+            issues.append({"severity": "P1", "where": f"workflows.{slug}", "message": (
+                f"'{slug}' {'records Stats' if slug in reviewed else 'starts due work'} only when it runs on a "
+                "schedule: add an automation whose scheduled_job targets this Workflow.")})
+    return issues
+
+
+# A run input only something from outside can fill: the id of a message or comment, an event's payload.
+_OUTSIDE_EVENT_INPUT = re.compile(
+    r"(?:^|_)(?:message|email|mail|comment|thread|dm|conversation|notification)_(?:id|event|payload)$"
+    r"|(?:^|_)(?:event|webhook|payload)(?:_(?:id|data|payload))?$")
+# Triggers that start nothing by themselves: an ``event`` binding fires only on an API call nothing here makes.
+_UNFIRED_TRIGGERS = frozenset({"", "manual", "internal", "event"})
+
+
+def unstartable_workflow_issues(fields: Dict[str, Any], *, planned: Any = ()) -> List[Dict[str, Any]]:
+    """Workflows nothing starts: internal with no Workflow running them, or waiting for an outside event.
+
+    A channel hands a new message to its service's Agent, never to a Workflow,
+    so one that takes an email's or comment's id runs only if something gives
+    it that id. ``planned`` are Workflows the design already asks an Automation for.
+    """
+    from packages.core.services.workspace_automations_designer import NEEDED_FIELD
+
+    workflows = [row for row in fields.get("workflows") or [] if isinstance(row, dict) and row.get("slug")]
+    started = {str((job.get("execution_target") or {}).get("workflow_slug") or "")
+               for job in fields.get("scheduled_jobs") or [] if isinstance(job, dict)}
+    for name in (NEEDED_FIELD, "automations"):
+        started |= {str(row.get("workflow") or "") for row in fields.get(name) or [] if isinstance(row, dict)}
+    started |= {str(slug) for slug in planned}
+    for workflow in workflows:
+        for step in workflow.get("steps") or []:
+            if isinstance(step, dict) and step.get("type") in {"subworkflow", "foreach_subworkflow"}:
+                config = step.get("config") or {}
+                started |= {str(config.get("workflow_id") or ""), str(config.get("source_workflow_key") or "")}
+    issues: List[Dict[str, Any]] = []
+    for workflow in workflows:
+        slug = str(workflow["slug"])
+        if slug in started or str(workflow.get("trigger_type") or "") not in _UNFIRED_TRIGGERS:
+            continue
+        if workflow.get("internal"):
+            issues.append({"severity": "P1", "where": f"workflows.{slug}", "message": (
+                f"'{slug}' is internal and no Workflow runs it, so nothing can start it.")})
+            continue
+        if (workflow.get("binding_config") or {}).get("started_by_person"):
+            continue
+        rows = [*(workflow.get("run_inputs") or []),
+                *((step.get("config") or {}).get("run_inputs") or [] for step in workflow.get("steps") or []
+                  if isinstance(step, dict) and step.get("type") == "trigger")]
+        rows = [cell for row in rows for cell in (row if isinstance(row, list) else [row]) if isinstance(cell, dict)]
+        waiting_for = sorted({str(row.get("key")) for row in rows if _OUTSIDE_EVENT_INPUT.search(str(row.get("key") or ""))})
+        if waiting_for:
+            issues.append({"severity": "P1", "where": f"workflows.{slug}", "message": (
+                f"'{slug}' waits for {', '.join(waiting_for)}, which only something from outside can give, and nothing "
+                "starts it: no channel hands a new message to a Workflow. Have an Automation start it "
+                "(wf_pattern_source_watch), or give it trigger_type:'webhook' if the sender can call a URL. If the "
+                "person starts it by hand, keep what they said in binding_config:{started_by_person:'<their words>'}. "
+                "Tell the person what still has to be connected, or ask them.")})
+    return issues
+
+
 async def _lint_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
     from sqlalchemy import and_, or_, select
 
@@ -3988,6 +5564,31 @@ async def _lint_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
 
     fields = dict(draft.fields or {})
     issues: List[Dict[str, Any]] = []
+    pending_connections: set[str] = set()
+
+    def _note_pending_connection(where: str, provider: Any) -> None:
+        """A requested integration that is not connected yet never blocks
+        creation: the Workspace keeps the requirement, asks the user to
+        connect it in Workspace chat, and the work starts once connected."""
+        from packages.core.services.integration_resolution import (
+            is_user_facing_integration_provider,
+        )
+        from packages.core.services.provider_keys import canonical_provider_key
+
+        key = canonical_provider_key(provider)
+        # Internal bridges have nothing for the user to connect.
+        if not is_user_facing_integration_provider(key) or key in pending_connections:
+            return
+        pending_connections.add(key)
+        issues.append({
+            "severity": "P2",
+            "where": where,
+            "message": (
+                f"{key!r} is not connected yet. Keep it: the Workspace is created with it "
+                "waiting for connection and asks the user to connect it in Workspace chat. "
+                "Tell the user, and do not remove the channel, binding or rules that need it."
+            ),
+        })
 
     # A data component is executable configuration, not decorative prose.  It
     # may only refer to native resources actually present in this Draft.  The
@@ -4010,14 +5611,21 @@ async def _lint_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
     from packages.core.services.workspace_app_designer import project_structure_issues
     issues.extend(project_structure_issues(
         [item for item in fields.get("workflows") or [] if isinstance(item, dict) and item.get("slug")]))
-    if isinstance(fields.get("app_view_candidate"), dict):
-        issues.append({"severity": "P1", "where": "app_view_candidate", "message": (
-            "An App design is waiting for acceptance -- accept it with ws_accept_app_view or "
-            "send it back with ws_design_app_view and feedback.")})
+    from packages.core.services.workspace_part_designers import missing_app_issue, pending_candidate_issues
+    issues.extend(pending_candidate_issues(fields))
+    # A Blueprint's page is its author's design, including none.
+    app_issue = None if getattr(draft, "applied_blueprint_id", None) else missing_app_issue(fields)
+    if app_issue is not None:
+        issues.append(app_issue)
+    issues.extend(_unscheduled_workflow_issues(fields))
+    from packages.core.services.workspace_build_spec import build_spec
+    if build_spec(fields) is not None:
+        issues.extend(unstartable_workflow_issues(fields))
     try:
         _validate_draft_resources(fields)
     except ValueError as exc:
         issues.append({"severity": "P0", "where": "resources", "message": str(exc)})
+    issues.extend(workflow_process_issues(fields))
 
     # Top-level basics
     for required in ("name", "kind", "operating_context", "primary_work"):
@@ -4214,14 +5822,21 @@ async def _lint_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
         if str(ref.get("marketplace_source") or "platform").strip() == "platform"
         and str(ref.get("marketplace_id") or "").strip()
     }
-    available_platform_skill_ids = set((await db.execute(
-        select(Skill.id).where(
-            Skill.id.in_(platform_skill_ids),
-            Skill.status == "active",
-            Skill.entity_id.is_(None),
-            Skill.is_public.is_(True),
-        )
-    )).scalars().all()) if platform_skill_ids else set()
+    # Same rule the install binds with: a Blueprint export names a built-in
+    # as ``builtin:<slug>``, never by its deployment-specific row id.
+    from packages.core.services.marketplace_skill_service import (
+        resolve_platform_marketplace_skill,
+    )
+
+    available_platform_skill_ids: set[str] = set()
+    for platform_skill_id in platform_skill_ids:
+        try:
+            await resolve_platform_marketplace_skill(
+                db, entity_id=entity_id, skill_id=platform_skill_id,
+            )
+        except ValueError:
+            continue
+        available_platform_skill_ids.add(platform_skill_id)
     manor_skill_ids = {
         str(ref.get("marketplace_id") or "").strip()
         for ref in exact_skill_binding_refs
@@ -4307,8 +5922,14 @@ async def _lint_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
                         "missing_capabilities": [missing_capability],
                         "message": (
                             "custom Agent bindings do not cover required runtime "
-                            f"capability {missing_capability!r}. "
-                            "Requirements diagnose the gap; they do not grant tools."
+                            f"capability {missing_capability!r}"
+                            + (
+                                f" ({CORE_CAPABILITIES[missing_capability].description.rstrip('.')}). "
+                                if missing_capability in CORE_CAPABILITIES else ". "
+                            )
+                            + "Requirements diagnose the gap; they do not grant tools. If the service does "
+                            "not need this, remove it from the service's required_capabilities "
+                            "(reading Knowledge is workspace.search)."
                         ),
                     })
             # Provisioning adds capability, baseline, and Skill invocation
@@ -4382,12 +6003,7 @@ async def _lint_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
                     server = next((row for row in mcp_rows if ref in (row.id, row.server_key)), None)
                     provider = canonical_provider_key(server.server_key) if server else ""
                     if not mcp_readiness.get(provider) or not mcp_readiness[provider].ready:
-                        issues.append({
-                            "severity": "P0",
-                            "where": f"agent_mappings.{sk}.mcp_bindings",
-                            "binding_ref": ref,
-                            "message": f"Integration {provider or ref!r} is not connected and available to this user.",
-                        })
+                        _note_pending_connection(f"agent_mappings.{sk}.mcp_bindings", provider or ref)
             for index, missing_skill in enumerate(custom.get("missing_skill_specs") or []):
                 if not isinstance(missing_skill, dict) or not str(missing_skill.get("name") or "").strip() or not str(missing_skill.get("system_prompt") or "").strip():
                     issues.append({
@@ -4440,34 +6056,18 @@ async def _lint_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
                         not mapped_mcp_readiness.get(provider)
                         or not mapped_mcp_readiness[provider].ready
                     ):
-                        issues.append({
-                            "severity": "P0",
-                            "where": f"agent_mappings.{sk}.mcp_bindings",
-                            "message": f"Mapped Agent integration {provider!r} is not connected and available to this user.",
-                        })
+                        _note_pending_connection(f"agent_mappings.{sk}.mcp_bindings", provider)
 
     if not getattr(draft, "applied_blueprint_id", None):
         for mapping in mappings:
             service_key = str((mapping or {}).get("service_key") or "")
             for item in _mapping_missing_integrations(mapping):
-                issues.append({
-                    "severity": "P0",
-                    "where": f"agent_mappings.{service_key}.missing_integrations",
-                    "message": (
-                        f"Integration {item.get('provider')!r} is not an existing connection. "
-                        "Choose a connected integration or remove this requirement."
-                    ),
-                })
+                _note_pending_connection(
+                    f"agent_mappings.{service_key}.missing_integrations", item.get("provider"),
+                )
         for item in fields.get("flagged_integrations") or []:
-            if isinstance(item, dict) and item.get("required", True):
-                issues.append({
-                    "severity": "P0",
-                    "where": "flagged_integrations",
-                    "message": (
-                        f"Integration {item.get('provider')!r} still needs setup. "
-                        "Only existing connections can be added to a new Workspace."
-                    ),
-                })
+            if isinstance(item, dict):
+                _note_pending_connection("flagged_integrations", item.get("provider"))
 
     # Goals are optional. When the user does configure one, keep its
     # measurement contract strict instead of inventing a target or cadence.
@@ -4549,22 +6149,7 @@ async def _lint_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
             for path, item in external:
                 provider = canonical_provider_key(item.get("provider") or item.get("channel_type"))
                 if provider not in connected:
-                    issues.append({
-                        "severity": "P0",
-                        "where": f"channel_config.{path}",
-                        "message": f"Channel integration {provider!r} is not an existing connection available to this user.",
-                    })
-
-    # Staff (informational P1) -- if no human is involved that's fine,
-    # but for typical operator workspaces an empty staff roster is
-    # usually a sign the architect skipped step G.
-    staff_assignments = fields.get("staff_assignments") or []
-    if not staff_assignments:
-        issues.append({
-            "severity": "P1",
-            "where": "staff_assignments",
-            "message": "No staff assigned. If humans review/own anything in this workspace, call ws_assign_staff (one per owner). Skip only for fully autonomous workspaces.",
-        })
+                    _note_pending_connection(f"channel_config.{path}", provider)
 
     # Knowledge attachments (informational P1) -- agents almost always
     # benefit from at least one knowledge group for retrieval; warn so
@@ -4585,12 +6170,101 @@ async def _lint_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
         rule_enforcement_conflicts,
     )
 
+    # An approval or ban that names no action is guidance only; nothing would
+    # stop the action it describes.
+    for rule in fields.get("rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        rule_type = str(rule.get("rule_type") or "").strip().lower()
+        if (rule_type == "approval_required" or rule_type in _HARD_BLOCK_RULE_TYPES) and not rule.get("action_patterns"):
+            issues.append({
+                "severity": "P1",
+                "where": f"rules.{rule.get('rule_key') or '?'}",
+                "message": (
+                    f"{rule_type} rule has no action_patterns, so it will not be enforced. "
+                    "Re-propose it with the action keys it covers (e.g. email.send); keep them "
+                    "even when that integration is not connected yet."
+                ),
+            })
+
     for conflict in rule_enforcement_conflicts(fields.get("rules") or []):
         issues.append({
             "severity": "P1",
             "where": f"rules.{conflict['pattern']}",
             "message": describe_rule_enforcement_conflict(conflict),
         })
+
+    # An automation is created only with a readable clock schedule; catch the
+    # rest here so the user decides, rather than finalize skipping it.
+    from packages.core.schedule_cadence import automation_cadence, looks_like_event_trigger
+
+    native_job_keys = {
+        str(job.get("job_id") or "").strip()
+        for job in fields.get("scheduled_jobs") or [] if isinstance(job, dict)
+    }
+    workflow_slugs = [str(row.get("slug")) for row in fields.get("workflows") or []
+                      if isinstance(row, dict) and row.get("slug")]
+    for a in fields.get("automations") or []:
+        if not isinstance(a, dict) or str(a.get("automation_key") or "").strip() in native_job_keys:
+            continue
+        # Staging 2026-11-09, 2 of 3 candle shop drafts: "start create_product_post
+        # three times" left how many posts and what each covers to the Agent.
+        started = [slug for slug in workflow_slugs if re.search(
+            rf"\b(start|run|initiate|trigger|launch)\w*\b[^.]*\b{re.escape(slug)}\b",
+            str(a.get("description") or ""), re.IGNORECASE)]
+        if started:
+            issues.append({
+                "severity": "P0",
+                "where": f"automations.{a.get('automation_key', '?')}",
+                "message": (
+                    f"automation asks its Agent to start {', '.join(started)}: schedule the Flow itself with "
+                    "scheduled_job.execution_target.workflow_slug; when it runs once per planned item, write a Flow "
+                    f"that plans the items and runs {started[0]} for each (foreach_subworkflow over the plan) and "
+                    "schedule that one."
+                ),
+            })
+        try:
+            readable = automation_cadence(a) is not None
+        except (TypeError, ValueError):
+            readable = False
+        if readable:
+            continue
+        event = looks_like_event_trigger(a.get("trigger"))
+        issues.append({
+            "severity": "P0",
+            "where": f"automations.{a.get('automation_key', '?')}",
+            "message": (
+                "automation is triggered by an event, which a scheduled automation cannot do; "
+                "remove it and tell the user, or replace it with a schedule they confirm."
+                if event else
+                "automation has no readable schedule; re-propose it with cron_expr or every_seconds."
+            ),
+        })
+
+    # Staging 2026-11-09: a restaurant draft had weekly_content and weekly_review_replies and no
+    # schedule at all, so every weekly routine waited for a person to start it.
+    scheduled = {str((job.get("execution_target") or {}).get("workflow_slug") or "")
+                 for job in fields.get("scheduled_jobs") or [] if isinstance(job, dict)}
+    for row in fields.get("workflows") or []:
+        if not isinstance(row, dict) or row.get("internal") or str(row.get("slug") or "") in scheduled:
+            continue
+        slug = str(row.get("slug") or "")
+        cadence = sorted(set(slug.split("_")) & _ROUTINE_WORDS) or re.findall(_ROUTINE_NAME, str(row.get("name") or ""))
+        if cadence:
+            issues.append({
+                "severity": "P0",
+                "where": f"workflows.{slug}",
+                "message": (
+                    f"{slug} reads as a {cadence[0]} routine but no schedule runs it: add an Automation whose "
+                    f"scheduled_job.execution_target.workflow_slug is {slug!r}. If a person starts it by hand "
+                    "each time, name it for what it makes, not for its cadence."
+                ),
+            })
+
+    from packages.core.services.workspace_workflow_designer import chat_post_step_issues
+
+    for message in chat_post_step_issues([row for row in fields.get("workflows") or [] if isinstance(row, dict)]):
+        issues.append({"severity": "P0", "where": "workflows", "message": message})
 
     # Automations referencing nonexistent services
     for a in fields.get("automations") or []:
@@ -4626,13 +6300,39 @@ async def _lint_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
             ),
         })
 
+    from packages.core.services.workspace_agents_designer import spec_platform_issues
+    from packages.core.services.workspace_schedule_cost import schedule_cost_summary
+
+    issues.extend(await spec_platform_issues(db, fields, entity_id=entity_id, user_id=user_id))
+    schedule_cost = await schedule_cost_summary(db, fields, entity_id=entity_id, user_id=user_id)
+
     p0 = sum(1 for i in issues if i["severity"] == "P0")
     return _ok({
         "ok_to_finalize": p0 == 0,
         "p0": p0,
         "p1": sum(1 for i in issues if i["severity"] == "P1"),
         "issues": issues,
+        **_issues_for_designers(fields, issues),
+        **({"schedule_cost": schedule_cost} if schedule_cost else {}),
     })
+
+
+def _issues_for_designers(fields: Dict[str, Any], issues: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """With a team build spec, which part designer each P0/P1 issue goes back to."""
+    from packages.core.services.workspace_build_spec import build_spec, issues_by_part
+    from packages.core.services.workspace_part_designers import CANDIDATES_FIELD, designer_lint_where
+
+    spec = build_spec(fields)
+    if spec is None or spec.get("mode") != "team":
+        return {}
+    owned = {part: [issue for issue in rows if not str(issue.get("where") or "").startswith(CANDIDATES_FIELD)]
+             for part, rows in issues_by_part(issues, designer_lint_where()).items()}
+    owned = {part: rows for part, rows in owned.items() if rows and part in (spec.get("progress") or {})}
+    if not owned:
+        return {}
+    return {"by_part": {part: [issue["where"] for issue in rows] for part, rows in owned.items()},
+            "next": ("Send each part its issues as feedback: ws_design_parts(parts=[{part, feedback}]) quoting "
+                     "them; fix the others yourself.")}
 
 
 # ── ws_mark_ready ───────────────────────────────────────────────────────────
@@ -4668,11 +6368,18 @@ async def _mark_ready(db, *, entity_id: str, user_id: str = "", **kwargs):
 # ---------------------------------------------------------------------------
 
 HANDLERS = {
+    "ws_ask_user": _ask_user,
     "ws_commit_basics": _commit_basics,
     "ws_propose_service": _propose_service,
     "ws_design_app_view": _design_app_view,
     "ws_accept_app_view": _accept_app_view,
+    "ws_accept_parts": _accept_parts,
+    "ws_design_workflows": _design_workflows,
+    "ws_commit_build_spec": _commit_build_spec,
+    "ws_design_parts": _design_parts,
     "ws_propose_workflow": _propose_workflow,
+    "ws_propose_record_collection": _propose_record_collection,
+    "ws_propose_source_watch": _propose_source_watch,
     "ws_propose_stat": _propose_stat,
     "ws_propose_goal": _propose_goal,
     "ws_propose_agent_mapping": _propose_agent_mapping,
@@ -4681,6 +6388,7 @@ HANDLERS = {
     "ws_attach_knowledge": _attach_knowledge,
     "ws_search_capabilities": _search_capabilities,
     "ws_propose_channel": _propose_channel,
+    "ws_flag_missing_integration": _flag_missing_integration,
     "ws_propose_rule": _propose_rule,
     "ws_propose_automation": _propose_automation,
     "ws_set_evaluation": _set_evaluation,
@@ -4691,6 +6399,7 @@ HANDLERS = {
     "ws_search_entity_agents": _search_entity_agents,
     "ws_search_blueprints": _search_blueprints,
     "ws_suggest_blueprint": _suggest_blueprint,
+    "ws_apply_blueprint": _apply_blueprint,
     "ws_get_draft": _get_draft,
     "ws_read_source": _read_source,
     "ws_lint_draft": _lint_draft,
@@ -4723,10 +6432,11 @@ def _make_session_wrapped_handler(name: str):
                     return result
                 except SQLAlchemyError as exc:
                     await db.rollback()
-                    return _err(f"db error: {exc}")
+                    logger.exception("tool %s failed on the database", name)
+                    return _tool_failed(exc)
         except Exception as exc:  # noqa: BLE001
             logger.exception("tool %s crashed", name)
-            return _err(f"tool crashed: {exc}")
+            return _tool_failed(exc)
     wrapped.__name__ = f"_ws_arch_{name}"
     return wrapped
 

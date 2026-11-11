@@ -1,3 +1,6 @@
+import { displayReadInterval } from "../lib/readRefreshPolicy";
+import { usePageVisible } from "../lib/usePageVisible";
+import { prefetchWorkspaceChatMessages } from "../lib/workspaceChatMessages";
 import {
   useState,
   useEffect,
@@ -17,6 +20,8 @@ import { usePageViewTracking, useWebSocket, type ChatRoomChangeEvent } from "../
 import { invalidateRealtimeQueries, useRealtimeResync } from "../lib/realtimeResync";
 import { invalidateChangedWorkspace } from "../lib/workspaceChangeInvalidation";
 import { useConfigStore } from "../stores/config";
+import { leaveSessionOrLogout } from "../lib/signOut";
+import { useConnectionStatus } from "../stores/connectionStatus";
 import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
 import {
   t,
@@ -31,12 +36,13 @@ import { scheduleQueryInvalidation } from "../lib/coalescedInvalidation";
 import { PEOPLE_HOME_PATH } from "../lib/peopleNavigation";
 import { agentListQueryOptions, catalogScope as catalogScopeForToken, useCatalogScope } from "../lib/catalogQueries";
 import { getAuthToken } from "../lib/authToken";
-import { createTaskUpdateInvalidationBatcher, type TaskUpdateInvalidationBatcher } from "../lib/taskUpdateInvalidation";
+import { WORKSPACE_LIST_REFRESH_INTERVAL_MS, createTaskUpdateInvalidationBatcher, type TaskUpdateInvalidationBatcher } from "../lib/taskUpdateInvalidation";
 import { invalidateCatalogQueries } from "../lib/catalogInvalidation";
 import { CATALOG_REVALIDATE_EVENT } from "../components/CatalogCacheBoundary";
 import type { Workspace, Agent, Conversation } from "../lib/types";
+import { isPersonalAgentConversation } from "../lib/agentConversations";
 import type { ChatRoom } from "../lib/chatRoomTypes";
-import FloatingChat from "../components/FloatingChat";
+import FloatingChatHost from "../components/FloatingChatHost";
 import TextSelectionToolbar from "../components/TextSelectionToolbar";
 import UserAvatar from "../components/ui/UserAvatar";
 import GroupChatAvatar from "../components/ui/GroupChatAvatar";
@@ -49,7 +55,7 @@ import AgentActivityOrb, {
   inferAgentActivity,
   type AgentActivity,
 } from "../components/ui/AgentActivityOrb";
-import { IconChevronRight, IconMoreHorizontal } from "../components/icons";
+import { IconChevronRight, IconMoreHorizontal, IconSidebar } from "../components/icons";
 import Button from "../components/ui/Button";
 import EmptyState from "../components/ui/EmptyState";
 import WorkspaceAttentionBadge from "../components/WorkspaceAttentionBadge";
@@ -72,15 +78,19 @@ import { isChatRunActive } from "../lib/chatStream";
 import { latestMessageByRole } from "../lib/chatHistoryScan";
 import { useChatStreamStore } from "../stores/chatStream";
 import {
-  compactSidebarWorkspaces,
-  orderSidebarWorkspaces,
-  WORKSPACE_SIDEBAR_LIMIT,
+  compactSidebarConversations,
+  CONVERSATION_SIDEBAR_LIMIT,
+  workspaceRecency,
+  type ConversationRanking,
 } from "../lib/workspaceChatSidebar";
 import { useSidebarReorder } from "../lib/useSidebarReorder";
 
 type AppMode = "workspace" | "chat";
 type ChatSidebarSection = "ai" | "workspaces" | "group" | "dm";
-type DirectSidebarItem = { id: string; kind: "room"; room: ChatRoom } | { id: string; kind: "agent"; agent: Agent };
+type ConversationSidebarItem =
+  | { id: string; kind: "workspace"; workspace: Workspace }
+  | { id: string; kind: "room"; room: ChatRoom }
+  | { id: string; kind: "agent"; agent: Agent };
 const CHAT_SIDEBAR_SECTIONS_KEY = "manor-chat-sidebar-sections";
 const DEFAULT_CHAT_SIDEBAR_SECTIONS: Record<ChatSidebarSection, boolean> = {
   ai: true,
@@ -167,21 +177,13 @@ const EMPTY_WORKSPACES: Workspace[] = [];
 const EMPTY_CONVERSATIONS: Conversation[] = [];
 const EMPTY_AGENTS: Agent[] = [];
 
-function isPersonalAgentConversation(conversation: Conversation, userId?: string): boolean {
-  return Boolean(
-    userId
-    && conversation.agent_id
-    && conversation.user_id === userId
-    && !conversation.workspace_id
-    && conversation.channel.toLowerCase() === "web",
-  );
-}
-
 function groupChatSummary(room: ChatRoom): string {
   const members = getLocale() === "zh" ? `${room.member_count} 位成员` : `${room.member_count} ${room.member_count === 1 ? "member" : "members"}`;
   if (room.member_count < 2 || !room.online_user_ids) return members;
   return `${members} · ${room.online_user_ids.length} ${getLocale() === "zh" ? "人在线" : "online"}`;
 }
+
+const COLLAPSED_CONVERSATION_LIMIT = 24;
 
 function positiveStat(value: unknown) {
   const count = Number(value || 0);
@@ -613,24 +615,6 @@ const IconBell = () => (
   </svg>
 );
 
-const IconMoreDots = () => (
-  <svg
-    width="14"
-    height="14"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth={2}
-    strokeLinecap="round"
-    strokeLinejoin="round"
-  >
-    <circle cx="5" cy="12" r="1" />
-    <circle cx="12" cy="12" r="1" />
-    <circle cx="19" cy="12" r="1" />
-  </svg>
-);
-
-
 const IconAgent = () => (
   <svg
     width="16"
@@ -729,31 +713,50 @@ interface NavItem {
 
 const workspaceItems: NavItem[] = [
   {
-    path: "/dashboard",
-    label: "Dashboard",
-    i18nKey: "nav.dashboard",
-    icon: <IconGrid4 />,
-    tourKey: "nav-dashboard",
-  },
-  {
     path: "/tasks",
-    label: "Tasks",
+    label: t("ui.tasks"),
     i18nKey: "nav.tasks",
     icon: <IconChecklist />,
     tourKey: "nav-tasks",
   },
   {
     path: "/jobs",
-    label: "Automations",
+    label: t("ui.automations"),
     i18nKey: "nav.automations",
     icon: <IconSchedule />,
     tourKey: "nav-automations",
   },
 ];
 
+const IconBag = () => (
+  <svg
+    width="16"
+    height="16"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth={1.8}
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    aria-hidden="true"
+  >
+    <path d="M5 8h14l-1.2 12H6.2z" />
+    <path d="M9 8V6.5a3 3 0 016 0V8" />
+  </svg>
+);
+
+const MARKETPLACE_PATH = "/workspaces?view=marketplace";
+
+/* One sidebar for everyone: the four places people go, then their conversations. */
+const primaryNavItems: NavItem[] = [
+  { path: "/tasks", label: t("ui.tasks"), i18nKey: "nav.tasks", icon: <IconChecklist />, tourKey: "nav-tasks" },
+  { path: "/workspaces", label: t("ui.workspaces"), i18nKey: "nav.workspaces", icon: <IconBuilding />, tourKey: "nav-workspaces" },
+  { path: "/knowledge", label: t("ui.knowledge"), i18nKey: "nav.knowledge", icon: <IconLibraryStack />, tourKey: "nav-knowledge" },
+];
+
 const peopleNavItem: NavItem = {
   path: PEOPLE_HOME_PATH,
-  label: "Team & Clients",
+  label: t("ui.team_clients"),
   i18nKey: "nav.people",
   icon: <IconPeople />,
   tourKey: "nav-team",
@@ -762,14 +765,14 @@ const peopleNavItem: NavItem = {
 const managementItems: NavItem[] = [
   {
     path: "/workspaces",
-    label: "Workspaces",
+    label: t("ui.workspaces"),
     i18nKey: "nav.workspaces",
     icon: <IconBuilding />,
     tourKey: "nav-workspaces",
   },
   {
     path: "/knowledge",
-    label: "Knowledge",
+    label: t("ui.knowledge"),
     i18nKey: "nav.knowledge",
     icon: <IconLibraryStack />,
     tourKey: "nav-knowledge",
@@ -800,14 +803,14 @@ const IconWorkflow = () => (
 const baseConfigurationItems: NavItem[] = [
   {
     path: "/integrations",
-    label: "Integrations",
+    label: t("ui.integrations"),
     i18nKey: "nav.integrations",
     icon: <IconConnection />,
     tourKey: "nav-integrations",
   },
   {
     path: "/agents",
-    label: "Agents",
+    label: t("ui.agents"),
     i18nKey: "nav.agents",
     icon: <IconAgent />,
     tourKey: "nav-agents",
@@ -816,7 +819,7 @@ const baseConfigurationItems: NavItem[] = [
   // for users. Pages, routes, and APIs all stay so deep links keep working.
   {
     path: "/skills",
-    label: "Skills",
+    label: t("ui.skills"),
     i18nKey: "nav.skills",
     icon: <IconLayers />,
     tourKey: "nav-skills",
@@ -825,7 +828,7 @@ const baseConfigurationItems: NavItem[] = [
 
 const flowsConfigurationItem = (enabled: boolean): NavItem => ({
   path: "/flows",
-  label: "Workflows",
+  label: t("ui.workflows"),
   i18nKey: "nav.flows",
   icon: <IconWorkflow />,
   disabled: !enabled,
@@ -896,7 +899,7 @@ function ContextSwitcher({
           height="12"
           viewBox="0 0 24 24"
           fill="none"
-          stroke="#a8a29e"
+          stroke="#aeaeb2"
           strokeWidth={2}
         >
           <path
@@ -1022,6 +1025,9 @@ const ManorLogo = ({
   </svg>
 );
 
+/** For what changes rarely and is refreshed by the actions that change it. */
+const SLOW_POLL_MS = 5 * 60_000;
+
 export default function AppLayout() {
   // Customer trials open in the embedded frame only (src/embed); a top-level
   // collaborator session is a legacy one, sent back to the person's own company.
@@ -1038,6 +1044,7 @@ function CompanyLayout() {
   const simpleMode = useDisplayPreferences((s) => s.interfaceMode === "simple");
   const hasSelectedInterfaceMode = useDisplayPreferences((s) => s.hasSelectedInterfaceMode);
   const queryClient = useQueryClient();
+  const pageVisible = usePageVisible();
   const startupSettled = useAfterStartup();
   const catalogScope = useCatalogScope();
   const storeUser = useAuthStore((s) => s.user);
@@ -1075,7 +1082,7 @@ function CompanyLayout() {
   const [mode, setMode] = useState<AppMode>(() =>
     shouldDefaultToChat(location.pathname) ? "chat" : "workspace",
   );
-  const sidebarMode = simpleMode ? "chat" : mode;
+  const sidebarMode = "chat" as AppMode;
   const [searchOpen, setSearchOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   const [configureOpen, setConfigureOpen] = useState(false);
@@ -1099,14 +1106,15 @@ function CompanyLayout() {
   const { data: humanChatRooms = [], isSuccess: humanChatRoomsLoaded } = useQuery({
     queryKey: ["chat-rooms", user?.id],
     queryFn: api.chatRooms.list,
-    enabled: sidebarMode === "chat" && !!user,
+    select: (rooms) => (Array.isArray(rooms) ? rooms : []),
+    enabled: pageVisible && sidebarMode === "chat" && !!user,
     // WebSocket events provide freshness; this is a safety resync.
-    refetchInterval: 60_000,
+    refetchInterval: (query) => displayReadInterval(query.state, 60_000),
   });
   const { data: groupUsage, isSuccess: groupUsageLoaded } = useQuery({
     queryKey: ["group-chat-usage", user?.id],
     queryFn: api.chatRooms.groupUsage,
-    enabled: sidebarMode === "chat" && !!user,
+    enabled: sidebarMode === "chat" && !!user && startupSettled,
     staleTime: 5 * 60_000,
   });
   const [unavailableWorkspaceId, setUnavailableWorkspaceId] = useState<string | null>(null);
@@ -1118,18 +1126,60 @@ function CompanyLayout() {
   );
   const { data: chatAgentsList = EMPTY_AGENTS, isLoading: chatAgentsLoading } = useQuery({
     ...agentListQueryOptions(catalogScope),
-    enabled: !!catalogScope && mode === "chat",
+    enabled: !!catalogScope && sidebarMode === "chat",
   });
   const [hiredAgents, setHiredAgents] = useState<Agent[]>([]);
   const [dmConversationByAgentId, setDmConversationByAgentId] = useState<
     Record<string, string>
   >({});
   const [convSearchQuery, setConvSearchQuery] = useState("");
-  const workspaceOrderKey = user ? `manor-workspace-sidebar:${user.entity_id}:${user.id}` : null;
-  const [allSidebarWorkspaces, setAllSidebarWorkspaces] = useState(false);
+  const globalSearchInputRef = useRef<HTMLInputElement>(null);
+  const backendReconnecting = useConnectionStatus((state) => state.reconnecting);
+  // Results open right under the field: the sidebar's own conversations
+  // filter instantly, and tasks, documents and AI employees come from the
+  // global index once typing settles (never mid-IME composition).
+  const [searchComposing, setSearchComposing] = useState(false);
+  const [settledSearchQuery, setSettledSearchQuery] = useState("");
   useEffect(() => {
-    setAllSidebarWorkspaces(false);
-  }, [workspaceOrderKey]);
+    const query = searchComposing ? "" : convSearchQuery.trim();
+    const timer = window.setTimeout(() => setSettledSearchQuery(query), query ? 250 : 0);
+    return () => window.clearTimeout(timer);
+  }, [convSearchQuery, searchComposing]);
+  const globalSearchQuery = useQuery({
+    queryKey: ["search", settledSearchQuery],
+    queryFn: () => api.search.global(settledSearchQuery),
+    enabled: settledSearchQuery.length > 0,
+    staleTime: 30_000,
+  });
+  const globalSearchGroups = (["task", "document", "agent"] as const)
+    .map((type) => ({
+      type,
+      items: settledSearchQuery && settledSearchQuery === convSearchQuery.trim()
+        ? (globalSearchQuery.data || []).filter((result) => result.type.toLowerCase() === type).slice(0, 5)
+        : [],
+    }))
+    .filter((group) => group.items.length > 0);
+  const openGlobalSearchResult = (type: string, id: string) => {
+    setConvSearchQuery("");
+    setMobileOpen(false);
+    navigate(type === "task" ? `/tasks/${id}` : type === "document" ? `/viewer/${id}` : `/agents/${id}`);
+  };
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "k" || event.shiftKey || event.altKey) return;
+      // Editors own ⌘K (insert link) while focused; they handle it first.
+      if (event.defaultPrevented) return;
+      event.preventDefault();
+      setCollapsed(false);
+      window.requestAnimationFrame(() => globalSearchInputRef.current?.focus());
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+  const [allSidebarConversations, setAllSidebarConversations] = useState(false);
+  useEffect(() => {
+    setAllSidebarConversations(false);
+  }, [user?.entity_id, user?.id]);
   const [chatSidebarSections, setChatSidebarSections] = useState(() => {
     if (typeof window === "undefined") return DEFAULT_CHAT_SIDEBAR_SECTIONS;
     try {
@@ -1226,15 +1276,14 @@ function CompanyLayout() {
     queryFn: () => api.workspaces.list(),
     staleTime: 60_000,
   });
-  // Deep links load the selected Workspace independently of the sidebar's
-  // full list and aggregated stats. Sidebar clicks reuse that list's cache.
-  const activeChatWorkspaceQuery = useQuery({
+  // Deep links load the selected Workspace independently of the sidebar's list.
+  // Sidebar clicks show that list's summary until the full record arrives.
+  const activeChatWorkspaceQuery = useQuery<Workspace>({
     queryKey: ["workspace", activeConvId],
     queryFn: ({ signal }) => api.workspaces.get(activeConvId, signal),
     enabled: mode === "chat" && activeConvType === "operation",
-    initialData: () => queryClient.getQueryData<Workspace[]>(["workspaces"])
+    placeholderData: () => queryClient.getQueryData<Workspace[]>(["workspaces"])
       ?.find((workspace) => workspace.id === activeConvId),
-    initialDataUpdatedAt: () => queryClient.getQueryState(["workspaces"])?.dataUpdatedAt,
     staleTime: 60_000,
   });
   const activeChatWorkspaceUnavailable = (
@@ -1248,6 +1297,11 @@ function CompanyLayout() {
   useEffect(() => {
     if (mode === "chat" && activeConvType === "operation") void loadWorkspaceChat().catch(() => {});
   }, [mode, activeConvType]);
+  useEffect(() => {
+    if (pageVisible && mode === "chat" && activeConvType === "operation" && activeConvId) {
+      prefetchWorkspaceChatMessages(queryClient, activeConvId);
+    }
+  }, [pageVisible, mode, activeConvType, activeConvId, queryClient]);
   const {
     data: chatConversations = EMPTY_CONVERSATIONS,
     isLoading: chatConversationsLoading,
@@ -1277,7 +1331,7 @@ function CompanyLayout() {
   }, [chatConversations, user?.id]);
   const conversationSearch = convSearchQuery.trim().toLocaleLowerCase();
   const isSearchingConversations = conversationSearch.length > 0;
-  const sidebarOrderKey = (section: "ai" | "group" | "dm") => user ? `manor-chat-sidebar-${section}:${user.entity_id}:${user.id}` : null;
+  const sidebarOrderKey = (section: "ai" | "conversations") => user ? `manor-chat-sidebar-${section}:${user.entity_id}:${user.id}` : null;
   const aiSidebar = useSidebarReorder(sidebarOrderKey("ai"), manorChatSessions, isSearchingConversations);
   const isChatSidebarSectionOpen = (section: ChatSidebarSection) =>
     isSearchingConversations || chatSidebarSections[section];
@@ -1481,14 +1535,19 @@ function CompanyLayout() {
   }, [refreshWorkspaces]);
   // Also refresh when entering chat mode (picks up newly created workspaces)
   useEffect(() => {
-    if (mode === "chat") refreshWorkspaces();
-  }, [mode, refreshWorkspaces]);
+    if (mode !== "chat") return;
+    // Opening the app lands here too, with the list already on its way.
+    const list = queryClient.getQueryState(["workspaces"]);
+    if (list?.fetchStatus === "fetching") return;
+    if (Date.now() - (list?.dataUpdatedAt ?? 0) < WORKSPACE_LIST_REFRESH_INTERVAL_MS) return;
+    refreshWorkspaces();
+  }, [mode, queryClient, refreshWorkspaces]);
 
   // DM agents are the agents that already own at least one personal
   // conversation. The same canonical conversation query also powers the
-  // expandable Manor AI session list below.
+  // expandable Manor AI session list below. The sidebar shows them on every page.
   useEffect(() => {
-    if (mode !== "chat") return;
+    if (sidebarMode !== "chat") return;
     const dmAgentIds = new Set<string>();
     const dmConversations: Record<string, string> = {};
     chatConversations
@@ -1514,7 +1573,7 @@ function CompanyLayout() {
       persistedDmAgents.forEach((agent) => merged.set(agent.id, agent));
       return Array.from(merged.values());
     });
-  }, [mode, chatConversations, chatAgentsList, user?.id]);
+  }, [sidebarMode, chatConversations, chatAgentsList, user?.id]);
 
   // During development/HMR or from older state, activeConvId may still be an
   // agent id. Normalize it to the new DM shape so EmbeddedChat never requests
@@ -1565,8 +1624,8 @@ function CompanyLayout() {
   const getChatInfo = useCallback(() => {
     if (activeConvType === "manor") {
       return {
-        title: "Manor AI",
-        subtitle: t("page.app_layout.your_ai_chief_of_staff"),
+        title: "Manor",
+        subtitle: "",
         agents: [] as Agent[],
       };
     }
@@ -1753,19 +1812,13 @@ function CompanyLayout() {
     setMobileOpen(false);
     navigate("/workspaces/new");
   };
-  const recentWorkspaces = useMemo(() => orderSidebarWorkspaces(chatWorkspaces, { mode: "recent", order: [] }), [chatWorkspaces]);
-  const workspaceSidebar = useSidebarReorder(workspaceOrderKey, recentWorkspaces, isSearchingConversations);
-  const orderedWorkspaces = workspaceSidebar.items;
   const matchingWorkspaces = isSearchingConversations
-    ? orderedWorkspaces.filter((ws) => {
+    ? chatWorkspaces.filter((ws) => {
         const name = String(ws?.name || "").toLowerCase();
         if (conversationSearch.length === 1) return name.startsWith(conversationSearch);
         return name.includes(conversationSearch);
       })
-    : orderedWorkspaces;
-  const filteredWorkspaces = isSearchingConversations || allSidebarWorkspaces
-    ? matchingWorkspaces
-    : compactSidebarWorkspaces(matchingWorkspaces, activeConvType === "operation" ? activeConvId : null);
+    : chatWorkspaces;
   const filteredDmAgents = hiredAgents.filter((agent) =>
     agent && agent.name && (
       matchesConversationSearch(agent)
@@ -1785,15 +1838,42 @@ function CompanyLayout() {
   const filteredHumanChatRooms = isSearchingConversations
     ? humanChatRooms.filter((room) => room.title.toLocaleLowerCase().includes(conversationSearch))
     : humanChatRooms;
-  const groupSidebar = useSidebarReorder(sidebarOrderKey("group"), humanChatRooms.filter((room) => room.kind === "group"), isSearchingConversations);
-  const dmSidebar = useSidebarReorder<DirectSidebarItem>(sidebarOrderKey("dm"), [
-    ...humanChatRooms.filter((room) => room.kind === "dm").map((room) => ({ id: `room:${room.id}`, kind: "room" as const, room })),
+  // Manor stays first above this list. Below it: what needs the user, then what
+  // they placed by hand, then the most recent, whatever the conversation's type.
+  const conversationRanking = useMemo<ConversationRanking<ConversationSidebarItem>>(() => ({
+    attention: (item) => {
+      if (item.kind === "workspace") return positiveStat(actionCounts[item.workspace.id]) > 0;
+      if (item.kind === "room") return positiveStat(item.room.unread_count) > 0;
+      return positiveStat(actionCounts[item.agent.id]) > 0;
+    },
+    recency: (item) => {
+      if (item.kind === "workspace") return workspaceRecency(item.workspace);
+      if (item.kind === "room") return Date.parse(item.room.last_message_at || item.room.created_at) || 0;
+      return Date.parse(dmConversationRecordByAgentId.get(item.agent.id)?.updated_at || "") || 0;
+    },
+  }), [actionCounts, dmConversationRecordByAgentId]);
+  const conversationSidebar = useSidebarReorder<ConversationSidebarItem>(sidebarOrderKey("conversations"), [
+    ...chatWorkspaces.map((workspace) => ({ id: `workspace:${workspace.id}`, kind: "workspace" as const, workspace })),
+    ...humanChatRooms.map((room) => ({ id: `room:${room.id}`, kind: "room" as const, room })),
     ...hiredAgents.map((agent) => ({ id: `agent:${agent.id}`, kind: "agent" as const, agent })),
-  ], isSearchingConversations);
-  const collapsedDmItems = useMemo(() => {
-    const count = { room: 0, agent: 0 };
-    return dmSidebar.items.filter((item) => ++count[item.kind] <= 8);
-  }, [dmSidebar.items]);
+  ], isSearchingConversations, conversationRanking);
+  const matchingConversationItems = conversationSidebar.items.filter((item) => {
+    if (item.kind === "workspace") return matchingWorkspaces.includes(item.workspace);
+    if (item.kind === "room") return filteredHumanChatRooms.includes(item.room);
+    return filteredDmAgents.includes(item.agent);
+  });
+  const activeConversationSidebarId = activeConvType === "operation" ? `workspace:${activeConvId}`
+    : activeConvType === "room" ? `room:${activeConvId}`
+    : activeConvType === "dm" ? `agent:${activeDmAgentId}`
+    : null;
+  const visibleConversationItems = isSearchingConversations || allSidebarConversations
+    ? matchingConversationItems
+    : compactSidebarConversations(matchingConversationItems, activeConversationSidebarId);
+  const openConversationItem = (item: ConversationSidebarItem) => {
+    if (item.kind === "workspace") openWorkspaceChat(item.workspace.id);
+    else if (item.kind === "room") openHumanRoom(item.room.id);
+    else openAgentDm(item.agent);
+  };
 
   const videoRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
@@ -1810,7 +1890,6 @@ function CompanyLayout() {
       if (data.type === "proposal") {
         queryClient.invalidateQueries({ queryKey: ["taskBoard"] });
         queryClient.invalidateQueries({ queryKey: ["tasks"] });
-        queryClient.invalidateQueries({ queryKey: ["dashboard-stats"] });
       }
       if (data.type === "booking_confirmed") {
         queryClient.invalidateQueries({ queryKey: ["calendar-settings"] });
@@ -1841,8 +1920,8 @@ function CompanyLayout() {
     (_data: Record<string, any>) => {
       // Scheduled job created / updated / deleted — refresh the
       // Automations page + any run history drawer that's open.
-      queryClient.invalidateQueries({ queryKey: ["scheduled-jobs"] });
-      queryClient.invalidateQueries({ queryKey: ["job-runs"] });
+      scheduleQueryInvalidation(queryClient, ["scheduled-jobs"]);
+      scheduleQueryInvalidation(queryClient, ["job-runs"]);
     },
     [queryClient],
   );
@@ -1895,7 +1974,8 @@ function CompanyLayout() {
       ) {
         refreshWorkspaces();
       }
-      if (data.has_pending_action) {
+      // A simulation's own cards are in front of the person driving it.
+      if (data.has_pending_action && data.simulation !== true) {
         const wsName =
           chatWorkspaces.find((w) => w.id === wsId)?.name ||
           t("page.app_layout.workspace");
@@ -2020,8 +2100,8 @@ function CompanyLayout() {
   const { data: notifData } = useQuery({
     queryKey: ["notifications", "badge"],
     queryFn: () => api.notifications.list({ limit: 1 }),
-    enabled: startupSettled,
-    refetchInterval: 60_000,
+    enabled: pageVisible && startupSettled,
+    refetchInterval: (query) => displayReadInterval(query.state, 60_000),
   });
   let unreadCount = notifData?.unread_count ?? wsUnread;
   const [locale, setLocaleState] = useState<Locale>(getLocale());
@@ -2056,6 +2136,9 @@ function CompanyLayout() {
     if (path === "/tasks/collections") {
       return location.pathname.startsWith("/tasks/collections");
     }
+    const marketplaceView = location.pathname === "/workspaces" && new URLSearchParams(location.search).get("view") === "marketplace";
+    if (path === MARKETPLACE_PATH) return marketplaceView;
+    if (path === "/workspaces") return location.pathname.startsWith("/workspaces") && !marketplaceView;
     return location.pathname.startsWith(path);
   };
   /* Close mobile sidebar on route change */
@@ -2137,7 +2220,12 @@ function CompanyLayout() {
     setConvSearchQuery("");
   }, [location.pathname, location.search, dmConversationByAgentId, chatAgentsList]);
 
-  const isSettingsRoute = location.pathname === "/settings";
+  // Team, clients and integrations open inside the Settings frame too.
+  const isSettingsRoute = location.pathname === "/settings"
+    || location.pathname === "/team"
+    || location.pathname.startsWith("/team/")
+    || location.pathname === "/integrations"
+    || location.pathname === "/computers";
   // A display preference only changes presentation. Account, setup, approval
   // and artifact links retain their existing authorization and runtime paths.
   const simpleSetupTab = new URLSearchParams(location.search).get("tab");
@@ -2160,6 +2248,7 @@ function CompanyLayout() {
     || location.pathname.startsWith("/editor/")
     || location.pathname.startsWith("/video-editor/")
     || location.pathname.startsWith("/integrations")
+    || location.pathname.startsWith("/computers")
     ;
   const simpleWorkspaceId = /^\/workspaces\/([^/]+)$/.exec(location.pathname)?.[1];
   const simpleChatPath = simpleWorkspaceId && simpleWorkspaceId !== "new"
@@ -2190,14 +2279,11 @@ function CompanyLayout() {
         }
         return;
       }
-      if (location.pathname === "/chat") navigate("/dashboard");
+      if (location.pathname === "/chat") navigate("/tasks");
     },
     [location.pathname, navigate, simpleMode],
   );
 
-  useEffect(() => {
-    if (hasSelectedInterfaceMode && simpleMode && location.pathname === "/dashboard") navigate("/chat", { replace: true });
-  }, [hasSelectedInterfaceMode, simpleMode, location.pathname, navigate]);
 
   // The onboarding tour highlights targets that only exist in one sidebar
   // mode; let it switch the app there (see OnboardingTour's "manor:tour-mode").
@@ -2222,7 +2308,7 @@ function CompanyLayout() {
     };
   }, [switchMode]);
 
-  const sidebarWidth = sidebarCollapsed ? 92 : 260;
+  const sidebarWidth = sidebarCollapsed ? 76 : 224;
   const sectionLabelStyle = {
     display: "flex",
     alignItems: "center",
@@ -2253,12 +2339,12 @@ function CompanyLayout() {
           padding: sidebarCollapsed
             ? 0
             : opts.nested
-              ? "8px 10px 8px 14px"
-              : "9px 10px",
-          borderRadius: opts.nested ? 10 : 12,
-          fontSize: opts.nested ? 12 : 12.5,
-          fontWeight: active ? 760 : 560,
-          letterSpacing: active ? "-0.01em" : "0",
+              ? "6px 10px 6px 14px"
+              : "5px 10px",
+          borderRadius: opts.nested ? 8 : 9,
+          fontSize: 13,
+          fontWeight: active ? 600 : 400,
+          letterSpacing: 0,
           color: item.disabled
             ? "var(--sidebar-nav-disabled)"
             : active
@@ -2284,24 +2370,10 @@ function CompanyLayout() {
           }
         }}
       >
-        {active && (
-          <span
-            style={{
-              position: "absolute",
-              left: sidebarCollapsed ? -6 : 0,
-              top: sidebarCollapsed ? "50%" : "24%",
-              height: sidebarCollapsed ? 22 : "52%",
-              width: 3,
-              background: "var(--sidebar-nav-active-indicator, var(--accent))",
-              borderRadius: "0 4px 4px 0",
-              transform: sidebarCollapsed ? "translateY(-50%)" : undefined,
-            }}
-          />
-        )}
         <span
           style={{
-            width: sidebarCollapsed ? 28 : opts.nested ? 24 : 28,
-            height: sidebarCollapsed ? 28 : opts.nested ? 24 : 28,
+            width: sidebarCollapsed ? 28 : opts.nested ? 22 : 22,
+            height: sidebarCollapsed ? 28 : opts.nested ? 22 : 22,
             borderRadius: opts.nested ? 9 : 10,
             color: item.disabled
               ? "var(--sidebar-nav-disabled)"
@@ -2330,7 +2402,6 @@ function CompanyLayout() {
                   background: "var(--surface-muted)",
                   padding: "2px 6px",
                   borderRadius: 6,
-                  letterSpacing: "0.03em",
                 }}
               >
                 {item.badge}
@@ -2433,96 +2504,206 @@ function CompanyLayout() {
   const newConversationKind = new URLSearchParams(location.search).get("kind") === "group" ? "group" : "dm";
   const manorMainActive = activeConvType === "manor" &&
     (activeConvId === "manor-ai" || activeConvId.startsWith("manor-new:") || !manorSessionsOpen);
-  const chatWorkspaceSection = (!isSearchingConversations || filteredWorkspaces.length > 0) && (
-    <section aria-label={t("page.app_layout.workspaces")}>
-      <ChatSidebarSectionHeader
-        id="chat-sidebar-workspaces"
-        label={t("page.app_layout.workspaces")}
-        expanded={isChatSidebarSectionOpen("workspaces")}
-        onToggle={() => toggleChatSidebarSection("workspaces")}
-        searching={isSearchingConversations}
-        attentionCount={matchingWorkspaces.reduce((count, ws) => count + positiveStat(actionCounts[ws.id]), 0)}
-        action={<WorkspaceAddAction
-          cloud={deploymentMode === "cloud"}
-          ready={workspaceAddReady}
-          className="conv-section-add"
-          tourId="create-workspace"
-          onCreate={openNewWorkspaceDraft}
-          onMarketplace={openWorkspaceMarketplace}
-        />}
+  const renderWorkspaceConversationRow = (ws: Workspace) => {
+    const sidebarId = `workspace:${ws.id}`;
+    const isActive = activeConvType === "operation" && activeConvId === ws.id;
+    if (renamingWorkspace?.id === ws.id) {
+      return <form key={sidebarId} className="conv-row conv-row-rename" onSubmit={(event) => {
+        event.preventDefault();
+        const name = workspaceNameDraft.trim();
+        if (name && name !== ws.name) renameWorkspaceFromSidebar.mutate({ id: ws.id, name });
+        else if (name === ws.name) setRenamingWorkspace(null);
+      }}>
+        <Input
+          value={workspaceNameDraft}
+          onChange={(event) => setWorkspaceNameDraft(event.target.value)}
+          onKeyDown={(event) => { if (event.key === "Escape") setRenamingWorkspace(null); }}
+          maxLength={255}
+          ariaLabel={getLocale() === "zh" ? `重命名 ${ws.name}` : `Rename ${ws.name}`}
+          className="conv-row-rename-field"
+          error={workspaceRenameError || undefined}
+          autoFocus
+          disabled={renameWorkspaceFromSidebar.isPending}
+        />
+        <Button type="submit" size="sm" variant="ghost" disabled={!workspaceNameDraft.trim() || renameWorkspaceFromSidebar.isPending} ariaLabel={t("action.save")}>{t("action.save")}</Button>
+        <Button type="button" size="sm" variant="ghost" onClick={() => setRenamingWorkspace(null)} disabled={renameWorkspaceFromSidebar.isPending} ariaLabel={t("action.cancel")}>×</Button>
+      </form>;
+    }
+    return <div key={sidebarId} data-workspace-id={ws.id} {...conversationSidebar.rowAttributes(sidebarId)}
+      className={`conv-row conv-row--with-menu workspace-sidebar-row ${isActive ? "conv-row--active" : ""}`}
+    >
+      <button type="button" className="conv-row-main sidebar-reorder-button"
+      aria-current={isActive ? "page" : undefined}
+      aria-description={isSearchingConversations ? undefined : t("page.app_layout.workspace_drag_name", { name: ws.name })}
+      title={isSearchingConversations ? undefined : t("page.app_layout.workspace_drag_hint")}
+      {...conversationSidebar.buttonAttributes(sidebarId, () => openWorkspaceChat(ws.id))}
+      >
+        <WorkspaceIconTile workspace={ws} size={30} iconSize={15} style={{ borderRadius: 9, flexShrink: 0 }} />
+        <span className="min-w-0 flex-1">
+          <HoverMarqueeText className="conv-name" text={ws.name} style={(actionCounts[ws.id] || 0) > 0 ? { fontWeight: 800, color: "var(--text-strong)" } : undefined} />
+          {(!simpleMode || (ws.status && ws.status !== "active")) && <span className="conv-preview block">{workspaceStatusLabel(ws.status)}</span>}
+        </span>
+      </button>
+      {(actionCounts[ws.id] || 0) > 0 && <WorkspaceAttentionBadge workspaceId={ws.id} name={ws.name} count={actionCounts[ws.id]} />}
+      <SidebarRowMenu
+        name={ws.name}
+        items={[
+          { key: "details", label: getLocale() === "zh" ? "Workspace 设置" : "Workspace settings" },
+          ...(ws.can_manage ? [{ key: "rename", label: getLocale() === "zh" ? "重命名 Workspace" : "Rename Workspace" }] : []),
+          ...(ws.can_delete ? [{ key: "delete", label: t("page.workspaces.delete_workspace"), danger: true }] : []),
+        ]}
+        onSelect={(key) => {
+          if (key === "details") navigate(`/workspaces/${encodeURIComponent(ws.id)}?tab=settings`);
+          if (key === "rename") {
+            setRenamingWorkspace(ws);
+            setWorkspaceNameDraft(ws.name);
+            setWorkspaceRenameError("");
+          }
+          if (key === "delete" && ws.can_delete) {
+            setDeleteWorkspaceTarget(ws);
+            setDeleteWorkspaceError("");
+          }
+        }}
       />
-      {isChatSidebarSectionOpen("workspaces") && <div id="chat-sidebar-workspaces">
-      <div data-sidebar-reorder-list="workspaces" className={`workspace-sidebar-list${allSidebarWorkspaces && !isSearchingConversations ? " workspace-sidebar-list--expanded" : ""}`}>
-      {filteredWorkspaces.map((ws) => {
-        const isActive = activeConvType === "operation" && activeConvId === ws.id;
-        if (renamingWorkspace?.id === ws.id) {
-          return <form key={ws.id} className="conv-row conv-row-rename" onSubmit={(event) => {
-            event.preventDefault();
-            const name = workspaceNameDraft.trim();
-            if (name && name !== ws.name) renameWorkspaceFromSidebar.mutate({ id: ws.id, name });
-            else if (name === ws.name) setRenamingWorkspace(null);
-          }}>
-            <Input
-              value={workspaceNameDraft}
-              onChange={(event) => setWorkspaceNameDraft(event.target.value)}
-              onKeyDown={(event) => { if (event.key === "Escape") setRenamingWorkspace(null); }}
-              maxLength={255}
-              ariaLabel={getLocale() === "zh" ? `重命名 ${ws.name}` : `Rename ${ws.name}`}
-              className="conv-row-rename-field"
-              error={workspaceRenameError || undefined}
-              autoFocus
-              disabled={renameWorkspaceFromSidebar.isPending}
-            />
-            <Button type="submit" size="sm" variant="ghost" disabled={!workspaceNameDraft.trim() || renameWorkspaceFromSidebar.isPending} ariaLabel={t("action.save")}>{t("action.save")}</Button>
-            <Button type="button" size="sm" variant="ghost" onClick={() => setRenamingWorkspace(null)} disabled={renameWorkspaceFromSidebar.isPending} ariaLabel={t("action.cancel")}>×</Button>
-          </form>;
-        }
-        return <div key={ws.id} data-workspace-id={ws.id} {...workspaceSidebar.rowAttributes(ws.id)}
-          className={`conv-row conv-row--with-menu workspace-sidebar-row ${isActive ? "conv-row--active" : ""}`}
-        >
-          <button type="button" className="conv-row-main sidebar-reorder-button"
-          aria-current={isActive ? "page" : undefined}
-          aria-description={isSearchingConversations ? undefined : t("page.app_layout.workspace_drag_name", { name: ws.name })}
-          title={isSearchingConversations ? undefined : t("page.app_layout.workspace_drag_hint")}
-          {...workspaceSidebar.buttonAttributes(ws.id, () => openWorkspaceChat(ws.id))}
+    </div>;
+  };
+  const renderRoomConversationRow = (room: ChatRoom) => {
+    const sidebarId = `room:${room.id}`;
+    const isActive = activeConvType === "room" && activeConvId === room.id;
+    const memberRole = room.members.find((member) => member.user_id === user?.id)?.role;
+    const otherMember = room.kind === "dm" ? room.members.find((member) => member.user_id !== user?.id) : undefined;
+    return <div key={sidebarId} {...conversationSidebar.rowAttributes(sidebarId)} className={`conv-row conv-row--with-menu ${isActive ? "conv-row--active" : ""}`}>
+      <button type="button" className="conv-row-main sidebar-reorder-button" aria-current={isActive ? "page" : undefined} aria-description={isSearchingConversations ? undefined : t("page.app_layout.workspace_drag_name", { name: room.title })} {...conversationSidebar.buttonAttributes(sidebarId, () => openHumanRoom(room.id))}>
+        {room.kind === "group" ? <GroupChatAvatar title={room.title} members={room.members} currentUserId={user?.id} /> : <UserAvatar name={room.title} avatarUrl={otherMember?.avatar_url} size={30} />}
+        <span className="min-w-0 flex-1"><HoverMarqueeText className="conv-name" text={room.title} style={(room.unread_count || 0) > 0 ? { fontWeight: 800, color: "var(--text-strong)" } : undefined} /><span className="conv-preview block">{room.kind === "group" ? groupChatSummary(room) : room.member_count < 2 ? (getLocale() === "zh" ? "私聊 · 等待加入" : "Direct message · Awaiting acceptance") : room.online_user_ids ? <span className="inline-flex items-center gap-1.5"><span aria-hidden="true" className={room.online_user_ids.some((id) => id !== user?.id) ? "chat-status-dot chat-status-dot--online" : "chat-status-dot bg-[var(--text-faint)]"} />{getLocale() === "zh" ? "私聊 · " : "Direct message · "}{room.online_user_ids.some((id) => id !== user?.id) ? (getLocale() === "zh" ? "在线" : "Online") : (getLocale() === "zh" ? "离线" : "Offline")}</span> : (getLocale() === "zh" ? "私聊" : "Direct message")}</span></span>
+      </button>
+      {(room.unread_count || 0) > 0 && <span className="conv-badge" aria-label={getLocale() === "zh" ? `${room.unread_count} 条未读消息` : `${room.unread_count} unread messages`}>{(room.unread_count || 0) > 99 ? "99+" : room.unread_count}</span>}
+      <SidebarRowMenu
+        name={room.title}
+        items={[
+          { key: "details", label: room.kind === "group" ? (getLocale() === "zh" ? "群聊详情" : "Group details") : (getLocale() === "zh" ? "私聊详情" : "Direct message details") },
+          ...(room.kind === "group" && (memberRole === "owner" || memberRole === "admin") ? [{ key: "rename", label: getLocale() === "zh" ? "重命名群聊" : "Rename group" }] : []),
+          ...(room.kind === "group" && memberRole === "owner" ? [{ key: "close", label: getLocale() === "zh" ? "解散群聊" : "Close group", danger: true }] : []),
+        ]}
+        onSelect={(key) => {
+          if (key === "details" || key === "rename" || key === "close") openHumanRoomAction(room.id, key);
+        }}
+      />
+    </div>;
+  };
+  const renderAgentConversationRow = (agent: Agent) => {
+    const sidebarId = `agent:${agent.id}`;
+    const dmConversation = dmConversationRecordByAgentId.get(agent.id);
+    const isDraft = !dmConversation && !chatConversationsLoading && !chatConversationsError;
+    const isActive = activeConvType === "dm" && activeDmAgentId === agent.id;
+    if ((dmConversation && renamingConversationId === dmConversation.id) || (isDraft && renamingAgentDraftId === agent.id)) {
+      return <form key={sidebarId} className="conv-row conv-row-rename" onSubmit={(event) => {
+        event.preventDefault();
+        submitRenameConversation();
+      }}>
+        <Input
+          value={conversationTitleDraft}
+          onChange={(event) => setConversationTitleDraft(event.target.value)}
+          onKeyDown={(event) => { if (event.key === "Escape") cancelRenameConversation(); }}
+          maxLength={500}
+          ariaLabel={t("component.session_switcher.rename_chat_label", { title: dmConversation?.title || agent.name })}
+          className="conv-row-rename-field"
+          error={conversationRenameError || undefined}
+          autoFocus
+          disabled={renameChatConversation.isPending || startAgentConversation.isPending}
+        />
+        <Button type="submit" size="sm" variant="ghost" loading={renameChatConversation.isPending || startAgentConversation.isPending} disabled={!conversationTitleDraft.trim()} ariaLabel={t("action.save")}>{t("action.save")}</Button>
+        <Button type="button" size="sm" variant="ghost" onClick={cancelRenameConversation} disabled={renameChatConversation.isPending || startAgentConversation.isPending} ariaLabel={t("action.cancel")}>×</Button>
+      </form>;
+    }
+    return (
+      <div
+        key={sidebarId}
+        {...conversationSidebar.rowAttributes(sidebarId)}
+        className={`conv-row conv-row--with-menu ${isActive ? "conv-row--active" : ""}`}
+      >
+        <button type="button" className="conv-row-main sidebar-reorder-button" aria-current={isActive ? "page" : undefined} aria-description={isSearchingConversations ? undefined : t("page.app_layout.workspace_drag_name", { name: dmConversation?.title || agent.name })} {...conversationSidebar.buttonAttributes(sidebarId, () => openAgentDm(agent))}>
+          <AgentAvatar name={agent.name} avatarUrl={agent.avatar_url} seed={agent.id} size={30} className="conv-avatar" />
+          <span className="min-w-0 flex-1">
+            <HoverMarqueeText className="conv-name" text={dmConversation?.title || agent.name} />
+            <span className="conv-preview block">{dmConversation?.title ? agent.name : agentPreview(agent, "page.app_layout.agent")}</span>
+          </span>
+        </button>
+        {(actionCounts[agent.id] || 0) > 0 && <span className="conv-badge">{actionCounts[agent.id]}</span>}
+        <SidebarRowMenu
+          name={agent.name}
+          items={[
+            { key: "profile", label: getLocale() === "zh" ? "查看 Agent" : "View Agent" },
+            ...(dmConversation || isDraft ? [
+              { key: "rename", label: t("component.session_switcher.rename_chat") },
+              { key: "delete", label: t("component.session_switcher.delete_chat"), danger: true },
+            ] : []),
+          ]}
+          onSelect={(key) => {
+            if (key === "profile") navigate(`/agents/${encodeURIComponent(agent.id)}`);
+            if (key === "rename") {
+              if (dmConversation) beginRenameConversation(dmConversation);
+              else if (isDraft) beginRenameAgentDraft(agent);
+            }
+            if (key === "delete" && dmConversation) {
+              setDeleteConversationError("");
+              setDeleteConversationTarget(dmConversation);
+            } else if (key === "delete" && isDraft) {
+              setHiredAgents((previous) => previous.filter((item) => item.id !== agent.id));
+              if (isActive) openManorChat();
+            }
+          }}
+        />
+      </div>
+    );
+  };
+  const chatConversationSection = (!isSearchingConversations || visibleConversationItems.length > 0 || visibleSearchAgents.length > 0) && isChatSidebarSectionOpen("ai") && (
+    <section aria-label={t("page.app_layout.conversations")} data-tour="chat-sidebar-workspaces">
+      <div data-sidebar-reorder-list="conversations" className="conversation-sidebar-list">
+        {visibleConversationItems.map((item) => {
+          if (item.kind === "workspace") return renderWorkspaceConversationRow(item.workspace);
+          if (item.kind === "room") return renderRoomConversationRow(item.room);
+          return renderAgentConversationRow(item.agent);
+        })}
+        {/* Search can offer new AI direct chats below existing ones. */}
+      {visibleSearchAgents.map((agent) => {
+        const isActive =
+          activeConvType === "dm" &&
+          activeDmAgentId === agent.id;
+        return (
+          <div
+            key={agent.id}
+            className={`conv-row conv-row--with-menu ${isActive ? "conv-row--active" : ""}`}
           >
-            <WorkspaceIconTile workspace={ws} size={30} iconSize={15} style={{ borderRadius: 9, flexShrink: 0 }} />
-            <span className="min-w-0 flex-1">
-              <HoverMarqueeText className="conv-name" text={ws.name} style={(actionCounts[ws.id] || 0) > 0 ? { fontWeight: 800, color: "var(--text-strong)" } : undefined} />
-              {(!simpleMode || (ws.status && ws.status !== "active")) && <span className="conv-preview block">{workspaceStatusLabel(ws.status)}</span>}
-            </span>
-          </button>
-          {(actionCounts[ws.id] || 0) > 0 && <WorkspaceAttentionBadge workspaceId={ws.id} name={ws.name} count={actionCounts[ws.id]} />}
-          <SidebarRowMenu
-            name={ws.name}
-            items={[
-              { key: "details", label: getLocale() === "zh" ? "Workspace 设置" : "Workspace settings" },
-              ...(ws.can_manage ? [{ key: "rename", label: getLocale() === "zh" ? "重命名 Workspace" : "Rename Workspace" }] : []),
-              ...(ws.can_delete ? [{ key: "delete", label: t("page.workspaces.delete_workspace"), danger: true }] : []),
-            ]}
-            onSelect={(key) => {
-              if (key === "details") navigate(`/workspaces/${encodeURIComponent(ws.id)}?tab=settings`);
-              if (key === "rename") {
-                setRenamingWorkspace(ws);
-                setWorkspaceNameDraft(ws.name);
-                setWorkspaceRenameError("");
-              }
-              if (key === "delete" && ws.can_delete) {
-                setDeleteWorkspaceTarget(ws);
-                setDeleteWorkspaceError("");
-              }
-            }}
-          />
-        </div>;
+            <button type="button" className="conv-row-main" aria-current={isActive ? "page" : undefined} onClick={() => openAgentDm(agent)}>
+              <AgentAvatar
+                name={agent.name}
+                avatarUrl={agent.avatar_url}
+                seed={agent.id}
+                size={30}
+                className="conv-avatar"
+              />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <HoverMarqueeText className="conv-name" text={agent.name} />
+                <div className="conv-preview">
+                  {agentPreview(
+                    agent,
+                    "page.app_layout.start_a_chat",
+                  )}
+                </div>
+              </div>
+            </button>
+            <SidebarRowMenu name={agent.name} items={[{ key: "profile", label: getLocale() === "zh" ? "查看 Agent" : "View Agent" }]} onSelect={() => navigate(`/agents/${encodeURIComponent(agent.id)}`)} />
+          </div>
+        );
       })}
       </div>
-      {!isSearchingConversations && matchingWorkspaces.length > WORKSPACE_SIDEBAR_LIMIT && <button
+      {!isSearchingConversations && matchingConversationItems.length > CONVERSATION_SIDEBAR_LIMIT && <button
         type="button"
-        className="workspace-sidebar-expand"
-        aria-expanded={allSidebarWorkspaces}
-        onClick={() => setAllSidebarWorkspaces((value) => !value)}
-      >{allSidebarWorkspaces ? t("page.app_layout.workspace_show_less") : t("page.app_layout.workspace_show_all", { count: String(matchingWorkspaces.length) })}</button>}
-      </div>}
+        className="conversation-sidebar-expand"
+        aria-expanded={allSidebarConversations}
+        onClick={() => setAllSidebarConversations((value) => !value)}
+      >{allSidebarConversations ? t("page.app_layout.workspace_show_less") : t("page.app_layout.workspace_show_all", { count: String(matchingConversationItems.length) })}</button>}
     </section>
   );
 
@@ -2537,11 +2718,11 @@ function CompanyLayout() {
           <div className="aurora-blob aurora-blob-3" />
         </div>
 
-        {/* Mobile overlay backdrop */}
+        {/* Mobile overlay backdrop: shown at the same width the sidebar becomes a drawer. */}
         {mobileOpen && (
           <div
-            className="fixed inset-0 z-40 lg:hidden"
-            style={{ background: "rgba(0,0,0,0.2)" }}
+            className="sidebar-mobile-backdrop fixed inset-0 z-40"
+            style={{ display: "none", background: "rgba(0,0,0,0.2)" }}
             onClick={() => setMobileOpen(false)}
           />
         )}
@@ -2550,6 +2731,7 @@ function CompanyLayout() {
         {!isSettingsRoute && (
         <aside
           className={`sidebar-mobile ${mobileOpen ? "open" : ""}`}
+          data-workflow-editor={/^\/flows\/[^/]+/.test(location.pathname) ? "true" : undefined}
           style={{
             width: sidebarWidth,
             flexShrink: 0,
@@ -2558,7 +2740,7 @@ function CompanyLayout() {
             marginLeft: mobileOpen ? 0 : undefined,
             position: "relative",
             zIndex: 50,
-            padding: 12,
+            padding: "8px 4px 8px 8px",
           }}
         >
           <div
@@ -2583,7 +2765,37 @@ function CompanyLayout() {
                 gap: sidebarCollapsed ? 8 : 10,
               }}
             >
-              {/* Dark logo box */}
+              {/* Narrow, the logo is the way back: nothing else competes with the navigation. */}
+              {sidebarCollapsed ? (
+                <button
+                  type="button"
+                  className="sidebar-rail-logo"
+                  aria-label={t("page.app_layout.expand_sidebar")}
+                  title={t("page.app_layout.expand_sidebar")}
+                  onClick={() => setCollapsed(false)}
+                >
+                <div
+                  className="manor-brand-mark"
+                  style={{
+                    width: 32,
+                    height: 32,
+                    minWidth: 32,
+                    borderRadius: 8,
+                    background: "#000000",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    flexShrink: 0,
+                    boxShadow: "0 2px 8px rgba(0,0,0,0.15)",
+                  }}
+                >
+                  <ManorLogo size={24} color="white" className="manor-brand-logo" />
+                </div>
+                  <span className="sidebar-rail-logo-expand" aria-hidden="true">
+                    <IconSidebar size={18} />
+                  </span>
+                </button>
+              ) : (
               <div
                 className="manor-brand-mark"
                 style={{
@@ -2601,106 +2813,114 @@ function CompanyLayout() {
               >
                 <ManorLogo size={24} color="white" className="manor-brand-logo" />
               </div>
+              )}
               {!sidebarCollapsed && (
                 <span
                   style={{
-                    fontSize: 18,
-                    fontWeight: 800,
+                    fontSize: 16,
+                    fontWeight: 600,
                     color: "var(--text-strong)",
-                    letterSpacing: 0,
+                    letterSpacing: "-0.01em",
                     lineHeight: 1,
                   }}
                 >
-                  Manor AI
+                  Manor
                 </span>
               )}
               {!sidebarCollapsed && (
                 <button
                   aria-label={t("page.app_layout.collapse_sidebar")}
                   title={t("page.app_layout.collapse_sidebar")}
+                  className="sidebar-collapse-toggle"
                   onClick={() => {
                     if (mobileOpen) {
                       setMobileOpen(false);
                     } else {
-                      setCollapsed(!collapsed);
+                      setCollapsed(true);
                     }
                   }}
-                  style={{
-                    marginLeft: "auto",
-                    width: 36,
-                    height: 36,
-                    borderRadius: "50%",
-                    background: "var(--sidebar-control-bg)",
-                    border: "1px solid var(--sidebar-control-border)",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    cursor: "pointer",
-                    flexShrink: 0,
-                    transition: "all 0.2s",
-                    color: "var(--text-muted)",
-                  }}
                 >
-                  <svg
-                    width="14"
-                    height="14"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth={2}
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    style={{
-                      transition: "transform 0.3s",
-                      transform: "rotate(0deg)",
-                    }}
-                  >
-                    <polyline points="15 18 9 12 15 6" />
-                  </svg>
+                  <IconSidebar size={18} aria-hidden="true" />
                 </button>
               )}
             </div>
 
-            {sidebarCollapsed && (
-              <button
-                className="app-sidebar-edge-toggle"
-                aria-label={t("page.app_layout.expand_sidebar")}
-                title={t("page.app_layout.expand_sidebar")}
-                onClick={() => {
-                  if (mobileOpen) {
-                    setMobileOpen(false);
-                  } else {
-                    setCollapsed(!collapsed);
-                  }
-                }}
-              >
+            {/* ── PRIMARY NAV ── */}
+            {/* Global search heads the menu (⌘K). */}
+            {!sidebarCollapsed && (
+            <div className="chat-sidebar-global-search-wrap">
+              <div className="chat-sidebar-global-search-field">
                 <svg
                   width="14"
                   height="14"
                   viewBox="0 0 24 24"
                   fill="none"
                   stroke="currentColor"
-                  strokeWidth={2}
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  aria-hidden="true"
+                  strokeWidth={1.8}
+                  className="chat-sidebar-global-search-icon"
                 >
-                  <polyline points="15 18 9 12 15 6" />
+                  <circle cx="11" cy="11" r="8" />
+                  <line x1="21" y1="21" x2="16.65" y2="16.65" />
                 </svg>
-              </button>
+                <input
+                  ref={globalSearchInputRef}
+                  type="text"
+                  className="chat-sidebar-global-search"
+                  value={convSearchQuery}
+                  onChange={(e) => setConvSearchQuery(e.target.value)}
+                  onCompositionStart={() => setSearchComposing(true)}
+                  onCompositionEnd={() => setSearchComposing(false)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") {
+                      setConvSearchQuery("");
+                      e.currentTarget.blur();
+                      return;
+                    }
+                    // Enter that confirms an IME candidate is not a pick.
+                    if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
+                    if (!conversationSearch) return;
+                    const firstSession = filteredManorChatSessions[0];
+                    if (firstSession) {
+                      e.preventDefault();
+                      openManorSession(firstSession.id);
+                      return;
+                    }
+                    if (manorIdentityMatchesSearch) {
+                      e.preventDefault();
+                      openManorChat();
+                      return;
+                    }
+                    const firstConversation = visibleConversationItems[0];
+                    if (firstConversation) {
+                      e.preventDefault();
+                      openConversationItem(firstConversation);
+                      return;
+                    }
+                    const firstMatch = visibleSearchAgents[0];
+                    e.preventDefault();
+                    if (firstMatch) { openAgentDm(firstMatch); return; }
+                    const firstGlobal = globalSearchGroups[0]?.items[0];
+                    if (firstGlobal) openGlobalSearchResult(firstGlobal.type.toLowerCase(), firstGlobal.id);
+                  }}
+                  placeholder={t("page.app_layout.search_chats_and_agents")}
+                  aria-label={t("page.app_layout.search_chats_and_agents")}
+                  aria-keyshortcuts="Meta+K Control+K"
+                />
+                {!convSearchQuery && <kbd className="chat-sidebar-global-search-key" aria-hidden="true">⌘K</kbd>}
+              </div>
+            </div>
             )}
-
-            {/* ── MODE SWITCHER ── */}
-            {(!simpleMode || sidebarCollapsed) && (
-            <div
-              style={{
-                padding: sidebarCollapsed ? "0 0 12px" : "0 16px 12px",
-                display: sidebarCollapsed ? "flex" : undefined,
-                justifyContent: sidebarCollapsed ? "center" : undefined,
-              }}
-              data-tour={simpleMode ? "create-workspace" : "mode-switcher"}
-            >
-              {simpleMode ? (
+            {/* While searching, results take the places' spot under the field. */}
+            {/* Simple mode has no places; the conversation heading's plus creates, and only a collapsed sidebar needs its own. */}
+            {isSearchingConversations && !sidebarCollapsed ? null : simpleMode ? sidebarCollapsed && (
+              <div
+                style={{
+                  padding: sidebarCollapsed ? "0 0 12px" : "0 16px 12px",
+                  display: sidebarCollapsed ? "flex" : undefined,
+                  justifyContent: sidebarCollapsed ? "center" : undefined,
+                }}
+                data-tour="create-workspace"
+              >
                 <WorkspaceAddAction
                   cloud={deploymentMode === "cloud"}
                   ready={workspaceAddReady}
@@ -2708,162 +2928,22 @@ function CompanyLayout() {
                   onCreate={openNewWorkspaceDraft}
                   onMarketplace={openWorkspaceMarketplace}
                 />
-              ) : sidebarCollapsed ? (
-                <div
-                  style={{
-                    display: "grid",
-                    gridTemplateColumns: "1fr",
-                    gap: 5,
-	                    width: 42,
-	                    padding: 3,
-	                    borderRadius: 14,
-	                    background: "var(--sidebar-mode-bg)",
-	                    border: "1px solid var(--sidebar-mode-border)",
-	                  }}
-	                >
-                  {[
-                    {
-                      key: "chat" as const,
-                      label: t("nav.chat"),
-                      icon: <IconChatSmall />,
-                    },
-                    {
-                      key: "workspace" as const,
-                      label: t("page.app_layout.workspace_mode"),
-                      icon: <IconGridSmall />,
-                    },
-                  ].map((item) => {
-                    const active = mode === item.key;
-                    return (
-                      <button
-                        key={item.key}
-                        type="button"
-                        title={item.label}
-                        aria-label={t("page.app_layout.switch_to").replace(
-                          "{label}",
-                          item.label,
-                        )}
-                        aria-pressed={active}
-                        onClick={() => switchMode(item.key)}
-                        style={{
-                          width: 34,
-                          height: 32,
-                          border: active
-                            ? "1px solid var(--sidebar-mode-active-border)"
-                            : "1px solid transparent",
-                          borderRadius: 11,
-                          background: active
-                            ? "var(--sidebar-mode-active-bg)"
-                            : "transparent",
-                          color: active
-                            ? "var(--sidebar-mode-active-text)"
-                            : "var(--sidebar-mode-text)",
-                          boxShadow: active
-                            ? "var(--sidebar-mode-active-shadow)"
-                            : "none",
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                          cursor: "pointer",
-                          transition: "all 0.18s ease",
-                          outline: "none",
-                        }}
-                      >
-                        {item.icon}
-                      </button>
-                    );
-                  })}
-                </div>
-              ) : (
-                <div
-                  style={{
-                    position: "relative",
-                    background: "var(--sidebar-mode-bg)",
-                    border: "1px solid var(--sidebar-mode-border)",
-                    borderRadius: 12,
-                    padding: 3,
-                    display: "flex",
-                  }}
-                >
-                  {/* Animated slider */}
-                  <div
-                    style={{
-                      position: "absolute",
-                      top: 3,
-                      left: 3,
-                      width: "calc(50% - 3px)",
-                      height: "calc(100% - 6px)",
-                      background: "var(--sidebar-mode-active-bg)",
-                      border: "1px solid var(--sidebar-mode-active-border)",
-                      borderRadius: 10,
-                      boxShadow: "var(--sidebar-mode-active-shadow)",
-                      transition: "transform 0.25s cubic-bezier(0.4,0,0.2,1)",
-                      transform:
-                        mode === "workspace"
-                          ? "translateX(100%)"
-                          : "translateX(0)",
-                      zIndex: 0,
-                    }}
-                  />
-                  <button
-                    onClick={() => switchMode("chat")}
-                    style={{
-                      flex: 1,
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      gap: 5,
-                      padding: "6px 0",
-                      fontSize: 12,
-                      fontWeight: mode === "chat" ? 600 : 500,
-                      color:
-                        mode === "chat"
-                          ? "var(--sidebar-mode-active-text)"
-                          : "var(--sidebar-mode-text)",
-                      background: "transparent",
-                      border: "none",
-                      outline: "none",
-                      cursor: "pointer",
-                      position: "relative",
-                      zIndex: 1,
-                      transition: "color 0.2s",
-                      borderRadius: 8,
-                    }}
-                  >
-                    <IconChatSmall />
-                    {t("nav.chat")}
-                  </button>
-                  <button
-                    onClick={() => switchMode("workspace")}
-                    style={{
-                      flex: 1,
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      gap: 5,
-                      padding: "6px 0",
-                      fontSize: 12,
-                      fontWeight: mode === "workspace" ? 600 : 500,
-                      color:
-                        mode === "workspace"
-                          ? "var(--sidebar-mode-active-text)"
-                          : "var(--sidebar-mode-text)",
-                      background: "transparent",
-                      border: "none",
-                      outline: "none",
-                      cursor: "pointer",
-                      position: "relative",
-                      zIndex: 1,
-                      transition: "color 0.2s",
-                      borderRadius: 8,
-                    }}
-                  >
-                    <IconGridSmall />
-                    {t("page.app_layout.workspace_mode")}
-                  </button>
-                </div>
-              )}
-            </div>
+              </div>
+            ) : (
+              <nav
+                aria-label={t("nav.more")}
+                data-tour="mode-switcher"
+                style={{
+                  padding: sidebarCollapsed ? "0 0 10px" : "0 8px 10px",
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: sidebarCollapsed ? "center" : "stretch",
+                  gap: sidebarCollapsed ? 6 : 1,
+                }}
+              >
+                {primaryNavItems
+                  .map((item) => renderNavItem(item))}
+              </nav>
             )}
 
             {/* ── SCROLLABLE NAV ── */}
@@ -2882,85 +2962,45 @@ function CompanyLayout() {
                 <div
                   style={{ display: "flex", flexDirection: "column", gap: 0 }}
                 >
-                  {/* Search input */}
-                  <div className="chat-sidebar-global-search-wrap">
-                    <div className="chat-sidebar-global-search-field">
-                      <svg
-                        width="13"
-                        height="13"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="#a8a29e"
-                        strokeWidth={2}
-                        className="chat-sidebar-global-search-icon"
-                      >
-                        <circle cx="11" cy="11" r="8" />
-                        <line x1="21" y1="21" x2="16.65" y2="16.65" />
-                      </svg>
-                      <input
-                        type="text"
-                        className="chat-sidebar-global-search"
-                        value={convSearchQuery}
-                        onChange={(e) => setConvSearchQuery(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key !== "Enter") return;
-                          if (!conversationSearch) return;
-                          const firstSession = filteredManorChatSessions[0];
-                          if (firstSession) {
-                            e.preventDefault();
-                            openManorSession(firstSession.id);
-                            return;
-                          }
-                          if (manorIdentityMatchesSearch) {
-                            e.preventDefault();
-                            openManorChat();
-                            return;
-                          }
-                          const firstWorkspace = filteredWorkspaces[0];
-                          if (firstWorkspace) {
-                            e.preventDefault();
-                            openWorkspaceChat(firstWorkspace.id);
-                            return;
-                          }
-                          const firstGroup = filteredHumanChatRooms.find((room) => room.kind === "group");
-                          if (firstGroup) {
-                            e.preventDefault();
-                            openHumanRoom(firstGroup.id);
-                            return;
-                          }
-                          const firstDirect = filteredHumanChatRooms.find((room) => room.kind === "dm");
-                          if (firstDirect) {
-                            e.preventDefault();
-                            openHumanRoom(firstDirect.id);
-                            return;
-                          }
-                          const firstMatch =
-                            filteredDmAgents[0] || visibleSearchAgents[0];
-                          if (!firstMatch) return;
-                          e.preventDefault();
-                          openAgentDm(firstMatch);
-                        }}
-                        placeholder={t(simpleMode ? "page.app_layout.search_conversations" : "page.app_layout.search_chats_and_agents")}
-                        aria-label={t(simpleMode ? "page.app_layout.search_conversations" : "page.app_layout.search_chats_and_agents")}
-                      />
-                    </div>
-                  </div>
-
-
                   {/* Manor AI and its sessions lead the chat list. */}
                   {(!isSearchingConversations || manorSearchHasResults) && (
-                    <section className="manor-session-group" aria-label={t("page.app_layout.ai_chats")}>
+                    <section className="manor-session-group" aria-label={t("page.app_layout.conversations")}>
+                      {/* One list of conversations under a single header and a single "+":
+                          Manor first, then chatConversationSection. */}
                       <ChatSidebarSectionHeader
                         id="chat-sidebar-ai-chats"
-                        label={t("page.app_layout.ai_chats")}
+                        label={t("page.app_layout.conversations")}
                         expanded={isChatSidebarSectionOpen("ai")}
                         onToggle={() => toggleChatSidebarSection("ai")}
                         searching={isSearchingConversations}
-                        attentionCount={positiveStat(actionCounts["manor-ai"])}
-                        action={<button type="button" className="conv-section-add" aria-label={t("component.session_switcher.new_chat_2")} title={t("component.session_switcher.new_chat_2")} onClick={startNewManorSession}>
-                          <IconPlus />
-                        </button>}
+                        attentionCount={
+                          positiveStat(actionCounts["manor-ai"])
+                          + matchingWorkspaces.reduce((count, ws) => count + positiveStat(actionCounts[ws.id]), 0)
+                          + filteredHumanChatRooms.reduce((count, room) => count + positiveStat(room.unread_count), 0)
+                        }
+                        badge={groupUsageLoaded && humanChatRoomsLoaded && groupDiscovery.badgeVisible && !isSearchingConversations ? <FeatureDiscoveryBadge label={t("component.feature_discovery.new")} onClick={groupDiscovery.reveal} expanded={groupDiscovery.open} controls="group-chat-feature-discovery" /> : undefined}
+                        action={<Dropdown
+                          align="right"
+                          trigger={<button type="button" className="conv-section-add" data-tour="create-workspace" aria-label={t("component.session_switcher.new_chat_2")} title={t("component.session_switcher.new_chat_2")}>
+                            <IconPlus />
+                          </button>}
+                          items={[
+                            { key: "manor", label: t("page.app_layout.new_manor_chat") },
+                            ...(workspaceAddReady ? [{ key: "workspace", label: t("page.app_layout.new_workspace") }] : []),
+                            ...(workspaceAddReady && deploymentMode === "cloud" ? [{ key: "marketplace", label: t("page.app_layout.add_from_marketplace") }] : []),
+                            { key: "group", label: t("page.app_layout.new_group_chat") },
+                            { key: "dm", label: t("page.app_layout.new_direct_chat") },
+                          ]}
+                          onSelect={(key: string) => {
+                            if (key === "manor") startNewManorSession();
+                            if (key === "workspace") openNewWorkspaceDraft();
+                            if (key === "marketplace") openWorkspaceMarketplace();
+                            if (key === "group") openNewGroup();
+                            if (key === "dm") openNewConversation();
+                          }}
+                        />}
                       />
+                      {groupDiscovery.open && !isSearchingConversations && <FeatureDiscoveryHint id="group-chat-feature-discovery" title={t("component.feature_discovery.group_chat_title")} description={t("component.feature_discovery.group_chat_description")} actionLabel={t("component.feature_discovery.create_group")} laterLabel={t("component.feature_discovery.later")} onAction={openNewGroup} onDismiss={groupDiscovery.dismiss} />}
                       {isChatSidebarSectionOpen("ai") && <div id="chat-sidebar-ai-chats">
                       <div
                         className={`conv-row conv-row--manor ${manorMainActive ? "conv-row--active" : ""}`}
@@ -2973,7 +3013,7 @@ function CompanyLayout() {
                         >
                           <UserAvatar type="manor" size={30} />
                           <span className="conv-row-copy">
-                            <span className="conv-name">Manor AI</span>
+                            <span className="conv-name">Manor</span>
                             <span className="conv-preview">
                               {t("page.app_layout.your_ai_chief_of_staff")}
                             </span>
@@ -3252,165 +3292,29 @@ function CompanyLayout() {
                     </section>
                   )}
 
-                  {chatWorkspaceSection}
+                  {chatConversationSection}
 
-                  {(["group", "dm"] as const).map((kind) => {
-                    const sidebar = kind === "group" ? groupSidebar : dmSidebar;
-                    const rank = new Map(sidebar.items.map((item, index) => [item.id, index]));
-                    const matchingRooms = filteredHumanChatRooms.filter((room) => room.kind === kind);
-                    if (isSearchingConversations && !matchingRooms.length && (kind === "group" || (filteredDmAgents.length === 0 && visibleSearchAgents.length === 0))) return null;
-                    const sectionLabel = kind === "group" ? (getLocale() === "zh" ? "群聊" : "Group chats") : (getLocale() === "zh" ? "私聊" : "Direct chats");
-                    return <section key={kind} aria-label={sectionLabel}>
-                      <ChatSidebarSectionHeader
-                        id={`chat-sidebar-${kind}`}
-                        label={sectionLabel}
-                        expanded={isChatSidebarSectionOpen(kind)}
-                        onToggle={() => toggleChatSidebarSection(kind)}
-                        searching={isSearchingConversations}
-                        attentionCount={kind === "group" ? matchingRooms.reduce((count, room) => count + positiveStat(room.unread_count), 0) : filteredDmAgents.reduce((count, agent) => count + positiveStat(actionCounts[agent.id]), 0)}
-                        badge={kind === "group" && groupUsageLoaded && humanChatRoomsLoaded && groupDiscovery.badgeVisible && !isSearchingConversations ? <FeatureDiscoveryBadge label={t("component.feature_discovery.new")} onClick={groupDiscovery.reveal} expanded={groupDiscovery.open} controls="group-chat-feature-discovery" /> : undefined}
-                        action={<button type="button" className="conv-section-add" aria-label={kind === "group" ? (getLocale() === "zh" ? "新建群聊" : "New group chat") : (getLocale() === "zh" ? "新建私聊" : "New direct chat")} title={kind === "group" ? (getLocale() === "zh" ? "新建群聊" : "New group chat") : (getLocale() === "zh" ? "新建私聊" : "New direct chat")} onClick={kind === "group" ? openNewGroup : openNewConversation}><IconPlus /></button>}
-                      />
-                      {kind === "group" && groupDiscovery.open && !isSearchingConversations && <FeatureDiscoveryHint id="group-chat-feature-discovery" title={t("component.feature_discovery.group_chat_title")} description={t("component.feature_discovery.group_chat_description")} actionLabel={t("component.feature_discovery.create_group")} laterLabel={t("component.feature_discovery.later")} onAction={openNewGroup} onDismiss={groupDiscovery.dismiss} />}
-                      {isChatSidebarSectionOpen(kind) && <div id={`chat-sidebar-${kind}`} data-sidebar-reorder-list={kind}>
-                      {!matchingRooms.length && kind === "group" && <div className="px-4 py-1 text-xs text-[var(--text-faint)]">{getLocale() === "zh" ? "还没有群聊" : "No group chats yet"}</div>}
-                      {[...matchingRooms.map((room) => {
-                        const sidebarId = kind === "dm" ? `room:${room.id}` : room.id;
-                        const isActive = activeConvType === "room" && activeConvId === room.id;
-                        const memberRole = room.members.find((member) => member.user_id === user?.id)?.role;
-                        const otherMember = room.kind === "dm" ? room.members.find((member) => member.user_id !== user?.id) : undefined;
-                        return <div key={sidebarId} {...sidebar.rowAttributes(sidebarId)} className={`conv-row conv-row--with-menu ${isActive ? "conv-row--active" : ""}`}>
-                          <button type="button" className="conv-row-main sidebar-reorder-button" aria-current={isActive ? "page" : undefined} aria-description={isSearchingConversations ? undefined : t("page.app_layout.workspace_drag_name", { name: room.title })} {...sidebar.buttonAttributes(sidebarId, () => openHumanRoom(room.id))}>
-                            {room.kind === "group" ? <GroupChatAvatar title={room.title} members={room.members} currentUserId={user?.id} /> : <UserAvatar name={room.title} avatarUrl={otherMember?.avatar_url} size={30} />}
-                            <span className="min-w-0 flex-1"><HoverMarqueeText className="conv-name" text={room.title} style={room.kind === "group" && (room.unread_count || 0) > 0 ? { fontWeight: 800, color: "var(--text-strong)" } : undefined} /><span className="conv-preview block">{room.kind === "group" ? groupChatSummary(room) : room.member_count < 2 ? (getLocale() === "zh" ? "私聊 · 等待加入" : "Direct message · Awaiting acceptance") : room.online_user_ids ? <span className="inline-flex items-center gap-1.5"><span aria-hidden="true" className={room.online_user_ids.some((id) => id !== user?.id) ? "chat-status-dot chat-status-dot--online" : "chat-status-dot bg-[var(--text-faint)]"} />{getLocale() === "zh" ? "私聊 · " : "Direct message · "}{room.online_user_ids.some((id) => id !== user?.id) ? (getLocale() === "zh" ? "在线" : "Online") : (getLocale() === "zh" ? "离线" : "Offline")}</span> : (getLocale() === "zh" ? "私聊" : "Direct message")}</span></span>
-                          </button>
-                          {room.kind === "group" && (room.unread_count || 0) > 0 && <span className="conv-badge" aria-label={getLocale() === "zh" ? `${room.unread_count} 条未读消息` : `${room.unread_count} unread messages`}>{(room.unread_count || 0) > 99 ? "99+" : room.unread_count}</span>}
-                          <SidebarRowMenu
-                            name={room.title}
-                            items={[
-                              { key: "details", label: room.kind === "group" ? (getLocale() === "zh" ? "群聊详情" : "Group details") : (getLocale() === "zh" ? "私聊详情" : "Direct message details") },
-                              ...(room.kind === "group" && (memberRole === "owner" || memberRole === "admin") ? [{ key: "rename", label: getLocale() === "zh" ? "重命名群聊" : "Rename group" }] : []),
-                              ...(room.kind === "group" && memberRole === "owner" ? [{ key: "close", label: getLocale() === "zh" ? "解散群聊" : "Close group", danger: true }] : []),
-                            ]}
-                            onSelect={(key) => {
-                              if (key === "details" || key === "rename" || key === "close") openHumanRoomAction(room.id, key);
-                            }}
-                          />
-                        </div>;
-                      }), ...(kind === "dm" ? filteredDmAgents
-                    .filter((agent) => agent && agent.name)
-                    .map((agent) => {
-                      const sidebarId = `agent:${agent.id}`;
-                      const dmConversation = dmConversationRecordByAgentId.get(agent.id);
-                      const isDraft = !dmConversation && !chatConversationsLoading && !chatConversationsError;
-                      const isActive = activeConvType === "dm" && activeDmAgentId === agent.id;
-                      if ((dmConversation && renamingConversationId === dmConversation.id) || (isDraft && renamingAgentDraftId === agent.id)) {
-                        return <form key={sidebarId} className="conv-row conv-row-rename" onSubmit={(event) => {
-                          event.preventDefault();
-                          submitRenameConversation();
-                        }}>
-                          <Input
-                            value={conversationTitleDraft}
-                            onChange={(event) => setConversationTitleDraft(event.target.value)}
-                            onKeyDown={(event) => { if (event.key === "Escape") cancelRenameConversation(); }}
-                            maxLength={500}
-                            ariaLabel={t("component.session_switcher.rename_chat_label", { title: dmConversation?.title || agent.name })}
-                            className="conv-row-rename-field"
-                            error={conversationRenameError || undefined}
-                            autoFocus
-                            disabled={renameChatConversation.isPending || startAgentConversation.isPending}
-                          />
-                          <Button type="submit" size="sm" variant="ghost" loading={renameChatConversation.isPending || startAgentConversation.isPending} disabled={!conversationTitleDraft.trim()} ariaLabel={t("action.save")}>{t("action.save")}</Button>
-                          <Button type="button" size="sm" variant="ghost" onClick={cancelRenameConversation} disabled={renameChatConversation.isPending || startAgentConversation.isPending} ariaLabel={t("action.cancel")}>×</Button>
-                        </form>;
-                      }
-                      return (
-                        <div
-                          key={sidebarId}
-                          {...dmSidebar.rowAttributes(sidebarId)}
-                          className={`conv-row conv-row--with-menu ${isActive ? "conv-row--active" : ""}`}
+                  {isSearchingConversations && globalSearchGroups.map((group) => (
+                    <section key={group.type} className="sidebar-search-group" aria-label={t(`page.search.group_${group.type}`)}>
+                      <div className="conv-section-label">{t(`page.search.group_${group.type}`)}</div>
+                      {group.items.map((result) => (
+                        <button
+                          type="button"
+                          key={`${result.type}:${result.id}`}
+                          className="sidebar-search-result"
+                          onClick={() => openGlobalSearchResult(group.type, result.id)}
                         >
-                          <button type="button" className="conv-row-main sidebar-reorder-button" aria-current={isActive ? "page" : undefined} aria-description={isSearchingConversations ? undefined : t("page.app_layout.workspace_drag_name", { name: dmConversation?.title || agent.name })} {...dmSidebar.buttonAttributes(sidebarId, () => openAgentDm(agent))}>
-                            <AgentAvatar name={agent.name} avatarUrl={agent.avatar_url} seed={agent.id} size={30} className="conv-avatar" />
-                            <span className="min-w-0 flex-1">
-                              <HoverMarqueeText className="conv-name" text={dmConversation?.title || agent.name} />
-                              <span className="conv-preview block">{dmConversation?.title ? agent.name : agentPreview(agent, "page.app_layout.agent")}</span>
-                            </span>
-                          </button>
-                          {(actionCounts[agent.id] || 0) > 0 && <span className="conv-badge">{actionCounts[agent.id]}</span>}
-                          <SidebarRowMenu
-                            name={agent.name}
-                            items={[
-                              { key: "profile", label: getLocale() === "zh" ? "查看 Agent" : "View Agent" },
-                              ...(dmConversation || isDraft ? [
-                                { key: "rename", label: t("component.session_switcher.rename_chat") },
-                                { key: "delete", label: t("component.session_switcher.delete_chat"), danger: true },
-                              ] : []),
-                            ]}
-                            onSelect={(key) => {
-                              if (key === "profile") navigate(`/agents/${encodeURIComponent(agent.id)}`);
-                              if (key === "rename") {
-                                if (dmConversation) beginRenameConversation(dmConversation);
-                                else if (isDraft) beginRenameAgentDraft(agent);
-                              }
-                              if (key === "delete" && dmConversation) {
-                                setDeleteConversationError("");
-                                setDeleteConversationTarget(dmConversation);
-                              } else if (key === "delete" && isDraft) {
-                                setHiredAgents((previous) => previous.filter((item) => item.id !== agent.id));
-                                if (isActive) openManorChat();
-                              }
-                            }}
-                          />
-                        </div>
-                      );
-                    }) : [])].sort((a, b) => (rank.get(String(a.key)) ?? Infinity) - (rank.get(String(b.key)) ?? Infinity))}
-
-                      {/* Search can offer new AI direct chats below existing ones. */}
-                      {kind === "dm" && visibleSearchAgents.length > 0 && (
-                    <>
-                      {visibleSearchAgents.map((agent) => {
-                        const isActive =
-                          activeConvType === "dm" &&
-                          activeDmAgentId === agent.id;
-                        return (
-                          <div
-                            key={agent.id}
-                            className={`conv-row conv-row--with-menu ${isActive ? "conv-row--active" : ""}`}
-                          >
-                            <button type="button" className="conv-row-main" aria-current={isActive ? "page" : undefined} onClick={() => openAgentDm(agent)}>
-                              <AgentAvatar
-                                name={agent.name}
-                                avatarUrl={agent.avatar_url}
-                                seed={agent.id}
-                                size={30}
-                                className="conv-avatar"
-                              />
-                              <div style={{ flex: 1, minWidth: 0 }}>
-                                <HoverMarqueeText className="conv-name" text={agent.name} />
-                                <div className="conv-preview">
-                                  {agentPreview(
-                                    agent,
-                                    "page.app_layout.start_a_chat",
-                                  )}
-                                </div>
-                              </div>
-                            </button>
-                            <SidebarRowMenu name={agent.name} items={[{ key: "profile", label: getLocale() === "zh" ? "查看 Agent" : "View Agent" }]} onSelect={() => navigate(`/agents/${encodeURIComponent(agent.id)}`)} />
-                          </div>
-                        );
-                      })}
-                    </>
-                  )}
-                      </div>}
-                    </section>;
-                  })}
+                          <span>{result.title}</span>
+                        </button>
+                      ))}
+                    </section>
+                  ))}
 
                   {convSearchQuery.trim() &&
+                    globalSearchGroups.length === 0 &&
+                    !globalSearchQuery.isFetching &&
                     !manorSearchHasResults &&
-                    filteredWorkspaces.length === 0 &&
-                    filteredHumanChatRooms.length === 0 &&
-                    filteredDmAgents.length === 0 &&
+                    visibleConversationItems.length === 0 &&
                     visibleSearchAgents.length === 0 && (
                       <div
                         style={{
@@ -3436,7 +3340,7 @@ function CompanyLayout() {
                     padding: "4px 0 10px",
                   }}
                 >
-                  <button type="button" title={getLocale() === "zh" ? "新建对话" : "New conversation"} aria-label={getLocale() === "zh" ? "新建对话" : "New conversation"} onClick={openNewConversation} className="flex h-9 w-9 items-center justify-center rounded-xl bg-[var(--surface-muted)] text-[var(--text-strong)]"><IconPlus /></button>
+                  <button type="button" title={getLocale() === "zh" ? "新建对话" : "New conversation"} aria-label={getLocale() === "zh" ? "新建对话" : "New conversation"} onClick={openNewConversation} className="flex h-9 w-9 items-center justify-center rounded-xl text-[var(--text-muted)] hover:bg-[var(--surface-muted)] hover:text-[var(--text-strong)]"><IconPlus /></button>
                   {renderCollapsedChatButton({
                     id: "manor-ai",
                     type: "manor",
@@ -3446,9 +3350,12 @@ function CompanyLayout() {
                     count: actionCounts["manor-ai"] || 0,
                   })}
 
-                  {orderedWorkspaces.slice(0, 8).map((ws) => {
-                    return renderCollapsedChatButton({
+                  {conversationSidebar.items.slice(0, COLLAPSED_CONVERSATION_LIMIT).map((item) => {
+                    if (item.kind === "workspace") {
+                      const ws = item.workspace;
+                      return renderCollapsedChatButton({
                       id: ws.id,
+                      sidebarId: item.id,
                       type: "operation",
                       label: ws.name,
                       subtitle:
@@ -3467,10 +3374,11 @@ function CompanyLayout() {
                       ),
                       count: actionCounts[ws.id] || 0,
                     });
-                  })}
-
-                  {groupSidebar.items.slice(0, 8).map((room) => renderCollapsedChatButton({ id: room.id, type: "room", label: room.title, subtitle: groupChatSummary(room), customAvatar: <GroupChatAvatar title={room.title} members={room.members} currentUserId={user?.id} />, count: room.unread_count || 0 }))}
-                  {collapsedDmItems.map((item) => {
+                    }
+                    if (item.kind === "room" && item.room.kind === "group") {
+                      const room = item.room;
+                      return renderCollapsedChatButton({ id: room.id, sidebarId: item.id, type: "room", label: room.title, subtitle: groupChatSummary(room), customAvatar: <GroupChatAvatar title={room.title} members={room.members} currentUserId={user?.id} />, count: room.unread_count || 0 });
+                    }
                     if (item.kind === "room") {
                       const room = item.room;
                       return renderCollapsedChatButton({ id: room.id, sidebarId: item.id, type: "room", label: room.title, subtitle: getLocale() === "zh" ? "私聊" : "Direct chat", customAvatar: <UserAvatar name={room.title} avatarUrl={room.members.find((member) => member.user_id !== user?.id)?.avatar_url} size={30} /> });
@@ -3514,8 +3422,6 @@ function CompanyLayout() {
                           fontSize: 10,
                           fontWeight: 800,
                           color: "var(--sidebar-section-text)",
-                          textTransform: "uppercase",
-                          letterSpacing: "0.16em",
                         }}
                       >
                         {t("page.app_layout.operate")}
@@ -3618,8 +3524,6 @@ function CompanyLayout() {
                           fontSize: 10,
                           fontWeight: 800,
                           color: "var(--sidebar-section-text)",
-                          textTransform: "uppercase",
-                          letterSpacing: "0.16em",
                         }}
                       >
                         {t("page.app_layout.library")}
@@ -3669,7 +3573,6 @@ function CompanyLayout() {
                             fontFamily: "inherit",
                             fontSize: 12,
                             fontWeight: 700,
-                            letterSpacing: "0.01em",
                           }}
                         >
                           <span
@@ -3777,13 +3680,13 @@ function CompanyLayout() {
                       minWidth: 0,
                     }}
                   >
+                    {/* The avatar is the menu: team, integrations, settings, help, language, sign out. */}
                     <button
                       type="button"
-                      onClick={() => {
-                        setMode("workspace");
-                        navigate("/account");
-                        setMoreOpen(false);
-                      }}
+                      data-tour="sidebar-more"
+                      aria-haspopup="menu"
+                      aria-expanded={moreOpen}
+                      onClick={() => setMoreOpen((open) => !open)}
                       title={user.display_name || user.email || "Profile"}
                       aria-label={user.display_name || user.email || "Profile"}
                       style={{
@@ -3814,12 +3717,21 @@ function CompanyLayout() {
                           : "transparent";
                       }}
                     >
-                      <UserAvatar
-                        name={user.display_name || user.email || "U"}
-                        avatarUrl={user.avatar_url}
-                        size={30}
-                        style={{ color: "white" }}
-                      />
+                      <span style={{ position: "relative", display: "inline-flex", flexShrink: 0 }}>
+                        <UserAvatar
+                          name={user.display_name || user.email || "U"}
+                          avatarUrl={user.avatar_url}
+                          size={30}
+                        />
+                        {backendReconnecting && (
+                          <span
+                            className="sidebar-connection-dot"
+                            role="status"
+                            title={t("lib.api.reconnecting_message")}
+                            aria-label={t("lib.api.reconnecting_title")}
+                          />
+                        )}
+                      </span>
                       {!sidebarCollapsed && (
                         <div style={{ flex: 1, minWidth: 0, textAlign: "left" }}>
                           <div
@@ -3848,54 +3760,8 @@ function CompanyLayout() {
                     </button>
                   </div>
                 )}
-                {!sidebarCollapsed && (
+                {(
                   <div style={{ position: "relative", order: 4 }}>
-                  <button
-                    data-tour="sidebar-more"
-                    type="button"
-                    onClick={() => {
-                      setMoreOpen(!moreOpen);
-                    }}
-                    title={t("nav.more")}
-                    aria-label={t("nav.more")}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 4,
-                      padding: 0,
-                      width: 24,
-                      height: 24,
-                      justifyContent: "center",
-                      borderRadius: 7,
-                      border: "none",
-                      background:
-                        moreOpen || isActive("/chat/history")
-                          ? "var(--accent-soft)"
-                          : "transparent",
-                      color:
-                        moreOpen || isActive("/chat/history")
-                          ? "var(--accent)"
-                          : "var(--text-muted)",
-                      fontSize: 11,
-                      fontWeight: 500,
-                      cursor: "pointer",
-                      transition: "all 0.2s",
-                    }}
-                    onMouseEnter={(e) => {
-                      if (!moreOpen && !isActive("/chat/history")) {
-                        e.currentTarget.style.color = "var(--text-strong)";
-                        e.currentTarget.style.background = "var(--sidebar-control-bg)";
-                      }
-                    }}
-                    onMouseLeave={(e) => {
-                      if (!moreOpen && !isActive("/chat/history")) {
-                        e.currentTarget.style.color = "var(--text-muted)";
-                        e.currentTarget.style.background = "transparent";
-                      }
-                    }}
-                  >
-                    <IconMoreDots />
-                  </button>
                   {moreOpen && (
                     <>
                       <div
@@ -3903,6 +3769,8 @@ function CompanyLayout() {
                         onClick={() => setMoreOpen(false)}
                       />
                       <div
+                        className="sidebar-avatar-menu"
+                        role="menu"
                         style={{
                           position: "fixed",
                           bottom: sidebarCollapsed ? 76 : 52,
@@ -3911,7 +3779,7 @@ function CompanyLayout() {
                           backdropFilter: "blur(24px)",
                           WebkitBackdropFilter: "blur(24px)",
                           borderRadius: 14,
-                          border: "1px solid var(--glass-border)",
+                          border: "0.5px solid var(--glass-border)",
                           boxShadow:
                             "var(--shadow-lg), 0 0 0 1px var(--glass-hairline)",
                           padding: 6,
@@ -3920,18 +3788,58 @@ function CompanyLayout() {
                           animation: "dialog-in 0.15s ease-out",
                         }}
                       >
-                        <div
+                        {/* People and connected accounts are company setup, visited now
+                            and then: they live here, not in the sidebar. */}
+                        {[
+                          { to: "/team", label: t("nav.people"), icon: <IconPeople /> },
+                          { to: "/integrations", label: t("nav.integrations"), icon: <IconConnection /> },
+                        ].map((item) => (
+                          <Link
+                            key={item.to}
+                            to={item.to}
+                            onClick={() => setMoreOpen(false)}
+                            className="sidebar-more-link"
+                            aria-current={isActive(item.to) ? "page" : undefined}
+                          >
+                            {item.icon}
+                            <span>{item.label}</span>
+                          </Link>
+                        ))}
+                        <Link
+                          to="/settings"
+                          state={{ returnTo: `${location.pathname}${location.search}` }}
+                          onClick={() => {
+                            setMode("workspace");
+                            setMoreOpen(false);
+                          }}
                           style={{
-                            padding: "6px 10px 8px",
-                            fontSize: 10,
-                            fontWeight: 700,
-                            color: "var(--text-faint)",
-                            textTransform: "uppercase",
-                            letterSpacing: "0.05em",
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 10,
+                            padding: "9px 10px",
+                            borderRadius: 9,
+                            color: "var(--text-default)",
+                            background: isActive("/settings")
+                              ? "var(--surface-muted)"
+                              : "transparent",
+                            textDecoration: "none",
+                            fontSize: 13,
+                            fontWeight: 400,
+                          }}
+                          onMouseEnter={(e) => {
+                            if (!isActive("/settings")) {
+                              e.currentTarget.style.background = "var(--surface-muted)";
+                            }
+                          }}
+                          onMouseLeave={(e) => {
+                            if (!isActive("/settings")) {
+                              e.currentTarget.style.background = "transparent";
+                            }
                           }}
                         >
-                          {t("nav.more")}
-                        </div>
+                          <IconGear />
+                          <span>{t("nav.settings")}</span>
+                        </Link>
                         <button
                           type="button"
                           onClick={() => {
@@ -3952,7 +3860,7 @@ function CompanyLayout() {
                             background: "transparent",
                             color: "var(--text-default)",
                             fontSize: 13,
-                            fontWeight: 500,
+                            fontWeight: 400,
                             cursor: "pointer",
                             textAlign: "left",
                           }}
@@ -3966,86 +3874,13 @@ function CompanyLayout() {
                           <IconHelp />
                           <span>{t("component.user_guide.title")}</span>
                         </button>
-                        <Link
-                          to="/settings"
-                          state={{ returnTo: `${location.pathname}${location.search}` }}
-                          onClick={() => {
-                            setMode("workspace");
-                            setMoreOpen(false);
-                          }}
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: 10,
-                            padding: "9px 10px",
-                            borderRadius: 9,
-                            color: isActive("/settings")
-                              ? "var(--accent)"
-                              : "var(--text-default)",
-                            background: isActive("/settings")
-                              ? "rgba(13,148,136,0.08)"
-                              : "transparent",
-                            textDecoration: "none",
-                            fontSize: 13,
-                            fontWeight: isActive("/settings") ? 650 : 500,
-                          }}
-                          onMouseEnter={(e) => {
-                            if (!isActive("/settings")) {
-                              e.currentTarget.style.background = "var(--surface-muted)";
-                            }
-                          }}
-                          onMouseLeave={(e) => {
-                            if (!isActive("/settings")) {
-                              e.currentTarget.style.background = "transparent";
-                            }
-                          }}
-                        >
-                          <IconGear />
-                          <span>{t("nav.settings")}</span>
-                        </Link>
-                        <Link
-                          to="/chat/history"
-                          onClick={() => {
-                            setMode("workspace");
-                            setMoreOpen(false);
-                          }}
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: 10,
-                            padding: "9px 10px",
-                            borderRadius: 9,
-                            color: isActive("/chat/history")
-                              ? "var(--accent)"
-                              : "var(--text-default)",
-                            background: isActive("/chat/history")
-                              ? "rgba(13,148,136,0.08)"
-                              : "transparent",
-                            textDecoration: "none",
-                            fontSize: 13,
-                            fontWeight: isActive("/chat/history") ? 650 : 500,
-                          }}
-                          onMouseEnter={(e) => {
-                            if (!isActive("/chat/history")) {
-                              e.currentTarget.style.background = "var(--surface-muted)";
-                            }
-                          }}
-                          onMouseLeave={(e) => {
-                            if (!isActive("/chat/history")) {
-                              e.currentTarget.style.background = "transparent";
-                            }
-                          }}
-                        >
-                          <IconChatSmall />
-                          <span>{t("nav.chatHistory")}</span>
-                        </Link>
                         {!supportTicketsEnabled && (
                           <a
                             href="https://github.com/manor-os/manor-ai/discussions"
                             target="_blank"
                             rel="noopener noreferrer"
                             onClick={() => setMoreOpen(false)}
-                            style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 10px", borderRadius: 9, color: "var(--text-default)", fontSize: 13, fontWeight: 500, textDecoration: "none" }}
+                            style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 10px", borderRadius: 9, color: "var(--text-default)", fontSize: 13, fontWeight: 400, textDecoration: "none" }}
                           >
                             <IconChatSmall />
                             <span>{t("nav.communitySupport")}</span>
@@ -4058,81 +3893,31 @@ function CompanyLayout() {
                             margin: "6px 4px",
                           }}
                         />
-                        <div
-                          style={{
-                            padding: "4px 10px 6px",
-                            fontSize: 10,
-                            fontWeight: 700,
-                            color: "var(--text-faint)",
-                            textTransform: "uppercase",
-                            letterSpacing: "0.05em",
-                          }}
-                        >
-                          {t("settings.language")}
-                        </div>
-                        {SUPPORTED_LOCALES.map((l) => {
-                          const active = locale === l.code;
-                          return (
-                            <button
-                              key={l.code}
-                              disabled={localeSaving}
-                              aria-pressed={active}
-                              aria-busy={localeSaving}
-                              onClick={() => {
-                                void handleLocaleChange(l.code);
-                                setMoreOpen(false);
-                              }}
-                              style={{
-                                display: "flex",
-                                alignItems: "center",
-                                gap: 10,
-                                width: "100%",
-                                padding: "8px 10px",
-                                borderRadius: 8,
-                                border: "none",
-                                background: active
-                                  ? "var(--accent-soft)"
-                                  : "transparent",
-                                cursor: localeSaving ? "wait" : "pointer",
-                                opacity: localeSaving ? 0.6 : 1,
-                                fontSize: 13,
-                                transition: "background 0.1s",
-                                fontWeight: active ? 600 : 400,
-                                color: active ? "var(--accent)" : "var(--text-default)",
-                              }}
-                              onMouseEnter={(e) => {
-                                if (!active)
-                                  e.currentTarget.style.background = "var(--surface-muted)";
-                              }}
-                              onMouseLeave={(e) => {
-                                e.currentTarget.style.background = active
-                                  ? "var(--accent-soft)"
-                                  : "transparent";
-                              }}
-                            >
-                              <img
-                                src={`https://flagcdn.com/w20/${({ en: "us", zh: "cn", es: "es", fr: "fr", de: "de" } as const)[l.code]}.png`}
-                                width="18"
-                                height="13"
-                                alt=""
-                                style={{ borderRadius: 2, objectFit: "cover" }}
-                              />
-                              <span style={{ flex: 1, textAlign: "left" }}>
-                                {l.name}
-                              </span>
-                              {active && (
-                                <svg
-                                  width="14"
-                                  height="14"
-                                  viewBox="0 0 24 24"
-                                  fill="currentColor"
-                                >
-                                  <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
-                                </svg>
-                              )}
-                            </button>
-                          );
-                      })}
+                        <label className="sidebar-language-row">
+                          <span>{t("settings.language")}</span>
+                          <select
+                            value={locale}
+                            disabled={localeSaving}
+                            aria-busy={localeSaving}
+                            onChange={(event) => {
+                              void handleLocaleChange(event.target.value as typeof locale);
+                              setMoreOpen(false);
+                            }}
+                          >
+                            {SUPPORTED_LOCALES.map((l) => (
+                              <option key={l.code} value={l.code}>{l.name}</option>
+                            ))}
+                          </select>
+                        </label>
+                      <div style={{ height: 1, background: "var(--border-subtle)", margin: "6px 4px" }} />
+                      <button
+                        type="button"
+                        className="sidebar-more-link sidebar-avatar-menu-plain"
+                        style={{ width: "100%", border: 0, background: "transparent", cursor: "pointer", textAlign: "left" }}
+                        onClick={() => { setMoreOpen(false); void leaveSessionOrLogout(); }}
+                      >
+                        <span>{t("action.logout")}</span>
+                      </button>
                     </div>
                   </>
                 )}
@@ -4218,7 +4003,7 @@ function CompanyLayout() {
               height: 40,
               borderRadius: 12,
               background: "var(--surface-panel)",
-              border: "1px solid var(--glass-border)",
+              border: "0.5px solid var(--glass-border)",
               alignItems: "center",
               justifyContent: "center",
               color: "var(--text-muted)",
@@ -4463,7 +4248,9 @@ function CompanyLayout() {
         {!simpleMode && mode === "workspace" &&
           !location.pathname.startsWith("/chat")
           && (
-          <FloatingChat />
+          // The corner launcher is the document assistant: shown where a
+          // document is open. Elsewhere Manor lives in the sidebar.
+          <FloatingChatHost showLauncher={/^\/(viewer|editor|video-editor|diagram-canvas)\b/.test(location.pathname)} />
         )}
 
         <TextSelectionToolbar />

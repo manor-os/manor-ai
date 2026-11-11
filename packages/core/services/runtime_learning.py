@@ -32,10 +32,6 @@ from packages.core.models.workspace import Agent, Workspace
 
 logger = logging.getLogger(__name__)
 
-_MEMORY_CUE_RE = re.compile(
-    r"(记住|以后|下次|一直|总是|必须|不要|不能|偏好|规则|remember|always|never|prefer|must|should)",
-    re.IGNORECASE,
-)
 _AGENT_PROFILE_CUE_RE = re.compile(
     r"(你是|你的职责|你负责|作为.*agent|作为.*智能体|lease consultant|leasing consultant|"
     r"role|responsibilit(?:y|ies)|capabilit(?:y|ies)|speciali[sz]e|agent profile|"
@@ -322,27 +318,8 @@ def build_chat_learning_candidate_drafts(
     tools = _normalize_tool_names(tool_calls_made)
     tool_pattern = _tool_pattern_key(tools, tool_results)
 
-    if guidance and _MEMORY_CUE_RE.search(guidance):
-        memory_type = "instruction" if _looks_like_instruction(guidance) else "preference"
-        drafts.append(LearningCandidateDraft(
-            candidate_type="memory",
-            scope="user",
-            title="Remember user guidance",
-            summary=(
-                "The user gave guidance that may need to persist for future runs. "
-                "Review before applying as agent memory."
-            ),
-            payload={
-                "memory_type": memory_type,
-                "content": guidance,
-                "source": "runtime_evidence",
-                "apply_target": "agent_memory",
-            },
-            risk_level="low",
-            confidence=0.72,
-            dedupe_key=f"memory:{_stable_hash(guidance.lower())}",
-        ))
-
+    # What the person asks the AI to remember is written by remember at chat
+    # time; no memory candidate waits for review.
     if guidance and _looks_like_agent_profile_update(guidance):
         drafts.append(LearningCandidateDraft(
             candidate_type="agent_profile_patch",
@@ -2650,11 +2627,6 @@ def _compact_text(value: Any, *, max_chars: int = _MAX_EXCERPT_CHARS) -> str:
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 1] + "…"
-
-
-def _looks_like_instruction(message: str) -> bool:
-    lower = message.lower()
-    return any(token in lower for token in ("必须", "不要", "不能", "always", "never", "must", "should"))
 
 
 def _looks_like_agent_profile_update(message: str) -> bool:

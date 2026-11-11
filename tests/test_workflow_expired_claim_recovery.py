@@ -120,11 +120,24 @@ async def test_sweep_selects_active_runs_with_expired_ownership(client, db_sessi
         ("approval", "waiting_approval", -1),
         ("done", "completed", -1),
         ("legacy", "running", None),
+        # No lease at all: only a node left running long enough ago counts.
+        ("orphaned", "running", "orphan"),
+        ("settling", "running", "recent"),
+        ("orphan_done", "completed", "orphan"),
+        ("stepping", "running", "orphan"),
     ]
+    running_node = [{"node_id": "work", "status": "completed"}, {"node_id": "work", "status": "running"}]
     for run_id, status, ttl in cases:
+        orphan = isinstance(ttl, str)
         db_session.add(WorkflowRun(
             id=run_id, workflow_id="workflow", entity_id="entity", status=status,
+            **({"execution_trace": running_node} if orphan else {}),
+            **({"updated_at": now - timedelta(hours=1)} if ttl == "orphan" else {}),
+            # A person steps this run: it waits for their next step.
+            **({"trigger_data": {"_execution_driver": "manual_step"}} if run_id == "stepping" else {}),
         ))
+        if orphan:
+            continue
         if ttl is not None:
             db_session.add(RuntimeExecutionClaim(
                 claim_key=f"workflow-run:{run_id}", claim_token="0" * 26,
@@ -134,15 +147,69 @@ async def test_sweep_selects_active_runs_with_expired_ownership(client, db_sessi
     seen = []
 
     async def recover(run_id, **kwargs):
-        seen.append((run_id, kwargs["expired_claim_token"]))
-        return {"expired": "running", "pending": "failed"}[run_id]
+        seen.append((run_id, kwargs.get("expired_claim_token")))
+        return {"expired": "running", "pending": "failed", "orphaned": "failed"}[run_id]
 
     monkeypatch.setattr("packages.core.database.create_worker_session", lambda: async_session)
     monkeypatch.setattr(WorkflowRunner, "_recover_lost_execution_claim", recover)
     assert await ai_tasks._recover_expired_workflow_claims() == {
-        "checked": 2, "settled": 1, "resumed": 1,
+        "checked": 3, "settled": 2, "resumed": 1,
     }
-    assert seen == [("expired", "0" * 26), ("pending", "0" * 26)]
+    assert seen == [("expired", "0" * 26), ("pending", "0" * 26), ("orphaned", None)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_settles", [True, False])
+async def test_a_node_that_breaks_the_run_session_never_leaves_it_running(
+    client, db_session, monkeypatch, owner_settles,
+):
+    from sqlalchemy import select
+
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.database import async_session
+    from packages.core.models.workflow import WorkflowProject
+    from packages.core.services import workflow_chat_projection, workflow_project_service
+    from test_workflow_projects import _keyed_project_runner
+
+    async def unguarded_create(db, **values):
+        # Any node whose flush fails and which reports the failure itself.
+        db.add(WorkflowProject(revision=0, **values))
+        await db.flush()
+
+    run = await _keyed_project_runner(client, db_session, f"broken_session_{owner_settles}", {
+        "operation": "create", "project_type": "article", "project_key": "{{topic}}", "state": {},
+    }, ["topic"])
+    assert (await run(topic="same")).status == "completed"
+    monkeypatch.setattr(workflow_project_service, "create_workflow_project", unguarded_create)
+    queued: list[dict] = []
+    monkeypatch.setattr(WorkflowRunner, "enqueue", staticmethod(
+        lambda run_id, *_a, **kwargs: queued.append({"run_id": run_id, **kwargs}) or True
+    ))
+    if not owner_settles:
+        async def owner_cannot_settle(db, *, run):
+            raise RuntimeError("settling failed")
+
+        monkeypatch.setattr(workflow_chat_projection, "project_workflow_run_status", owner_cannot_settle)
+    broken = await run(topic="same")
+
+    if not owner_settles:
+        # The owner crashed while settling. Its lease was released cleanly,
+        # so no expiry would ever surface the run: recovery hands it to the
+        # next worker at once instead of leaving it ownerless.
+        assert broken.status == "running"
+        handoffs = [item for item in queued if item.get("claim_handoff_token")]
+        assert [item["run_id"] for item in handoffs] == [broken.id]
+        monkeypatch.undo()
+        await WorkflowRunner(session_factory=async_session).run(
+            broken.id, claim_handoff_token=handoffs[0]["claim_handoff_token"],
+        )
+        broken = await db_session.get(WorkflowRun, broken.id, populate_existing=True)
+    assert broken.status == "failed"
+    assert broken.step_results["project"]["status"] == "failed"
+    assert "uq_workflow_projects_business_key" in broken.step_results["project"]["error_details"]
+    assert broken.error and "uq_workflow_projects_business_key" not in broken.error
+    assert await db_session.scalar(select(RuntimeExecutionClaim).where(
+        RuntimeExecutionClaim.claim_key == f"workflow-run:{broken.id}")) is None
 
 
 @pytest.mark.asyncio
@@ -391,7 +458,7 @@ async def test_interrupted_step_with_unknown_effects_fails_explicitly(client, db
     run = (await client.get(f"/api/v1/workflows/runs/{run_id}", headers=headers)).json()
     assert run["status"] == "failed"
     # People read that the step was interrupted and can be retried; the stored error keeps the cause.
-    assert run["error"].startswith('"Produce" was interrupted')
+    assert run["error"].startswith('"Produce" stopped before it finished')
     assert run["step_results"]["evidence"]["status"] == "completed"
     assert "produce" not in run["step_results"]
     stored = await db_session.get(WorkflowRun, run_id)

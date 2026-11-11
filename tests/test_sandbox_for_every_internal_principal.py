@@ -6,6 +6,8 @@ or surface added later is covered without editing this file.
 """
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from packages.core.ai.runtime.capabilities import (
@@ -336,7 +338,7 @@ def _agent_envelope(surface: ChatSurface, agent_id: str, entity_id: str):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("surface", [ChatSurface.AGENT_DM, ChatSurface.SCHEDULED_AGENT_RUN], ids=str)
-async def test_execution_gate_admits_an_unbound_agent_sandbox(db_session, monkeypatch, surface) -> None:
+async def test_execution_gate_admits_an_unbound_agent_sandbox(db_session, monkeypatch, caplog, surface) -> None:
     import json
     from contextlib import asynccontextmanager
 
@@ -366,8 +368,14 @@ async def test_execution_gate_admits_an_unbound_agent_sandbox(db_session, monkey
     # Creation is a Runtime control: it passes the boundary and never asks.
     assert await guard("create", envelope) is None
     # A command passes the permission boundary and continues to the policy
-    # stage, which here stops only for the missing persisted call identity.
+    # stage. This calls the guard directly with no call identity, which every
+    # agent loop supplies; reaching the check is a platform fault, logged as one.
+    caplog.clear()
     assert json.loads(await guard("exec", envelope))["error"] == "approval_operation_identity_missing"
+    assert any(
+        record.levelno == logging.ERROR and "missing run identity" in record.getMessage()
+        for record in caplog.records
+    )
 
     external = _agent_envelope(ChatSurface.PUBLIC_CUSTOMER_CHAT, agent.id, agent.entity_id)
     for call in ("create", "exec"):

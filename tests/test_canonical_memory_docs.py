@@ -1,6 +1,10 @@
+import pytest
+
 from packages.core.config import get_settings
+from packages.core.ai.runtime import AIRuntimeRequest, ChatSurface, RuntimeResolver
 from packages.core.ai.runtime.prompt_adapter import ChatContext
-from packages.core.ai.runtime.prompt_sections import workspace_operating_memory
+from packages.core.ai.runtime.prompt_context import runtime_agent_memories_prompt
+from packages.core.ai.runtime.prompt_sections import agent_identity, workspace_operating_memory
 from packages.core.memory.canonical import (
     WORKSPACE_MEMORY_FILES,
     append_workspace_memory_block,
@@ -55,16 +59,31 @@ def test_canonical_workspace_memory_docs_are_created_and_bounded(tmp_path):
         assert "### RULES.md" in block
         assert ("Always cite the source. " * 500).rstrip() in block
 
-        prompt_block = workspace_operating_memory(
-            ChatContext(
-                entity_id="ent_memory_docs",
-                workspace_id="ws_memory_docs",
-                workspace=type("WorkspaceObj", (), {"name": "Leasing Ops", "kind": "property"})(),
-            )
+        write_workspace_memory_file(
+            "ent_memory_docs", "ws_memory_docs", "STATE.md", "# State\n\n- CANARY-STALE-STATE",
         )
+        prompt_ctx = ChatContext(
+            entity_id="ent_memory_docs",
+            workspace_id="ws_memory_docs",
+            workspace=type("WorkspaceObj", (), {"name": "Leasing Ops", "kind": "property"})(),
+        )
+        prompt_block = workspace_operating_memory(prompt_ctx)
         assert prompt_block
-        assert "Workspace Operating Memory" in prompt_block
-        assert "WORKSPACE.md" in prompt_block
+        assert "### RULES.md" in prompt_block
+        assert "### WORKSPACE.md" not in prompt_block
+        assert "### MEMORY.md" not in prompt_block
+        assert "CANARY-STALE-STATE" not in prompt_block
+
+        write_workspace_memory_file(
+            "ent_memory_docs", "ws_memory_docs", "MEMORY.md",
+            "# Workspace Memory\n\n- The brochure has no cup-volume threshold.",
+        )
+        assert "no cup-volume threshold" not in (workspace_operating_memory(prompt_ctx) or "")
+        from packages.core.memory.layers import MemoryLayerFile, render_layer_file, workspace_memory_path
+        layer = render_layer_file("ent_memory_docs", MemoryLayerFile(
+            "workspace", workspace_memory_path("ent_memory_docs", "ws_memory_docs"), "ws_memory_docs",
+        ))
+        assert "no cup-volume threshold" in layer["content"]
 
         result = append_workspace_memory_block(
             "ent_memory_docs",
@@ -190,3 +209,75 @@ def test_agent_fixed_memory_docs_are_supported_without_loading_placeholders(tmp_
     finally:
         settings.MANOR_FS_ROOT = old_root
         settings.MANOR_FS_ENABLED = old_enabled
+
+
+@pytest.fixture
+def memory_fs(tmp_path):
+    settings = get_settings()
+    old_root, old_enabled = settings.MANOR_FS_ROOT, settings.MANOR_FS_ENABLED
+    settings.MANOR_FS_ROOT = str(tmp_path)
+    settings.MANOR_FS_ENABLED = True
+    try:
+        yield tmp_path
+    finally:
+        settings.MANOR_FS_ROOT = old_root
+        settings.MANOR_FS_ENABLED = old_enabled
+
+
+def _identity_prompt(surface, **request):
+    envelope = RuntimeResolver().resolve_trace_envelope(
+        AIRuntimeRequest(surface=surface, entity_id="ent_layers", user_id="user_owner", **request)
+    )
+    ctx = ChatContext(
+        entity_id="ent_layers",
+        user_id="user_owner",
+        agent_id=request.get("agent_id"),
+        workspace_id=request.get("workspace_id"),
+        runtime_envelope=envelope,
+    )
+    return agent_identity(ctx) or ""
+
+
+def test_personal_and_master_memory_files_stay_out_of_workspace_chat(memory_fs):
+    provision_entity_filesystem("ent_layers", "Layers Inc")
+    provision_agent_workspace("ent_layers", "agent_sales")
+    write_agent_file("ent_layers", None, "MEMORY.md", "# Memory\n\n- CANARY-MASTER-ENTITY")
+    write_agent_file(
+        "ent_layers", None, "MEMORY.md", "# Memory\n\n- CANARY-MASTER-PERSONAL", user_id="user_owner",
+    )
+    write_agent_file("ent_layers", "agent_sales", "MEMORY.md", "# Memory\n\n- CANARY-AGENT-ENTITY")
+    write_agent_file(
+        "ent_layers", "agent_sales", "MEMORY.md", "# Memory\n\n- CANARY-AGENT-PERSONAL",
+        user_id="user_owner",
+    )
+
+    owner = _identity_prompt(ChatSurface.GLOBAL_OWNER_CHAT)
+    workspace = _identity_prompt(ChatSurface.WORKSPACE_CHAT, workspace_id="ws_layers")
+    service = _identity_prompt(
+        ChatSurface.WORKSPACE_CHAT, workspace_id="ws_layers", agent_id="agent_sales",
+    )
+
+    assert "CANARY-MASTER-PERSONAL" in owner
+    assert "CANARY-MASTER" not in workspace
+    assert "CANARY-AGENT-ENTITY" in service
+    assert "CANARY-AGENT-PERSONAL" not in service
+
+
+@pytest.mark.asyncio
+async def test_workspace_agent_prompt_only_loads_shared_database_memory(monkeypatch):
+    async def read_memories(_db, _entity_id, *, user_id, **_kwargs):
+        return "personal canary" if user_id else "shared canary"
+
+    monkeypatch.setattr("packages.core.services.memory_service.get_context_memories", read_memories)
+    for surface, workspace_id, expected in (
+        (ChatSurface.WORKSPACE_CHAT, "ws_layers", "shared canary"),
+        (ChatSurface.AGENT_DM, None, "personal canary"),
+    ):
+        envelope = RuntimeResolver().resolve_trace_envelope(AIRuntimeRequest(
+            surface=surface, entity_id="ent_layers", user_id="user_owner",
+            agent_id="agent_sales", workspace_id=workspace_id,
+        ))
+        assert await runtime_agent_memories_prompt(
+            object(), envelope=envelope, entity_id="ent_layers",
+            agent_id="agent_sales", user_id="user_owner",
+        ) == f"## Agent Memories\n{expected}"

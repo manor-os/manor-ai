@@ -170,7 +170,7 @@ export default function WebhookManager({ embedded = false }: { embedded?: boolea
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, gap: 12 }}>
           <div>
             <h3 className="manor-section-title" style={{ margin: "0 0 4px" }}>{t("page.webhooks.title")}</h3>
-            <p style={{ margin: 0, fontSize: 12, color: "var(--ink-3, #78716c)" }}>{t("page.webhooks.subtitle")}</p>
+            <p style={{ margin: 0, fontSize: 12, color: "var(--ink-3, #8e8e93)" }}>{t("page.webhooks.subtitle")}</p>
           </div>
           <PageHeaderAddButton label={t("page.webhooks.add_webhook")} onClick={openCreate} />
         </div>
@@ -212,10 +212,10 @@ export default function WebhookManager({ embedded = false }: { embedded?: boolea
                     <tr key={hook.id} style={{ cursor: "pointer" }} onClick={() => setExpandedId(expandedId === hook.id ? null : hook.id)}>
                       <td style={{ padding: "12px 16px" }}>
                         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                          <span style={{ transition: "transform 0.2s", transform: expandedId === hook.id ? "rotate(90deg)" : "none", flexShrink: 0, display: "inline-flex", color: "#a8a29e" }}>
+                          <span style={{ transition: "transform 0.2s", transform: expandedId === hook.id ? "rotate(90deg)" : "none", flexShrink: 0, display: "inline-flex", color: "var(--text-muted)" }}>
                             <IconChevronRight size={14} />
                           </span>
-                          <span style={{ fontWeight: 600, color: "#292524", fontFamily: "monospace", fontSize: 12 }}>{hook.url}</span>
+                          <span style={{ fontWeight: 600, color: "var(--text-strong)", fontFamily: "var(--font-mono)", fontSize: 12 }}>{hook.url}</span>
                         </div>
                       </td>
                       <td style={{ padding: "12px 16px" }}>
@@ -226,8 +226,8 @@ export default function WebhookManager({ embedded = false }: { embedded?: boolea
                               borderRadius: 4,
                               fontSize: 10,
                               fontWeight: 600,
-                              background: "#f5f5f4",
-                              color: "#57534e",
+                              background: "var(--surface-muted)",
+                              color: "var(--text-muted)",
                             }}>
                               {ev}
                             </span>
@@ -237,26 +237,26 @@ export default function WebhookManager({ embedded = false }: { embedded?: boolea
                       <td style={{ padding: "12px 16px" }}>
                         <StatusBadge type={statusBadgeType(hook.status)} dot>{hook.status}</StatusBadge>
                       </td>
-                      <td style={{ padding: "12px 16px", color: "#78716c", fontSize: 12 }}>{formatDate(hook.created_at)}</td>
+                      <td style={{ padding: "12px 16px", color: "var(--text-muted)", fontSize: 12 }}>{formatDate(hook.created_at)}</td>
                       <td style={{ padding: "12px 16px", textAlign: "right" }}>
                         <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 4 }} onClick={(e) => e.stopPropagation()}>
                           <button
                             onClick={() => openEdit(hook)}
-                            style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "#a8a29e" }}
+                            style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "var(--text-muted)" }}
                             title={t("action.edit")}
                           >
                             <IconEdit size={16} />
                           </button>
                           <button
                             onClick={() => testMutation.mutate(hook.id)}
-                            style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "#a8a29e" }}
+                            style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "var(--text-muted)" }}
                             title={t("page.webhooks.test")}
                           >
                             <IconPlay size={16} />
                           </button>
                           <button
                             onClick={() => setDeleteTarget(hook.id)}
-                            style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "#a8a29e" }}
+                            style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "var(--text-muted)" }}
                             title={t("action.delete")}
                           >
                             <IconTrash size={16} />
@@ -269,19 +269,19 @@ export default function WebhookManager({ embedded = false }: { embedded?: boolea
                       <tr key={`${hook.id}-deliveries`}>
                         <td colSpan={5} style={{ padding: "12px 16px", background: "rgba(250,250,249,0.5)" }}>
                           <div style={{ paddingLeft: 24 }}>
-                            <h4 style={{ fontSize: 11, fontWeight: 700, color: "#78716c", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>{t("page.webhooks.recent_deliveries")}</h4>
+                            <h4 style={{ fontSize: 11, fontWeight: 700, color: "var(--text-muted)", marginBottom: 8 }}>{t("page.webhooks.recent_deliveries")}</h4>
                             {deliveriesLoading ? (
                               <TableRowsSkeleton rows={3} cols={4} showHeader={false} />
                             ) : (deliveries as WebhookDelivery[]).length === 0 ? (
-                              <p style={{ fontSize: 12, color: "#a8a29e", margin: 0 }}>{t("page.webhooks.no_deliveries_yet")}</p>
+                              <p style={{ fontSize: 12, color: "var(--text-muted)", margin: 0 }}>{t("page.webhooks.no_deliveries_yet")}</p>
                             ) : (
                               <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                                 {(deliveries as WebhookDelivery[]).slice(0, 10).map((d) => (
                                   <div key={d.id} style={{ display: "flex", alignItems: "center", gap: 16, fontSize: 12, padding: "6px 0" }}>
                                     <StatusBadge type={deliveryStatusBadge(d.response_code)}>{d.response_code || t("page.webhooks.na")}</StatusBadge>
-                                    <span style={{ color: "#57534e", fontWeight: 500 }}>{d.event}</span>
-                                    <span style={{ color: "#a8a29e" }}>{d.status}</span>
-                                    <span style={{ color: "#a8a29e", marginLeft: "auto" }}>{formatDate(d.created_at)}</span>
+                                    <span style={{ color: "var(--text-muted)", fontWeight: 500 }}>{d.event}</span>
+                                    <span style={{ color: "var(--text-muted)" }}>{d.status}</span>
+                                    <span style={{ color: "var(--text-muted)", marginLeft: "auto" }}>{formatDate(d.created_at)}</span>
                                   </div>
                                 ))}
                               </div>
@@ -331,7 +331,7 @@ export default function WebhookManager({ embedded = false }: { embedded?: boolea
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
           <Input label={t("page.webhooks.url")} value={formUrl} onChange={(e) => setFormUrl(e.target.value)} placeholder={t("page.webhooks.https_example_com_webhook")} />
           <div>
-            <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: "#78716c", marginBottom: 8 }}>{t("page.webhooks.events")}</label>
+            <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: "var(--text-muted)", marginBottom: 8 }}>{t("page.webhooks.events")}</label>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
               {EVENTS.map((ev) => {
                 const selected = formEvents.includes(ev);
@@ -346,9 +346,9 @@ export default function WebhookManager({ embedded = false }: { embedded?: boolea
                       fontSize: 11,
                       fontWeight: 600,
                       border: "1px solid",
-                      borderColor: selected ? "#4f7d75" : "#e7e5e4",
-                      background: selected ? "#f2f6f5" : "#fafaf9",
-                      color: selected ? "#4f7d75" : "#78716c",
+                      borderColor: selected ? "#4f7d75" : "#e5e5ea",
+                      background: selected ? "#f2f6f5" : "#fafafa",
+                      color: selected ? "#4f7d75" : "#8e8e93",
                       cursor: "pointer",
                       transition: "all 0.2s",
                     }}

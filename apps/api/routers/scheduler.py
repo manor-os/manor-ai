@@ -5,8 +5,10 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from pydantic import BaseModel
+import re
+
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,6 +30,7 @@ from packages.core.services.scheduler_service import (
     mutate_scheduled_job, delete_scheduled_job, toggle_scheduled_job,
     summarize_scheduled_jobs,
     list_job_runs,
+    scheduled_runs_waiting_on_people,
     create_agent_execution, list_agent_executions, update_agent_execution,
     defer_scheduled_job_skill_generation,
     scheduled_job_workspace_scope,
@@ -244,6 +247,9 @@ class JobRunResponse(BaseModel):
     started_at: str | None = None
     completed_at: str | None = None
     created_at: str | None = None
+    # Set when status is "waiting": the occurrence's own Task needs a person.
+    waiting_task_id: str | None = None
+    waiting_reason: str | None = None
 
 
 # ── Schemas: Agent Executions ──
@@ -357,9 +363,11 @@ def _job_response(
     )
 
 
-def _run_response(r) -> JobRunResponse:
+def _run_response(r, waiting: dict[str, str] | None = None) -> JobRunResponse:
     return JobRunResponse(
-        id=r.id, job_id=r.job_id, status=r.status,
+        id=r.id, job_id=r.job_id, status="waiting" if waiting else r.status,
+        waiting_task_id=(waiting or {}).get("task_id"),
+        waiting_reason=(waiting or {}).get("reason") or None,
         idempotency_key=r.idempotency_key,
         trigger_type=r.trigger_type, result=r.result, error=r.error,
         duration_ms=r.duration_ms,
@@ -836,7 +844,8 @@ async def get_job_runs(
     _reject_agent_initiative_driver(job)
     await _legacy_compatible_workspace_gate(db, user, job.workspace_id, writable=False)
     runs = await list_job_runs(db, job.job_id, limit=limit)
-    return [_run_response(r) for r in runs]
+    waiting = await scheduled_runs_waiting_on_people(db, runs)
+    return [_run_response(r, waiting.get(r.id)) for r in runs]
 
 
 class JobRunDetailResponse(BaseModel):
@@ -932,11 +941,26 @@ async def get_job_run_detail(
             ).order_by(AgentExecution.created_at.desc()).limit(1)
         )).scalar_one_or_none()
 
+    waiting = await scheduled_runs_waiting_on_people(db, [run])
     return JobRunDetailResponse(
-        run=_run_response(run),
+        run=_run_response(run, waiting.get(run.id)),
         task=task_dict,
         agent_execution=_exec_response(exec_row) if exec_row else None,
     )
+
+
+class RunNowRequest(BaseModel):
+    """Answers a person gave when starting a run: each completes the run's wait for that variable with its choice."""
+
+    responses: dict[str, str] = Field(default_factory=dict, max_length=5)
+
+    @field_validator("responses")
+    @classmethod
+    def _valid_responses(cls, value: dict[str, str]) -> dict[str, str]:
+        for variable, choice in value.items():
+            if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", variable) or not choice or len(choice) > 64:
+                raise ValueError("A response needs a variable name and a short choice")
+        return value
 
 
 class RunNowResponse(BaseModel):
@@ -955,6 +979,7 @@ async def run_job_now(
         max_length=128,
         pattern=r"^[A-Za-z0-9._:-]+$",
     ),
+    body: RunNowRequest | None = Body(None),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1002,6 +1027,7 @@ async def run_job_now(
             job_db_id=job_db_id,
             occurrence_key=occurrence_key,
             requesting_user_id=requesting_user_id,
+            preapproved=(body.responses or None) if body else None,
         )
     except Exception as exc:
         raise HTTPException(503, f"Worker queue unreachable: {exc}") from exc

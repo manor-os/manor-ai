@@ -29,6 +29,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 
 from packages.core.ai.context import build_agent_context
+from packages.core.ai.runtime.billing import runtime_durable_loop_billing
 from packages.core.ai.runtime.envelope import RuntimeEnvelope
 from packages.core.ai.runtime.human_input import (
     REQUEST_INPUT_TOOL_NAME,
@@ -54,6 +55,7 @@ from packages.core.ai.runtime.workspace_delegation_actions import (
 from packages.core.constants.task import TaskLogType, TaskStatus
 from packages.core.constants.task_actors import TaskActor
 from packages.core.database import create_worker_session
+from packages.core.models.base import generate_ulid
 from packages.core.models.task import Task
 from packages.core.models.task_coordinator import (
     TaskCoordinatorEngine,
@@ -66,6 +68,7 @@ from packages.core.services.task_constraints import (
     render_constraints_block,
 )
 from packages.core.services import durable_run
+from packages.core.services.billing_payer import resolve_run_payer
 from packages.core.services.task_coordinator_wakeup import (
     AGENT_LOOP_RESUMED_AFTER,
     AGENT_LOOP_RETRY_KEY,
@@ -133,6 +136,7 @@ from packages.core.workers.task_agent_loop_completion import (
     people_facing_effects,
     resolve_deliverables,
     running_work_problems,
+    saved_deliverables,
     unconfirmed_call_ids,
     unconfirmed_effects,
 )
@@ -141,6 +145,8 @@ from packages.core.workers.task_agent_loop_completion import (
 logger = logging.getLogger(__name__)
 
 _LEASE_SECONDS = task_run_host.TASK_RUN_LEASE_SECONDS
+#: About three hours of redelivery before a Task with no runner stops being woken.
+_NO_RUNNER_WAKE_ATTEMPTS = 6
 _HEARTBEAT_SECONDS = task_run_host.TASK_RUN_HEARTBEAT_SECONDS
 # One delivery works at most this long, then yields at a round boundary and
 # re-stages its own wake. Kept well under the Celery soft limit (3300 s) so a
@@ -441,13 +447,28 @@ def task_brief(task: Any) -> str:
     description = _text(getattr(task, "description", None))
     if description:
         parts.append(f"## Description\n{description}")
+    details = getattr(task, "details", None)
+    changes = [
+        _text(item.get("text")) for item in (details.get("changes") or [] if isinstance(details, dict) else [])
+        if isinstance(item, dict) and _text(item.get("text"))
+    ]
+    if changes:
+        # Later instructions outrank the description and upstream outputs.
+        parts.append(
+            "## Changes since this Task was created\n"
+            "These override the description above and the outputs of earlier Tasks. Where an "
+            "earlier Task's output uses figures or facts these change, work from the changed ones "
+            "and recompute. Before completing, re-read each deliverable in full: every figure "
+            "derived from a changed value (totals, remainders, ratios, explanations) is "
+            "recomputed, and no sentence keeps a value a change replaced.\n"
+            + "\n".join(f"- {text}" for text in changes)
+        )
     expected = getattr(task, "expected_output", None)
     if expected:
         parts.append(
             "## Expected output\n"
             + (expected if isinstance(expected, str) else json.dumps(expected, ensure_ascii=False, default=str))
         )
-    details = getattr(task, "details", None)
     parts.extend(_detail_sections(details if isinstance(details, dict) else {}, description=description))
     constraints = render_constraints_block(extract_binding_constraints(details))
     if constraints:
@@ -619,6 +640,17 @@ def _no_acquisition_section(*, can_delegate: bool) -> str:
 _EPHEMERAL_STATE_KEYS = TASK_LOOP_EPHEMERAL_STATE_KEYS
 _initial_state = task_loop_initial_state
 _run_state_slots = task_loop_run_state_slots
+
+
+async def _rules_revision(db: Any, workspace_id: str | None) -> int | None:
+    """The Workspace's governance revision; rules and approval settings bump it."""
+    if not workspace_id:
+        return None
+    from packages.core.models.governance import GovernancePolicy
+
+    return (await db.execute(
+        select(GovernancePolicy.revision).where(GovernancePolicy.workspace_id == workspace_id)
+    )).scalar_one_or_none()
 
 
 def _argument_error(
@@ -817,6 +849,7 @@ async def _admit_and_claim(
         engine=TaskCoordinatorEngine.AGENT_LOOP.value,
         lease_seconds=_LEASE_SECONDS,
         session_factory=create_worker_session(),
+        no_runner_max_attempts=_NO_RUNNER_WAKE_ATTEMPTS,
     )
 
 
@@ -1251,6 +1284,7 @@ def _question_from_payload(payload: Any) -> dict[str, Any] | None:
             options=payload.get("options"),
             fields=payload.get("fields"),
             context=payload.get("context"),
+            recommendation=payload.get("recommendation"),
             # Host-owned (a screen hand-over): request_input never sets it.
             action_link=payload.get("action_link"),
             action_to_take=payload.get("action_to_take"),
@@ -1898,9 +1932,16 @@ async def _block(
         if stop is not None:
             comment = stop["comment"]
             checkpoint = {**checkpoint, **stop["checkpoint"]}
+    # Nobody resumes an Agent Initiative run's Task: it fails, which settles
+    # the run, and the Initiative's next occurrence is the retry.
+    task_status = (
+        TaskStatus.FAILED.value
+        if await _is_initiative_run(session_factory, claim.task_id)
+        else TaskStatus.BLOCKED.value
+    )
     written = await _write_terminal(
         session_factory, claim,
-        task_status=TaskStatus.BLOCKED.value,
+        task_status=task_status,
         run_phase=TaskCoordinatorPhase.FAILED.value,
         checkpoint={**checkpoint, _OUTCOME_KEY: outcome},
         log_type=TaskLogType.AI_EXECUTION_FAILED,
@@ -1913,7 +1954,17 @@ async def _block(
     )
     if not written:
         return {"status": "stale", "task_id": claim.task_id}
-    return {"status": "blocked", "task_id": claim.task_id, "code": code}
+    return {"status": task_status, "task_id": claim.task_id, "code": code}
+
+
+async def _is_initiative_run(session_factory: Any, task_id: str) -> bool:
+    from packages.core.services.agent_initiative_decision import has_initiative_task_marker
+
+    async with session_factory() as db:
+        details = (await db.execute(
+            select(Task.details).where(Task.id == task_id)
+        )).scalar_one_or_none()
+    return has_initiative_task_marker(details)
 
 
 def _legacy_completion(submission: dict[str, Any], checkpoint: dict[str, Any]) -> dict[str, Any]:
@@ -2117,7 +2168,7 @@ async def _finish_submission(
                 **effect_lines,
             },
         )
-        if fault is not None and blocked.get("status") == "blocked":
+        if fault is not None and blocked.get("status") != "stale":
             await report_task_platform_block(
                 task_id=claim.task_id, entity_id=None, workspace_id=None,
                 code="platform_fault", cause=reason or submission["summary"],
@@ -2236,6 +2287,10 @@ async def run_task_agent_loop_once(
             root_agent_id = run.root_agent_id
             root_subscription_id = run.root_subscription_id
             brief = task_brief(task)
+            # Changes recorded after this point reach the run between rounds.
+            state["brief_built_at"] = datetime.now(timezone.utc).isoformat()
+            # So do the Workspace's rules, when they change after this point.
+            state["rules_revision"] = await _rules_revision(db, workspace_id)
             result_schema = task_result_schema(task)
             # Tools the Task's creator excluded from this run (an Initiative
             # never delivers by itself); the envelope carries them to every gate.
@@ -2469,11 +2524,36 @@ async def run_task_agent_loop_once(
             # This round's journal row: the call, redacted on the spot.
             host.observe_tool_end(name, result, arguments)
 
+        async def _saved_files() -> list[dict[str, Any]]:
+            # A report that delivered nothing still shows what the run saved,
+            # as long as the host can still verify it.
+            try:
+                async with session_factory() as db:
+                    saved, _unverified = await resolve_deliverables(
+                        db, deliverables=saved_deliverables(evidence.receipts), evidence=evidence,
+                        entity_id=entity_id, workspace_id=workspace_id, user_id=user_id,
+                    )
+                    await db.rollback()
+            except Exception:
+                logger.warning("Task %s saved files could not be verified", task_id, exc_info=True)
+                return []
+            return delivered_files(saved, entity_id=entity_id)
+
         async def _complete_task(arguments: dict[str, Any]) -> str:
             submission, error = _parse_submission(arguments, result_schema)
             if error is not None:
                 return _argument_error(COMPLETE_TASK_TOOL_NAME, error)
             completed = submission["outcome"] == "completed"
+            if completed and (late_changes := await _task_changes()):
+                # A change that landed during the last step would otherwise be
+                # completed past: hand it over and let the run redo its part.
+                return _argument_error(
+                    COMPLETE_TASK_TOOL_NAME,
+                    "The user changed this work while it ran: " + " / ".join(late_changes)
+                    + " These override the brief and earlier Tasks' outputs: redo what they "
+                    "affect, update the deliverables, then complete. Nothing was completed.",
+                    code="changed_during_run", changes=late_changes,
+                )
             problems = acceptance_problems(submission, state["task_plan"])
             try:
                 async with session_factory() as db:
@@ -2545,8 +2625,11 @@ async def run_task_agent_loop_once(
                         unconfirmed_calls=_refusal_calls(evidence)[:50],
                     )
             decision = outcome_decision(ledger_state, submission["outcome"], verified_delivery=delivered)
+            files = delivered_files(resolved, entity_id=entity_id)
+            if not files and not delivered:
+                files = await _saved_files()
             state["completion"] = {
-                "files": delivered_files(resolved, entity_id=entity_id),
+                "files": files,
                 "deliverables": [
                     {k: entry.get(k) for k in ("index", "reference", "source", "handle") if entry.get(k)}
                     for entry in resolved
@@ -2574,6 +2657,49 @@ async def run_task_agent_loop_once(
                 arguments, scope=delegation_scope, resumed_wait=state["resumed_wait"],
                 session_factory=session_factory,
             )
+
+        delivered_changes: set[str] = set()
+
+        def _fresh_changes(details: Any) -> list[str]:
+            """Changes in ``details`` recorded since this run's brief and not yet delivered."""
+            fresh: list[str] = []
+            for item in (details or {}).get("changes") or []:
+                at = str(item.get("at") or "") if isinstance(item, dict) else ""
+                text = str(item.get("text") or "").strip() if isinstance(item, dict) else ""
+                if text and at > state["brief_built_at"] and at not in delivered_changes:
+                    delivered_changes.add(at)
+                    fresh.append(text)
+            return fresh
+
+        async def _task_changes() -> list[str]:
+            """The Task's changes recorded since this run's brief, each delivered once."""
+            async with session_factory() as db:
+                details = (await db.execute(
+                    select(Task.details).where(Task.id == task_id)
+                )).scalar_one_or_none()
+            return _fresh_changes(details)
+
+        async def _incoming_updates() -> list[str | dict[str, Any]]:
+            """The Task's changes, then the Workspace's rules if they changed since the brief."""
+            async with session_factory() as db:
+                details = (await db.execute(
+                    select(Task.details).where(Task.id == task_id)
+                )).scalar_one_or_none()
+                updates: list[str | dict[str, Any]] = list(_fresh_changes(details))
+                revision = await _rules_revision(db, workspace_id)
+                if revision is not None and state["rules_revision"] is not None and revision != state["rules_revision"]:
+                    state["rules_revision"] = revision
+                    from packages.core.workspace_chat.context import rules_text
+
+                    updates.append({
+                        "update": "The Workspace's rules changed while this ran.",
+                        "rules": await rules_text(db, workspace_id, entity_id),
+                        "message": (
+                            "These are the rules in force now and replace the ones in your instructions. "
+                            "Follow them for the rest of this work; tools are already checked against them."
+                        ),
+                    })
+            return updates
 
         task_section = _task_section(
             brief, can_delegate=can_delegate, durable_delegation=durable_delegation,
@@ -2611,6 +2737,7 @@ async def run_task_agent_loop_once(
             }),
             "terminal_tool_result_policy": copy.deepcopy(_TERMINAL_POLICY),
             "on_round_end": host.checkpoint,
+            "incoming_updates": _incoming_updates,
             "on_round_end_strict": True,
             "on_llm_call_before": host.before_model,
             "on_tool_end": _observe_tool_end,
@@ -2672,12 +2799,40 @@ async def run_task_agent_loop_once(
                 + "Finish only by calling complete_task."
             )
         capability_scope: Any = contextlib.nullcontext()
+        payer_entity_id = await resolve_run_payer(
+            None, entity_id=entity_id, workspace_id=workspace_id,
+        )
         try:
             # This loop's own media jobs dispatch through Celery: an in-loop
             # job would be drained by run_in_worker after the Task parks,
             # holding the heavy worker (prompt skills and delegated agents
             # wait in process and keep theirs on this loop).
-            with runtime_media_jobs_detached_scope(task_id=task_id, run_id=claim.run_id), capability_scope:
+            with (
+                runtime_media_jobs_detached_scope(task_id=task_id, run_id=claim.run_id),
+                capability_scope,
+                runtime_durable_loop_billing(
+                    # A fresh nonce per wake: provider work repeated after a
+                    # crash is charged again, never hidden by an earlier fence.
+                    source_prefix=f"task:{task_id}:{generate_ulid()}",
+                    entity_id=entity_id,
+                    user_id=user_id,
+                    agent_id=root_agent_id,
+                    workspace_id=workspace_id,
+                    conversation_id=conversation_id,
+                    fallback_model=ctx.model,
+                    payer_entity_id=payer_entity_id,
+                    source=RUNTIME_PLAN_AND_RUN_TASK_SOURCE,
+                    operation_id=task_id,
+                    task_id=task_id,
+                ) as (reserve_llm_call, settle_llm_call),
+            ):
+                async def _before_model(*args: Any, **kwargs: Any) -> Any:
+                    # The claim fence first: a lost claim reserves nothing.
+                    await host.before_model()
+                    return await reserve_llm_call(*args, **kwargs)
+
+                loop_kwargs["on_llm_call_before"] = _before_model
+                loop_kwargs["on_llm_usage_settled"] = settle_llm_call
                 result = await runtime_execute_agentic_loop(**loop_kwargs)
         except (RuntimeError, ValueError):
             if not await host.is_current():

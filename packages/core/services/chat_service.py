@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import Any
@@ -22,7 +23,7 @@ from packages.core.ai.runtime import (
     runtime_persist_chat_runtime_events,
     runtime_persist_chat_stream_runtime_events,
     runtime_release_billing_context,
-    runtime_set_suppressed_billing_context,
+    runtime_set_callback_settled_billing_context,
 )
 from packages.core.ai.llm_client import LLMRateLimited
 from packages.core.ai.runtime.skill_forcing import (
@@ -30,6 +31,7 @@ from packages.core.ai.runtime.skill_forcing import (
     runtime_message_text_for_intent,
 )
 from packages.core.ai.runtime.control import RuntimeContextWriterFenced
+from packages.core.ai.runtime.file_context import editor_document_round_processor
 from packages.core.ai.runtime.turn_policy import runtime_turn_max_rounds
 from packages.core.ai.runtime.output_policy import (
     BYOK_PROVIDER_ERROR_CODE,
@@ -79,7 +81,7 @@ from packages.core.services.assistant_blocks import (
     assistant_tool_uses_structured_result,
     assistant_blocks_stream_payload,
 )
-from packages.core.services.chat_artifacts import chat_attachments_from_tool_results
+from packages.core.services.chat_artifacts import chat_turn_attachments
 from packages.core.services.file_refs import enforce_reply_file_links
 from packages.core.services.chat_approvals import register_chat_provider_approval
 from packages.core.services.chat_approvals import (
@@ -248,6 +250,31 @@ def _runtime_assistant_origin_meta(ctx: Any) -> dict[str, str]:
     return assistant_message_origin_meta(origin_user_message_id)
 
 
+# When credits stop a turn and the exception carried no message.
+CREDIT_EXHAUSTED_FALLBACK = "AI credits ran out before this request finished. Add credits or upgrade your plan to continue."
+
+
+_RESERVATION_SHORTFALL = re.compile(r"^insufficient credits: required (\d+), available (-?\d+)$")
+
+
+def credit_exhausted_reply(result: Any) -> str:
+    """The reply body of a turn that credits stopped: the limit's own message.
+
+    The reservation shortfall keeps its machine form for the clients that
+    parse it (Workflow failures); a chat reply reads it in plain words.
+    """
+    detail = getattr(result, "error_detail", None)
+    message = str((detail.get("message") if isinstance(detail, dict) else None)
+                  or getattr(result, "error", None) or "").strip()
+    if shortfall := _RESERVATION_SHORTFALL.match(message):
+        required, available = (int(group) for group in shortfall.groups())
+        return (
+            f"Not enough AI credits for this request: it needs {required:,} credits and your "
+            f"balance is {max(available, 0):,}. Add credits or upgrade your plan to continue."
+        )
+    return message or CREDIT_EXHAUSTED_FALLBACK
+
+
 def _workspace_final_response_contract(ctx: Any):
     from packages.core.ai.runtime.chat_evidence import chat_evidence_contract
     return chat_evidence_contract(ctx)
@@ -271,7 +298,6 @@ def _chat_llm_billing_callbacks(
     workspace_id: str | None,
     conversation_id: str | None,
     fallback_model: str | None,
-    byok: bool = False,
     payer_entity_id: str | None = None,
 ):
     """Build per-turn durable billing callbacks for the agentic loop."""
@@ -283,7 +309,6 @@ def _chat_llm_billing_callbacks(
         workspace_id=workspace_id,
         conversation_id=conversation_id,
         fallback_model=fallback_model,
-        byok=byok,
         payer_entity_id=payer_entity_id,
     )
 
@@ -332,6 +357,8 @@ def _chat_result_public_error(result, surface: ChatSurface | str | None, tool_ca
     """The ``error`` field of a stream_end / response payload for this surface."""
     if not result.error:
         return None
+    if result.error in {"sandbox_allocation_failed", "sandbox_queue_timeout", "sandbox_capacity_timeout", "sandbox_runner_unavailable", "sandbox_allocation_rejected"}:
+        return _chat_result_visible_content(result, surface, tool_calls)
     if result.error == "final_response_validation_failed" and surface != ChatSurface.PUBLIC_CUSTOMER_CHAT:
         from packages.core.ai.runtime.output_policy import runtime_response_validation_failure_content
 
@@ -656,6 +683,9 @@ async def stream_chat_response(
 
     stream_completed = False
     hitl_data: dict | None = None
+    # The turn parked durably (on an approval, a question or a queue): its
+    # open request now belongs to the parked run, not to this stream.
+    loop_parked = [False]
     persisted_message_id: list[str | None] = [
         assistant_message_id if persist_messages else None
     ]
@@ -803,6 +833,7 @@ async def stream_chat_response(
         # accepts it (final_response_start), or withdraws it on a ledger gate.
         turn_reply_contract = _workspace_final_response_contract(ctx)
         live_post_tool_text = bool(getattr(turn_reply_contract, "streams_candidate_text", False))
+        editor_round_processor = editor_document_round_processor(ctx.runtime_envelope, entity_id)
 
         def with_assistant_blocks(payload: dict) -> dict:
             return runtime_public_transport_payload({
@@ -1250,6 +1281,18 @@ async def stream_chat_response(
                     # "durable" text (>=24 chars) and 2s/400 chars, so hanging
                     # the snapshot off it would blank the first sentence.
                     publish_stream_snapshot()
+            elif event_type == "text_commit":
+                # Everything so far has been accepted. Send it now, so a later
+                # reset can only withdraw text that came after this point. The
+                # timeline keeps only the readable part; every later event
+                # carries the timeline, and patch bodies would grow each one.
+                from packages.core.services.chat_feedback import visible_assistant_text
+
+                flush_sentinel_scan_buffer()
+                flush_text_buffer()
+                classify_pending_post_tool_text("progress")
+                assistant_blocks.map_text(visible_assistant_text)
+                event_queue.put_nowait(scoped_sse("text_commit", data))
             elif event_type == "text_reset":
                 reset_stream_buffer[0] = True
                 text_buffer[0] = ""
@@ -1314,7 +1357,11 @@ async def stream_chat_response(
             provider_approvals.capture(name, args, result)
             if hitl_data is None:
                 hitl_data = parse_hitl_envelope(result)
-            if runtime_is_internal_failure_detail(result):
+            # A read of the document returns the document's words, which may
+            # quote an error message; that is not a failed tool.
+            if runtime_is_internal_failure_detail(result) and not (
+                editor_round_processor is not None and name in {"read_file", "grep_files"}
+            ):
                 internal_tool_failure_seen[0] = True
 
             preview = tool_result_for_chat(name, result)
@@ -1418,7 +1465,6 @@ async def stream_chat_response(
             workspace_id=ctx.workspace_id,
             conversation_id=conversation_id if persist_messages else None,
             fallback_model=resolved_model,
-            byok=bool(getattr(ctx, "byok", False)),
             payer_entity_id=turn_payer_entity_id,
         )
         _reserve_llm_call = reserve_llm_call
@@ -1431,14 +1477,14 @@ async def stream_chat_response(
 
         async def _run_loop():
             nonlocal hitl_data, turn_recommendation
-            # Chat settles every completed provider call through durable callbacks.
-            _billing_handle = runtime_set_suppressed_billing_context(
+            # Loop rounds settle through the durable callbacks; the calls around
+            # them (tools, compaction, completions) keep their automatic record.
+            _billing_handle = runtime_set_callback_settled_billing_context(
                 entity_id=entity_id or "",
                 workspace_id=ctx.workspace_id,
                 agent_id=agent_id,
                 user_id=user_id,
                 conversation_id=conversation_id if persist_messages else None,
-                durable_per_call=True,
                 payer_entity_id=turn_payer_entity_id,
             )
             try:
@@ -1493,6 +1539,7 @@ async def stream_chat_response(
                     ),
                     max_rounds=runtime_turn_max_rounds(ctx),
                     final_response_contract=turn_reply_contract,
+                    round_text_processor=editor_round_processor,
                 )
                 loop_result[0] = result
                 loop_ended_at_ms = int(time.time() * 1000)
@@ -1530,7 +1577,16 @@ async def stream_chat_response(
                             )
 
                             await record_human_input_question_message(runtime_db, run=run)
+                        elif persist_messages and conversation_id and hitl_data:
+                            from packages.core.services.runtime_human_input import (
+                                record_parked_approval_message,
+                            )
+
+                            await record_parked_approval_message(
+                                runtime_db, run=run, hitl_requests=hitl_requests_from_data(hitl_data),
+                            )
                         await runtime_db.commit()
+                    loop_parked[0] = True
                     event_queue.put_nowait(
                         scoped_sse(
                             "runtime_waiting",
@@ -1568,7 +1624,7 @@ async def stream_chat_response(
                             workspace_id=ctx.workspace_id,
                             agent_id=agent_id,
                             tool_results=tool_results,
-                            attachments=chat_attachments_from_tool_results(tool_results) or None,
+                            attachments=await chat_turn_attachments(tool_results, entity_id=entity_id) or None,
                             message_id=persisted_message_id[0],
                             meta=assistant_blocks.meta() or None,
                         )
@@ -1603,6 +1659,14 @@ async def stream_chat_response(
                     # refresh/reload does not make the reply disappear.
                     if not (result.content or "").strip() and streamed_fallback_content and not result.tool_calls_made:
                         result.content = streamed_fallback_content
+                    if result.stop_reason == "credit_exhausted" and (result.content or "").strip() in {
+                        "", str(result.error or "").strip(),
+                        str((result.error_detail or {}).get("message") or "").strip(),
+                    }:
+                        # The turn stopped on credits, not on the model: say so,
+                        # rather than leaving it empty (read as "empty response")
+                        # or in the limit's machine form.
+                        result.content = credit_exhausted_reply(result)
                     # Apply fallback if LLM returned nothing
                     if not (result.content or "").strip() and not result.tool_calls_made:
                         result.content = (
@@ -1709,7 +1773,7 @@ async def stream_chat_response(
                                 else None
                             )
                             assistant_meta = _chat_assistant_result_meta(result)
-                            attachments = chat_attachments_from_tool_results(tool_results)
+                            attachments = await chat_turn_attachments(tool_results, entity_id=entity_id)
                             flush_final_summary_text(visible_content)
                             assistant_blocks.set_final_text(visible_content)
                             pending_post_tool_text[0] = ""
@@ -1945,7 +2009,7 @@ async def stream_chat_response(
                                 workspace_id=ctx.workspace_id,
                                 agent_id=agent_id,
                                 tool_results=tool_results,
-                                attachments=chat_attachments_from_tool_results(tool_results) or None,
+                                attachments=await chat_turn_attachments(tool_results, entity_id=entity_id) or None,
                                 message_id=persisted_message_id[0],
                                 partial_content=(
                                     streamed_text_content[0].strip()
@@ -2016,6 +2080,8 @@ async def stream_chat_response(
         result = loop_result[0]
         if result and result.stop_reason == "waiting_resource":
             trace.total_usage = result.usage or {}
+            # Parked, not stopped: the run resumes once its request is answered.
+            stream_completed = True
             return
         if result:
             trace.total_usage = result.usage or {}
@@ -2036,7 +2102,7 @@ async def stream_chat_response(
                 for item in public_tool_events
                 if isinstance(item, dict) and item.get("name")
             ]
-            attachments = chat_attachments_from_tool_results(tool_results)
+            attachments = await chat_turn_attachments(tool_results, entity_id=entity_id)
             end_payload = {
                 "conversation_id": conversation_id,
                 "message_id": persisted_message_id[0],
@@ -2059,6 +2125,11 @@ async def stream_chat_response(
                 end_payload["error"] = _chat_result_public_error(result, runtime_surface, tool_results)
                 if result.error in {
                     "final_response_validation_failed",
+                    "sandbox_allocation_failed",
+                    "sandbox_queue_timeout",
+                    "sandbox_capacity_timeout",
+                    "sandbox_runner_unavailable",
+                    "sandbox_allocation_rejected",
                     "llm_configuration_missing",
                     "llm_call_failed",
                     "llm_provider_unavailable",
@@ -2156,7 +2227,10 @@ async def stream_chat_response(
                 runtime_tool_stream_sink_var.reset(tool_stream_token)
             except Exception:
                 pass
-        if persist_messages and conversation_id and not stream_completed and hitl_data:
+        if (
+            persist_messages and conversation_id and not stream_completed and hitl_data
+            and not loop_parked[0]
+        ):
             try:
                 hitl = hitl_data.get("hitl") if isinstance(hitl_data, dict) else {}
                 hitl_id = str((hitl or {}).get("id") or "").strip()
@@ -2349,17 +2423,16 @@ async def run_chat_message(
             workspace_id=ctx.workspace_id,
             conversation_id=conversation_id,
             fallback_model=_resolved_model,
-            byok=bool(getattr(ctx, "byok", False)),
         )
 
-        # Chat settles every completed provider call through durable callbacks.
-        _billing_handle = runtime_set_suppressed_billing_context(
+        # Loop rounds settle through the durable callbacks; the calls around
+        # them (tools, compaction, completions) keep their automatic record.
+        _billing_handle = runtime_set_callback_settled_billing_context(
             entity_id=entity_id or "",
             workspace_id=ctx.workspace_id,
             agent_id=agent_id,
             user_id=user_id,
             conversation_id=conversation_id,
-            durable_per_call=True,
         )
         manual_skill_ids = runtime_manual_skill_ids_from_refs(manual_skill_refs)
 
@@ -2392,6 +2465,7 @@ async def run_chat_message(
             system_prompt=system_prompt,
             user_message=message,
             tools=tools,
+            round_text_processor=editor_document_round_processor(ctx.runtime_envelope, entity_id),
             entity_id=entity_id or "",
             user_id=user_id,
             agent_id=agent_id,
@@ -2500,7 +2574,7 @@ async def run_chat_message(
                 else None
             )
             assistant_meta = _chat_assistant_result_meta(result)
-            attachments = chat_attachments_from_tool_results(_tool_results)
+            attachments = await chat_turn_attachments(_tool_results, entity_id=entity_id, db=db)
             runtime_meta = runtime_context_meta(ctx)
             if runtime_meta:
                 assistant_meta["runtime"] = runtime_meta
@@ -2595,7 +2669,7 @@ async def run_chat_message(
         for item in _tool_results
         if isinstance(item, dict) and item.get("name")
     ]
-    attachments = chat_attachments_from_tool_results(_tool_results)
+    attachments = await chat_turn_attachments(_tool_results, entity_id=entity_id, db=db)
     return {
         "conversation_id": conversation_id,
         "message_id": message_id,

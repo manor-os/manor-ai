@@ -266,8 +266,10 @@ async def archive_file_collection(
     workflow_lineage_root_run_id: str | None,
     collection: Any,
     write_guard: Callable[[list[str]], Awaitable[str | None]] | None = None,
+    workflow_project_root: str | None = None,
 ) -> dict[str, Any]:
-    """Copy verified source media into the trusted Workflow lineage archive."""
+    """Copy verified source media into the trusted Workflow lineage archive
+    (the project's folder for a run that works on a WorkflowProject)."""
     run_id = _text(workflow_run_id)
     lineage = _text(workflow_lineage_root_run_id)
     if not entity_id or not workspace_id or not run_id or not lineage:
@@ -329,6 +331,7 @@ async def archive_file_collection(
     archive_dir = workspace_execution_artifact_dir(
         workspace_artifact_storage_base(workspace.artifact_folder_id), workflow_run_id=run_id,
         workflow_lineage_root_run_id=lineage, entity_root=get_entity_root(entity_id),
+        workflow_project_root=workflow_project_root,
     )
     target_names = archive_file_collection_target_names({
         role: snapshots[source_ids[role]]["fs_path"] for role in _ARCHIVE_ROLES

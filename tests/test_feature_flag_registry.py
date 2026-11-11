@@ -8,6 +8,8 @@ modifies an existing row — an ops-set default or an archived status wins.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from sqlalchemy import delete, select
 
@@ -16,6 +18,10 @@ from packages.core.models.feature_flag import FeatureFlag
 from packages.core.services.feature_flags import (
     KNOWN_FLAGS,
     _bump_cache,
+    _entity_bucket,
+    create_flag,
+    enabled_flags,
+    evaluate,
     is_enabled,
     seed_known_flags,
     set_override,
@@ -161,3 +167,36 @@ async def test_seeded_flag_is_evaluable_and_overridable(db_session):
     assert await is_enabled(
         db_session, "strategist_review_v2", entity_id=generate_ulid(),
     ) is False
+
+
+@pytest.mark.asyncio
+async def test_all_flags_resolve_with_override_precedence(db_session):
+    """One read of the overrides gives each flag what ``evaluate`` gives it:
+    user override, then tenant override, then percent rollout, then default;
+    an expired override does not apply."""
+    await _clear_flags(db_session)
+    entity_id, user_id = generate_ulid(), generate_ulid()
+    for key in ("p_user", "p_tenant", "p_expired", "p_percent", "p_default"):
+        await create_flag(db_session, key=key, description=None, default_enabled=False)
+    override = dict(set_by_admin_id=None, set_reason="test")
+    await set_override(db_session, key="p_user", scope="tenant", scope_id=entity_id, enabled=True, **override)
+    await set_override(db_session, key="p_user", scope="user", scope_id=user_id, enabled=False, **override)
+    await set_override(db_session, key="p_tenant", scope="tenant", scope_id=entity_id, enabled=True, **override)
+    await set_override(
+        db_session, key="p_expired", scope="user", scope_id=user_id, enabled=True,
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1), **override,
+    )
+    # Every entity's bucket is below 100: the rollout covers it.
+    await set_override(db_session, key="p_percent", scope="percent", scope_id="100", enabled=True, **override)
+    assert _entity_bucket("p_percent", entity_id) < 100
+    await db_session.commit()
+    flags = list((await db_session.execute(select(FeatureFlag))).scalars().all())
+
+    resolved = await enabled_flags(db_session, flags, entity_id=entity_id, user_id=user_id)
+
+    assert resolved == {
+        "p_user": False, "p_tenant": True, "p_expired": False,
+        "p_percent": True, "p_default": False,
+    }
+    for key, enabled in resolved.items():
+        assert (await evaluate(db_session, key, entity_id=entity_id, user_id=user_id)).enabled is enabled

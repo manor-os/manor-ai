@@ -50,7 +50,14 @@ from packages.core.ai.runtime.bash_output_paths import (
     scope_bash_output_command,
     workspace_output_dir,
 )
-from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_handler
+from packages.core.ai.runtime.document_actions import (
+    runtime_glob_names_location,
+    runtime_workspace_search_scope_note,
+)
+from packages.core.ai.runtime.tool_context import (
+    runtime_tool_call_context_from_handler,
+    runtime_tool_call_context_is_person_chat,
+)
 from packages.core.ai.runtime import bash_mirror
 from packages.core.services.sandbox_sdk import capabilities as runner_caps
 from packages.core.ai.runtime.bash_mirror import (
@@ -695,6 +702,7 @@ async def _workspace_bash_artifact_base(
     workflow_run_id: str | None,
     workflow_lineage_root_run_id: str | None,
     entity_root: str,
+    workflow_project_root: str | None = None,
 ) -> str:
     """Read the already-provisioned Workspace output root without creating it."""
     normalized_workspace_id = str(workspace_id or "").strip()
@@ -739,6 +747,7 @@ async def _workspace_bash_artifact_base(
         workflow_run_id=workflow_run_id,
         workflow_lineage_root_run_id=workflow_lineage_root_run_id,
         entity_root=entity_root,
+        workflow_project_root=workflow_project_root,
     )
 
 
@@ -1414,6 +1423,7 @@ class _StageRequest:
     deep: bool  # directories: the whole tree, else direct children only
     explicit: bool  # named as such, not found by expanding a directory
     children: bool = True  # False: only the directory itself (a write target's parent)
+    discovery: bool = False  # names no location (entity root, top-level glob): stops at a run's Workspace
 
 
 def _command_segments_with_separators(command: str) -> list[tuple[str | None, list[str]]]:
@@ -1530,19 +1540,20 @@ def _stage_requests(command: str, entity_root: str) -> list[_StageRequest]:
                     content=content or redirect_target,
                     deep=deep,
                     explicit=True,
+                    discovery=not resolved or (glob.has_magic(rel) and not runtime_glob_names_location(rel)),
                 ))
         if named or not names_files:
             continue
         # Commands that default to the working directory.
         if base == "ls" or base in {"find", "tree", "du"}:
-            requests.append(_StageRequest(cwd_rel, True, False, deep, True))
+            requests.append(_StageRequest(cwd_rel, True, False, deep, True, discovery=not cwd_rel))
         elif base == "rg" and separator != "|":
-            requests.append(_StageRequest(cwd_rel, True, True, True, True))
+            requests.append(_StageRequest(cwd_rel, True, True, True, True, discovery=not cwd_rel))
         elif base in {"grep", "egrep", "fgrep"} and separator != "|" and any(
             arg in {"-r", "-R", "--recursive"} or (arg.startswith("-") and not arg.startswith("--") and ("r" in arg or "R" in arg))
             for arg in args
         ):
-            requests.append(_StageRequest(cwd_rel, True, True, True, True))
+            requests.append(_StageRequest(cwd_rel, True, True, True, True, discovery=not cwd_rel))
     return requests
 
 
@@ -1554,6 +1565,7 @@ class _StagePlan:
     dirs: set[str] = field(default_factory=set)
     deletes: list[str] = field(default_factory=list)
     reset: bool = False
+    files_outside_workspace: int = 0
 
 
 class _StagingRefused(Exception):
@@ -1658,6 +1670,24 @@ async def _unreadable(entity_id: str, runtime_context: Any, files: list[str], di
     return blocked
 
 
+async def _outside_run_workspace(
+    entity_id: str, runtime_context: Any, files: list[str], dirs: list[str],
+) -> set[str]:
+    if not runtime_context.workspace_id or (not files and not dirs):
+        return set()
+    from packages.core.database import async_session
+    from packages.core.services.document_access import paths_outside_workspace_scope
+
+    async with async_session() as db:
+        return await paths_outside_workspace_scope(
+            db,
+            entity_id=entity_id,
+            workspace_id=runtime_context.workspace_id,
+            rel_paths=files,
+            directory_paths=dirs,
+        )
+
+
 def _staging_limit_error(reason: str) -> dict[str, Any]:
     return {
         "error": "bash_staging_limit",
@@ -1699,6 +1729,9 @@ async def _plan_staging(
     wanted_dirs: set[str] = set()
     explicit_files: set[str] = set()
     explicit_dirs: set[str] = set()
+    named_paths: set[str] = set()
+    discovered_files: set[str] = set()
+    discovered_dirs: set[str] = set()
     for request in requests:
         files, dirs = await asyncio.to_thread(_walk_request, entity_root, request, max_entries)
         if len(files) + len(dirs) > max_entries:
@@ -1710,6 +1743,11 @@ async def _plan_staging(
         wanted_dirs.update(dirs)
         if request.explicit:
             (explicit_dirs if request.is_dir else explicit_files).add(request.rel)
+        if request.discovery:
+            discovered_files.update(files)
+            discovered_dirs.update(dirs)
+        else:
+            named_paths.update(files, dirs)
     if len(wanted_files) + len(wanted_dirs) > max_entries:
         raise _StagingRefused(_staging_limit_error(
             f"The command names more than {max_entries} files and folders."
@@ -1740,6 +1778,17 @@ async def _plan_staging(
         path for path in wanted_dirs
         if path not in blocked_dirs and not any(path.startswith(directory + "/") for directory in blocked_dirs)
     }
+    # A command that names no location sees this run's Workspace, like the
+    # file tools; whatever it names stays subject to the read ACL above only.
+    outside = await _outside_run_workspace(
+        entity_id,
+        runtime_context,
+        sorted((discovered_files & set(wanted_files)) - named_paths),
+        sorted((discovered_dirs & wanted_dirs) - named_paths),
+    )
+    plan.files_outside_workspace = sum(1 for rel in wanted_files if rel in outside)
+    wanted_files = {rel: content for rel, content in wanted_files.items() if rel not in outside}
+    wanted_dirs -= outside
     # A document that became unreadable since it was staged leaves the copy.
     plan.deletes.extend(sorted(path for path in manifest.files if path in blocked))
 
@@ -1828,8 +1877,11 @@ async def _stage_command(
     sandbox_id: str,
     fresh: bool = False,
     output_dirs: tuple[str, ...] = (),
-) -> tuple[dict[str, Any] | None, str]:
-    """Stage what a command names: ``(refusal payload or None, working-copy epoch)``.
+) -> tuple[dict[str, Any] | None, str, int]:
+    """Stage what a command names.
+
+    Returns ``(refusal payload or None, working-copy epoch, files left out
+    because they are outside the run's Workspace)``.
 
     ``fresh`` discards what the manifest says is staged (the container's
     copy turned out not to match it) and starts the copy over.
@@ -1861,16 +1913,16 @@ async def _stage_command(
                         plan.dirs.add(path)
                         path = posixpath.dirname(path)
             except _StagingRefused as refused:
-                return refused.payload, manifest.epoch
+                return refused.payload, manifest.epoch, 0
             unexpected_reset = await _apply_stage_plan(mirror, manifest, plan)
             if not unexpected_reset:
                 await bash_mirror.save_manifest(manifest)
-                return None, manifest.epoch
+                return None, manifest.epoch, plan.files_outside_workspace
             # The container's copy did not match the manifest (new or wiped
             # copy): everything it was assumed to hold must be staged again.
             manifest = bash_mirror.MirrorManifest.fresh(mirror.manifest_id)
         await bash_mirror.save_manifest(manifest)
-        return None, manifest.epoch
+        return None, manifest.epoch, plan.files_outside_workspace
 
 
 # ---------------------------------------------------------------------------
@@ -2891,6 +2943,7 @@ async def _bash(entity_id: str, **kwargs: Any) -> str:
                 workflow_run_id=runtime_context.workflow_run_id,
                 workflow_lineage_root_run_id=runtime_context.workflow_lineage_root_run_id,
                 entity_root=entity_root,
+                workflow_project_root=runtime_context.workflow_project_root,
             )
         except ValueError as exc:
             if may_write:
@@ -3289,6 +3342,7 @@ async def _run_in_sandbox(
     epoch = str(state.get("epoch") or "")
     keep_active = False  # parked: the run stays on record as executing this command
     uncertain = False  # the command may or may not have run: keep the ticket to collect it again
+    files_outside_workspace = 0
     try:
         timed_out = False
         while True:
@@ -3296,7 +3350,7 @@ async def _run_in_sandbox(
             if pending is None:
                 if entity_root:
                     try:
-                        refusal, epoch = await _stage_command(
+                        refusal, epoch, files_outside_workspace = await _stage_command(
                             entity_id=entity_id,
                             entity_root=entity_root,
                             runtime_context=runtime_context,
@@ -3464,6 +3518,11 @@ async def _run_in_sandbox(
             result["outcome"] = detail or outcome
         result.update(_stream_output_fields("stdout", stdout))
         result.update(_stream_output_fields("stderr", stderr))
+        if files_outside_workspace:
+            result["scope_note"] = runtime_workspace_search_scope_note(
+                files_outside_workspace,
+                person_in_chat=runtime_tool_call_context_is_person_chat(runtime_context),
+            )
 
         operations: list[dict[str, Any]] = []
         if exec_id:

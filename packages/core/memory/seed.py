@@ -54,6 +54,8 @@ async def seed_workspace_memory(
         source="workspace_setup",
         importance=8,
         slug="about",
+        # MEMORY.md is what people tell the AI; the note stays searchable.
+        mirror_to_canonical=False,
     )
     written += 1
 
@@ -85,6 +87,7 @@ async def seed_workspace_memory(
         source="workspace_setup",
         importance=6,
         slug="approval-defaults",
+        mirror_to_canonical=False,
     )
     written += 1
 

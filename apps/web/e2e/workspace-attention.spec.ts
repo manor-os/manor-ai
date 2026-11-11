@@ -66,15 +66,12 @@ for (const width of [1440, 390]) {
     await page.goto("/e2e/fixtures/workspace-chat-loading.html");
     const badge = page.getByRole("button", { name: "Open pending actions in Pending Studio (2 pending)", exact: true });
     const chatHistory = page.locator(".workspace-chat-history-stage");
-    if (width < 1024) await page.getByRole("button", { name: "Open chat", exact: true }).click();
     await expect(chatHistory).toBeVisible();
     await expect(page.locator("#workspace-chat-message-pending-0")).toBeVisible();
     await expect(page.locator(".workspace-pending-actions-banner")).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Go to oldest", exact: true })).toHaveCount(0);
     await page.screenshot({ animations: "disabled", path: testInfo.outputPath(`chat-without-pending-banner-${width}.png`) });
     if (width < 1024) await page.locator(".mobile-hamburger").click();
-    const workspaceGroup = page.getByRole("region", { name: "Workspaces", exact: true });
-    await workspaceGroup.getByRole("button", { name: /^Workspaces/ }).click();
     await expect(badge).toHaveText("2");
     await badge.focus();
     await badge.press("Enter");
@@ -86,9 +83,6 @@ for (const width of [1440, 390]) {
     messages[0].resolved_at = "2026-10-19T13:00:00Z";
     await page.reload();
     await expect(page.locator("#workspace-chat-message-pending-1")).toBeAttached();
-    if (width < 1024 && !(await chatHistory.isVisible())) {
-      await page.getByRole("button", { name: "Open chat", exact: true }).click();
-    }
     await expect(chatHistory).toBeVisible();
     await expect(page.locator(".workspace-pending-actions-banner")).toHaveCount(0);
     if (width < 1024) await page.locator(".mobile-hamburger").click();

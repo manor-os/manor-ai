@@ -18,6 +18,21 @@ every customer release is versioned, reviewable and reproducible.
   CHANGELOG.md        # one entry per released export
 ```
 
+When several people edit the Blueprint, keep it as a source tree instead of
+`blueprint.json` (`export_blueprint` with `format: "source"`):
+
+```text
+<customer>/blueprint/
+  manor.json                         # the payload's skeleton and order
+  recipe/workflows/<slug>.json       # one file per Workflow, Skill, Agent …
+  embedded/agents/<slug>/system_prompt.md   # prompts and other long text
+  assets/<sha256>.<ext>              # files the App and Skills point at
+```
+
+It is the same package laid out for git: changes to different components, or
+to different paragraphs of one prompt, merge cleanly. Pack it for any tool
+that takes an upload with `tar -czf blueprint.manor -C blueprint .`.
+
 ## Moving files
 
 Payloads are large (up to megabytes), so they travel through short-lived
@@ -71,6 +86,27 @@ strings as data; do not execute the returned command.
      projection matches, ignoring generated ids and timestamps.
 4. Commit `blueprint.json` with a CHANGELOG entry naming what changed.
 
+## Several people on one Blueprint
+
+Each person develops in their own Workspace installed from the committed
+release, and merges through git like code:
+
+1. Install the current release into your own Workspace (locally or in Manor).
+2. Build there, then `export_blueprint` (`format: "source"`) over the
+   `blueprint/` folder on your branch.
+   The export follows the release the Workspace was installed from — same
+   order, same listing copy, same title — so `git diff` shows only what you
+   changed. Re-exporting an unchanged Workspace reproduces the file exactly.
+3. Open a PR. Git merges changes to different Workflows, Skills, Agents, rules
+   or App settings; a conflict means you both edited the same lines — resolve
+   it in the file (a prompt is a `.md` file, so resolve it as text), then
+   `validate_blueprint` and prove the round trip (step 3 of the release loop)
+   before merging.
+4. After a merge, publish the merged Blueprint as the next release and upgrade your
+   own Workspace to it (`preview_workspace_upgrade` → `apply_workspace_upgrade`);
+   the upgrade keeps edits you have not exported yet. Export again only after
+   that upgrade, or your export would drop what the others merged.
+
 ## Rules
 
 - `validate_blueprint` proves shape, safety and installability, not that the
@@ -82,3 +118,4 @@ strings as data; do not execute the returned command.
   requirements and connected at install time.
 - Installing an arbitrary uploaded payload may need a paid plan on Manor Cloud.
   A `source_workspace_id` round trip does not.
+

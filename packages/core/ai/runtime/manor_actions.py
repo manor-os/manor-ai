@@ -1627,6 +1627,7 @@ async def runtime_manor_list_documents(
     user_id: str | None = None,
     workspace_id: str | None = None,
     params: Mapping[str, Any] | None = None,
+    person_in_chat: bool = False,
 ) -> str:
     """List Knowledge documents via the Runtime Manor document boundary."""
 
@@ -1638,6 +1639,7 @@ async def runtime_manor_list_documents(
         workspace_id=workspace_id,
         params=dict(params or {}),
         db=db,
+        person_in_chat=person_in_chat,
     )
 
 
@@ -1649,6 +1651,7 @@ async def runtime_manor_search_documents(
     workspace_id: str | None = None,
     params: Mapping[str, Any] | None = None,
     user_wording: str | None = None,
+    person_in_chat: bool = False,
 ) -> str:
     """Search Knowledge documents via the Runtime Manor document boundary."""
 
@@ -1661,6 +1664,7 @@ async def runtime_manor_search_documents(
         params=dict(params or {}),
         db=db,
         user_wording=user_wording,
+        person_in_chat=person_in_chat,
     )
 
 
@@ -2284,10 +2288,28 @@ async def runtime_manor_delete_document(
     workspace_id: str | None = None,
     params: Mapping[str, Any] | None = None,
 ) -> str:
-    """Delete a Knowledge document via the Runtime Manor document boundary."""
+    """Delete a Knowledge document via the Runtime Manor document boundary.
+
+    ``document_ids`` deletes several in one call (a removed post's files): each
+    is checked on its own, and one that is already gone is reported, not an error.
+    """
 
     if not user_id:
         return json.dumps({"deleted": False, "error": "User context is required"})
+    batch = (params or {}).get("document_ids")
+    if batch is not None:
+        if not isinstance(batch, list) or len(batch) > 200:
+            return json.dumps({"deleted": False, "error": "document_ids must be a list of at most 200 IDs"})
+        results = {}
+        for document_id in dict.fromkeys(str(item or "").strip() for item in batch):
+            if not document_id:
+                continue
+            outcome = json.loads(await runtime_manor_delete_document(
+                db, entity_id=entity_id, user_id=user_id, workspace_id=workspace_id,
+                params={"document_id": document_id},
+            ))
+            results[document_id] = outcome.get("error") or ("deleted" if outcome.get("deleted") else "not_deleted")
+        return json.dumps({"deleted": sum(value == "deleted" for value in results.values()), "results": results})
 
     from packages.core.models.permission import Capability
     from packages.core.services.document_access import (
@@ -2898,6 +2920,7 @@ async def runtime_manor_start_workspace_draft(
     user_id: str = "",
     params: Mapping[str, Any] | None = None,
     runtime_envelope: Any | None = None,
+    active_user_message: str | None = None,
 ) -> str:
     """Start a workspace draft via the Runtime Manor action boundary."""
 
@@ -2908,6 +2931,7 @@ async def runtime_manor_start_workspace_draft(
         user_id=user_id or "",
         initial_brief=dict(params or {}).get("initial_brief"),
         runtime_envelope=runtime_envelope,
+        active_user_message=active_user_message,
     )
 
 
@@ -2916,6 +2940,7 @@ async def runtime_manor_continue_workspace_draft(
     entity_id: str,
     user_id: str = "",
     params: Mapping[str, Any] | None = None,
+    active_user_message: str | None = None,
 ) -> str:
     """Continue a workspace draft via the Runtime Manor action boundary."""
 
@@ -2929,6 +2954,7 @@ async def runtime_manor_continue_workspace_draft(
         user_id=user_id or "",
         draft_id=str(values.get("draft_id") or ""),
         message=str(values.get("message") or ""),
+        active_user_message=active_user_message,
     )
 
 
@@ -3848,23 +3874,228 @@ async def runtime_manor_list_notifications(
     }, default=str)
 
 
+async def _runtime_chat_history_reader(
+    db: Any,
+    *,
+    entity_id: str,
+    user_id: str | None,
+    workspace_ids: Any = (),
+    conversation_id: str | None = None,
+    shared_run: bool = False,
+) -> Any:
+    """Who reads, narrowed by who else will see this turn's answer.
+
+    The stored conversation decides as well as the tool context, so a shared
+    conversation stays narrow even when the context carries no Workspace.
+    """
+
+    from sqlalchemy import select
+
+    from packages.core.models.task import Conversation
+    from packages.core.services.chat_history_access import ChatHistoryInvalid, ChatHistoryReader
+    from packages.core.services.conversation_records import CHANNEL_HISTORY_CHANNELS
+    from packages.core.services.runtime_authorization import collaborator
+
+    if not user_id:
+        raise ChatHistoryInvalid("Chat records can only be read for a signed-in person.")
+    if await collaborator.is_runtime_collaborator(user_id, entity_id):
+        raise ChatHistoryInvalid("Chat records are not available to external collaborators.")
+    scopes = {str(value) for value in workspace_ids if value}
+    if conversation_id:
+        conversation = await db.scalar(select(Conversation).where(
+            Conversation.id == conversation_id, Conversation.entity_id == entity_id,
+        ))
+        if conversation is not None:
+            if (conversation.channel or "").lower() in CHANNEL_HISTORY_CHANNELS:
+                raise ChatHistoryInvalid("Chat records cannot be read from an external channel.")
+            if conversation.workspace_id:
+                scopes.add(conversation.workspace_id)
+            if conversation.thread_ref_kind == "task":
+                shared_run = True
+                if not conversation.workspace_id:
+                    raise ChatHistoryInvalid("Chat records in a Task or Workflow require a Workspace scope.")
+    if len(scopes) > 1:
+        raise ChatHistoryInvalid("This turn belongs to more than one Workspace, so chat records stay closed.")
+    if shared_run and not scopes:
+        raise ChatHistoryInvalid("Chat records in a Task or Workflow require a Workspace scope.")
+    return ChatHistoryReader(user_id=user_id, entity_id=entity_id, workspace_id=next(iter(scopes), None))
+
+
+async def _runtime_chat_history_answer(
+    db: Any,
+    call: Any,
+    *,
+    entity_id: str,
+    user_id: str | None,
+    params: Mapping[str, Any] | None,
+    workspace_ids: Any,
+    conversation_id: str | None,
+    shared_run: bool = False,
+) -> str:
+    from packages.core.services.chat_history_access import (
+        ChatHistoryInvalid,
+        ChatHistoryNotFound,
+        ChatHistoryQueryTooBroad,
+    )
+
+    try:
+        reader = await _runtime_chat_history_reader(
+            db, entity_id=entity_id, user_id=user_id, workspace_ids=workspace_ids, conversation_id=conversation_id,
+            shared_run=shared_run,
+        )
+        return json.dumps(await call(reader, dict(params or {})), ensure_ascii=False, default=str)
+    except (ChatHistoryInvalid, ChatHistoryNotFound, ChatHistoryQueryTooBroad) as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
 async def runtime_manor_list_conversations(
     db: Any,
     *,
     entity_id: str,
     user_id: str | None = None,
+    params: Mapping[str, Any] | None = None,
+    workspace_ids: Any = (),
+    conversation_id: str | None = None,
+    shared_run: bool = False,
 ) -> str:
-    """List conversation records via the Runtime Manor communication boundary."""
+    """List the conversations this person may read, within this turn's audience."""
 
-    from packages.core.services.conversation_records import list_conversations
+    from packages.core.services.chat_history_access import list_conversation_sources
 
-    if not user_id:
-        return json.dumps({"error": "user context is required"})
-    convos = await list_conversations(db, entity_id, user_id=user_id)
-    return json.dumps([
-        {"id": c.id, "title": c.title}
-        for c in convos
-    ], default=str)
+    async def call(reader: Any, args: dict[str, Any]) -> dict[str, Any]:
+        return await list_conversation_sources(
+            db, reader, kind=args.get("kind"), workspace_id=args.get("workspace_id"), limit=args.get("limit"),
+        )
+
+    return await _runtime_chat_history_answer(
+        db, call, entity_id=entity_id, user_id=user_id, params=params,
+        workspace_ids=workspace_ids, conversation_id=conversation_id,
+        shared_run=shared_run,
+    )
+
+
+async def runtime_manor_search_conversation_messages(
+    db: Any,
+    *,
+    entity_id: str,
+    user_id: str | None = None,
+    params: Mapping[str, Any] | None = None,
+    workspace_ids: Any = (),
+    conversation_id: str | None = None,
+    shared_run: bool = False,
+) -> str:
+    """Search messages across the conversations this person may read."""
+
+    from packages.core.services.chat_history_access import search_messages
+
+    async def call(reader: Any, args: dict[str, Any]) -> dict[str, Any]:
+        return await search_messages(
+            db, reader, query=args.get("query") or "", kind=args.get("kind"),
+            conversation_id=args.get("conversation_id"), workspace_id=args.get("workspace_id"),
+            sender_user_id=args.get("sender_user_id"), after=args.get("after"), before=args.get("before"),
+            cursor=args.get("cursor"), limit=args.get("limit"),
+        )
+
+    return await _runtime_chat_history_answer(
+        db, call, entity_id=entity_id, user_id=user_id, params=params,
+        workspace_ids=workspace_ids, conversation_id=conversation_id,
+        shared_run=shared_run,
+    )
+
+
+async def runtime_manor_read_conversation_messages(
+    db: Any,
+    *,
+    entity_id: str,
+    user_id: str | None = None,
+    params: Mapping[str, Any] | None = None,
+    workspace_ids: Any = (),
+    conversation_id: str | None = None,
+    shared_run: bool = False,
+) -> str:
+    """Read messages of one conversation this person may read."""
+
+    from packages.core.services.chat_history_access import read_messages
+
+    async def call(reader: Any, args: dict[str, Any]) -> dict[str, Any]:
+        return await read_messages(
+            db, reader, kind=args.get("kind") or "", conversation_id=args.get("conversation_id") or "",
+            around_message_id=args.get("around_message_id"), before=args.get("before"),
+            after=args.get("after"), limit=args.get("limit"),
+        )
+
+    return await _runtime_chat_history_answer(
+        db, call, entity_id=entity_id, user_id=user_id, params=params,
+        workspace_ids=workspace_ids, conversation_id=conversation_id,
+        shared_run=shared_run,
+    )
+
+
+async def runtime_manor_read_memory(
+    db: Any,
+    *,
+    entity_id: str,
+    user_id: str | None = None,
+    params: Mapping[str, Any] | None = None,
+    runtime_envelope: Any = None,
+) -> str:
+    """Read one memory layer file this turn may see."""
+    from packages.core.memory.layer_prompt import speaker_is_collaborator
+    from packages.core.memory.layers import (
+        memory_scope_has_speaker_in_workspace, memory_turn_scope, read_memory_layer,
+    )
+
+    args = dict(params or {})
+    scope = memory_turn_scope(runtime_envelope, user_id=user_id)
+    if memory_scope_has_speaker_in_workspace(scope):
+        scope = memory_turn_scope(runtime_envelope, user_id=user_id, collaborator=await speaker_is_collaborator(
+            db, entity_id=entity_id, user_id=scope.speaker_id,
+        ))
+    result = await read_memory_layer(
+        db, scope, entity_id=entity_id, layer=str(args.get("layer") or "").strip(),
+        workspace_id=str(args.get("workspace_id") or "").strip() or None,
+        user_id=str(args.get("user_id") or "").strip() or None,
+    )
+    return json.dumps(result, ensure_ascii=False)
+
+
+async def runtime_file_chat_mentions(
+    db: Any,
+    *,
+    entity_id: str,
+    user_id: str | None,
+    file_name: str,
+    after: Any = None,
+    workspace_ids: Any = (),
+    conversation_id: str | None = None,
+    shared_run: bool = False,
+) -> list[dict[str, Any]]:
+    """Chat messages naming a file, for the turn that opened it; empty when chat stays closed."""
+
+    from sqlalchemy import select
+
+    from packages.core.models.user import UserMembership
+    from packages.core.permissions import Permission, user_has_effective_permission
+    from packages.core.services.chat_history_access import (
+        ChatHistoryInvalid,
+        ChatHistoryQueryTooBroad,
+        file_mentions,
+    )
+
+    try:
+        reader = await _runtime_chat_history_reader(
+            db, entity_id=entity_id, user_id=user_id, workspace_ids=workspace_ids, conversation_id=conversation_id,
+            shared_run=shared_run,
+        )
+        role = await db.scalar(select(UserMembership.role).where(
+            UserMembership.user_id == reader.user_id, UserMembership.entity_id == entity_id,
+            UserMembership.status == "active",
+        ))
+        if not await user_has_effective_permission(db, reader.user_id, entity_id, role, Permission.CHAT_USE):
+            return []
+        return await file_mentions(db, reader, file_name=file_name, after=after)
+    except (ChatHistoryInvalid, ChatHistoryQueryTooBroad):
+        return []
 
 
 async def runtime_manor_send_email(

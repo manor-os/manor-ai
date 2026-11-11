@@ -51,6 +51,9 @@ from sqlalchemy.pool import NullPool  # noqa: E402
 from packages.core.models.base import Base  # noqa: E402
 import packages.core.models  # noqa: E402,F401 — import all models for metadata
 from packages.core.services.mcp_seed import seed_mcp_catalog  # noqa: E402
+# Imported here so a test stubbing ``packages.core.config.get_settings`` cannot be
+# the first to import it: the module would keep that stub for the whole process.
+import packages.core.services.sandbox_queue_service  # noqa: E402,F401
 
 _tables_created = False
 _TEST_DATABASE_ADVISORY_LOCK_ID = 742918364

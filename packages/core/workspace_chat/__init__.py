@@ -23,7 +23,6 @@ from packages.core.workspace_chat.notifiers import (
     notify_step_done,
     notify_step_failed,
     notify_step_needs_human,
-    notify_goal_measured,
     notify_goal_pace_changed,
     notify_goal_achieved,
 )
@@ -39,7 +38,6 @@ __all__ = [
     "notify_step_done",
     "notify_step_failed",
     "notify_step_needs_human",
-    "notify_goal_measured",
     "notify_goal_pace_changed",
     "notify_goal_achieved",
 ]

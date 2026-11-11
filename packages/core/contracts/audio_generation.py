@@ -82,10 +82,14 @@ class AudioGenerationErrorCode(StringValueEnum):
     MODEL_CHANGED_REINSPECT_REQUIRED = "audio_model_changed_reinspect_required"
     UNSUPPORTED_NONVOICE_AUDIO_MODEL = "unsupported_nonvoice_audio_model"
     PROVIDER_KEY_REQUIRED = "provider_key_required"
+    # Manor has no price for the model, so it cannot run on Manor credits.
+    MODEL_NOT_BILLABLE = "model_not_billable"
     NATIVE_MUSIC_KEY_REQUIRED = "native_music_key_required"
     AUDIO_PROVIDER_UNAVAILABLE = "audio_provider_unavailable"
     PROVIDER_BLOCKER = "provider_blocker"
     AUDIO_GENERATION_FAILED = "audio_generation_failed"
+    # The provider refused the description itself; the person describes it differently.
+    PROMPT_DECLINED = "prompt_declined"
     NARRATION_VOICE_PROFILE_TASK_REQUIRED = "narration_voice_profile_task_required"
     NARRATION_VOICE_PROFILE_CONVERSATION_REQUIRED = "narration_voice_profile_conversation_required"
     NARRATION_VOICE_PROFILE_WORKSPACE_REQUIRED = "narration_voice_profile_workspace_required"

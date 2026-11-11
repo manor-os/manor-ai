@@ -26,7 +26,10 @@ class MetricsWorkspaceDaily(Base):
     """One row per (day, workspace_id, surface).
 
     Run surfaces (task / agent / workflow / automation) fill the outcome
-    columns; the ``workspace`` surface fills the quality counts and credits."""
+    columns; the ``workspace`` surface fills the quality counts and credits.
+    The ``work`` surface fills the outcome columns too, from the same runs read
+    as work units, so it must never be added to the run surfaces. Its
+    ``top_errors`` stay empty and its ``retried`` stays 0."""
 
     __tablename__ = "metrics_workspace_daily"
     __table_args__ = (
@@ -51,6 +54,7 @@ class MetricsWorkspaceDaily(Base):
     duration_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     duration_buckets: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     top_errors: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
+    error_codes: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     user_cancelled: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     reviews_accepted: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     reviews_rejected: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")

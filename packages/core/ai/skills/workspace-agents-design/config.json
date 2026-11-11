@@ -1,0 +1,28 @@
+{
+  "id": "workspace-agents-design",
+  "name": "workspace-agents-design",
+  "display_name": "Workspace Agents design",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Design the Agent each Workspace service gets: reuse an existing Agent or design a custom one whose capabilities and Skills the matcher selects, covering every file kind it must make. Guides the Agents designer.",
+  "category": "workspace-design",
+  "output_format": "guidance",
+  "tags": [
+    "workspace-operations",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "search": {
+    "terms": [
+      "agent design",
+      "workspace agents",
+      "capability matching",
+      "agent skills"
+    ],
+    "examples": [
+      "design the agents of a workspace",
+      "guidance for designing a custom agent for a service",
+      "guidance for agents designer capability matching per service"
+    ]
+  }
+}

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import re
+from datetime import date, datetime
 from enum import Enum
 from typing import Any
 
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, FormatChecker, ValidationError, validators
 from referencing import Registry
 from referencing.jsonschema import DRAFT202012
 
@@ -261,10 +263,75 @@ def iter_schema_refs(schema: Any):
                 yield node[key]
 
 
+# ── Form controls ────────────────────────────────────────────────────────
+#
+# Forms (Workflow run inputs, wait inputs, request_input fields) pick each
+# control from the schema: ``format`` and ``x-ui.control``. The few rules a
+# control implies that plain JSON Schema cannot say are checked here, so every
+# surface that validates an answer refuses the same values the form does.
+
+_PHONE_PATTERN = re.compile(r"^\+?[0-9 ()./-]{6,24}$")
+_HEX_COLOR_PATTERN = re.compile(r"^#[0-9A-Fa-f]{6}$")
+#: The rating scale when the schema names no ``maximum``.
+DEFAULT_RATING_MAX = 5
+
+
+def _format_checker() -> FormatChecker:
+    checker = FormatChecker(formats=())
+    checker.checkers = dict(Draft202012Validator.FORMAT_CHECKER.checkers)
+
+    @checker.checks("phone")
+    def _phone(value: object) -> bool:
+        if not isinstance(value, str):
+            return True
+        digits = sum(char.isdigit() for char in value)
+        return bool(_PHONE_PATTERN.match(value.strip())) and 6 <= digits <= 15
+
+    return checker
+
+
+def _range_bound(value: Any) -> datetime | date | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        if len(text) == 10:
+            return date.fromisoformat(text)
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _x_ui_control(validator: Any, ui: Any, instance: Any, schema: dict[str, Any]):
+    """The value rules of ``x-ui.control`` that JSON Schema keywords cannot state."""
+    if not isinstance(ui, dict):
+        return
+    control = ui.get("control")
+    if control == "color" and isinstance(instance, str) and instance and not _HEX_COLOR_PATTERN.match(instance):
+        yield ValidationError(f"{instance!r} is not a colour like #1A2B3C")
+    elif control == "rating" and not isinstance(instance, bool) and isinstance(instance, (int, float)):
+        low = schema.get("minimum", 1)
+        high = schema.get("maximum", DEFAULT_RATING_MAX)
+        if instance != int(instance) or not low <= instance <= high:
+            yield ValidationError(f"{instance!r} is not a whole rating from {low} to {high}")
+    elif control == "date_range" and isinstance(instance, dict):
+        start, end = _range_bound(instance.get("start")), _range_bound(instance.get("end"))
+        if start is not None and end is not None and type(start) is type(end):
+            try:
+                reversed_range = end < start
+            except TypeError:  # an aware and a naive moment cannot be ordered
+                reversed_range = False
+            if reversed_range:
+                yield ValidationError("The end of the range is before its start")
+
+
+_ContractValidator = validators.extend(Draft202012Validator, {"x-ui": _x_ui_control})
+
+
 class SchemaContractValidatorFactory:
     """Build every runtime validator with one dialect and format policy."""
 
-    _format_checker = Draft202012Validator.FORMAT_CHECKER
+    _format_checker = _format_checker()
 
     @classmethod
     def assertion_keywords(cls) -> frozenset[str]:
@@ -279,7 +346,7 @@ class SchemaContractValidatorFactory:
     @classmethod
     def build(cls, schema: dict[str, Any]) -> Draft202012Validator:
         registry, _ = _validated_contract(schema)
-        return Draft202012Validator(
+        return _ContractValidator(
             schema,
             registry=registry,
             format_checker=cls._format_checker,

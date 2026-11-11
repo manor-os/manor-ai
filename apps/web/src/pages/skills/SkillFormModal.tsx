@@ -134,7 +134,15 @@ export function SkillFormModal({ skill, open, onClose }: SkillFormModalProps) {
       invalidateCatalogQueries(queryClient, "skills");
       onClose();
     },
-    onError: (e: any) => toast.error(e?.message || t("page.skills.failed_update_skill")),
+    onError: (e: any) => {
+      // Someone else saved first: keep this form open so nothing typed is lost.
+      if (e?.code === "skill.error.edited_elsewhere") {
+        invalidateCatalogQueries(queryClient, "skills");
+        toast.error(t("skill.error.edited_elsewhere"));
+        return;
+      }
+      toast.error(e?.message || t("page.skills.failed_update_skill"));
+    },
   });
 
   const handleSubmit = () => {
@@ -164,6 +172,7 @@ export function SkillFormModal({ skill, open, onClose }: SkillFormModalProps) {
       payload.extra_files = extraFiles;
       payload.requirements = requirements;
     }
+    if (skill && Number(skill.edit_version)) payload.expected_edit_version = Number(skill.edit_version);
     if (skill) updateMutation.mutate({ id: skill.id as string, data: payload });
     else createMutation.mutate(payload);
   };
@@ -202,7 +211,7 @@ export function SkillFormModal({ skill, open, onClose }: SkillFormModalProps) {
               borderRadius: 8,
               border: "none",
               background: mode === m ? "var(--modal-sunken-bg)" : "transparent",
-              boxShadow: mode === m ? "0 1px 2px rgba(28, 25, 23, 0.08)" : "none",
+              boxShadow: mode === m ? "0 1px 2px rgba(29, 29, 31, 0.08)" : "none",
               color: mode === m ? "var(--text-strong)" : "var(--text-muted)",
               fontSize: 13,
               fontWeight: 600,
@@ -285,12 +294,12 @@ export function SkillFormModal({ skill, open, onClose }: SkillFormModalProps) {
             loading={filesLoading}
           />
           <div>
-            <label htmlFor="skill-execution-type" className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-1.5">Execution method</label>
+            <label htmlFor="skill-execution-type" className="block text-xs font-semibold text-stone-500 mb-1.5">{t("ui.execution_method")}</label>
             <select id="skill-execution-type" value={executionType} onChange={(event) => setExecutionType(event.target.value)} className="manor-input">
-              <option value="">Automatic</option>
-              <option value="prompt">Agent follows instructions</option>
-              <option value="runtime_guidance">Agent follows runtime guidance</option>
-              <option value="sandbox">Run bundled scripts</option>
+              <option value="">{t("ui.automatic")}</option>
+              <option value="prompt">{t("ui.agent_follows_instructions")}</option>
+              <option value="runtime_guidance">{t("ui.agent_follows_runtime_guidance")}</option>
+              <option value="sandbox">{t("ui.run_bundled_scripts")}</option>
             </select>
           </div>
           <Input
@@ -303,7 +312,7 @@ export function SkillFormModal({ skill, open, onClose }: SkillFormModalProps) {
             style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 240px), 1fr))", gap: 14 }}
           >
             <div>
-              <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-1.5">
+              <label className="block text-xs font-semibold text-stone-500 mb-1.5">
                 {t("page.workspaces.category")}
               </label>
               <select value={category} onChange={(e) => setCategory(e.target.value)} className="manor-input">
@@ -314,7 +323,7 @@ export function SkillFormModal({ skill, open, onClose }: SkillFormModalProps) {
               </select>
             </div>
             <div>
-              <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-1.5">
+              <label className="block text-xs font-semibold text-stone-500 mb-1.5">
                 {t("page.skill_form.output_format")}
               </label>
               <select value={outputFormat} onChange={(e) => setOutputFormat(e.target.value)} className="manor-input">

@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from packages.core.ai.runtime.memory import (
-    runtime_allows_agent_memory_reader,
+    IDENTITY_MEMORY_FILES,
+    runtime_identity_file_filter,
     runtime_allows_workspace_memory_reader,
 )
 
@@ -50,6 +51,7 @@ def runtime_agent_identity_prompt(
     agent_id: str | None = None,
     user_id: str | None = None,
     allow_agent_files: bool = True,
+    file_allowed: Callable[[str, str, str | None], bool] | None = None,
     strict: bool = False,
 ) -> RuntimeAgentIdentityPrompt:
     """Render the base agent identity and optional file-backed supplements."""
@@ -75,11 +77,14 @@ def runtime_agent_identity_prompt(
             )
 
             effective_id = effective_agent_id(agent_id)
+            file_options: dict[str, Any] = {"strict": True} if strict else {}
+            if file_allowed is not None:
+                def level_allowed(filename: str, level: str) -> bool:
+                    return file_allowed(filename, effective_id, level)
+
+                file_options["level_allowed"] = level_allowed
             files, levels = load_agent_files_with_levels(
-                entity_id,
-                effective_id,
-                user_id=user_id,
-                **({"strict": True} if strict else {}),
+                entity_id, effective_id, user_id=user_id, **file_options,
             )
             if files.has_content() and agent_files_have_custom_content(files, effective_id):
                 source = "db+files" if base_prompt else "files"
@@ -92,7 +97,7 @@ def runtime_agent_identity_prompt(
                         file_parts.append(rendered)
                         section = context_section(
                             filename, rendered,
-                            category="memory_files" if filename in {"MEMORY.md", "LEARNINGS.md"} else "agent_instructions",
+                            category="memory_files" if filename in IDENTITY_MEMORY_FILES else "agent_instructions",
                             source=f"agent_files:{entity_id}:{effective_id}:{levels.get(filename, 'entity')}:{user_id if levels.get(filename) == 'user' else ''}:{filename}",
                         )
                         section["resolved_scope"] = levels.get(filename)
@@ -212,6 +217,7 @@ def runtime_workspace_operating_memory_prompt(
         from packages.core.memory.canonical import (
             ensure_workspace_memory_docs,
             WORKSPACE_MEMORY_DEFAULT_LOAD_ORDER, WORKSPACE_AGENT_MEMORY_FILES,
+            WORKSPACE_GENERATED_CACHE_FILES, WORKSPACE_PROMPT_LAYERED_FILES, is_default_memory_doc,
             read_workspace_memory_file, read_workspace_agent_memory_file,
         )
         from packages.core.services.agent_files import effective_agent_id
@@ -232,18 +238,27 @@ def runtime_workspace_operating_memory_prompt(
         for scope, filenames in (("workspace", WORKSPACE_MEMORY_DEFAULT_LOAD_ORDER),
                                  ("workspace_agent", WORKSPACE_AGENT_MEMORY_FILES)):
             for filename in filenames:
+                if scope == "workspace" and (
+                    filename in WORKSPACE_GENERATED_CACHE_FILES or filename in WORKSPACE_PROMPT_LAYERED_FILES
+                ):
+                    continue
                 content = (
                     read_workspace_memory_file(entity_id, workspace_id, filename)
                     if scope == "workspace" else
                     read_workspace_agent_memory_file(entity_id, workspace_id, aid, filename)
                 )
-                if content:
-                    title = "Workspace Operating Memory" if scope == "workspace" else "Workspace-Agent Override Memory"
-                    sections.append(context_section(
-                        f"{scope}:{filename}", f"## {title}\n### {filename}\n{content}",
-                        category="rules" if filename == "RULES.md" else "memory_files",
-                        source=f"{scope}:{entity_id}:{workspace_id}:{aid if scope == 'workspace_agent' else ''}:{filename}",
-                    ))
+                if is_default_memory_doc(
+                    filename, content, agent=scope == "workspace_agent",
+                    workspace_name=getattr(workspace, "name", None),
+                    workspace_kind=getattr(workspace, "kind", None),
+                ):
+                    continue
+                title = "Workspace Operating Memory" if scope == "workspace" else "Workspace-Agent Override Memory"
+                sections.append(context_section(
+                    f"{scope}:{filename}", f"## {title}\n### {filename}\n{content}",
+                    category="rules" if filename == "RULES.md" else "memory_files",
+                    source=f"{scope}:{entity_id}:{workspace_id}:{aid if scope == 'workspace_agent' else ''}:{filename}",
+                ))
         if sections_out is not None:
             sections_out.extend(sections)
         else:
@@ -254,6 +269,36 @@ def runtime_workspace_operating_memory_prompt(
             raise
         logger.debug("Runtime workspace operating memory loading failed", exc_info=True)
         return None
+
+
+async def runtime_read_agent_memories(
+    db: Any,
+    *,
+    envelope,
+    entity_id: str,
+    agent_id: str | None,
+    user_id: str | None,
+    query: str | None,
+    sync_files: bool = True,
+) -> str:
+    """Read one exact memory scope for initial prompts and context refresh."""
+    from packages.core.services.agent_files import effective_agent_id
+
+    allowed = runtime_identity_file_filter(envelope, user_id)
+    if allowed is not None:
+        # Stored memories share the scope of the identity's MEMORY.md.
+        identity = effective_agent_id(agent_id)
+        if not user_id or not allowed("MEMORY.md", identity, "user"):
+            if not allowed("MEMORY.md", identity, "entity"):
+                return ""
+            user_id = None
+
+    from packages.core.services.memory_service import get_context_memories
+
+    return await get_context_memories(
+        db, entity_id, agent_id=agent_id, user_id=user_id,
+        query=query, sync_files=sync_files,
+    )
 
 
 async def runtime_agent_memories_prompt(
@@ -268,17 +313,10 @@ async def runtime_agent_memories_prompt(
     """Render agent/user memories only when the runtime mounted them."""
     if not db or not entity_id:
         return None
-    if not runtime_allows_agent_memory_reader(envelope):
-        return None
     try:
-        from packages.core.services.memory_service import get_context_memories
-
-        memories = await get_context_memories(
-            db,
-            entity_id,
-            agent_id=agent_id,
-            user_id=user_id,
-            query=active_user_message,
+        memories = await runtime_read_agent_memories(
+            db, envelope=envelope, entity_id=entity_id, agent_id=agent_id,
+            user_id=user_id, query=active_user_message,
         )
         if memories:
             return f"## Agent Memories\n{memories}"

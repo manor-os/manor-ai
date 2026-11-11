@@ -12,24 +12,23 @@ SUBAGENTS_METADATA_KEY = "runtime_subagents"
 # many rounds; the account balance and Workspace budget bound what it spends.
 SUBAGENT_MAX_ROUNDS = 200
 PLAN_STEP_MAX_ROUNDS = SUBAGENT_MAX_ROUNDS
+# The Workspace Architect, and each part designer it commands, gets this many.
+ARCHITECT_MAX_ROUNDS = 500
 # Designs a Workspace App page when the Architect or Workspace chat commands it;
 # those agents only send the brief and accept or send back its candidate.
 WORKSPACE_APP_DESIGNER_SUBAGENT = "workspace_app_designer"
-WORKSPACE_APP_DESIGNER_TOOLS = ("app_read_context", "app_pattern_project_tree", "app_submit_candidate")
+# Designs a Workspace's Workflows and Stats the same way.
+WORKSPACE_WORKFLOW_DESIGNER_SUBAGENT = "workspace_workflow_designer"
+# Design each service's Agent, the Knowledge nets and the Automations the same way.
+WORKSPACE_AGENTS_DESIGNER_SUBAGENT = "workspace_agents_designer"
+WORKSPACE_KNOWLEDGE_DESIGNER_SUBAGENT = "workspace_knowledge_designer"
+WORKSPACE_AUTOMATIONS_DESIGNER_SUBAGENT = "workspace_automations_designer"
 
 
-def _workspace_app_designer_spec(profile: RuntimeProfile) -> SubAgentSpec:
-    return SubAgentSpec(
-        name=WORKSPACE_APP_DESIGNER_SUBAGENT,
-        purpose="Design a Workspace App page from what the Workspace runs and submit a checked candidate.",
-        profile=profile,
-        allowed_tools=WORKSPACE_APP_DESIGNER_TOOLS,
-        max_steps=SUBAGENT_MAX_ROUNDS,
-        output_contract={
-            "format": "app_view_candidate",
-            "required_fields": ("app_view", "design_notes"),
-        },
-    )
+def _part_designer_specs(profile: RuntimeProfile, max_steps: int) -> tuple[SubAgentSpec, ...]:
+    from packages.core.services.workspace_part_designers import designer_subagent_specs
+
+    return designer_subagent_specs(profile, max_steps)
 
 
 @dataclass(frozen=True)
@@ -98,7 +97,7 @@ def subagent_specs_for_surface(
                     "required_fields": ("risks", "missing_capabilities", "recommendations"),
                 },
             ),
-            _workspace_app_designer_spec(RuntimeProfile.WORKSPACE_ARCHITECT),
+            *_part_designer_specs(RuntimeProfile.WORKSPACE_ARCHITECT, ARCHITECT_MAX_ROUNDS),
         )
 
     if surface == ChatSurface.WORKSPACE_CHAT and workspace_id:
@@ -115,7 +114,7 @@ def subagent_specs_for_surface(
                     "required_fields": ("findings", "recommendations", "open_questions"),
                 },
             ),
-            _workspace_app_designer_spec(RuntimeProfile.WORKSPACE_OPERATOR),
+            *_part_designer_specs(RuntimeProfile.WORKSPACE_OPERATOR, SUBAGENT_MAX_ROUNDS),
         )
 
     if surface in {

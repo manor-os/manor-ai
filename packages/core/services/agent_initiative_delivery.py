@@ -482,6 +482,31 @@ def initiative_notification_link(
     return "/chat/history"
 
 
+def initiative_notification_channels(
+    configured: list[str], user_preferences: dict | None,
+) -> list[str]:
+    """The Initiative's channels, unless the owner set "Agent initiative update".
+
+    The owner's own per-kind notification setting wins, as for every other
+    catalogued kind: switched off means the bell only; chosen channels
+    replace the Initiative's.
+    """
+    from packages.core.services.notification_routing import (
+        by_kind_override,
+        user_notification_prefs,
+    )
+
+    override = by_kind_override(
+        user_notification_prefs(user_preferences), "agent_initiative_update",
+    )
+    if override is None:
+        return configured
+    if override.get("enabled") is False:
+        return ["inapp"]
+    chosen = [channel for channel in override.get("channels") or [] if isinstance(channel, str)]
+    return list(dict.fromkeys(["inapp", *chosen])) if chosen else configured
+
+
 def initiative_quiet_hours_active(
     interruption_policy: InterruptionPolicy,
     *,
@@ -1178,7 +1203,9 @@ async def _deliver_notification(
             return delivery.status
 
         notification_policy = context.delivery_policy.notification
-        channels = list(notification_policy.channels)
+        channels = initiative_notification_channels(
+            list(notification_policy.channels), owner.preferences,
+        )
         quiet = initiative_quiet_hours_active(
             context.interruption_policy,
             user_preferences=owner.preferences,

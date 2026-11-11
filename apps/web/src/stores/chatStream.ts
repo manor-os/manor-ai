@@ -16,7 +16,10 @@ import type {
   StreamProcessResult,
 } from "../lib/chatStream";
 import { runtimeHumanInputFromPayload } from "../lib/chatStream";
+import { t } from "../lib/i18n";
+import { requestInputAnswerText } from "../lib/requestInputForm";
 import { getAuthToken } from "../lib/authToken";
+import { onSessionReset } from "../lib/sessionReset";
 import { translateApiError } from "../lib/api";
 
 export type { ChatMessage };
@@ -74,6 +77,8 @@ export interface ChatStreamSession {
   controllerKey?: string;
   runtimeRunId?: string;
   runtimeStatus?: string;
+  /** Why a waiting run waits; `capability_approval` = parked on an approval. */
+  runtimeStatusReason?: string;
   runtimeQueue?: RuntimeQueueState;
   /** Set while the run is parked on a `request_input` question. */
   runtimeHumanInput?: RuntimeHumanInputState;
@@ -379,6 +384,7 @@ function runtimeStateFromStatus(payload: Record<string, any>): RuntimeStreamStat
   return {
     runId: String(payload.id || payload.run_id || ""),
     status,
+    statusReason: typeof payload.status_reason === "string" ? payload.status_reason : undefined,
     pollAfterSeconds,
     humanInput:
       status === "waiting_resource"
@@ -394,6 +400,44 @@ function runtimeStateFromStatus(payload: Record<string, any>): RuntimeStreamStat
         }
       : undefined,
   };
+}
+
+/**
+ * Approve or reject the approval a durable run is parked on (a card carrying
+ * `runtime_run_id`). The run resumes server-side and the session's poll loop
+ * replays the rest of the turn, so this works while the chat shows the run
+ * as still working.
+ */
+export async function decideRuntimeApproval(
+  runId: string,
+  requestId: string,
+  decision: "approve" | "reject",
+): Promise<void> {
+  const response = await fetch(`/api/v1/chat/runs/${encodeURIComponent(runId)}/approval`, {
+    method: "POST",
+    headers: { ...runtimeHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify({ request_id: requestId, decision }),
+  });
+  if (!response.ok) {
+    let detail = `Approval failed (${response.status})`;
+    try {
+      const body = await response.json();
+      if (body && typeof body.detail === "string") detail = body.detail;
+    } catch {
+      /* keep the status text */
+    }
+    throw new Error(detail);
+  }
+}
+
+/** Whether a session's run is parked on an approval (not a question). */
+export function parkedOnApproval(session: { runtimeStatus?: string; runtimeStatusReason?: string } | undefined): boolean {
+  return session?.runtimeStatus === "waiting_resource" && session.runtimeStatusReason === "capability_approval";
+}
+
+/** The decision a parked approval card's choice stands for. */
+export function parkedApprovalDecision(choice: string): "approve" | "reject" {
+  return /^approve/i.test(String(choice || "")) ? "approve" : "reject";
 }
 
 /**
@@ -436,7 +480,7 @@ export async function answerRuntimeHumanInput(
   const state = runtimeStateFromStatus(await response.json());
   const answerText =
     answer.trim()
-    || (fields ? Object.entries(fields).map(([key, value]) => `${key}: ${String(value)}`).join("; ") : "")
+    || (fields ? requestInputAnswerText(input.fields || [], fields as Record<string, unknown>, t("component.workflow_schema.yes"), t("component.workflow_schema.no")) : "")
     || (choice || "");
   useChatStreamStore.setState((current) => {
     const existing = current.sessions[sessionKey];
@@ -726,6 +770,7 @@ export const useChatStreamStore = create<ChatStreamState>((set, get) => ({
             ...existing,
             runtimeRunId: runtimeState.runId,
             runtimeStatus,
+            runtimeStatusReason: runtimeStatus === "waiting_resource" ? runtimeState.statusReason : undefined,
             runtimeQueue:
               runtimeStatus === "waiting_resource" ? runtimeState.queue : undefined,
             runtimeHumanInput:
@@ -1118,3 +1163,5 @@ export const useChatStreamStore = create<ChatStreamState>((set, get) => ({
     });
   },
 }));
+
+onSessionReset(() => useChatStreamStore.getState().reset());

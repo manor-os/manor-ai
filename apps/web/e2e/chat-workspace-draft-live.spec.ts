@@ -258,7 +258,7 @@ test("ordinary Chat creates a measured Workspace and round-trips its Blueprint t
     await runtimeMode.click();
     await expect(runtimeMode).not.toBeChecked();
     if (!initialDraft.ready) {
-      await expect(panel.getByRole("button", { name: "Keep chatting until ready" })).toBeDisabled();
+      await expect(panel.locator(".workspace-draft-panel__footer")).toHaveCount(0);
     }
 
     // Keep the Draft usable at the narrowest two-pane width. This reproduces
@@ -270,12 +270,12 @@ test("ordinary Chat creates a measured Workspace and round-trips its Blueprint t
       const header = element.querySelector<HTMLElement>(".workspace-draft-panel__header");
       const progress = element.querySelector<HTMLElement>(".workspace-draft-progress");
       const footer = element.querySelector<HTMLElement>(".workspace-draft-panel__footer");
-      if (!body || !header || !progress || !footer) return null;
+      if (!body || !header || !progress) return null;
       const panelRect = element.getBoundingClientRect();
       const bodyRect = body.getBoundingClientRect();
       const headerRect = header.getBoundingClientRect();
       const progressRect = progress.getBoundingClientRect();
-      const footerRect = footer.getBoundingClientRect();
+      const footerRect = footer?.getBoundingClientRect();
       return {
         panelWidth: panelRect.width,
         bodyHeight: bodyRect.height,
@@ -285,7 +285,7 @@ test("ordinary Chat creates a measured Workspace and round-trips its Blueprint t
         headerBottom: headerRect.bottom,
         progressRight: progressRect.right,
         panelRight: panelRect.right,
-        footerTop: footerRect.top,
+        footerTop: footerRect?.top ?? panelRect.bottom,
       };
     });
     expect(narrowLayout).not.toBeNull();

@@ -36,6 +36,9 @@ are load-bearing rather than cosmetic:
   retry loop. Auth failures are deliberately left unmatched: the raw message
   they fall back to already says to check the API key, which for them is
   correct advice.
+
+The ``code`` on each hint is also a reporting vocabulary that is counted over
+time, so renaming one splits its history.
 """
 from __future__ import annotations
 
@@ -63,12 +66,16 @@ class ExecutionErrorHint:
     """True when the failure is expected to clear on its own once the user
     fixes something external — the retry policy backs off instead of burning
     an attempt and re-asking for approval."""
+    code: str = ""
+    """Stable, content-free name of this failure. Safe to report outside the
+    account it happened in, unlike the failure's own message."""
 
 
 _SIGNATURES: tuple[tuple[re.Pattern[str], ExecutionErrorHint], ...] = (
     (
         re.compile(r"chrome (extension|control) (is )?unavailable", re.I),
         ExecutionErrorHint(
+            code="chrome_unavailable",
             what_happened="The Manor Chrome extension is not responding.",
             action_to_take=(
                 "Open Chrome and confirm the Manor extension is enabled, then retry."
@@ -84,6 +91,7 @@ _SIGNATURES: tuple[tuple[re.Pattern[str], ExecutionErrorHint], ...] = (
     (
         re.compile(r"\bLLM rate limited; retry after \d+(?:\.\d+)?s\b", re.I),
         ExecutionErrorHint(
+            code="llm_rate_limited",
             what_happened="The AI provider is temporarily rate limiting requests.",
             action_to_take=(
                 "Manor will wait for the provider's retry window and continue "
@@ -106,6 +114,7 @@ _SIGNATURES: tuple[tuple[re.Pattern[str], ExecutionErrorHint], ...] = (
             re.I,
         ),
         ExecutionErrorHint(
+            code="byok_provider_down",
             what_happened=(
                 "Your own (BYOK) AI provider did not answer — it was "
                 "temporarily unavailable or took too long. Manor's settings "
@@ -143,6 +152,7 @@ _SIGNATURES: tuple[tuple[re.Pattern[str], ExecutionErrorHint], ...] = (
             re.I,
         ),
         ExecutionErrorHint(
+            code="provider_down",
             what_happened=(
                 "The AI provider did not answer — it was temporarily "
                 "unavailable or took too long. This is not a problem with "
@@ -167,6 +177,7 @@ _SIGNATURES: tuple[tuple[re.Pattern[str], ExecutionErrorHint], ...] = (
     (
         re.compile(r"\b(?:ACCESS|PERMISSION)_DENIED\b"),
         ExecutionErrorHint(
+            code="app_permission_denied",
             what_happened=(
                 "A connected app refused the request. Manor's connection to it "
                 "does not have permission for what this step needed to do."
@@ -194,3 +205,59 @@ def classify_execution_error(error: Any) -> Optional[ExecutionErrorHint]:
         if pattern.search(message):
             return hint
     return None
+
+
+#: Failures where the model service failed or limited requests, not the
+#: Workspace or its setup. A rate limit may be on the account's own key: the
+#: message does not name the route.
+PLATFORM_FAILURE_CODES = frozenset({"llm_rate_limited", "provider_down"})
+
+#: Failures whose own sentence already tells the user what to do, so they have
+#: no hint above. For counting only: a hint would change their cards and retries.
+_REPORT_ONLY_SIGNATURES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"your byok model provider stopped responding", re.I),
+        "byok_provider_down",
+    ),
+    (
+        re.compile(
+            r"the ai model provider stopped responding|model provider outage:",
+            re.I,
+        ),
+        "provider_down",
+    ),
+)
+
+#: The typed codes the model runtime already reports for the same failures.
+#: ``llm_provider_unavailable`` is almost always a transient failure of
+#: Manor's managed route; the exception is a BYOK empty response that outlasts
+#: its retries, which the runtime also finishes with this code (see
+#: ``_finalize_provider_failure`` in ``llm_client``). ``byok_provider_error``
+#: types every failure on the account's own key, a rejected key included, so
+#: it counts as an outage only when the runtime also marked it transient.
+_RUNTIME_ERROR_CODES = {
+    "llm_provider_unavailable": "provider_down",
+    "byok_provider_error": "byok_provider_down",
+}
+_TRANSIENT_ONLY_RUNTIME_CODES = frozenset({"byok_provider_error"})
+
+
+def failure_code(error: Any) -> Optional[str]:
+    """The stable code of a known failure, else None. Never returns its text."""
+    if isinstance(error, dict):
+        runtime_code = error.get("code")
+        if isinstance(runtime_code, str) and runtime_code in _RUNTIME_ERROR_CODES and (
+            runtime_code not in _TRANSIENT_ONLY_RUNTIME_CODES
+            or error.get("transient") is True
+        ):
+            return _RUNTIME_ERROR_CODES[runtime_code]
+        error = error.get("message") or error.get("detail")
+    if not isinstance(error, str):
+        return None
+    hint = classify_execution_error({"message": error})
+    if hint:
+        return hint.code
+    return next(
+        (code for pattern, code in _REPORT_ONLY_SIGNATURES if pattern.search(error)),
+        None,
+    )

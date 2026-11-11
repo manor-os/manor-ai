@@ -166,3 +166,15 @@ async def test_history_recovers_legacy_cancellation_without_writes_or_cross_enti
     await db_session.commit()
     await db_session.refresh(message)
     assert message.meta["stream_status"] == "running"
+
+
+@pytest.mark.unit
+def test_a_run_superseded_while_waiting_on_an_approval_carries_no_interruption_notice():
+    """The person moved on; nothing broke, so no technical notice is shown."""
+    message = stale_message(content="I'll add the audio capability.")
+    snapshot = cancelled_runtime_message_snapshot(message, cancelled_run(status_reason="superseded"))
+    assert snapshot.meta["stream_status"] == "interrupted"
+    assert snapshot.content == "I'll add the audio capability."
+    assert "interrupted" not in snapshot.content
+    plain = cancelled_runtime_message_snapshot(stale_message(content="partial"), cancelled_run(status_reason="user_cancelled"))
+    assert "interrupted before the assistant could finish" in plain.content

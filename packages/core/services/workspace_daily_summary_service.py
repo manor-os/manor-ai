@@ -377,6 +377,8 @@ async def _automation_health(
             ScheduledJob.entity_id == entity_id,
             ScheduledJob.workspace_id == workspace_id,
             ScheduledJob.enabled.is_(True),
+            # Initiative drivers are hidden; their runs report on the Initiative.
+            ScheduledJob.agent_initiative_id.is_(None),
         )
     )).scalars().all())
     errored = [job for job in rows if job.last_status == "error"]

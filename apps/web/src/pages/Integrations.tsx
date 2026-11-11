@@ -1,3 +1,5 @@
+import { localizeCatalogText } from "../lib/eventCopy";
+import { displayReadInterval } from "../lib/readRefreshPolicy";
 import { agentListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
 import { useEffect, useRef, useState } from "react";
 import { useLocation, useSearchParams } from "react-router-dom";
@@ -39,6 +41,7 @@ import CompactCard from "../components/ui/CompactCard";
 import IconTile from "../components/ui/IconTile";
 import AgentAvatar from "../components/ui/AgentAvatar";
 import { openDetail, closeDetail, useDetailStore } from "../stores/detail";
+import { startOAuthInPlace } from "../lib/integrationConnect";
 import InfoPopover from "../components/ui/InfoPopover";
 
 import { t } from "../lib/i18n";
@@ -241,7 +244,6 @@ export default function Integrations() {
       {/* Header */}
       <PageHeader
         title={t("nav.integrations")}
-        subtitle={t("page.integrations.connect_external_services_and_tools")}
         tabs={
           <TabSwitcher
             tabs={tabs}
@@ -339,10 +341,8 @@ function DefaultBadge() {
         fontWeight: 700,
         padding: "1px 6px",
         borderRadius: 4,
-        background: "#e7e5e4",
-        color: "#44403c",
-        textTransform: "uppercase" as const,
-        letterSpacing: "0.05em",
+        background: "#e5e5ea",
+        color: "var(--text-muted)",
         flexShrink: 0,
       }}
     >
@@ -362,10 +362,8 @@ function ExpiredBadge() {
         fontWeight: 700,
         padding: "1px 6px",
         borderRadius: 4,
-        background: "#f5f5f4",
-        color: "#78716c",
-        textTransform: "uppercase" as const,
-        letterSpacing: "0.05em",
+        background: "var(--surface-muted)",
+        color: "var(--text-muted)",
         flexShrink: 0,
       }}
     >
@@ -418,7 +416,7 @@ function InfoAlert({
   const palette =
     tone === "red"
       ? { bg: "#fef2f2", border: "#fecaca", color: "#b91c1c" }
-      : { bg: "#fafaf9", border: "#e7e5e4", color: "#57534e" };
+      : { bg: "#fafafa", border: "#e5e5ea", color: "var(--text-muted)" };
   return (
     <div
       style={{
@@ -546,19 +544,19 @@ function ChannelBindingsPanel() {
             justifyContent: "center",
             padding: "64px 0",
             gap: 12,
-            color: "#a8a29e",
+            color: "var(--text-faint)",
           }}
         >
           <LoadingSpinner size={20} />
           <span style={{ fontSize: 14 }}>
-            {t("page.integrations.loading_channels")}
+            <span className="sr-only">{t("page.integrations.loading_channels")}</span>
           </span>
         </div>
       ) : !bindings || bindings.length === 0 ? (
         <EmptyState
           icon={
             <svg
-              style={{ width: 32, height: 32, color: "#d6d3d1" }}
+              style={{ width: 32, height: 32, color: "var(--text-faint)" }}
               fill="none"
               viewBox="0 0 24 24"
               stroke="currentColor"
@@ -701,7 +699,7 @@ function BindingRow({
 }) {
   const brandProvider = resolveIntegrationBrand(binding.channel_type)
     ? binding.channel_type : binding.provider;
-  const iconColor = "#78716c";
+  const iconColor = "#8e8e93";
   const label = friendlyChannelName(binding);
   const detailText = channelDetailText(binding, label);
   const isWhatsApp = binding.channel_type === "whatsapp";
@@ -849,7 +847,7 @@ function BindingRow({
             }}
             buttonStyle={{
               minHeight: 34,
-              borderColor: "rgba(28,25,23,0.07)",
+              borderColor: "rgba(29, 29, 31,0.07)",
               background: "rgba(255,255,255,0.78)",
               fontSize: 12,
               fontWeight: 600,
@@ -900,17 +898,50 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 }
 
 
+/**
+ * The requested provider's own setup (detail drawer, credential forms, OAuth),
+ * opened over whatever page the person is on; see IntegrationConnectHost.
+ */
+
+export function IntegrationSetupPanel({ provider, onClose }: { provider: string; onClose: () => void }) {
+  return <MCPAgentsPanel requestedProvider={provider} setupOnly onSetupClose={onClose} />;
+}
+
+/** A setup request for a provider this catalog does not offer: say so and step back. */
+function SetupUnavailable({ onClose }: { onClose?: () => void }) {
+  useEffect(() => {
+    useToastStore.getState().info(t("page.integrations.setup_link_unavailable"));
+    onClose?.();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  return null;
+}
+
+const COLLAPSED_INTEGRATION_COUNT = 5;
+
+function isConnectedIntegration(row: { connections?: unknown[]; entity_accounts?: unknown[] }) {
+  return (row.connections?.length ?? 0) > 0 || (row.entity_accounts?.length ?? 0) > 0;
+}
+
 function MCPAgentsPanel({
   search: externalSearch,
   onClearSearch,
   requestedProvider,
   onClearProvider,
+  setupOnly = false,
+  onSetupClose,
+  computersOnly = false,
 }: {
+  /** Settings › Computers: machines only, no app catalog. */
+  computersOnly?: boolean;
   search?: string;
   onClearSearch?: () => void;
   requestedProvider?: string | null;
   onClearProvider?: () => void;
+  /** Only the requested provider's setup, over the current page: no catalog, OAuth in a popup. */
+  setupOnly?: boolean;
+  onSetupClose?: () => void;
 }) {
+  const [showAllIntegrations, setShowAllIntegrations] = useState(false);
   const role = useAuthStore((s) => s.user?.role);
   const authToken = useAuthStore((s) => s.token);
   const authLoading = useAuthStore((s) => s.isLoading);
@@ -934,11 +965,22 @@ function MCPAgentsPanel({
     clientSecretRequired?: boolean;
   } | null>(null);
   const [wechatScanFor, setWechatScanFor] = useState<string | null>(null);
+  // Setup over another page ends when neither its drawer nor a form it opened is showing.
+  const setupDrawerOpen = useDetailStore((state) => Boolean(state.payload));
+  const setupFormOpen = Boolean(emailConfigFor || apiKeyConfigFor || oauthConfigFor || wechatScanFor);
+  const setupShown = useRef(false);
+  useEffect(() => {
+    if (!setupOnly) return;
+    if (setupDrawerOpen || setupFormOpen) {
+      setupShown.current = true;
+      return;
+    }
+    if (setupShown.current) onSetupClose?.();
+  }, [setupOnly, setupDrawerOpen, setupFormOpen]); // eslint-disable-line react-hooks/exhaustive-deps
   const search = externalSearch ?? "";
   // Top filter is execution model: cloud accounts vs local/user-session tools.
   // Section grouping below stays purpose-based so users do not have to reason
   // about backend auth categories while scanning the catalog.
-  const [audience, setAudience] = useState<IntegrationAudience>("all");
 
   const {
     data: servers,
@@ -979,6 +1021,12 @@ function MCPAgentsPanel({
     connectionId?: string,
   ) {
     try {
+      if (setupOnly) {
+        // Connecting from a chat: the provider opens in a popup and the
+        // person stays on the conversation.
+        await startOAuthInPlace(serverKey, { connectionId });
+        return;
+      }
       const { authorize_url } = await api.integrations.oauthStart(serverKey, {
         connectionId,
       });
@@ -998,12 +1046,12 @@ function MCPAgentsPanel({
   }
 
   if (isLoading) {
-    return <IntegrationCatalogLoading />;
+    return setupOnly ? null : <IntegrationCatalogLoading />;
   }
 
   if (!servers) {
     return (
-      <div style={{ textAlign: "center", padding: "64px 0", color: "#a8a29e" }}>
+      <div style={{ textAlign: "center", padding: "64px 0", color: "var(--text-muted)" }}>
         <p style={{ fontSize: 14, margin: "0 0 8px" }}>
           {t("page.integrations.failed_to_load_integrations")}
         </p>
@@ -1013,7 +1061,7 @@ function MCPAgentsPanel({
           }
           style={{
             fontSize: 13,
-            color: "#44403c",
+            color: "var(--text-muted)",
             background: "none",
             border: "none",
             cursor: "pointer",
@@ -1031,7 +1079,6 @@ function MCPAgentsPanel({
   const baseRowsRaw = servers.map((server) =>
     server.setup_pending && isError ? { ...server, setup_unavailable: true } : server,
   );
-  const catalogRefreshFailed = isError || servers.some((server) => server.setup_unavailable);
   const GOOGLE_KEYS = ["google_calendar", "google_drive"];
   const googleSubs = baseRowsRaw.filter((s) =>
     GOOGLE_KEYS.includes(s.server_key),
@@ -1086,26 +1133,17 @@ function MCPAgentsPanel({
   };
   let localIntegratedRows: McpServerRow[] = [];
   let catalogRows = visibleRows;
+  let audience: IntegrationAudience = "all";
   let allRows =
     audience === "all"
       ? catalogRows
       : catalogRows.filter((s) => !isRuntimeManagedCard(s));
-  const connectedCount = allRows.filter((s) => s.agent_can_use).length;
   const q = search.trim().toLowerCase();
   const rows = q ? allRows.filter((s) => matchesSearch(s, q)) : allRows;
   let localIntegratedVisibleRows: McpServerRow[] = [];
-  let integratedVisibleCount = 0;
-  let integratedReadyCount = 0;
-  const visibleCatalogCount = allRows.length + integratedVisibleCount;
-  const readyCatalogCount = connectedCount + integratedReadyCount;
   let showLocalCodePanel = false;
   const showSearchEmptyState =
     rows.length === 0 && Boolean(q) && !showLocalCodePanel;
-  const cloudAudienceCount = visibleRows.filter(
-    (s) => !isRuntimeManagedCard(s),
-  ).length;
-  let localAudienceCount = 0;
-  const allAudienceCount = cloudAudienceCount + localAudienceCount;
 
   const renderServerCard = (s: McpServerRow, openOnLoad = false) => {
     return s.server_key === "_google_workspace" ? (
@@ -1192,96 +1230,59 @@ function MCPAgentsPanel({
     );
   };
 
+  const modals = (
+    <>
+    {/* Email (IMAP + SMTP) configuration (entity-level credentials) */}
+    <EmailConfigModal
+      open={!!emailConfigFor}
+      serverKey={emailConfigFor?.serverKey || null}
+      accountId={emailConfigFor?.accountId}
+      onClose={() => setEmailConfigFor(null)}
+    />
+
+    {/* Generic API-key / bearer-token configuration */}
+    <ApiKeyConfigModal
+      open={!!apiKeyConfigFor}
+      target={apiKeyConfigFor}
+      onClose={() => setApiKeyConfigFor(null)}
+      onSaved={(id, key) => {
+        // After saving a wechat_personal account, drop the user straight
+        // into the scan panel so they can see the QR without hunting.
+        if (key === "wechat_personal") setWechatScanFor(id);
+      }}
+    />
+
+    <OAuthClientConfigModal
+      open={!!oauthConfigFor}
+      target={oauthConfigFor}
+      onClose={() => setOAuthConfigFor(null)}
+    />
+
+    {/* WeChat (Personal) — live QR scan + status */}
+    <WeChatPersonalScanModal
+      open={!!wechatScanFor}
+      accountId={wechatScanFor}
+      onClose={() => setWechatScanFor(null)}
+    />
+
+    </>
+  );
+
+  if (setupOnly) {
+    // The tile stays out of sight; its detail drawer and the forms it opens
+    // are what the person sees.
+    return (
+      <>
+        <div hidden>{setupServer ? renderServerCard(setupServer, true) : <SetupUnavailable onClose={onSetupClose} />}</div>
+        {modals}
+      </>
+    );
+  }
+
   return (
     <div style={{ flex: 1, overflowY: "auto", padding: 0 }}>
-      {/* Header strip */}
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          gap: 16,
-          marginBottom: 16,
-          padding: "14px 18px",
-          background: "#ffffff",
-          border: "1px solid rgba(28,25,23,0.06)",
-          borderRadius: 14,
-        }}
-      >
-        <div style={{ minWidth: 0, flex: 1 }}>
-          <div style={{ fontSize: 13, fontWeight: 700, color: "#44403c" }}>
-            {readyCatalogCount} / {visibleCatalogCount}{" "}
-            {t("page.integrations.ready")}
-          </div>
-          <div style={{ fontSize: 11, color: "#78716c", marginTop: 2 }}>
-            {t("page.integrations.connect_external_services_and_tools")}
-          </div>
-        </div>
-        <div role="status" style={{ fontSize: 12, color: "var(--text-muted)", display: "flex", alignItems: "center", gap: 8 }}>
-          {catalogRefreshing ? (
-            <><LoadingSpinner size={13} />{t("page.integrations.refreshing_status")}</>
-          ) : catalogRefreshFailed ? (
-            <>
-              <span>{t("page.integrations.refresh_failed")}</span>
-              <Button variant="ghost" size="sm" onClick={() => void queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY })}>
-                {t("page.dashboard.retry")}
-              </Button>
-            </>
-          ) : null}
-        </div>
-      </div>
-
-      {/* Execution filter — keep both visible for users who want everything in one place. */}
-      <div
-        style={{
-          display: "flex",
-          gap: 4,
-          marginBottom: 16,
-          padding: 4,
-          background: "#f5f5f4",
-          borderRadius: 10,
-          width: "fit-content",
-        }}
-      >
-        {(
-          [
-            [
-              "all",
-              t("page.integrations.all_count").replace(
-                "{count}",
-                String(allAudienceCount),
-              ),
-            ],
-            [
-              "cloud",
-              t("page.integrations.saas_count").replace(
-                "{count}",
-                String(cloudAudienceCount),
-              ),
-            ],
-          ] as const
-        ).map(([key, label]) => (
-          <button
-            key={key}
-            onClick={() => setAudience(key)}
-            style={{
-              padding: "6px 14px",
-              fontSize: 12,
-              fontWeight: 600,
-              borderRadius: 7,
-              border: "none",
-              cursor: "pointer",
-              background: audience === key ? "#ffffff" : "transparent",
-              color: audience === key ? "#1c1917" : "#78716c",
-              boxShadow:
-                audience === key ? "0 1px 2px rgba(0,0,0,0.06)" : "none",
-            }}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
-
+      {/* No summary strip: each section counts its own, and a failed status
+          refresh retries quietly instead of telling the user. */}
 
       {showSearchEmptyState && !requestedProvider && !catalogRefreshing ? (
         <EmptyState
@@ -1307,60 +1308,49 @@ function MCPAgentsPanel({
         </div>
       )}
 
-      {/* Group by display category */}
-      {!requestedProvider && groupIntegrationsByDisplayCategory(rows).map(([cat, group]) => (
-        <div key={cat} className="integration-section">
-          <IntegrationSectionHeader
-            categoryKey={cat}
-            readyCount={group.filter((g) => g.agent_can_use).length}
-            totalCount={group.length}
-          />
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns:
-                "repeat(auto-fill, minmax(min(100%, 300px), 1fr))",
-              gap: 12,
-            }}
-          >
-            {group.map((server) => renderServerCard(server))}
-          </div>
-        </div>
-      ))}
+      {/* What is connected comes first; the catalog stays folded until asked for. */}
+      {!requestedProvider && (() => {
+        const connected = rows.filter(isConnectedIntegration);
+        const available = rows.filter((row) => !isConnectedIntegration(row));
+        const browsing = showAllIntegrations || Boolean(search.trim());
+        const shown = browsing ? available : available.slice(0, COLLAPSED_INTEGRATION_COUNT);
+        return (
+          <>
+            {connected.length > 0 && (
+              <div className="integration-section">
+                <h3 className="config-group-title integration-list-title">{t("page.integrations.connected_group")}</h3>
+                <div className="integration-list">{connected.map((server) => renderServerCard(server))}</div>
+              </div>
+            )}
+            {available.length > 0 && (
+              <div className="integration-section">
+                <h3 className="config-group-title integration-list-title">{t("page.integrations.available_group")}</h3>
+                {browsing
+                  ? groupIntegrationsByDisplayCategory(shown).map(([cat, group]) => (
+                      <div key={cat} className="integration-section">
+                        <IntegrationSectionHeader
+                          categoryKey={cat}
+                          readyCount={group.filter((g) => g.agent_can_use).length}
+                          totalCount={group.length}
+                        />
+                        <div className="integration-list">{group.map((server) => renderServerCard(server))}</div>
+                      </div>
+                    ))
+                  : <div className="integration-list">{shown.map((server) => renderServerCard(server))}</div>}
+                {!search.trim() && available.length > COLLAPSED_INTEGRATION_COUNT && (
+                  <button type="button" className="config-group-link integration-list-more" onClick={() => setShowAllIntegrations((value) => !value)}>
+                    {showAllIntegrations
+                      ? t("page.integrations.show_fewer")
+                      : t("page.integrations.show_all_apps", { count: available.length })}
+                  </button>
+                )}
+              </div>
+            )}
+          </>
+        );
+      })()}
 
-      {/* Email (IMAP + SMTP) configuration (entity-level credentials) */}
-      <EmailConfigModal
-        open={!!emailConfigFor}
-        serverKey={emailConfigFor?.serverKey || null}
-        accountId={emailConfigFor?.accountId}
-        onClose={() => setEmailConfigFor(null)}
-      />
-
-      {/* Generic API-key / bearer-token configuration */}
-      <ApiKeyConfigModal
-        open={!!apiKeyConfigFor}
-        target={apiKeyConfigFor}
-        onClose={() => setApiKeyConfigFor(null)}
-        onSaved={(id, key) => {
-          // After saving a wechat_personal account, drop the user straight
-          // into the scan panel so they can see the QR without hunting.
-          if (key === "wechat_personal") setWechatScanFor(id);
-        }}
-      />
-
-      <OAuthClientConfigModal
-        open={!!oauthConfigFor}
-        target={oauthConfigFor}
-        onClose={() => setOAuthConfigFor(null)}
-      />
-
-      {/* WeChat (Personal) — live QR scan + status */}
-      <WeChatPersonalScanModal
-        open={!!wechatScanFor}
-        accountId={wechatScanFor}
-        onClose={() => setWechatScanFor(null)}
-      />
-
+      {modals}
     </div>
   );
 }
@@ -1684,7 +1674,7 @@ function GoogleWorkspaceCard({
     ? "#d65f59"
     : hasAnyReadyConnection
       ? "#168a5b"
-      : "#d6d3d1";
+      : "#d1d1d6";
   const statusLabel = isComingSoon
     ? t("page.integrations.coming_soon")
     : hasAuthFailure
@@ -1717,8 +1707,8 @@ function GoogleWorkspaceCard({
                 gap: 5,
                 fontSize: 10.5,
                 fontWeight: 600,
-                color: "#57534e",
-                background: "#f5f5f4",
+                color: "var(--text-muted)",
+                background: "var(--surface-muted)",
                 padding: "2px 9px",
                 borderRadius: 6,
               }}
@@ -1749,9 +1739,7 @@ function GoogleWorkspaceCard({
                     style={{
                       fontSize: 10,
                       fontWeight: 700,
-                      color: "#a8a29e",
-                      textTransform: "uppercase",
-                      letterSpacing: "0.06em",
+                      color: "var(--text-faint)",
                     }}
                   >
                     {t("page.integrations.connected_google_accounts")}
@@ -1778,7 +1766,7 @@ function GoogleWorkspaceCard({
                             ? "#d65f59"
                             : acct.anyOk
                               ? "#54a176"
-                              : "#a8a29e",
+                              : "#aeaeb2",
                           flexShrink: 0,
                         }}
                       />
@@ -1786,7 +1774,7 @@ function GoogleWorkspaceCard({
                         style={{
                           flex: 1,
                           minWidth: 0,
-                          color: "#44403c",
+                          color: "var(--text-muted)",
                           fontWeight: 500,
                           whiteSpace: "nowrap" as const,
                           overflow: "hidden",
@@ -1861,7 +1849,7 @@ function GoogleWorkspaceCard({
                           display: "flex",
                           alignItems: "center",
                           justifyContent: "center",
-                          background: "#ffffff",
+                          background: "var(--surface-panel)",
                           color: getLogoColor(s.server_key),
                           flexShrink: 0,
                         }}
@@ -1876,12 +1864,12 @@ function GoogleWorkspaceCard({
                           style={{
                             fontSize: 12,
                             fontWeight: 600,
-                            color: "#1c1917",
+                            color: "var(--text-strong)",
                           }}
                         >
                           {friendlyName}
                         </div>
-                        <div style={{ fontSize: 10, color: "#a8a29e" }}>
+                        <div style={{ fontSize: 10, color: "var(--text-muted)" }}>
                           {isComingSoon
                             ? t("page.integrations.coming_soon")
                             : subAuthFailed
@@ -2132,7 +2120,7 @@ function ServerCard({
         ? "var(--text-faint)"
       : hasPartialConnection
         ? "#cf9b44"
-        : "#d6d3d1";
+        : "#d1d1d6";
   const setupState = integrationSetupState(server);
   const setupPending = setupState !== "ready";
   const setupLabel = setupState === "unavailable"
@@ -2162,7 +2150,7 @@ function ServerCard({
         </IconTile>
       ),
       title: server.name,
-      subtitle: server.category || server.tagline || undefined,
+      subtitle: server.category || (server.tagline ? localizeCatalogText(server.tagline) : undefined),
       badges: (
         <span
           style={{
@@ -2171,8 +2159,8 @@ function ServerCard({
             gap: 5,
             fontSize: 10.5,
             fontWeight: 600,
-            color: "#57534e",
-            background: "#f5f5f4",
+            color: "var(--text-muted)",
+            background: "var(--surface-muted)",
             padding: "2px 9px",
             borderRadius: 6,
           }}
@@ -2197,19 +2185,17 @@ function ServerCard({
                   color: "var(--text-faint)",
                   fontSize: 10,
                   fontWeight: 700,
-                  letterSpacing: "0.06em",
-                  textTransform: "uppercase",
                   marginBottom: 8,
                 }}
               >
-                One Facebook login covers
+                {t("ui.one_facebook_login_covers")}
               </div>
               <MetaProductMarks labeled />
             </div>
           )}
-          <p style={{ margin: 0, color: "#44403c" }}>
+          <p style={{ margin: 0, color: "var(--text-default)" }}>
             {server.description ||
-              server.tagline ||
+              (server.tagline ? localizeCatalogText(server.tagline) : "") ||
               server.setup_hint ||
               t(
                 "page.integrations.connect_this_integration_then_use_its_tools_from_any_b",
@@ -2244,8 +2230,6 @@ function ServerCard({
                   fontSize: 10,
                   fontWeight: 700,
                   color: "var(--text-faint)",
-                  textTransform: "uppercase",
-                  letterSpacing: "0.06em",
                   margin: "16px 0 8px",
                 }}
               >
@@ -2271,7 +2255,7 @@ function ServerCard({
                         width: 6,
                         height: 6,
                         borderRadius: "50%",
-                        background: skill.installed ? "#168a5b" : "#d6d3d1",
+                        background: skill.installed ? "#168a5b" : "#d1d1d6",
                         marginTop: 6,
                       }}
                     />
@@ -2299,19 +2283,17 @@ function ServerCard({
                 style={{
                   fontSize: 10,
                   fontWeight: 700,
-                  color: "#a8a29e",
-                  textTransform: "uppercase",
-                  letterSpacing: "0.06em",
+                  color: "var(--text-faint)",
                   margin: "16px 0 8px",
                 }}
               >
-                What it can do
+                {t("ui.what_it_can_do")}
               </div>
               <ul
                 style={{
                   margin: 0,
                   paddingLeft: 18,
-                  color: "#57534e",
+                  color: "var(--text-muted)",
                   fontSize: 12.5,
                   lineHeight: 1.7,
                 }}
@@ -2328,13 +2310,11 @@ function ServerCard({
                 style={{
                   fontSize: 10,
                   fontWeight: 700,
-                  color: "#a8a29e",
-                  textTransform: "uppercase",
-                  letterSpacing: "0.06em",
+                  color: "var(--text-faint)",
                   margin: "16px 0 8px",
                 }}
               >
-                Connected accounts
+                {t("ui.connected_accounts")}
               </div>
               {["email", "gmail", "outlook"].includes(server.server_key) && (
                 <p className="m-0 mb-3 text-xs leading-5 text-[var(--text-muted)]">{t("email_accounts.description")}</p>
@@ -2577,7 +2557,7 @@ function ServerCard({
         )
       }
       title={server.name}
-      subtitle={server.tagline || server.category || ""}
+      subtitle={server.tagline ? localizeCatalogText(server.tagline) : server.category || ""}
       meta={
         (
           <span
@@ -2892,7 +2872,7 @@ function EmailConfigModal({
           </InfoAlert>
         )}
         <p
-          style={{ fontSize: 12, color: "#78716c", lineHeight: 1.5, margin: 0 }}
+          style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.5, margin: 0 }}
         >
           {t(
             "page.integrations.one_credential_bundle_for_reading_imap_and_sendi",
@@ -2929,9 +2909,7 @@ function EmailConfigModal({
             style={{
               fontSize: 11,
               fontWeight: 800,
-              letterSpacing: "0.08em",
-              textTransform: "uppercase" as const,
-              color: "#78716c",
+              color: "var(--text-muted)",
               marginBottom: 6,
             }}
           >
@@ -2968,9 +2946,7 @@ function EmailConfigModal({
             style={{
               fontSize: 11,
               fontWeight: 800,
-              letterSpacing: "0.08em",
-              textTransform: "uppercase" as const,
-              color: "#78716c",
+              color: "var(--text-muted)",
               marginBottom: 6,
             }}
           >
@@ -3338,9 +3314,9 @@ const API_KEY_FIELDS: Record<string, ApiKeyProviderSpec> = {
     fields: [
       {
         key: "api_key",
-        label: "API key",
+        label: t("ui.api_key"),
         type: "password",
-        placeholder: "Twelve Data API key",
+        placeholder: t("ui.twelve_data_api_key"),
         required: true,
       },
     ],
@@ -3351,9 +3327,9 @@ const API_KEY_FIELDS: Record<string, ApiKeyProviderSpec> = {
     fields: [
       {
         key: "api_key",
-        label: "API key",
+        label: t("ui.api_key"),
         type: "password",
-        placeholder: "Alpha Vantage API key",
+        placeholder: t("ui.alpha_vantage_api_key"),
         required: true,
       },
     ],
@@ -3364,16 +3340,16 @@ const API_KEY_FIELDS: Record<string, ApiKeyProviderSpec> = {
     fields: [
       {
         key: "api_key",
-        label: "API key ID",
+        label: t("ui.api_key_id"),
         type: "password",
-        placeholder: "Alpaca API key ID",
+        placeholder: t("ui.alpaca_api_key_id"),
         required: true,
       },
       {
         key: "api_secret",
-        label: "API secret key",
+        label: t("ui.api_secret_key"),
         type: "password",
-        placeholder: "Alpaca API secret key",
+        placeholder: t("ui.alpaca_api_secret_key"),
         required: true,
       },
     ],
@@ -3476,7 +3452,7 @@ function OAuthClientConfigModal({
     >
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
         <p
-          style={{ fontSize: 12, color: "#78716c", lineHeight: 1.5, margin: 0 }}
+          style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.5, margin: 0 }}
         >
           {t(target.key === "lark" ? "page.integrations.lark_oauth_admin_hint" : needsSecret ? "page.integrations.oauth_client_description" : "page.integrations.public_oauth_client_hint")}
         </p>
@@ -3702,7 +3678,7 @@ function ApiKeyConfigModal({
           </p>
         )}
         <p
-          style={{ fontSize: 12, color: "#78716c", lineHeight: 1.5, margin: 0 }}
+          style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.5, margin: 0 }}
         >
           {t(
             "page.integrations.credentials_are_stored_at_the_entity_level_any_a",
@@ -3730,7 +3706,7 @@ function ApiKeyConfigModal({
             const helpId = `${fieldId}-help`;
             return (
               <div key={f.key}>
-                <label htmlFor={fieldId} className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-1.5">
+                <label htmlFor={fieldId} className="block text-xs font-semibold text-stone-500 mb-1.5">
                   {f.label}
                 </label>
                 <Select
@@ -3755,7 +3731,7 @@ function ApiKeyConfigModal({
                 style={{ display: "flex", flexDirection: "column", gap: 4 }}
               >
                 <label
-                  style={{ fontSize: 12, fontWeight: 600, color: "#57534e" }}
+                  style={{ fontSize: 12, fontWeight: 600, color: "var(--text-muted)" }}
                 >
                   {f.label}
                   {f.required && <span style={{ color: "#c14a44" }}> *</span>}
@@ -3770,10 +3746,10 @@ function ApiKeyConfigModal({
                   placeholder={placeholder}
                   rows={f.rows || 6}
                   style={{
-                    fontFamily: "ui-monospace, SFMono-Regular, monospace",
+                    fontFamily: "var(--font-mono)",
                     fontSize: 12,
                     padding: 10,
-                    border: "1px solid rgba(28,25,23,0.06)",
+                    border: "0.5px solid rgba(29, 29, 31,0.06)",
                     borderRadius: 8,
                     width: "100%",
                     resize: "vertical",
@@ -3781,7 +3757,7 @@ function ApiKeyConfigModal({
                 />
                 {f.help && (
                   <span
-                    style={{ fontSize: 11, color: "#78716c", lineHeight: 1.4 }}
+                    style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.4 }}
                   >
                     {f.help}
                   </span>
@@ -3855,6 +3831,8 @@ function WeChatPersonalScanModal({
   // session_id; existing-account mode polls by integration id and
   // proxies to the runner's session under the hood.
   const isNew = !!accountId && accountId.startsWith("new:");
+  const pollingStarted = useRef(Date.now());
+  useEffect(() => { pollingStarted.current = Date.now(); }, [open, accountId]);
 
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
@@ -3907,7 +3885,8 @@ function WeChatPersonalScanModal({
         ? api.integrations.wechatPersonalSessionStatus(sessionId!)
         : api.integrations.wechatPersonalStatus(accountId!),
     enabled: open && (isNew ? !!sessionId : !!accountId),
-    refetchInterval: open ? 3_000 : false,
+    refetchInterval: (query) => displayReadInterval(query.state, !open ? false
+      : query.state.data?.online || Date.now() - pollingStarted.current > 120_000 ? 30_000 : 3_000),
     refetchIntervalInBackground: false,
   });
 
@@ -3922,7 +3901,8 @@ function WeChatPersonalScanModal({
         ? api.integrations.wechatPersonalSessionQrBlob(sessionId!)
         : api.integrations.wechatPersonalQrBlob(accountId!),
     enabled: open && !online && (isNew ? !!sessionId : !!accountId),
-    refetchInterval: open && !online ? 3_000 : false,
+    refetchInterval: (query) => displayReadInterval(query.state, !open || online ? false
+      : Date.now() - pollingStarted.current > 120_000 ? 30_000 : 3_000),
     refetchIntervalInBackground: false,
     gcTime: 0,
   });
@@ -3999,7 +3979,7 @@ function WeChatPersonalScanModal({
           {waitingForRunner ? (
             <>
               <LoadingSpinner />
-              <div style={{ fontSize: 13, color: "#78716c" }}>
+              <div style={{ fontSize: 13, color: "var(--text-muted)" }}>
                 {t("page.integrations.asking_the_runner_for_a_fresh_session")}
               </div>
             </>
@@ -4022,7 +4002,7 @@ function WeChatPersonalScanModal({
               </div>
               <div style={{ textAlign: "center" as const }}>
                 <div
-                  style={{ fontSize: 14, fontWeight: 700, color: "#1c1917" }}
+                  style={{ fontSize: 14, fontWeight: 700, color: "var(--text-strong)" }}
                 >
                   {nick
                     ? t("page.integrations.logged_in_as").replace(
@@ -4031,7 +4011,7 @@ function WeChatPersonalScanModal({
                       )
                     : t("page.integrations.logged_in")}
                 </div>
-                <div style={{ fontSize: 12, color: "#78716c", marginTop: 4 }}>
+                <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 4 }}>
                   {t(
                     "page.integrations.the_runner_is_online_and_relaying_messages_to_ma",
                   )}
@@ -4043,9 +4023,9 @@ function WeChatPersonalScanModal({
               <div
                 style={{
                   padding: 12,
-                  border: "1px solid rgba(28,25,23,0.06)",
+                  border: "0.5px solid rgba(29, 29, 31,0.06)",
                   borderRadius: 12,
-                  background: "#ffffff",
+                  background: "var(--surface-panel)",
                 }}
               >
                 <img
@@ -4059,7 +4039,7 @@ function WeChatPersonalScanModal({
               </div>
               <div style={{ textAlign: "center" as const, maxWidth: 360 }}>
                 <div
-                  style={{ fontSize: 13, fontWeight: 600, color: "#1c1917" }}
+                  style={{ fontSize: 13, fontWeight: 600, color: "var(--text-strong)" }}
                 >
                   {t("page.integrations.scan_with_the_wechat")}{" "}
                   <span style={{ color: "#07C160" }}>
@@ -4070,7 +4050,7 @@ function WeChatPersonalScanModal({
                 <div
                   style={{
                     fontSize: 12,
-                    color: "#78716c",
+                    color: "var(--text-muted)",
                     marginTop: 4,
                     lineHeight: 1.5,
                   }}
@@ -4100,14 +4080,14 @@ function WeChatPersonalScanModal({
               </div>
               <div style={{ textAlign: "center" as const }}>
                 <div
-                  style={{ fontSize: 14, fontWeight: 700, color: "#1c1917" }}
+                  style={{ fontSize: 14, fontWeight: 700, color: "var(--text-strong)" }}
                 >
                   {t("page.integrations.runner_unreachable")}
                 </div>
                 <div
                   style={{
                     fontSize: 12,
-                    color: "#78716c",
+                    color: "var(--text-muted)",
                     marginTop: 4,
                     lineHeight: 1.5,
                   }}
@@ -4129,20 +4109,20 @@ function WeChatPersonalScanModal({
               alignSelf: "stretch",
               padding: "12px 14px",
               borderRadius: 10,
-              background: "#fafaf9",
-              border: "1px solid rgba(28,25,23,0.06)",
+              background: "var(--surface-muted)",
+              border: "0.5px solid rgba(29, 29, 31,0.06)",
               display: "flex",
               flexDirection: "column",
               gap: 6,
               fontSize: 12.5,
-              color: "#44403c",
+              color: "var(--text-muted)",
               lineHeight: 1.55,
             }}
           >
             <div
               style={{
                 fontWeight: 700,
-                color: "#1c1917",
+                color: "var(--text-strong)",
                 fontSize: 13,
                 marginBottom: 2,
               }}
@@ -4242,12 +4222,12 @@ function WeChatPersonalScanModal({
             alignSelf: "stretch",
             padding: "8px 12px",
             borderRadius: 8,
-            background: "#fafaf9",
+            background: "var(--surface-muted)",
             display: "flex",
             flexDirection: "column",
             gap: 4,
             fontSize: 11.5,
-            color: "#57534e",
+            color: "var(--text-muted)",
           }}
         >
           <div>
@@ -4304,10 +4284,13 @@ function IntegrationSectionHeader({
         <Icon size={13} />
       </span>
       <span className="integration-section-title">{t(meta.labelKey)}</span>
-      <span className="integration-section-count">
-        {readyCount} / {totalCount}{" "}
-        {countLabel || t("page.integrations.ready")}
-      </span>
+      {/* Nothing ready is the usual start, so only a ready count is shown. */}
+      {readyCount > 0 && (
+        <span className="integration-section-count">
+          {readyCount} / {totalCount}{" "}
+          {countLabel || t("page.integrations.ready")}
+        </span>
+      )}
     </div>
   );
 }
@@ -4582,7 +4565,7 @@ function EntityAccountRow({
           style={{
             flex: 1,
             minWidth: 0,
-            color: "#44403c",
+            color: "var(--text-muted)",
             fontWeight: 500,
             whiteSpace: "nowrap" as const,
             overflow: "hidden",
@@ -4594,7 +4577,7 @@ function EntityAccountRow({
             account.display_name &&
             account.display_name !== account.name && (
               <span
-                style={{ color: "#a8a29e", fontWeight: 400, marginLeft: 6 }}
+                style={{ color: "var(--text-muted)", fontWeight: 400, marginLeft: 6 }}
               >
                 · {account.display_name}
               </span>
@@ -4665,7 +4648,7 @@ function EntityAccountRow({
           style={{
             fontSize: 11,
             lineHeight: 1.45,
-            color: "#57534e",
+            color: "var(--text-muted)",
             paddingLeft: 16,
             wordBreak: "break-all" as const,
           }}
@@ -4675,7 +4658,7 @@ function EntityAccountRow({
         </div>
       )}
       {account.ownership === "shared" && account.owner_display_name && (
-        <div style={{ color: "#78716c", fontSize: 11, paddingLeft: 16 }}>
+        <div style={{ color: "var(--text-muted)", fontSize: 11, paddingLeft: 16 }}>
           {t("page.integrations.sharing_shared_by").replace("{name}", account.owner_display_name)}
         </div>
       )}
@@ -4766,7 +4749,7 @@ function WhatsAppReadinessChecklist({ health }: { health: HealthShape }) {
             ? "#397354"
             : check?.ok === false
               ? "#9f4a45"
-              : "#a8a29e";
+              : "#aeaeb2";
           return (
             <span
               key={key}
@@ -4775,7 +4758,7 @@ function WhatsAppReadinessChecklist({ health }: { health: HealthShape }) {
                 display: "inline-flex",
                 alignItems: "center",
                 gap: 5,
-                color: "#57534e",
+                color: "var(--text-muted)",
                 fontSize: 11,
                 whiteSpace: "nowrap",
               }}
@@ -4816,7 +4799,7 @@ function ConnectionStatusPip({
     : credOk === false
         ? "#d65f59"
       : !connected
-        ? "#d6d3d1"
+        ? "#d1d1d6"
         : wiring && (wireOk === null || wireOk === undefined)
           ? "#cf9b44"
         : wiring && wireOk === false
@@ -4916,7 +4899,7 @@ function ConnectionStatusPip({
         flexShrink: 0,
         padding: label ? "1px 8px 1px 5px" : 0,
         borderRadius: 999,
-        background: label ? "#f5f5f4" : "transparent",
+        background: label ? "#f5f5f7" : "transparent",
       }}
     >
       <span
@@ -4935,9 +4918,7 @@ function ConnectionStatusPip({
           style={{
             fontSize: 10,
             fontWeight: 700,
-            color: "#57534e",
-            textTransform: "uppercase" as const,
-            letterSpacing: "0.05em",
+            color: "var(--text-muted)",
             whiteSpace: "nowrap" as const,
           }}
         >
@@ -5112,7 +5093,7 @@ function ConnectionRow({
           style={{
             flex: 1,
             minWidth: 0,
-            color: "#44403c",
+            color: "var(--text-muted)",
             fontWeight: 500,
             whiteSpace: "nowrap" as const,
             overflow: "hidden",
@@ -5187,7 +5168,7 @@ function ConnectionRow({
         </div>
       )}
       {connection.ownership === "shared" && connection.owner_display_name && (
-        <div style={{ color: "#78716c", fontSize: 11, paddingLeft: 16 }}>
+        <div style={{ color: "var(--text-muted)", fontSize: 11, paddingLeft: 16 }}>
           {t("page.integrations.sharing_shared_by").replace("{name}", connection.owner_display_name)}
         </div>
       )}

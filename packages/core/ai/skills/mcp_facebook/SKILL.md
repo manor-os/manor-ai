@@ -41,7 +41,7 @@ Live & insights:
 Instagram (two-step publish):
 - `list_instagram_accounts`, `get_instagram_account`, `list_instagram_media`, `get_instagram_media`.
 - `create_instagram_media` (build a media container) → `get_instagram_container_status` (wait for `FINISHED`) → `publish_instagram_media` (publish it).
-- `list_instagram_comments`, `reply_instagram_comment`, `delete_instagram_comment`, `get_instagram_insights`.
+- `list_recent_instagram_comments` (every linked account's latest media, no ids needed), `list_instagram_comments`, `reply_instagram_comment`, `delete_instagram_comment`, `get_instagram_insights`.
 
 ## Common Recipes
 

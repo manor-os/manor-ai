@@ -11,7 +11,6 @@ real OAuth + quota.
 """
 from __future__ import annotations
 
-import base64
 import json
 import logging
 from datetime import datetime, timezone
@@ -130,29 +129,17 @@ class GmailInboxSource:
 
 
 def _normalise_gmail_message(msg: dict) -> InboxSignal:
-    """Extract sender/subject/body from a Gmail v1 ``get_message`` envelope."""
-    headers = {
-        h.get("name", "").lower(): h.get("value", "")
-        for h in (msg.get("payload", {}).get("headers") or [])
-    }
-    body_b64 = msg.get("payload", {}).get("body", {}).get("data", "")
-    body_text = ""
-    if body_b64:
-        try:
-            body_text = base64.urlsafe_b64decode(body_b64.encode("ascii")).decode("utf-8")
-        except Exception:
-            body_text = ""
-
+    """Extract sender/subject/body from a Gmail ``get_message`` result."""
     return {
         "source": "gmail",
-        "source_ref": msg["id"],
-        "thread_ref": msg.get("threadId"),
-        "sender": headers.get("from", ""),
-        "subject": headers.get("subject", ""),
-        "received_at": headers.get("date", ""),
+        "source_ref": msg["message_id"],
+        "thread_ref": msg.get("thread_id"),
+        "sender": msg.get("from", ""),
+        "subject": msg.get("subject", ""),
+        "received_at": msg.get("date", ""),
         "snippet": msg.get("snippet", ""),
-        "body_text": body_text,
-        "labels": list(msg.get("labelIds") or []),
+        "body_text": msg.get("content", ""),
+        "labels": list(msg.get("labels") or []),
     }
 
 

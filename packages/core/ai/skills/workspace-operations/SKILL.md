@@ -30,3 +30,12 @@ Task; persistent Workspace changes use the reviewed configuration draft path.
 An existing open blocker or approval card takes precedence over creating duplicate
 work. General requests to continue Workspace work use `request_strategist_review`;
 retrying an existing Task belongs to that Task's recovery path.
+
+Long or multi-step work runs as a Task, not in this Chat turn: making, editing
+or rendering video or other media, a long sandbox or script run, research or a
+document with several stages, anything an Agent cannot finish in a few minutes.
+This holds when the user names an Agent and says now: Workspace `create_task`
+with `owner_service_key` for that Agent survives a restart and queues for a
+sandbox, which a `delegate_to_agent` child cannot. Keep `delegate_to_agent` for
+quick work that finishes in this turn (an answer, a calculation, a short draft,
+one short file), or when the user says not to create a Task.

@@ -1,0 +1,157 @@
+/* Media in a Workspace App: frames, gallery layouts, the viewer, players and their companions. Tokens only. */
+
+/* A file in its frame. Once a frame is chosen (or the file's own shape), the whole file shows: contain, never crop. */
+.workspace-app-media__frame { position: relative; display: grid; place-items: center; width: 100%; aspect-ratio: 1; overflow: hidden;
+  border-radius: var(--radius-card); background: var(--surface-muted); color: var(--text-muted); box-shadow: var(--shadow-sm); }
+.workspace-app-media__frame > img { width: 100%; height: 100%; object-fit: cover; }
+.workspace-app-media__frame.is-framed > img { object-fit: contain; }
+.workspace-app-media__overlay { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: var(--surface-muted); }
+.workspace-app-media__frame:not(.is-framed) .workspace-app-media__overlay { object-fit: cover; }
+.workspace-app-media__file { display: grid; place-items: center; }
+.workspace-app-media__badge { position: absolute; right: 6px; bottom: 6px; padding: 2px 6px; border-radius: 999px; background: var(--surface-panel);
+  color: var(--text-strong); font-size: 10px; box-shadow: var(--shadow-sm); }
+/* A cut-out or a logo over a checkerboard, so its transparent parts read as transparent. */
+.is-transparent { background-color: var(--surface-panel);
+  background-image: linear-gradient(45deg, var(--surface-muted) 25%, transparent 25%), linear-gradient(-45deg, var(--surface-muted) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, var(--surface-muted) 75%), linear-gradient(-45deg, transparent 75%, var(--surface-muted) 75%);
+  background-size: 16px 16px; background-position: 0 0, 0 8px, 8px -8px, -8px 0; }
+/* A picture field in its chosen frame. */
+.workspace-app-data__image-field.is-framed img, .workspace-app-data__images-item.is-framed img { object-fit: contain; }
+.workspace-app-data__images-item.is-framed { width: auto; height: 64px; }
+.workspace-app-data__images.is-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); overflow: visible; }
+.workspace-app-data__images.is-grid .workspace-app-data__images-item { width: 100%; height: auto; aspect-ratio: 1; }
+
+/* Gallery layouts. */
+.workspace-app-media__gallery-block { display: grid; gap: 10px; min-width: 0; }
+.workspace-app-media__gallery-tools { display: flex; justify-content: flex-end; }
+.workspace-app-media__gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 16px; min-width: 0; }
+.workspace-app-media__card { display: grid; align-content: start; gap: 8px; min-width: 0; padding: 0; border: 0; background: none; color: inherit;
+  font: inherit; text-align: left; cursor: pointer; }
+.workspace-app-media__card:hover .workspace-app-media__frame { transform: translateY(-2px); }
+.workspace-app-media__frame { transition: transform 0.15s ease; }
+.workspace-app-media__card:focus-visible { outline: none; }
+.workspace-app-media__card:focus-visible .workspace-app-media__frame { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* A masonry wall: pictures in their own shapes, in columns. */
+.workspace-app-media__gallery.is-masonry { display: block; columns: 4 160px; column-gap: 12px; }
+.workspace-app-media__gallery.is-masonry .workspace-app-media__card { break-inside: avoid; margin-bottom: 12px; width: 100%; }
+/* A mood board: a tight collage, no captions. */
+.workspace-app-media__gallery.is-board { display: block; columns: 5 120px; column-gap: 4px; }
+.workspace-app-media__gallery.is-board .workspace-app-media__card { break-inside: avoid; margin-bottom: 4px; width: 100%; }
+.workspace-app-media__gallery.is-board .workspace-app-media__frame { border-radius: calc(4px * var(--app-radius-scale, 1)); box-shadow: none; }
+/* A strip of small thumbnails, scrolled sideways. */
+.workspace-app-media__gallery.is-strip { display: flex; gap: 6px; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: thin; }
+.workspace-app-media__gallery.is-strip .workspace-app-media__card { flex: none; width: 72px; }
+.workspace-app-media__gallery.is-strip .workspace-app-media__frame { border-radius: calc(6px * var(--app-radius-scale, 1)); box-shadow: none; }
+.workspace-app-media__versions { display: flex; flex-wrap: wrap; gap: 4px; }
+.workspace-app-media__versions small { padding: 1px 6px; border-radius: 999px; background: var(--surface-muted); color: var(--text-muted); font-size: 10px; }
+
+/* A carousel: one at a time, swiped or stepped. */
+.workspace-app-media__carousel { position: relative; min-width: 0; }
+.workspace-app-media__carousel-track { display: flex; overflow-x: auto; scroll-snap-type: x mandatory; scrollbar-width: none; gap: 0; }
+.workspace-app-media__carousel-track::-webkit-scrollbar { display: none; }
+.workspace-app-media__carousel .workspace-app-media__carousel-track > * { flex: 0 0 100%; width: 100%; max-width: none; height: auto; scroll-snap-align: start; }
+.workspace-app-media__carousel .workspace-app-media__carousel-track > .workspace-app-data__images-item { height: auto; aspect-ratio: 4 / 3; }
+.workspace-app-media__carousel-prev, .workspace-app-media__carousel-next { position: absolute; top: 40%; }
+.workspace-app-media__carousel-prev { left: 4px; }
+.workspace-app-media__carousel-next { right: 4px; }
+.workspace-app-media__dots { display: flex; justify-content: center; gap: 4px; margin-top: 6px; }
+.workspace-app-media__dots i { width: 6px; height: 6px; border-radius: 50%; background: var(--border-subtle); }
+.workspace-app-media__dots i[data-active] { background: var(--text-strong); }
+.workspace-app-media__sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+/* A list: a row per file with its player (tracks, episodes, voices). */
+.workspace-app-media__list { display: grid; margin: 0; padding: 0; list-style: none; min-width: 0; }
+.workspace-app-media__row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto; align-items: center; gap: 12px; padding: 10px 0; }
+.workspace-app-media__row + .workspace-app-media__row { border-top: 0.5px solid var(--border-subtle); }
+.workspace-app-media__row-thumb { width: 64px; padding: 0; border: 0; background: none; cursor: pointer; }
+.workspace-app-media__row-copy { order: -1; display: grid; gap: 2px; min-width: 0; }
+.workspace-app-media__row-title { padding: 0; border: 0; background: none; color: var(--text-strong); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.workspace-app-media__row-title strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-media__row-copy small { color: var(--text-muted); font-size: 11px; }
+.workspace-app-media__row-player { min-width: 0; }
+@media (max-width: 560px) {
+  .workspace-app-media__row { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* The viewer. */
+.workspace-app-media__viewer { display: grid; gap: 14px; min-width: 0; }
+.workspace-app-media__stage { display: grid; place-items: center; min-width: 0; }
+.workspace-app-media__stage-picture { display: grid; place-items: center; width: 100%; }
+.workspace-app-media__picture { position: relative; display: inline-block; max-width: 100%; border-radius: var(--radius-control); overflow: hidden; }
+.workspace-app-media__picture img { display: block; max-width: 100%; max-height: 60vh; }
+.workspace-app-media__marker { position: relative; display: inline-block; cursor: crosshair; touch-action: none; user-select: none; }
+.workspace-app-media__marker img { display: block; max-width: 100%; max-height: 60vh; }
+.workspace-app-media__pin { position: absolute; border: 2px solid var(--accent); border-radius: 4px; pointer-events: auto; }
+.workspace-app-media__pin b { position: absolute; top: -10px; left: -10px; display: grid; place-items: center; width: 20px; height: 20px; border-radius: 50%;
+  background: var(--accent); color: var(--surface-panel); font-size: 11px; }
+.workspace-app-media__pin.is-new { border-style: dashed; }
+.workspace-app-media__toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; color: var(--text-muted); font-size: 12px; }
+.workspace-app-media__actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.workspace-app-media__open { color: var(--text-muted); font-size: 12px; }
+.workspace-app-media__details { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px 16px; margin: 0; }
+.workspace-app-media__details dt { color: var(--text-muted); font-size: 11px; }
+.workspace-app-media__details dd { margin: 2px 0 0; color: var(--text-strong); font-size: 13px; overflow-wrap: anywhere; }
+.workspace-app-media__details .is-wide { grid-column: 1 / -1; }
+.workspace-app-media__details .is-wide dd { color: var(--text-default); line-height: 1.5; white-space: pre-wrap; }
+.workspace-app-media__comments { display: grid; gap: 8px; }
+.workspace-app-media__note { margin: 0; color: var(--text-muted); font-size: 12px; }
+
+/* Players and what goes with them. */
+.workspace-app-media__video { position: relative; display: block; width: 100%; }
+.workspace-app-media__video video { display: block; width: 100%; max-height: 70vh; aspect-ratio: var(--media-aspect, auto); border-radius: var(--radius-control);
+  background: var(--surface-sunken); object-fit: contain; }
+.workspace-app-media__caption { position: absolute; left: 50%; bottom: 48px; max-width: 86%; transform: translateX(-50%); padding: 4px 10px;
+  border-radius: var(--radius-control); background: var(--text-strong); color: var(--surface-panel); font-size: 14px; line-height: 1.4; text-align: center;
+  pointer-events: none; white-space: pre-line; }
+.workspace-app-media__start, .workspace-app-media__listen { display: grid; width: 100%; padding: 0; border: 0; background: none; color: var(--text-muted);
+  font: inherit; cursor: pointer; }
+.workspace-app-media__listen { grid-auto-flow: column; justify-content: start; align-items: center; gap: 10px; font-size: 12px; }
+.workspace-app-media__field-player { display: grid; gap: 10px; width: 100%; min-width: 0; }
+.workspace-app-media__field-player.is-video { max-width: 520px; }
+.workspace-app-media__side-by-side { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; width: 100%; }
+.workspace-app-media__side-by-side > span { display: grid; gap: 4px; min-width: 0; }
+.workspace-app-media__side-by-side small { color: var(--text-muted); font-size: 11px; }
+.workspace-app-media__side-by-side img { width: 100%; border-radius: var(--radius-control); }
+.workspace-app-media__chapters, .workspace-app-media__transcript { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.workspace-app-media__transcript { max-height: 220px; overflow-y: auto; }
+.workspace-app-media__chapters button, .workspace-app-media__transcript button { display: grid; grid-template-columns: 56px minmax(0, 1fr); gap: 8px; width: 100%;
+  min-height: 0; padding: 4px 6px; border: 0; border-radius: var(--radius-control); background: none; color: var(--text-default); font: inherit;
+  font-size: 13px; line-height: 1.4; text-align: left; cursor: pointer; }
+.workspace-app-media__chapters .mono, .workspace-app-media__transcript .mono { color: var(--text-muted); font-size: 11px; }
+.workspace-app-media__chapters li[aria-current] button, .workspace-app-media__transcript li[aria-current] button { background: var(--surface-muted); color: var(--text-strong); }
+.workspace-app-media__chapters button:hover, .workspace-app-media__transcript button:hover { background: var(--surface-muted); }
+
+/* Before and after: the earlier picture over the later one, cut at the handle. */
+.workspace-app-media__compare { position: relative; display: block; width: 100%; max-width: 360px; overflow: hidden; border-radius: var(--radius-control); }
+.workspace-app-media__compare img { display: block; width: 100%; }
+.workspace-app-media__compare-before { position: absolute; inset: 0; height: 100%; object-fit: contain; background: var(--surface-muted); clip-path: inset(0 calc(100% - var(--compare)) 0 0); }
+.workspace-app-media__compare-handle { position: absolute; top: 0; bottom: 0; left: var(--compare); width: 2px; background: var(--surface-panel); box-shadow: var(--shadow-sm); }
+.workspace-app-media__compare input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: ew-resize; }
+
+/* Clips: a numbered strip, the chosen one playing below. */
+.workspace-app-media__clips { display: grid; gap: 8px; width: 100%; min-width: 0; }
+.workspace-app-media__clip-strip { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: thin; }
+.workspace-app-media__clip { display: inline-flex; flex: none; align-items: center; gap: 6px; max-width: 180px; padding: 4px 10px; border: 0; border-radius: 999px;
+  background: var(--surface-muted); color: var(--text-default); font: inherit; font-size: 12px; cursor: pointer; }
+.workspace-app-media__clip span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-media__clip[aria-pressed="true"] { background: var(--text-strong); color: var(--surface-panel); }
+
+/* An edit's timeline: a lane per track. */
+.workspace-app-media__timeline { display: grid; gap: 4px; width: 100%; min-width: 0; }
+.workspace-app-media__lane { display: grid; grid-template-columns: 64px minmax(0, 1fr); align-items: center; gap: 8px; }
+.workspace-app-media__lane small { overflow: hidden; color: var(--text-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-media__lane-track { position: relative; height: 22px; border-radius: 4px; background: var(--surface-muted); }
+.workspace-app-media__segment { position: absolute; top: 2px; bottom: 2px; overflow: hidden; border-radius: 3px; background: var(--accent-ring, var(--border-subtle));
+  box-shadow: inset -1px 0 0 var(--surface-panel); }
+.workspace-app-media__segment span { display: block; padding: 0 4px; overflow: hidden; color: var(--text-strong); font-size: 10px; line-height: 18px;
+  text-overflow: ellipsis; white-space: nowrap; }
+.workspace-app-media__timeline-scale { display: flex; justify-content: space-between; margin-left: 72px; color: var(--text-faint); font-size: 10px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .workspace-app-media__frame, .workspace-app-media__card:hover .workspace-app-media__frame { transition: none; transform: none; }
+}
+/* In the viewer a comparison takes the stage's width. */
+.workspace-app-media__stage .workspace-app-media__compare { max-width: 100%; }
+.workspace-app-media__clip, .workspace-app-media__row-title, .workspace-app-media__listen { min-height: 0; }
+/* Inside a list card, these lines keep their own spacing, not the card list's. */
+.workspace-app-media__field-player .workspace-app-media__transcript > li, .workspace-app-media__field-player .workspace-app-media__chapters > li, .workspace-app-media__viewer .workspace-app-media__chapters > li { display: block; margin: 0; padding: 0; border: 0; }

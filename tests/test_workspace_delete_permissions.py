@@ -92,7 +92,7 @@ async def test_admin_can_delete_and_restore_imported_workspace_without_global_re
     trash = await client.get("/api/v1/workspaces/trash/list", headers=admin["headers"])
     assert trash.status_code == 200, trash.text
     assert [row["id"] for row in trash.json()] == [workspace_id]
-    assert trash.json()[0]["can_delete"] is False
+    assert trash.json()[0]["can_delete"] is True
     restored = await client.post(f"/api/v1/workspaces/{workspace_id}/restore", headers=admin["headers"])
     assert restored.status_code == 200, restored.text
     assert restored.json()["deleted_at"] is None
@@ -164,6 +164,8 @@ async def test_scoped_trash_and_restore_exclude_unmanaged_workspaces(client: Asy
     for workspace_id in [*denied_ids, foreign_id, generate_ulid()]:
         restore = await client.post(f"/api/v1/workspaces/{workspace_id}/restore", headers=admin["headers"])
         assert restore.status_code == 404, restore.text
+        purge = await client.delete(f"/api/v1/workspaces/trash/{workspace_id}", headers=admin["headers"])
+        assert purge.status_code == 404, purge.text
     async with db_module.async_session() as db:
         for workspace_id in [owned_id, foreign_id, *denied_ids]:
             assert (await db.get(Workspace, workspace_id)).deleted_at is not None

@@ -74,6 +74,7 @@ from packages.core.services.workflow_retry import (
     merge_retry_evidence,
     retry_target,
 )
+from packages.core.services.workflow_contracts import workflow_step_label
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,8 @@ DIRECT_RUN_INPUT_CHECKED_SOURCES = {"manual", "schedule"}
 WORKSPACE_APP_ACTION_KEY = "_workspace_app_action"
 # Who asked for a retry that continues as the run's starter (see retry_workflow_run).
 RETRY_REQUESTED_BY_KEY = "_workflow_retry_requested_by"
+# Work finished outside a run that a retry accepted as one step's result.
+SUPPLIED_OUTPUT_KEY = "_workflow_supplied_output"
 RUN_RESERVED_TRIGGER_FIELDS = {
     RETRY_CONTEXT_KEY,
     RETRY_REQUESTED_BY_KEY,
@@ -102,6 +105,7 @@ RUN_RESERVED_TRIGGER_FIELDS = {
     # A public start/binding payload must never mint this server-owned context.
     "_workflow_runtime_context",
     "_workflow_effect_review",
+    SUPPLIED_OUTPUT_KEY,
     RUN_DISPLAY_I18N_KEY,
 }
 
@@ -192,14 +196,19 @@ async def _assert_workspace_workflow_execution_ready(
     if is_sandbox_workspace(workspace):
         raise ValueError("Workspace simulation cannot start an ordinary Workflow run")
     from packages.core.services.workspace_readiness import (
+        blocking_setup_blocks_workflow,
         evaluate_workspace_blocking_setup,
     )
 
-    setup_status = await evaluate_workspace_blocking_setup(db, workspace)
+    # Integrations are the acting person's own: whoever starts or retries the run brings their connections.
+    setup_status = await evaluate_workspace_blocking_setup(db, workspace, actor_user_id=started_by)
     if setup_status is not None and setup_status.blocks_work:
-        raise ValueError(
-            "Workspace setup is incomplete; normal Workflow runs are suspended"
-        )
+        # Setup a Workflow never reaches (a publishing connection, for a song) does not hold it up.
+        definition = await db.get(WorkflowDefinition, workflow_id) if workflow_id else None
+        if blocking_setup_blocks_workflow(setup_status, definition.steps if definition is not None else None):
+            raise ValueError(
+                "Workspace setup is incomplete; normal Workflow runs are suspended"
+            )
 
 
 async def _lock_workspace_workflow_configuration_scope(
@@ -385,35 +394,199 @@ async def _validate_workspace_service_dependencies(
         )
 
 
+# The operations the runner's workflow_project node executes, each with the
+# config fields it needs. Keep in step with ``_execute_workflow_project_step``.
+WORKFLOW_PROJECT_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
+    "create": ("project_type", "schema_version", "state_schema"),
+    "claim": ("project_type", "project_key", "schema_version", "state_schema"),
+    "get": ("project_id", "project_type", "schema_version", "state_schema"),
+    "list": ("project_type", "state_schema"),
+    "lease_due": ("project_type", "schema_version", "state_schema", "due_path", "pending_stages"),
+    "complete_lease": ("project_id", "project_type", "schema_version", "state_schema", "current_stage"),
+    "patch": ("project_id", "project_type", "schema_version", "expected_revision", "state_schema"),
+    "delete": ("project_id", "project_type"),
+}
+# What each operation's step output holds, for ``{{step.field}}`` bindings.
+_WORKFLOW_PROJECT_RECORD_FIELDS = frozenset({
+    "project_id", "created_by", "project_type", "project_key", "schema_version",
+    "current_stage", "state", "revision", "last_run_id",
+})
+_WORKFLOW_PROJECT_OUTPUT_FIELDS: dict[str, frozenset[str]] = {
+    **{operation: _WORKFLOW_PROJECT_RECORD_FIELDS for operation in WORKFLOW_PROJECT_REQUIRED_FIELDS},
+    "claim": _WORKFLOW_PROJECT_RECORD_FIELDS | {"claimed"},
+    "list": frozenset({"projects", "has_more", "next_cursor"}),
+    "lease_due": frozenset({"has_project", "project"}),
+    "delete": frozenset({"project_id", "deleted_ids", "deleted_count"}),
+}
+# Config fields the runner resolves to a project identity or revision.
+_WORKFLOW_PROJECT_BINDING_FIELDS = ("project_id", "expected_revision", "parent_id", "after_id")
+# State writes only a patch applies, with the keys each list entry is read by.
+_WORKFLOW_PROJECT_PATCH_WRITES: dict[str, tuple[str, ...]] = {
+    "list_appends": ("path", "items"),
+    "list_upserts": ("path", "item"),
+    # The runner defaults keys/items to [] for clearing or reordering existing rows.
+    "list_reconciles": ("path",),
+    "list_removes": ("path", "field", "values"),
+    "history_event": (),
+}
+_STEP_REFERENCE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)[^{}]*\}\}")
+
+
+def _step_operation(config: dict) -> str:
+    return str(config.get("operation") or "").strip().lower()
+
+
+def _validate_workflow_project_contracts(
+    nodes: list,
+    errors: list[dict[str, str]],
+) -> None:
+    """Reject workflow_project nodes the runner cannot execute as written.
+
+    Covers top-level nodes and stage operations: an operation the runner does
+    not have, ``state`` on a patch (the runner only applies ``patch``), and an
+    identity binding such as ``{{create_article.id}}`` that names a field the
+    producing workflow_project step never outputs.
+    """
+
+    flat: list[tuple[str, dict]] = []
+
+    def collect(items: object, parent_id: str) -> None:
+        if not isinstance(items, list):
+            return
+        for index, node in enumerate(items):
+            if not isinstance(node, dict):
+                continue
+            node_id = str(node.get("id") or index)
+            flat.append((f"{parent_id}.{node_id}" if parent_id else node_id, node))
+            config = node.get("config") if isinstance(node.get("config"), dict) else {}
+            for nested_key in ("operations", "steps"):
+                collect(config.get(nested_key), flat[-1][0])
+
+    collect(nodes, "")
+    # A name another node also writes (its id, output_var or named output) is
+    # ambiguous; such references are left to the runner.
+    producers: dict[str, set[str]] = {}
+    other_names: set[str] = set()
+    for _, node in flat:
+        config = node.get("config") if isinstance(node.get("config"), dict) else {}
+        names = {str(node.get("id") or "").strip(), str(config.get("output_var") or "").strip()}
+        names.discard("")
+        operation = _step_operation(config)
+        if str(node.get("type") or "").strip().lower() == "workflow_project":
+            fields = _WORKFLOW_PROJECT_OUTPUT_FIELDS.get(operation)
+            for name in names:
+                if fields is None:
+                    other_names.add(name)
+                else:
+                    producers.setdefault(name, set()).update(fields)
+        else:
+            other_names.update(names)
+        for item in config.get("outputs") or []:
+            if isinstance(item, dict):
+                other_names.add(str(item.get("key") or item.get("name") or "").strip())
+
+    supported = ", ".join(WORKFLOW_PROJECT_REQUIRED_FIELDS)
+    for qualified_id, node in flat:
+        if str(node.get("type") or "").strip().lower() != "workflow_project":
+            continue
+        config = node.get("config") if isinstance(node.get("config"), dict) else {}
+        operation = _step_operation(config)
+        if operation and operation not in WORKFLOW_PROJECT_REQUIRED_FIELDS:
+            errors.append({
+                "code": "unsupported_workflow_project_operation",
+                "message": (
+                    f"Node '{qualified_id}' has unsupported workflow_project operation "
+                    f"'{operation}'; use one of {supported}. To change an existing project use "
+                    "'patch' with project_id, expected_revision (the revision output of the step "
+                    "that last read or wrote it) and a 'patch' object of state changes"
+                ),
+            })
+        key = config.get("project_key")
+        # One key is one project: a fixed key on create lets only the first run make it.
+        if operation == "create" and isinstance(key, str) and key.strip() and "{{" not in key:
+            errors.append({
+                "code": "invalid_node_config",
+                "message": (
+                    f"Node '{qualified_id}' creates its project under the fixed project_key "
+                    f"'{key.strip()}', so only the first run can create it and every later run fails. "
+                    "Leave project_key out so each run makes its own project, or build it from the short "
+                    "value that tells runs apart (an id, a code or a period such as '{{period_key}}'); "
+                    "to keep reusing one project, claim it instead"
+                ),
+            })
+        if operation == "patch" and "state" in config:
+            errors.append({
+                "code": "invalid_node_config",
+                "message": (
+                    f"Node '{qualified_id}' sets config.state, which a workflow_project patch "
+                    "ignores; put the state changes in config.patch"
+                ),
+            })
+        stage, allowed = config.get("current_stage"), config.get("allowed_stages")
+        # A patch moves the project only to a stage it allows; a run value is checked when it runs.
+        if (operation == "patch" and isinstance(stage, str) and stage and "{{" not in stage
+                and isinstance(allowed, list) and allowed and stage not in {str(value) for value in allowed}):
+            errors.append({
+                "code": "invalid_node_config",
+                "message": (
+                    f"Node '{qualified_id}' moves the project to stage '{stage}', which its "
+                    f"config.allowed_stages {allowed} does not include; add it there"
+                ),
+            })
+        for key, entry_keys in _WORKFLOW_PROJECT_PATCH_WRITES.items():
+            if key not in config:
+                continue
+            if operation != "patch":
+                errors.append({
+                    "code": "invalid_node_config",
+                    "message": (
+                        f"Node '{qualified_id}' sets config.{key}, which only a workflow_project patch "
+                        f"applies; a {operation or 'get'} ignores it. Write it on a patch of the project"
+                    ),
+                })
+                continue
+            if not entry_keys:
+                continue
+            entries = config.get(key) or []
+            if not isinstance(entries, list):
+                errors.append({
+                    "code": "invalid_node_config",
+                    "message": f"Node '{qualified_id}' config.{key} must be an array of objects",
+                })
+                continue
+            for entry in entries:
+                missing = [name for name in entry_keys if name not in entry] if isinstance(entry, dict) else entry_keys
+                if missing:
+                    errors.append({
+                        "code": "invalid_node_config",
+                        "message": (
+                            f"Node '{qualified_id}' has a config.{key} entry without "
+                            + ", ".join(missing) + f"; each entry is {{{', '.join(entry_keys)}}}"
+                            + (", key? (the field that tells items apart, default 'id')" if key != "list_removes" else "")
+                        ),
+                    })
+        for field in _WORKFLOW_PROJECT_BINDING_FIELDS:
+            value = config.get(field)
+            if not isinstance(value, str):
+                continue
+            for name, attribute in _STEP_REFERENCE.findall(value):
+                outputs = producers.get(name)
+                if outputs is None or name in other_names or attribute in outputs:
+                    continue
+                errors.append({
+                    "code": "unknown_workflow_project_output",
+                    "message": (
+                        f"Node '{qualified_id}' config.{field} reads '{name}.{attribute}', but "
+                        f"workflow_project step '{name}' outputs no '{attribute}'; it outputs "
+                        + ", ".join(sorted(outputs))
+                    ),
+                })
+
+
 def _required_step_config_fields(step_type: str, config: dict) -> tuple[str, ...]:
-    operation = str(config.get("operation") or "").strip().lower()
+    operation = _step_operation(config)
     if step_type == "workflow_project":
-        if operation == "create":
-            return ("project_type", "schema_version", "state_schema")
-        if operation == "claim":
-            return (
-                "project_type",
-                "project_key",
-                "schema_version",
-                "state_schema",
-            )
-        if operation == "get":
-            return ("project_id", "project_type", "schema_version", "state_schema")
-        if operation == "patch":
-            return (
-                "project_id",
-                "project_type",
-                "schema_version",
-                "expected_revision",
-                "state_schema",
-            )
-        if operation == "list":
-            return ("project_type", "state_schema")
-        if operation == "lease_due":
-            return ("project_type", "schema_version", "state_schema", "due_path", "pending_stages")
-        if operation == "complete_lease":
-            return ("project_id", "project_type", "schema_version", "state_schema", "current_stage")
-        return ("operation",)
+        return WORKFLOW_PROJECT_REQUIRED_FIELDS.get(operation, ("operation",))
     if step_type == "workflow_action_grant":
         if operation == "create":
             declaration = config.get("declaration")
@@ -684,6 +857,356 @@ def _validate_tool_operation_denylist(
             )
 
 
+# The operations the runner executes for node types that dispatch on
+# ``config.operation``; any other value fails only once a run reaches it.
+STEP_OPERATIONS: dict[str, tuple[str, ...]] = {
+    "workflow_project": ("create", "claim", "get", "list", "lease_due", "complete_lease", "patch", "delete"),
+    "workflow_action_grant": ("create", "revoke", "revoke_current"),
+    "browser_effect": ("decide", "transition"),
+}
+_STEP_OPERATION_HINTS = {
+    "workflow_project": (
+        " To change a project's state or stage use 'patch' with project_id ('{{create_step.project_id}}'), "
+        "expected_revision (the previous project step's '{{step_id.revision}}'), patch:{...}, current_stage "
+        "and the state_schema."
+    ),
+}
+
+
+def _validate_step_operation(
+    node_id: str, node_type: str, config: dict, errors: list[dict[str, str]],
+) -> None:
+    operations = STEP_OPERATIONS.get(node_type)
+    raw = config.get("operation")
+    if operations is None or raw in (None, "") or (isinstance(raw, str) and "{{" in raw):
+        return
+    operation = str(raw).strip().lower()
+    if operation not in operations:
+        errors.append({
+            "code": "unsupported_node_operation",
+            "message": (
+                f"Node '{node_id}' has unsupported config.operation '{raw}' for {node_type}; use one of "
+                + ", ".join(operations) + "." + _STEP_OPERATION_HINTS.get(node_type, "")
+            ),
+        })
+
+
+def _validate_step_expectations(
+    node_id: str, node_type: str, config: dict, errors: list[dict[str, str]],
+) -> None:
+    from packages.core.contracts.step_execution import STEP_EXPECTS_KEY, parse_step_expectations
+
+    if STEP_EXPECTS_KEY not in config:
+        return
+    if node_type != "agent":
+        message = f"config.{STEP_EXPECTS_KEY} only applies to agent nodes"
+    else:
+        try:
+            parse_step_expectations(config[STEP_EXPECTS_KEY])
+            return
+        except ValueError as exc:
+            message = f"config.{STEP_EXPECTS_KEY} {exc}"
+    errors.append({"code": "invalid_step_expectations", "message": f"Node '{node_id}' {message}"})
+
+
+def _validate_project_folder(
+    node_id: str, node_type: str, config: dict, errors: list[dict[str, str]],
+) -> None:
+    """A literal ``folder.under`` must name a folder inside ``projects/``; the runner refuses any other."""
+    from packages.core.services.workspace_layout import PROJECT_ARTIFACT_SEGMENT
+
+    folder = config.get("folder")
+    if node_type != "workflow_project" or not isinstance(folder, dict):
+        return
+    under = folder.get("under")
+    if under in (None, "") or (isinstance(under, str) and "{{" in under):
+        return
+    parts = str(under).strip().strip("/").split("/")
+    if parts[0] != PROJECT_ARTIFACT_SEGMENT or any(part in {"", ".", ".."} for part in parts):
+        errors.append({
+            "code": "invalid_project_folder",
+            "message": (
+                f"Node '{node_id}' config.folder.under {under!r} is not inside "
+                f"{PROJECT_ARTIFACT_SEGMENT}/. Omit it to keep the project in "
+                f"{PROJECT_ARTIFACT_SEGMENT}/<name>, or name a parent project's folder."
+            ),
+        })
+
+
+# Scope words a reference may be written under by habit from other tools. The
+# runner has no such scopes: run inputs and variables are top-level names and
+# step results live under the step id, so ``{{inputs.topic}}`` stays
+# unrendered unless the graph itself names something ``inputs``.
+_UNDECLARED_SCOPE_ROOTS = frozenset({
+    "inputs", "run_inputs", "variables", "vars", "params", "steps", "nodes",
+})
+_TEMPLATE_REFERENCE = re.compile(r"\{\{([^{}]+?)\}\}")
+_REFERENCE_ROOT = re.compile(r"\s*([A-Za-z_][\w-]*)")
+# Config fields whose string value names a variable the step writes.
+_DECLARING_CONFIG_KEYS = frozenset({"key", "name", "target", "variable", "output_var", "item_var"})
+_DECLARING_LISTS = ("run_inputs", "inputs", "outputs", "variables", "assignments")
+
+
+def _declared_workflow_names(nodes: object, names: set[str]) -> None:
+    if not isinstance(nodes, list):
+        return
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        for key in ("id", "name"):
+            if isinstance(node.get(key), str) and node[key].strip():
+                names.add(node[key].strip())
+        config = node.get("config") if isinstance(node.get("config"), dict) else {}
+        if str(node.get("type") or "").strip().lower() == "wait" and config.get("wait_type") in {"input", "human_input"}:
+            names.add(str(config.get("response_variable") or "inputs").strip() or "inputs")
+        for key, value in config.items():
+            if isinstance(value, str) and (key in _DECLARING_CONFIG_KEYS or key.endswith(("_variable", "_var"))):
+                names.add(value.strip())
+        for list_key in _DECLARING_LISTS:
+            items = config.get(list_key)
+            if isinstance(items, dict):
+                names.update(str(key).strip() for key in items)
+            for item in items if isinstance(items, list) else ():
+                if isinstance(item, dict):
+                    names.update(
+                        str(item[key]).strip() for key in ("key", "name", "target")
+                        if isinstance(item.get(key), str)
+                    )
+        for nested_key in ("operations", "steps"):
+            _declared_workflow_names(config.get(nested_key), names)
+
+
+def _template_references(value: object, found: list[str]) -> None:
+    if isinstance(value, str):
+        found.extend(match.strip() for match in _TEMPLATE_REFERENCE.findall(value))
+    elif isinstance(value, dict):
+        for item in value.values():
+            _template_references(item, found)
+    elif isinstance(value, list):
+        for item in value:
+            _template_references(item, found)
+
+
+# What a workflow_project step that returns one project outputs (the
+# runner's _workflow_project_output, plus ``claimed`` for claim).
+_PROJECT_STEP_OUTPUT_FIELDS = frozenset({
+    "project_id", "created_by", "project_type", "project_key", "schema_version",
+    "current_stage", "state", "revision", "last_run_id", "claimed",
+})
+_SINGLE_PROJECT_OPERATIONS = frozenset({"create", "claim", "get", "patch", "complete_lease"})
+
+
+def _project_step_ids(nodes: object, found: set[str]) -> None:
+    if not isinstance(nodes, list):
+        return
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        config = node.get("config") if isinstance(node.get("config"), dict) else {}
+        if (
+            str(node.get("type") or "").strip().lower() == "workflow_project"
+            and str(config.get("operation") or "").strip().lower() in _SINGLE_PROJECT_OPERATIONS
+            and isinstance(node.get("id"), str)
+        ):
+            found.add(node["id"].strip())
+        for nested_key in ("operations", "steps"):
+            _project_step_ids(config.get(nested_key), found)
+
+
+def _validate_workflow_references(
+    nodes: list,
+    errors: list[dict[str, str]],
+    *,
+    variable_names: Sequence[str] = (),
+) -> None:
+    """Refuse references the runner cannot resolve.
+
+    A reference under a scope the runner does not have, or to a field a
+    project step never outputs, would stay unrendered at run time.
+    """
+    declared = {str(name).strip() for name in variable_names}
+    _declared_workflow_names(nodes, declared)
+    project_steps: set[str] = set()
+    _project_step_ids(nodes, project_steps)
+    for index, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            continue
+        references: list[str] = []
+        _template_references(node.get("config"), references)
+        for reference in dict.fromkeys(references):
+            match = _REFERENCE_ROOT.match(reference)
+            root = match.group(1) if match else ""
+            if root in project_steps and root not in variable_names:
+                field = reference[match.end():].lstrip(".").split(".")[0].strip()
+                if field and field not in _PROJECT_STEP_OUTPUT_FIELDS:
+                    errors.append({
+                        "code": "unresolvable_reference",
+                        "message": (
+                            f"Node '{node.get('id') or index}' refers to '{{{{{reference}}}}}', but project step "
+                            f"'{root}' outputs " + ", ".join(sorted(_PROJECT_STEP_OUTPUT_FIELDS - {"claimed"}))
+                            + f" (project fields are under '{root}.state')."
+                        ),
+                    })
+                continue
+            if root not in _UNDECLARED_SCOPE_ROOTS or root in declared:
+                continue
+            field = reference[match.end():].lstrip(".").strip() or "name"
+            errors.append({
+                "code": "unresolvable_reference",
+                "message": (
+                    f"Node '{node.get('id') or index}' refers to '{{{{{reference}}}}}', but nothing in "
+                    f"this Workflow is named '{root}'. Refer to a run input or variable by its own "
+                    f"name ('{{{{{field.split('.')[0]}}}}}') and to a step result by its step id "
+                    "('{{step_id.field}}')."
+                ),
+            })
+
+
+_AGENT_OUTPUT_STEP_TYPES = frozenset({"agent", "llm", "classifier"})
+# Schema keywords that let an object hold fields its ``properties`` do not list.
+_OPEN_SCHEMA_KEYWORDS = ("anyOf", "oneOf", "allOf", "$ref", "patternProperties", "if")
+
+
+def _flat_workflow_nodes(nodes: object, found: list[dict]) -> None:
+    if not isinstance(nodes, list):
+        return
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        found.append(node)
+        config = node.get("config") if isinstance(node.get("config"), dict) else {}
+        for nested_key in ("operations", "steps"):
+            _flat_workflow_nodes(config.get(nested_key), found)
+
+
+def _agent_output_reference_problem(node: dict, field: str) -> str | None:
+    """Why ``field`` of this agent, llm or classifier step's result never has a value.
+
+    A step without its own ``output_schema`` returns every field later steps
+    read from it (the runner makes them its output contract), except a
+    classifier, whose result is its label. A step with an ``output_schema``
+    returns the reply text unless ``output_format`` is ``json``, and then only
+    the fields the schema declares.
+    """
+    config = node.get("config") if isinstance(node.get("config"), dict) else {}
+    step_type = str(node.get("type") or "").strip().lower()
+    if config.get("batch") or config.get("stat_assessment_keys"):
+        return None
+    schema = config.get("output_schema")
+    if schema is None:
+        if step_type != "classifier":
+            return None
+        return (
+            "returns its label as text. Refer to the label as '{{%s}}', or give it an output_schema "
+            "that lists '%s' and output_format: 'json'" % (node["id"], field)
+        )
+    if not isinstance(schema, dict):
+        return None
+    properties = schema.get("properties")
+    if schema.get("type") != "object" and not isinstance(properties, dict):
+        return None
+    if str(config.get("output_format") or "text").strip().lower() != "json":
+        return (
+            "has an output_schema but no output_format: 'json', so its result is the reply text. "
+            "Set output_format: 'json' on it, or refer to the whole reply as '{{%s}}'" % node["id"]
+        )
+    if (
+        not isinstance(properties, dict) or not properties or field in properties
+        or schema.get("additionalProperties") or any(key in schema for key in _OPEN_SCHEMA_KEYWORDS)
+    ):
+        return None
+    return (
+        "has an output_schema that declares no '%s' (it declares %s). Add '%s' to its "
+        "output_schema properties and required, or remove its output_schema so it returns every "
+        "field later steps read from it" % (field, ", ".join(sorted(properties)), field)
+    )
+
+
+def _is_approval_wait(node: dict) -> bool:
+    config = node.get("config") if isinstance(node.get("config"), dict) else {}
+    return (
+        str(node.get("type") or "").strip().lower() == "wait"
+        and str(config.get("wait_type") or "approval").strip().lower() == "approval"
+    )
+
+
+def _approval_wait_reference_problem(node: dict) -> str:
+    """An approval wait's own result is its message text; the answer is under its response_variable."""
+    config = node.get("config") if isinstance(node.get("config"), dict) else {}
+    variable = str(config.get("response_variable") or "").strip()
+    answer = (
+        f"read the decision as '{{{{{variable}.choice}}}}' and the person's note as '{{{{{variable}.note}}}}'"
+        if variable else
+        "give it a response_variable (e.g. 'final_approval') and read the decision as "
+        "'{{final_approval.choice}}' and the person's note as '{{final_approval.note}}'"
+    )
+    return (
+        f"results in its message text, with no fields: {answer}. No variable holds when it was decided; "
+        "a workflow_project patch's history_event records that with a timestamp"
+    )
+
+
+def _validate_agent_output_references(
+    nodes: list,
+    errors: list[dict[str, str]],
+    *,
+    variable_names: Sequence[str] = (),
+) -> None:
+    """Refuse ``{{step.field}}`` reads of an agent step result that has no such field.
+
+    A reply that stays text, or a declared output_schema without the field,
+    leaves the reference without a value at run time: the step that stores
+    or sends it fails, and a prompt shows the literal ``{{...}}``. A name
+    another node or a definition variable also writes is ambiguous and left
+    to the runner.
+    """
+    flat: list[dict] = []
+    _flat_workflow_nodes(nodes, flat)
+    writers: dict[str, int] = {}
+    producers: dict[str, dict] = {}
+    for node in flat:
+        config = node.get("config") if isinstance(node.get("config"), dict) else {}
+        shallow = {**node, "config": {key: value for key, value in config.items() if key not in {"operations", "steps"}}}
+        names: set[str] = set()
+        _declared_workflow_names([shallow], names)
+        if isinstance(config.get("set"), dict):
+            names.update(str(key).strip() for key in config["set"])
+        for name in names:
+            writers[name] = writers.get(name, 0) + 1
+        step_type = str(node.get("type") or "").strip().lower()
+        if step_type in _AGENT_OUTPUT_STEP_TYPES and isinstance(node.get("id"), str) and node["id"].strip():
+            for name in (node["id"], config.get("output_var")):
+                if isinstance(name, str) and name.strip():
+                    producers[name.strip()] = node
+        elif _is_approval_wait(node) and isinstance(node.get("id"), str) and node["id"].strip():
+            producers[node["id"].strip()] = node
+    declared = {str(name).strip() for name in variable_names}
+    for node in flat:
+        references: list[str] = []
+        _template_references(node.get("config"), references)
+        for reference in dict.fromkeys(references):
+            match = _REFERENCE_ROOT.match(reference)
+            if not match or not reference[match.end():].startswith("."):
+                continue
+            root = match.group(1)
+            producer = producers.get(root)
+            if producer is None or producer is node or writers.get(root, 0) > 1 or root in declared:
+                continue
+            field = reference[match.end():].lstrip(".").split(".")[0].strip()
+            if _is_approval_wait(producer):
+                problem = _approval_wait_reference_problem(producer)
+            else:
+                problem = _agent_output_reference_problem(producer, field) if field else None
+            if problem:
+                errors.append({
+                    "code": "unknown_wait_output" if _is_approval_wait(producer) else "unknown_agent_output",
+                    "message": (
+                        f"Node '{node.get('id')}' refers to '{{{{{reference}}}}}', but "
+                        f"{producer.get('type')} step '{producer['id']}' {problem}."
+                    ),
+                })
+
+
 def _validate_workflow_schema_contracts(
     nodes: object,
     errors: list[dict[str, str]],
@@ -725,6 +1248,9 @@ def _validate_workflow_schema_contracts(
         _validate_tool_operation_denylist(
             qualified_id, node_type, config, errors,
         )
+        _validate_step_expectations(qualified_id, node_type, config, errors)
+        _validate_step_operation(qualified_id, node_type, config, errors)
+        _validate_project_folder(qualified_id, node_type, config, errors)
         for side in ("input", "output"):
             key = f"{side}_schema"
             schema = config.get(key)
@@ -813,10 +1339,24 @@ def _is_imported_unmapped_node(step: dict, source: str) -> bool:
 _DERIVE_IMPORT_SOURCE = object()
 
 
+def workflow_variable_names(variables: object) -> tuple[str, ...]:
+    """Names a definition's variables declare: a ``{key: default}`` map or ``[{key}]`` list."""
+    if isinstance(variables, dict):
+        return tuple(str(key) for key in variables)
+    if isinstance(variables, list):
+        return tuple(
+            str(item.get("key") or item.get("name"))
+            for item in variables
+            if isinstance(item, dict) and (item.get("key") or item.get("name"))
+        )
+    return ()
+
+
 def _require_runtime_workflow(
     workflow: object,
     *,
     steps: list[dict] | None = None,
+    variables: object = None,
     imported_source: str | None | object = _DERIVE_IMPORT_SOURCE,
 ) -> None:
     """Require a safe graph while preserving imported-node skip semantics."""
@@ -831,6 +1371,9 @@ def _require_runtime_workflow(
         runtime_steps,
         imported_source=(
             str(trusted_source).strip().lower() if trusted_source else None
+        ),
+        variable_names=workflow_variable_names(
+            variables if variables is not None else getattr(workflow, "variables", None)
         ),
     )
     if not validation["valid"]:
@@ -889,11 +1432,87 @@ def _step_skill_tool_warnings(
     ]
 
 
+_NEGATED_INSTRUCTION = re.compile(r"\b(?:not|never|no|avoid|without)\b[^.;:]*$", re.IGNORECASE)
+# A tool the text tells the node to use: "use analyze_audio", "call `mcp__chrome__read_page`".
+_INSTRUCTED_TOOL = re.compile(
+    r"\b(?:use|uses|using|call|calling|run|running|invoke|invoking|with)\s+(?:the\s+)?`?"
+    r"(mcp__[a-z0-9_-]+__[a-z0-9_]+|[a-z][a-z0-9]*(?:_[a-z0-9]+)+)`?",
+    re.IGNORECASE,
+)
+
+
+def _step_named_tool_warnings(step_id: str, step_type: str, config: dict) -> list[dict[str, str]]:
+    """Tools a node's own instructions name but its ``tools`` list leaves out.
+
+    A node told to "check silence with analyze_audio" or to verify the post
+    with ``mcp__chrome__read_page`` cannot do either when its explicit tools
+    withhold them; it can only report a check it never ran, or loop on it.
+    Only a registered or MCP tool name the text tells the node to use counts;
+    a plan describing what a later step will call does not.
+    """
+    tools = config.get("tools")
+    if step_type not in {"agent", "llm"} or not isinstance(tools, list):
+        return []
+    text = "\n".join(
+        config[key] for key in ("prompt", "system_prompt", "input", "instructions")
+        if isinstance(config.get(key), str)
+    )
+    if not text:
+        return []
+    from packages.core.ai.tool_pool import tool_pool
+
+    if not tool_pool.tool_count:
+        tool_pool.initialize()
+    known = set(tool_pool.registered_tool_names(include_undiscoverable=True))
+    named = [
+        match.group(1) for match in _INSTRUCTED_TOOL.finditer(text)
+        if (match.group(1) in known or match.group(1).startswith("mcp__"))
+        # "Do not call list_files" withholds it on purpose.
+        and not _NEGATED_INSTRUCTION.search(text[max(0, match.start() - 24):match.start()])
+    ]
+    allowed = {str(tool) for tool in tools}
+    missing = [name for name in dict.fromkeys(named) if name not in allowed]
+    if not missing:
+        return []
+    return [{
+        "code": "instructed_tools_withheld",
+        "message": (
+            f"Node '{step_id}' is instructed to use {', '.join(missing)} but its tools leave "
+            "them out; add them or change the instructions, or the check cannot run here"
+        ),
+    }]
+
+
+def _first_cycle(edges: dict[str, list[str]]) -> list[str] | None:
+    """The first route back to a step already on the path, as step ids, or None."""
+    state: dict[str, int] = {}
+
+    def visit(node: str, path: list[str]) -> list[str] | None:
+        state[node] = 1
+        for target in edges.get(node, []):
+            if state.get(target) == 1:
+                return [*path[path.index(target):], target]
+            if target in edges and target not in state:
+                found = visit(target, [*path, target])
+                if found:
+                    return found
+        state[node] = 2
+        return None
+
+    for node in edges:
+        if node not in state:
+            found = visit(node, [node])
+            if found:
+                return found
+    return None
+
+
 def validate_workflow_steps(
     steps: list[dict] | None,
     *,
     imported_source: str | None = None,
     resolve_skill: Callable[[str], Any] | None = None,
+    variable_names: Sequence[str] = (),
 ) -> dict:
     """Validate a workflow graph for authoring, deployment, and execution.
 
@@ -902,6 +1521,8 @@ def validate_workflow_steps(
     node-specific credentials and external resources are resolved at runtime.
     ``resolve_skill`` maps a Skill slug to its declaration for the
     withheld-tool warning; packaged built-ins are resolved by default.
+    ``variable_names`` are the definition's own variables, which references
+    may name.
     """
     if resolve_skill is None:
         from packages.core.services.builtin_skill_loader import packaged_builtin_skill_declaration
@@ -922,6 +1543,12 @@ def validate_workflow_steps(
         }
 
     _validate_workflow_schema_contracts(nodes, errors)
+    if not imported_source:
+        # Imported expressions are left visible on purpose (see the runner's
+        # _render_template); they are mapped by the import, not authored here.
+        _validate_workflow_references(nodes, errors, variable_names=variable_names)
+        _validate_agent_output_references(nodes, errors, variable_names=variable_names)
+    _validate_workflow_project_contracts(nodes, errors)
 
     ids: list[str] = []
     seen: set[str] = set()
@@ -976,6 +1603,7 @@ def validate_workflow_steps(
                     "message": f"Node '{step_id}' requires config.{field}",
                 })
         warnings.extend(_step_skill_tool_warnings(step_id, step_type, config, resolve_skill))
+        warnings.extend(_step_named_tool_warnings(step_id, step_type, config))
 
         outgoing = _step_outgoing_targets(step, step_id=step_id, errors=errors)
         if step_type == "stage":
@@ -1006,6 +1634,19 @@ def validate_workflow_steps(
                     "code": "missing_edge_target",
                     "message": f"Node '{source}' points to missing node '{target}'",
                 })
+
+    if not imported_source:
+        cycle = _first_cycle(edges_by_id)
+        if cycle:
+            # A step runs once its active predecessors have, so a step routed back to never runs again.
+            errors.append({
+                "code": "graph_cycle",
+                "message": (
+                    "Workflow routes back to an earlier step (" + " → ".join(cycle) + "); a run takes each step "
+                    "at most once, so it would wait there forever. Repeat work with foreach_subworkflow over "
+                    "the items, or let an Automation run the Workflow again"
+                ),
+            })
 
     entry = entries[0] if len(entries) == 1 else None
     if entry:
@@ -1040,6 +1681,7 @@ def validate_workflow_definition(workflow: object) -> dict:
     return validate_workflow_steps(
         getattr(workflow, "steps", None),
         imported_source=_imported_workflow_source(workflow),
+        variable_names=workflow_variable_names(getattr(workflow, "variables", None)),
     )
 
 
@@ -1309,16 +1951,36 @@ async def update_workflow(
     entity_id: str,
     *,
     require_valid_steps: bool = False,
+    expected_version: int | None = None,
     **kwargs,
 ) -> WorkflowDefinition | None:
-    wf = await get_workflow(db, workflow_id, entity_id)
+    """Apply ``kwargs`` to the workflow. With ``expected_version`` the row is
+    locked and the save is refused (``StaleRevisionError``) when anyone saved
+    it since that version, so two editors never silently overwrite each other."""
+    if expected_version is None:
+        wf = await get_workflow(db, workflow_id, entity_id)
+    else:
+        wf = (await db.execute(
+            select(WorkflowDefinition)
+            .where(WorkflowDefinition.id == workflow_id, WorkflowDefinition.entity_id == entity_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )).scalar_one_or_none()
     if not wf:
         return None
+    if expected_version is not None and int(wf.version or 1) != int(expected_version):
+        from packages.core.revisions import StaleRevisionError
+
+        raise StaleRevisionError(
+            target_kind="workflow_definition", target_id=wf.id,
+            expected=int(expected_version), actual=int(wf.version or 1),
+        )
     imported_source = _imported_workflow_source(wf)
     if require_valid_steps and kwargs.get("steps") is not None:
         _require_runtime_workflow(
             wf,
             steps=kwargs["steps"],
+            variables=kwargs.get("variables"),
             imported_source=imported_source,
         )
     steps_changed = (
@@ -1841,7 +2503,7 @@ async def import_workflow_definition(
 
 def _workflow_display_metadata(workflow: WorkflowDefinition) -> dict:
     node_names = {
-        str(step.get("id")): str(step.get("name") or step.get("id"))
+        str(step.get("id")): workflow_step_label(step)
         for step in (workflow.steps or [])
         if isinstance(step, dict) and str(step.get("id") or "").strip()
     }
@@ -1889,7 +2551,7 @@ async def _name_run_after_binding(db: AsyncSession, trigger_data: dict, binding_
 
 def _snapshot_display_metadata(snapshot: dict) -> dict:
     node_names = {
-        str(node.get("id")): str(node.get("name") or node.get("id"))
+        str(node.get("id")): workflow_step_label(node)
         for node in (snapshot.get("nodes") or [])
         if isinstance(node, dict) and str(node.get("id") or "").strip()
     }
@@ -2131,7 +2793,8 @@ def _retry_variables(
     retained_stage_states = {
         sid: state for sid, state in stage_execution.items()
         if sid in retry_stage_ids and isinstance(state, dict)
-        and (prior_results.get(sid) or {}).get("status") != "completed"
+        and ((prior_results.get(sid) or {}).get("status") != "completed"
+             or (prior_results.get(sid) or {}).get("needs_person"))
         and state.get("status") != "completed"
     }
     if retained_stage_states:
@@ -2369,6 +3032,44 @@ def _retry_variables(
     if variables:
         updated.update(deepcopy(variables))
     return updated
+
+
+async def _retry_production_progress(
+    db: AsyncSession, prior: WorkflowRun, steps: list[dict], step_id: str,
+) -> dict | None:
+    """The units every attempt of this result already made, for a retried step that makes units.
+
+    A retry redoes only what came up short: the clips earlier attempts
+    finished are handed to the step, and the units still to make are named.
+    """
+    from packages.core.models.media_job import MediaJob
+    from packages.core.services.workflow_production import (
+        production_progress, production_unit_steps, workflow_production_config, workflow_run_local_clips,
+    )
+
+    config = workflow_production_config(steps)
+    if config is None or step_id not in production_unit_steps(config):
+        return None
+    root = prior.lineage_root_run_id or prior.id
+    run_ids = list((await db.scalars(select(WorkflowRun.id).where(
+        WorkflowRun.entity_id == prior.entity_id,
+        WorkflowRun.workflow_id == prior.workflow_id,
+        or_(WorkflowRun.id == root, WorkflowRun.lineage_root_run_id == root),
+    ).limit(RUN_FAMILY_MAX_RUNS))).all())
+    jobs = (await db.scalars(select(MediaJob).where(
+        MediaJob.entity_id == prior.entity_id,
+        MediaJob.params["run_id"].astext.in_([*run_ids, prior.id]),
+    ).limit(500))).all()
+    return production_progress(config, prior.variables or {}, [{
+        "id": job.id, "status": job.status, "kind": job.kind,
+        "unit_id": (job.params or {}).get("unit_id"),
+        "output_name": (job.params or {}).get("output_name"),
+        "document_id": (job.params or {}).get("result_document_id"),
+        "result_url": job.result_url, "duration_seconds": job.duration_seconds,
+        "created_at": job.created_at.isoformat() if job.created_at else "",
+    } for job in jobs] + await workflow_run_local_clips(
+        db, entity_id=prior.entity_id, run_ids=[*run_ids, prior.id],
+    ))
 
 
 async def _refresh_retry_workflow_project(
@@ -3148,6 +3849,105 @@ async def restart_stalled_run(
     return run, launched
 
 
+async def _supplied_step_output_audit(
+    db: AsyncSession,
+    prior: WorkflowRun,
+    *,
+    steps: dict[str, dict],
+    supplied: dict,
+    requested_by: str,
+) -> dict:
+    """Check work finished outside a run before it stands in for one step.
+
+    The output must satisfy the step's own declared contract and name each
+    supplied Knowledge Document. Each Document must be readable, in the run's
+    Workspace, by the person supplying it and by the person the run continues
+    as. Nothing is skipped: the run continues from that step, so its checks and
+    reviews still run.
+    """
+    from packages.core.models.document import Document
+    from packages.core.services.document_access import user_can_read_document
+    from packages.core.services.workflow_agent_recovery import step_output_contract
+    from packages.core.services.workflow_retry import _DETERMINISTIC_STEP_TYPES
+
+    step_id = str(supplied.get("step_id") or "").strip()
+    step = steps.get(step_id)
+    if step is None:
+        raise ValueError("Supplied output names a step that is not part of the workflow")
+    if step.get("type") in _DETERMINISTIC_STEP_TYPES or step.get("type") == "wait":
+        raise ValueError("Supplied output can only stand in for a step that produces work")
+    schema = step_output_contract(step)
+    if schema is None:
+        raise ValueError(f"Supplied output needs step '{step_id}' to declare an output_schema")
+    output = supplied.get("output")
+    if not isinstance(output, dict):
+        raise ValueError("Supplied output must be an object")
+    errors = sorted(
+        SchemaContractValidatorFactory.build(schema).iter_errors(output),
+        key=lambda error: list(error.path),
+    )
+    if errors:
+        where = ".".join(str(part) for part in errors[0].path) or "output"
+        raise ValueError(f"Supplied output does not match step '{step_id}' output_schema at {where}: {errors[0].message}")
+    document_ids = [str(item or "").strip() for item in supplied.get("document_ids") or []]
+    if not document_ids or not all(document_ids) or len(document_ids) > 20 or len(set(document_ids)) != len(document_ids):
+        raise ValueError("Supplied output needs 1-20 distinct document_ids")
+
+    def strings(value: object) -> set[str]:
+        if isinstance(value, str):
+            return {value}
+        if isinstance(value, dict):
+            return set().union(*(strings(child) for child in value.values()))
+        if isinstance(value, list):
+            return set().union(*(strings(child) for child in value))
+        return set()
+
+    named = strings(output)
+    if not requested_by:
+        raise ValueError("Supplied output needs the person who supplies it")
+    readers = [await db.get(User, user_id) for user_id in dict.fromkeys([requested_by, prior.started_by]) if user_id]
+    for document_id in document_ids:
+        if document_id not in named:
+            raise ValueError(f"Supplied output does not reference document '{document_id}'")
+        document = await db.get(Document, document_id)
+        if document is None or document.is_trashed or not all([
+            reader is not None and await user_can_read_document(
+                db, document, entity_id=prior.entity_id, user_id=reader.id,
+                role=reader.role, workspace_id=prior.workspace_id,
+            )
+            for reader in readers
+        ]):
+            raise ValueError(f"Supplied document '{document_id}' isn't a readable Document in this run's Workspace")
+    note = str(supplied.get("note") or "").strip()
+    if len(note) > 2000:
+        raise ValueError("Supplied output note must be at most 2000 characters")
+    return {
+        "step_id": step_id,
+        "document_ids": document_ids,
+        "note": note,
+        "source_run_id": prior.id,
+        "supplied_by": requested_by,
+        "supplied_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# Tools that only read, render, merge, or save files inside the Workspace.  A
+# provider outage during them left nothing outside Manor, so a retry repeats
+# billed generation but cannot repeat a publish or a Chrome action.
+GENERATION_ONLY_TOOLS = frozenset({
+    "read_file", "generate_file", "generate_image", "generate_video", "still_to_video",
+    "render_frame_samples", "merge_videos", "probe_media", "wait_media_jobs", "workspace_search",
+})
+
+
+def provider_outage_without_external_effect(result: Any) -> bool:
+    """True when a failed attempt stopped in a provider outage and used only generation tools."""
+    if not isinstance(result, dict) or result.get("provider_transient") is not True:
+        return False
+    tools = result.get("tools_used")
+    return isinstance(tools, list) and bool(tools) and all(tool in GENERATION_ONLY_TOOLS for tool in tools)
+
+
 async def retry_workflow_run(
     db: AsyncSession,
     *,
@@ -3163,8 +3963,15 @@ async def retry_workflow_run(
     effect_review: dict | None = None,
     definition: str = "original",
     revision: bool = False,
+    supplied_output: dict | None = None,
 ) -> WorkflowRun:
     """Create a linked attempt that resumes from a prior run checkpoint.
+
+    ``supplied_output`` (``step_id``, ``output``, ``document_ids``, ``note``)
+    accepts work finished outside the run, such as a file made in chat, as
+    that step's result: the step is not run again and everything after it,
+    including its checks and reviews, runs as usual (see
+    ``_supplied_step_output_audit``).
 
     ``revision`` makes a finished run's next version: the person asked for a
     change, so a completed run may start again from the step its Workflow's
@@ -3340,10 +4147,32 @@ async def retry_workflow_run(
         if isinstance(step, dict)
     }
 
+    supplied_audit = supplied_result = None
+    if supplied_output is not None:
+        if effect_review is not None or revision or variables or expected_latest_run_id is not None:
+            raise ValueError("Supplied output can't be combined with an effect review, revision or changed inputs")
+        supplied_audit = await _supplied_step_output_audit(
+            db, prior, steps=workflow_steps, supplied=supplied_output, requested_by=started_by,
+        )
+        if supplied_audit["step_id"] not in source_steps:
+            raise ValueError("Supplied output names a step the failed attempt did not have")
+        if from_step_id and from_step_id != supplied_audit["step_id"]:
+            raise ValueError("Supplied output must be for the retry step")
+        from_step_id = supplied_audit["step_id"]
+        supplied_result = deepcopy(supplied_output["output"])
+
+    def was_supplied(step_id: str) -> bool:
+        # The supplied step is not run again, so its old outcome can't replay.
+        return bool(supplied_audit and step_id == supplied_audit["step_id"])
+
     from packages.core.services.workflow_agent_recovery import (
         workflow_cancelled_agent_requires_review,
     )
-    if effect_review is None and workflow_cancelled_agent_requires_review(prior):
+    if (
+        effect_review is None
+        and workflow_cancelled_agent_requires_review(prior)
+        and not was_supplied(str(prior.current_step_id or ""))
+    ):
         raise ValueError(
             "Workflow retry is blocked: the cancelled agent step must be reconciled first"
         )
@@ -3406,6 +4235,8 @@ async def retry_workflow_run(
         from_step_id = review["step_id"]
 
     def was_reviewed(step_id: str, result: dict) -> bool:
+        if was_supplied(step_id):
+            return True
         return bool(review_audit and step_id == review_audit["step_id"] and result == reviewed_result)
 
     def agent_recovery_checkpoint(step_id: str, result: dict) -> bool:
@@ -3424,6 +4255,8 @@ async def retry_workflow_run(
         recovery path, which re-observes before taking another action.
         """
         if result.get("status") != "failed" or agent_recovery_checkpoint(step_id, result) or was_reviewed(step_id, result):
+            return False
+        if provider_outage_without_external_effect(result):
             return False
         from packages.core.ai.runtime.outcome import attempt_forbids_replay
 
@@ -3560,15 +4393,30 @@ async def retry_workflow_run(
         retry_evidence.step_results[sid] = deepcopy(settled)
         # Cancelled Agents may not have saved a result/source before review.
         retry_evidence.source_run_ids[sid] = prior.id
+    if supplied_audit:
+        sid = supplied_audit["step_id"]
+        if sid not in retry_evidence.executed_results and sid != prior.current_step_id:
+            raise ValueError(f"Supplied output is for step '{sid}', which this run never reached")
+        # Like an applied review, the supplied result is a completed root and
+        # only what follows it runs; a later retry may run the step again.
+        settled = {"status": "completed", "output": deepcopy(supplied_result), "supplied_output": supplied_audit}
+        retry_evidence.executed_results[sid] = settled
+        retry_evidence.step_results[sid] = deepcopy(settled)
+        retry_evidence.source_run_ids[sid] = prior.id
     retry_context = build_retry_context(
         execution_workflow.steps or [], retry_evidence.step_results, retry_step_id,
-        explicit_checkpoint=bool(from_step_id),
+        # A terminal target the resolver replaced is not the caller's checkpoint.
+        explicit_checkpoint=bool(from_step_id) and retry_step_id == str(from_step_id).strip(),
         added_step_ids=set(workflow_steps) - set(source_steps) if use_current else (),
     )
-    if review_audit and review_audit["decision"] == "applied":
+    accepted_step_id = (
+        review_audit["step_id"] if review_audit and review_audit["decision"] == "applied"
+        else supplied_audit["step_id"] if supplied_audit else None
+    )
+    if accepted_step_id:
         # Traverse the accepted node as a completed root; only its downstream
         # frontier is runnable. This also supports an Agent that ends the graph.
-        sid = review_audit["step_id"]
+        sid = accepted_step_id
         retry_context["invalidated_step_ids"].remove(sid)
         retry_context["inherited_step_ids"].append(sid)
     inherited_ids = set(retry_context["inherited_step_ids"])
@@ -3644,6 +4492,9 @@ async def retry_workflow_run(
             "resume_strategy": "reexecute",
             "agent_retry_recovery": True,
         }
+        progress = await _retry_production_progress(db, prior, execution_workflow.steps or [], recovery_step_id)
+        if progress is not None:
+            inherited_results[recovery_step_id]["production_progress"] = progress
         if review_audit and recovery_step_id == review_audit["step_id"] and recovery is not None:
             recovery["operator_effect_review"] = deepcopy(review_audit)
     prior_trigger = {
@@ -3661,6 +4512,8 @@ async def retry_workflow_run(
     retry_trigger = _attempt_trigger_data(execution_workflow, prior_trigger)
     if review_audit:
         retry_trigger["_workflow_effect_review"] = review_audit
+    if supplied_audit:
+        retry_trigger[SUPPLIED_OUTPUT_KEY] = supplied_audit
     # A revision is a new version, not a recovery: what writes per attempt
     # (a project's take folder) must not reuse the version it revises.
     retry_trigger.pop("_workflow_revision", None)
@@ -3962,10 +4815,26 @@ async def _transfer_retry_project_leases(
             and isinstance(expected, dict)
             and project.last_run_id == expected.get("run_id")
         )
-        if (project is None or project.current_stage not in {"leased", "verification_required"}
+        # A project the failed owner put on hold (a provider outage) is retried from that owner's lease.
+        held_by_owner = (
+            project is not None and project.current_stage == "held"
+            and isinstance(expected, dict) and project.last_run_id == expected.get("run_id")
+        )
+        # The failed owner released its lease back to the stage it waited in
+        # (release_failed_run_project_leases): the retry leases that stage again.
+        released_failure = (
+            project is not None and isinstance(expected, dict)
+            and project.current_stage == expected.get("pending_stage")
+            and project.current_stage != "leased" and lease == {}
+            and project.last_run_id == expected.get("run_id")
+        )
+        if (project is None or (project.current_stage not in {"leased", "verification_required"}
+                                and not held_by_owner and not released_failure)
                 or not isinstance(expected, dict) or not expected.get("run_id")
-                or not isinstance(lease, dict) or (lease != expected and not released_review)
-                or (project.current_stage == "verification_required" and not retained_verification_lease and not released_review)):
+                or not isinstance(lease, dict)
+                or (lease != expected and not released_review and not released_failure)
+                or (project.current_stage == "verification_required" and not retained_verification_lease
+                    and not released_review and not released_failure)):
             raise ValueError("Workflow project lease changed; reconcile it before retrying")
         owner = await db.get(WorkflowRun, expected["run_id"])
         if (owner is None or owner.entity_id != retry.entity_id
@@ -3983,14 +4852,15 @@ async def _transfer_retry_project_leases(
             )
         )
         if (project.current_stage == "verification_required"
-                and not retained_verification_lease_is_current_owner_state and not released_review):
+                and not retained_verification_lease_is_current_owner_state
+                and not released_review and not released_failure):
             raise ValueError("Workflow project lease changed; reconcile it before retrying")
         owner_proves_handoff_state = owner_proved_current_project(project, owner)
         handoff_state = deepcopy(project.state)
         state = deepcopy(project.state)
         handoff_revision = project.revision
         _set_state_value(state, lease_path, {
-            **(expected if released_review else lease), "run_id": retry.id,
+            **(expected if released_review or released_failure else lease), "run_id": retry.id,
             "expires_at": (datetime.now(timezone.utc) + timedelta(
                 seconds=int(config.get("lease_seconds") or 900),
             )).isoformat(),
@@ -4052,10 +4922,29 @@ async def _transfer_retry_project_leases(
                 and candidate.get("state") == handoff_state
             )
 
+        def is_released_failure_projection(candidate: dict) -> bool:
+            """The owner's view of its lease, from just before the failure released it."""
+            def with_lease(state: dict) -> dict:
+                moved = deepcopy(state)
+                _set_state_value(moved, lease_path, deepcopy(expected))
+                return moved
+
+            return (
+                released_failure
+                and candidate.get("revision") == handoff_revision - 1
+                and candidate.get("last_run_id") == owner.id
+                and candidate.get("project_type") == project.project_type
+                and candidate.get("schema_version") == project.schema_version
+                and candidate.get("current_stage") == "leased"
+                and isinstance(candidate.get("state"), dict)
+                and with_lease(candidate["state"]) == with_lease(handoff_state)
+            )
+
         def is_refreshable_handoff_projection(candidate: dict) -> bool:
             return (
                 is_retained_verification_projection(candidate)
                 or is_legacy_handoff_projection(candidate)
+                or is_released_failure_projection(candidate)
                 or (released_review
                     and candidate.get("revision") == released_checkpoint.get("checkpoint_revision")
                     and candidate.get("last_run_id") == owner.id
@@ -4076,7 +4965,8 @@ async def _transfer_retry_project_leases(
         # and state were checked above under the project row lock, so it may
         # move with the lease.  Other projections must have observed the
         # durable project at this handoff revision to be refreshed below.
-        if owner_proves_handoff_state or retained_verification_lease_is_current_owner_state or released_review:
+        if (owner_proves_handoff_state or retained_verification_lease_is_current_owner_state
+                or released_review or released_failure):
             retry.step_results[step_id] = {
                 **result,
                 "output": {**output, "project": deepcopy(refreshed)},

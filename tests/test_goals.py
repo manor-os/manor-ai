@@ -1447,7 +1447,7 @@ async def test_concurrent_entity_goal_key_conflict_is_a_domain_error(db_session)
 
 
 @pytest.mark.asyncio
-async def test_goal_mode_change_invalidates_an_open_operation_draft(client: AsyncClient):
+async def test_goal_mode_change_survives_an_open_operation_draft(client: AsyncClient):
     headers = await _auth(client, "goal_mode_revision")
     workspace = await client.post(
         "/api/v1/workspaces",
@@ -1484,12 +1484,19 @@ async def test_goal_mode_change_invalidates_an_open_operation_draft(client: Asyn
         json={"status": "paused"},
     )
     assert paused.status_code == 200, paused.text
-    stale_apply = await client.post(
+    # The draft was made before the pause; it is applied on top of it and
+    # must not bring the Goal back.
+    rebased_apply = await client.post(
         f"/api/v1/workspaces/{workspace_id}/operation/drafts/{draft.json()['id']}/apply",
         headers=headers,
         json={"user_confirmation": True},
     )
-    assert stale_apply.status_code == 409, stale_apply.text
+    assert rebased_apply.status_code == 200, rebased_apply.text
+    state = (await client.get(
+        f"/api/v1/workspaces/{workspace_id}/operation/current", headers=headers,
+    )).json()["state"]
+    assert state["heartbeat_policy"]["enabled"] is True
+    assert (await client.get(f"/api/v1/goals/{goal.json()['id']}", headers=headers)).json()["status"] == "paused"
 
 
 @pytest.mark.asyncio

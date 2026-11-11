@@ -17,7 +17,6 @@ import {
 // Lazy load all pages
 const AppLayout = lazy(() => import("./layouts/AppLayout"));
 const Login = lazy(() => import("./pages/Login"));
-const Dashboard = lazy(() => import("./pages/Dashboard"));
 const Tasks = lazy(() => import("./pages/Tasks"));
 const TaskImport = lazy(() => import("./pages/TaskImport"));
 const TaskImportEmbed = lazy(() => import("./pages/TaskImportEmbed"));
@@ -32,13 +31,10 @@ const DocEditor = lazy(() => import("./pages/DocEditor"));
 const FileViewer = lazy(() => import("./pages/FileViewer"));
 const VideoEditor = lazy(() => import("./pages/VideoEditor"));
 const DiagramStudio = lazy(() => import("./pages/DiagramStudio"));
-const ChatHistory = lazy(() => import("./pages/ChatHistory"));
-const Agents = lazy(() => import("./pages/Agents"));
 const AgentDetail = lazy(() => import("./pages/AgentDetail"));
 const AgentDashboard = lazy(() => import("./pages/AgentDashboard"));
 const Flows = lazy(() => import("./pages/Flows"));
 const WorkflowRun = lazy(() => import("./pages/WorkflowRun"));
-const Skills = lazy(() => import("./pages/Skills"));
 const Integrations = lazy(() => import("./pages/Integrations"));
 const Workspaces = lazy(() => import("./pages/Workspaces"));
 const WorkspaceDraftChat = lazy(() => import("./pages/WorkspaceDraftChat"));
@@ -51,15 +47,17 @@ const Messages = lazy(() => import("./pages/Messages"));
 const Users = lazy(() => import("./pages/Users"));
 const Activity = lazy(() => import("./pages/Activity"));
 const Settings = lazy(() => import("./pages/Settings"));
+// Team, clients and integrations open inside the Settings frame.
+const SettingsFrame = lazy(() => import("./pages/Settings").then((m) => ({ default: m.SettingsFrame })));
 const Notifications = lazy(() => import("./pages/Notifications"));
 const ApprovalRequest = lazy(() => import("./pages/ApprovalRequest"));
 const Clients = lazy(() => import("./pages/Clients"));
 const ClientDelivery = lazy(() => import("./pages/ClientDelivery"));
 const WorkspaceCollaboration = lazy(() => import("./pages/WorkspaceCollaboration"));
 const Account = lazy(() => import("./pages/Account"));
-const ScheduledJobs = lazy(() => import("./pages/ScheduledJobs"));
 const BrowserSessions = lazy(() => import("./pages/BrowserSessions"));
 const OAuthCallback = lazy(() => import("./pages/OAuthCallback"));
+const IntegrationOAuthDone = lazy(() => import("./pages/IntegrationOAuthDone"));
 const OAuthAuthorize = lazy(() => import("./pages/OAuthAuthorize"));
 const NotFound = lazy(() => import("./pages/NotFound"));
 const ForgotPassword = lazy(() => import("./pages/ForgotPassword"));
@@ -71,12 +69,10 @@ const ClientPortal = lazy(() => import("./pages/ClientPortal"));
 const SharedFolder = lazy(() => import("./pages/SharedFolder"));
 const SharedDocument = lazy(() => import("./pages/SharedDocument"));
 const SignDocument = lazy(() => import("./pages/SignDocument"));
-const SearchResults = lazy(() => import("./pages/SearchResults"));
 const ApiKeys = lazy(() => import("./pages/ApiKeys"));
 const AdminOAuthClients = lazy(() => import("./pages/AdminOAuthClients"));
 const WebhookManager = lazy(() => import("./pages/WebhookManager"));
 const CustomFields = lazy(() => import("./pages/CustomFields"));
-const AgentMemories = lazy(() => import("./pages/Memories"));
 const Reports = lazy(() => import("./pages/Reports"));
 const JobLogs = lazy(() => import("./pages/JobLogs"));
 
@@ -90,11 +86,27 @@ function S({ children }: { children: React.ReactNode }) {
   return <Suspense fallback={<PageLoader />}>{children}</Suspense>;
 }
 
+function ChatHistoryRedirect() {
+  const location = useLocation();
+  const params = new URLSearchParams(location.search);
+  params.set("tab", "history");
+  return <Navigate to={`/settings?${params}`} replace />;
+}
+
 function LegacyClientsRedirect() {
   const location = useLocation();
   return <Navigate to={`/team/clients${location.search}${location.hash}`} replace />;
 }
 
+
+/** Old library routes land on their Settings › AI tab with the same query. */
+function SettingsTabRedirect({ tab }: { tab: "agents" | "skills" | "memories" | "flows" | "automations" }) {
+  const location = useLocation();
+  const query = new URLSearchParams(location.search);
+  query.delete("tab");
+  const rest = query.toString();
+  return <Navigate to={`/settings?tab=${tab}${rest ? `&${rest}` : ""}${location.hash}`} state={location.state} replace />;
+}
 
 function PreviewFeatureRoute({
   feature,
@@ -105,7 +117,7 @@ function PreviewFeatureRoute({
 }) {
   const access = usePreviewFeatureAccess(feature);
   if (!access.loaded) return <PageLoader />;
-  if (!access.enabled) return <Navigate to="/skills" replace />;
+  if (!access.enabled) return <Navigate to="/settings?tab=skills" replace />;
   return <>{children}</>;
 }
 
@@ -164,6 +176,15 @@ const routes: RouteObject[] = [
     ),
   },
   {
+    // An integration's OAuth popup lands here and reports to the chat that opened it.
+    path: "/integrations/connected",
+    element: (
+      <S>
+        <IntegrationOAuthDone />
+      </S>
+    ),
+  },
+  {
     path: "/oauth/authorize",
     element: (
       <S>
@@ -210,11 +231,7 @@ const routes: RouteObject[] = [
           { path: "/chat", element: <></> },
           {
             path: "/chat/history",
-            element: (
-              <S>
-                <ChatHistory />
-              </S>
-            ),
+            element: <ChatHistoryRedirect />,
           },
           {
             path: "/chat/:id",
@@ -257,14 +274,7 @@ const routes: RouteObject[] = [
             path: "/goals/:goalId",
             element: <Navigate to="/workspaces" replace />,
           },
-          {
-            path: "/jobs",
-            element: (
-              <S>
-                <ScheduledJobs />
-              </S>
-            ),
-          },
+          { path: "/jobs", element: <SettingsTabRedirect tab="automations" /> },
           {
             path: "/jobs/:jobId/logs",
             element: (
@@ -315,11 +325,7 @@ const routes: RouteObject[] = [
           },
           {
             path: "/dashboard",
-            element: (
-              <S>
-                <Dashboard />
-              </S>
-            ),
+            element: <Navigate to="/chat" replace />,
           },
           {
             path: "/settings",
@@ -329,14 +335,8 @@ const routes: RouteObject[] = [
               </S>
             ),
           },
-          {
-            path: "/agents",
-            element: (
-              <S>
-                <Agents />
-              </S>
-            ),
-          },
+          // The AI libraries live in Settings › AI; old links keep their query.
+          { path: "/agents", element: <SettingsTabRedirect tab="agents" /> },
           {
             path: "/agents/dashboard",
             element: (
@@ -358,7 +358,7 @@ const routes: RouteObject[] = [
             element: (
               <PreviewFeatureRoute feature="flows">
                 <S>
-                  <WorkflowLegacyRedirect><Flows /></WorkflowLegacyRedirect>
+                  <WorkflowLegacyRedirect><SettingsTabRedirect tab="flows" /></WorkflowLegacyRedirect>
                 </S>
               </PreviewFeatureRoute>
             ),
@@ -375,19 +375,12 @@ const routes: RouteObject[] = [
             path: "/workspaces/:workspaceId/workflow-runs/:runId",
             element: <PreviewFeatureRoute feature="flows"><S><WorkflowRun /></S></PreviewFeatureRoute>,
           },
-          {
-            path: "/skills",
-            element: (
-              <S>
-                <Skills />
-              </S>
-            ),
-          },
+          { path: "/skills", element: <SettingsTabRedirect tab="skills" /> },
           {
             path: "/integrations",
             element: (
               <S>
-                <Integrations />
+                <SettingsFrame activeKey="integrations"><Integrations /></SettingsFrame>
               </S>
             ),
           },
@@ -451,7 +444,7 @@ const routes: RouteObject[] = [
             path: "/team",
             element: (
               <S>
-                <TeamLayout />
+                <SettingsFrame activeKey="team"><TeamLayout /></SettingsFrame>
               </S>
             ),
             children: [
@@ -473,7 +466,7 @@ const routes: RouteObject[] = [
               },
             ],
           },
-          { path: "/team/clients", element: <S><Clients /></S> },
+          { path: "/team/clients", element: <S><SettingsFrame activeKey="clients"><Clients /></SettingsFrame></S> },
           { path: "/company/clients", element: <LegacyClientsRedirect /> },
           { path: "/client-delivery/:token", element: <S><ClientDelivery /></S> },
           { path: "/workspaces/:workspaceId/collaboration", element: <S><WorkspaceCollaboration /></S> },
@@ -526,14 +519,8 @@ const routes: RouteObject[] = [
               </S>
             ),
           },
-          {
-            path: "/search",
-            element: (
-              <S>
-                <SearchResults />
-              </S>
-            ),
-          },
+          // Search lives in the sidebar (⌘K); old links land on the home page.
+          { path: "/search", element: <Navigate to="/chat" replace /> },
           {
             path: "/api-keys",
             element: (
@@ -569,14 +556,7 @@ const routes: RouteObject[] = [
               </S>
             ),
           },
-          {
-            path: "/memories",
-            element: (
-              <S>
-                <AgentMemories />
-              </S>
-            ),
-          },
+          { path: "/memories", element: <SettingsTabRedirect tab="memories" /> },
           {
             path: "/reports",
             element: (

@@ -456,6 +456,24 @@ def runtime_tool_call_context_is_external_customer(kwargs: dict[str, Any]) -> bo
     }
 
 
+def runtime_tool_call_context_is_person_chat(context: RuntimeToolCallContext) -> bool:
+    """Return true when a signed-in person is driving this turn from chat.
+
+    Workflow steps, scheduled runs and Tasks also carry a user and a message
+    (the prompt they were given), so neither of those tells a person asked.
+    Only the Runtime envelope's surface and the run's own ids do.
+    """
+
+    surface = getattr(context.runtime_envelope, "surface", None)
+    return bool(context.user_id) and getattr(surface, "value", surface) in {
+        ChatSurface.WORKSPACE_CHAT.value,
+        ChatSurface.AGENT_DM.value,
+        ChatSurface.FILE_EDITOR_CHAT.value,
+        ChatSurface.VOICE_CHAT.value,
+        ChatSurface.WORKSPACE_DRAFT_ARCHITECT.value,
+    } and not (context.task_id or context.workflow_run_id or context.workflow_step_id)
+
+
 def runtime_tool_call_context_is_public_customer(kwargs: dict[str, Any]) -> bool:
     """Return true only for QR/public webchat customer turns."""
 

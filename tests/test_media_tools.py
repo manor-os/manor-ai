@@ -30,7 +30,6 @@ def test_media_tools_registered():
         "probe_media",
         "verify_media_sources",
         "measure_media_audio_alignment",
-        "verify_stickman_final_media",
         "render_frame_samples",
         "transcribe_video",
         "analyze_audio",
@@ -6204,9 +6203,74 @@ async def test_compose_video_filter_attaches_audio_input_without_empty_filter(tm
     filter_complex = captured["args"][captured["args"].index("-filter_complex") + 1]
     assert "[1:a:0]aresample=48000" in filter_complex
     assert "[1:a:0],aresample" not in filter_complex
-    expected_trim = "atrim=0:2.000" if not source_start else "atrim=3.250:5.250"
-    assert expected_trim in filter_complex
+    # An excerpt is seeked on its input, not decoded from the start and trimmed after.
+    assert "atrim=0:2.000" in filter_complex
+    assert "atrim=3.250" not in filter_complex
+    song_input = captured["args"].index(str(tmp_path / "audio" / "narration.wav"))
+    if source_start:
+        assert captured["args"][song_input - 3:song_input] == ["-ss", "3.250", "-i"]
+    else:
+        assert "-ss" not in captured["args"]
     assert captured["args"][captured["args"].index("-t") + 1] == "5.000"
+
+
+@pytest.mark.skipif(not (shutil.which("ffmpeg") and shutil.which("ffprobe")), reason="ffmpeg not installed")
+@pytest.mark.asyncio
+async def test_composed_excerpt_from_late_in_a_song_stays_aligned(tmp_path, monkeypatch):
+    """A music video laying 15 s of a song from 155 s timed out in compose: the song was decoded
+    from its start and trimmed after. It is now seeked on input, and must stay exactly aligned:
+    a beep 12.5 s into the song sounds 0.5 s into an excerpt that starts at 12 s."""
+    from packages.core.services.generated_media_naming import GeneratedMediaTarget
+
+    song = tmp_path / "song.wav"
+    picture = tmp_path / "picture.mp4"
+    subprocess.run([
+        "ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
+        "aevalsrc='if(between(t,12.5,12.6),0.8*sin(2*PI*1000*t),0)':s=48000:d=20", "-ac", "2", str(song),
+    ], check=True)
+    subprocess.run([
+        "ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "color=black:size=160x90:rate=30:duration=2",
+        "-pix_fmt", "yuv420p", str(picture),
+    ], check=True)
+
+    def fake_commit(_entity_id, rel_path, source_path, **_kwargs):
+        target = tmp_path / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(Path(source_path).read_bytes())
+        return str(target)
+
+    async def fake_workspace_base_dir(**_kwargs):
+        return ""
+
+    monkeypatch.setattr(media_tools, "runtime_copy_entity_file_atomic", fake_commit)
+    monkeypatch.setattr("packages.core.services.entity_fs.get_entity_root", lambda _entity_id: str(tmp_path))
+    monkeypatch.setattr(
+        "packages.core.services.generated_media_naming.resolve_workspace_artifact_base_dir", fake_workspace_base_dir,
+    )
+    monkeypatch.setattr("packages.core.services.generated_media_naming.build_generated_media_target", lambda **_: (
+        GeneratedMediaTarget(filename="mixed.mp4", rel_dir="final", rel_path="final/mixed.mp4",
+                             abs_dir=str(tmp_path / "final"), abs_path=str(tmp_path / "final" / "mixed.mp4"))
+    ))
+    track = media_tools.TimelineAudioTrack(
+        track_id="song", track_type="music", rel_path="song.wav", abs_path=str(song), start=0.0, end=2.0,
+        volume_db=0, loop=False, fade_in=0, fade_out=0, duration=2.0, source_start=12.0,
+    )
+    await media_tools._compose_video_file(
+        ffmpeg=shutil.which("ffmpeg"), entity_id="entity", output_name="final/mixed.mp4", workspace_id=None,
+        clean_video_abs=str(picture), subtitle_abs="", subtitle_style={}, audio_tracks=[track],
+        include_source_audio=False, ducking_config={"enabled": False}, loudness_config={"enabled": False},
+        crf=23, preset="ultrafast", total_duration=2.0,
+    )
+
+    pcm = subprocess.run([
+        "ffmpeg", "-loglevel", "error", "-i", str(tmp_path / "final" / "mixed.mp4"),
+        "-ac", "1", "-ar", "48000", "-f", "s16le", "-",
+    ], capture_output=True, check=True).stdout
+    import array
+
+    samples = array.array("h", pcm)
+    onset = next(index for index, value in enumerate(samples) if abs(value) > 3000) / 48000
+    assert abs(onset - 0.5) < 0.03
 
 
 @pytest.mark.asyncio
@@ -7359,9 +7423,14 @@ async def test_still_to_video_renders_and_registers_h264_scene(monkeypatch, tmp_
         resolution="1080p",
         aspect_ratio="16:9",
         fps=30,
+        _workflow_run_id_from_context="run-1",
+        _workflow_scene_id_from_context="S11",
     ))
 
     args = captured["args"]
+    # A Workflow's clip names its run and unit on its receipt, so the run counts it as made.
+    assert captured["generation"]["workflow_run_id"] == "run-1"
+    assert captured["generation"]["unit_id"] == "S11"
     assert args[:5] == ["/usr/bin/ffmpeg", "-y", "-loop", "1", "-i"]
     assert "scale=1920:1080:force_original_aspect_ratio=decrease" in args[args.index("-vf") + 1]
     assert args[args.index("-t") + 1] == "4.500"
@@ -7388,9 +7457,14 @@ def _ffmpeg_burns_text() -> bool:
     with tempfile.TemporaryDirectory() as folder:
         subtitles = Path(folder) / "probe.srt"
         subtitles.write_text("1\n00:00:00,000 --> 00:00:01,000\nx\n", encoding="utf-8")
-        return subprocess.run(
-            [ffmpeg, "-v", "error", "-f", "lavfi", "-i", "color=s=64x64:d=0.1", "-vf", f"subtitles={subtitles}",
-             "-f", "null", "-"], capture_output=True, check=False).returncode == 0
+        try:
+            probe = subprocess.run(
+                [ffmpeg, "-v", "error", "-f", "lavfi", "-i", "color=s=64x64:d=0.1", "-vf", f"subtitles={subtitles}",
+                 "-f", "null", "-"], capture_output=True, check=False)
+        except OSError:
+            # A broken binary on PATH (wrong CPU architecture) is missing capability, not a collection error.
+            return False
+        return probe.returncode == 0
 
 
 @pytest.mark.asyncio
@@ -8064,6 +8138,188 @@ async def test_transcribe_video_returns_text_when_stt_has_no_timestamps(monkeypa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("timed_route", [True, False])
+async def test_transcribe_audio_asks_a_timestamp_model_before_text_only(monkeypatch, timed_route):
+    from contextlib import asynccontextmanager
+
+    from packages.core import database
+    from packages.core.ai.tools import extended_tools
+    from packages.core.services import model_resolver
+    from packages.core.services.voice import whisper
+
+    async def load(_path, _entity_id):
+        return "song.mp3", b"mp3", "audio/mpeg"
+
+    @asynccontextmanager
+    async def session():
+        yield None
+
+    async def chat_audio_model(*_args, **_kwargs):
+        return "openai/gpt-4o-audio-preview"
+
+    async def no_byok(*_args, **_kwargs):
+        return {}
+
+    calls = []
+
+    async def transcribe(_blob, **kwargs):
+        calls.append((kwargs["resolved_model"], kwargs.get("require_timestamps", False)))
+        if kwargs.get("require_timestamps"):
+            if not timed_route:
+                raise whisper.WhisperTimestampError("no timestamp-capable route")
+            return SimpleNamespace(text="We light the night", duration_seconds=3.0, model="whisper-1",
+                                   segments=[{"start": 0.5, "end": 2.5, "text": "We light the night"}])
+        return SimpleNamespace(text="We light the night", duration_seconds=3.0, model="chat-audio", segments=[])
+
+    monkeypatch.setattr(extended_tools, "_load_audio_reference_bytes", load)
+    monkeypatch.setattr(database, "async_session", session)
+    monkeypatch.setattr(model_resolver, "resolve_model_for_user", chat_audio_model)
+    monkeypatch.setattr(model_resolver, "resolve_llm_metadata_for_user", no_byok)
+    monkeypatch.setattr(whisper, "transcribe_blob", transcribe)
+
+    result = json.loads(await extended_tools._transcribe_audio_handler(
+        entity_id="entity-1", user_id="user-1", audio_path="Music/song.mp3",
+    ))
+
+    assert result["text"] == "We light the night"
+    assert result["timestamps_available"] is timed_route
+    if timed_route:
+        assert result["segments"] == [{"start": 0.5, "end": 2.5, "text": "We light the night"}]
+        assert calls == [("openai/whisper-1", True)]
+    else:
+        assert result["segments"] == []
+        assert calls == [("openai/whisper-1", True), ("openai/gpt-4o-audio-preview", False)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("own_key", [None, "sk-own-key"], ids=["platform", "byok"])
+async def test_transcribe_audio_bills_a_platform_call_and_only_logs_a_byok_call(monkeypatch, own_key):
+    # A lyric step's speech-to-text was never recorded: a platform call is charged, a BYOK call is logged at no charge.
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from packages.core import database
+    from packages.core.ai import runtime
+    from packages.core.ai.tools import extended_tools
+    from packages.core.services import model_resolver, usage_service, voice
+    from packages.core.services.voice import whisper
+
+    async def load(_path, _entity_id):
+        return "song.mp3", b"mp3", "audio/mpeg"
+
+    @asynccontextmanager
+    async def session():
+        yield SimpleNamespace(commit=lambda: None)
+
+    async def commit(*_args, **_kwargs):
+        return None
+
+    async def model(*_args, **_kwargs):
+        return "openai/whisper-1"
+
+    async def metadata(*_args, **_kwargs):
+        return {"llm_api_key": own_key} if own_key else {}
+
+    async def transcribe(_blob, **_kwargs):
+        return SimpleNamespace(text="We light the night", duration_seconds=30.0, model="openai/whisper-1",
+                               segments=[{"start": 0.5, "end": 2.5, "text": "We light the night"}])
+
+    gate, records = [], []
+
+    async def credit_gate(*_args, **kwargs):
+        gate.append(kwargs["source"])
+
+    async def record(_db, *_args, **kwargs):
+        records.append(kwargs)
+
+    monkeypatch.setattr(extended_tools, "_load_audio_reference_bytes", load)
+    monkeypatch.setattr(database, "async_session", session)
+    monkeypatch.setattr(model_resolver, "resolve_model_for_user", model)
+    monkeypatch.setattr(model_resolver, "resolve_llm_metadata_for_user", metadata)
+    monkeypatch.setattr(whisper, "transcribe_blob", transcribe)
+    monkeypatch.setattr(runtime, "runtime_assert_credit_available", credit_gate)
+    monkeypatch.setattr(usage_service, "record_media_usage", record)
+
+    result = json.loads(await extended_tools._transcribe_audio_handler(
+        entity_id="entity-1", user_id="user-1", audio_path="Music/song.mp3",
+    ))
+
+    assert result["text"] == "We light the night"
+    [record_call] = records
+    assert record_call["kind"] == "whisper" and record_call["units"] == 30
+    assert record_call["byok"] is (own_key is not None)
+    if own_key is None:
+        assert gate == [record_call["source"]] and record_call["cost_usd"] > 0
+    else:
+        assert gate == []
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg not installed")
+@pytest.mark.asyncio
+@pytest.mark.media_integration
+@pytest.mark.parametrize("window", [None, (120.0, 140.0)], ids=["over-the-limit", "excerpt"])
+async def test_transcribe_audio_sends_a_studio_song_as_compact_speech_audio(monkeypatch, tmp_path, window):
+    """A music video's lyric step sent a 39 MB studio WAV whole and the STT upload limit (25 MB)
+    refused it, so the cut shipped without lyrics. A large file, or the excerpt asked for, is
+    sent as compact speech audio, and its segment times stay in the song's own time."""
+    from contextlib import asynccontextmanager
+
+    from packages.core import database
+    from packages.core.ai.tools import extended_tools
+    from packages.core.services import model_resolver
+    from packages.core.services.voice import whisper
+
+    song = tmp_path / "song.wav"
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=150",
+                    "-ac", "2", "-c:a", "pcm_s16le", str(song)], check=True)
+    assert song.stat().st_size > whisper.WHISPER_MAX_UPLOAD_BYTES
+
+    async def load(_path, _entity_id):
+        return "song.wav", song.read_bytes(), "audio/wav"
+
+    @asynccontextmanager
+    async def session():
+        yield None
+
+    async def model(*_args, **_kwargs):
+        return "openai/whisper-1"
+
+    async def no_byok(*_args, **_kwargs):
+        return {}
+
+    sent = {}
+
+    async def transcribe(blob, **kwargs):
+        sent.update(size=len(blob), mime=kwargs["mime"], filename=kwargs["filename"])
+        decoded = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", "pipe:0", "-f", "s16le", "-ac", "1", "-ar", "16000", "pipe:1"],
+            input=blob, capture_output=True, check=True,
+        ).stdout
+        sent["duration_seconds"] = len(decoded) / (16000 * 2)
+        return SimpleNamespace(text="We light the night", duration_seconds=20.0, model="whisper-1",
+                               segments=[{"start": 2.0, "end": 4.5, "text": "We light the night"}])
+
+    monkeypatch.setattr(extended_tools, "_load_audio_reference_bytes", load)
+    monkeypatch.setattr(database, "async_session", session)
+    monkeypatch.setattr(model_resolver, "resolve_model_for_user", model)
+    monkeypatch.setattr(model_resolver, "resolve_llm_metadata_for_user", no_byok)
+    monkeypatch.setattr(whisper, "transcribe_blob", transcribe)
+
+    args = {} if window is None else {"start_seconds": window[0], "end_seconds": window[1]}
+    result = json.loads(await extended_tools._transcribe_audio_handler(
+        entity_id="entity-1", user_id="user-1", audio_path="Music/song.wav", **args,
+    ))
+
+    assert "error" not in result, result
+    assert sent["mime"] == "audio/mpeg" and sent["filename"] == "song.mp3"
+    # 150 s of mono 16 kHz speech audio is about 0.9 MB; a 20 s excerpt is a small fraction of that.
+    assert sent["size"] < (1_000_000 if window is None else 200_000)
+    assert sent["duration_seconds"] == pytest.approx(150.0 if window is None else 20.0, abs=0.2)
+    offset = 0.0 if window is None else window[0]
+    assert result["segments"] == [{"start": 2.0 + offset, "end": 4.5 + offset, "text": "We light the night"}]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("prompt", "matches"),
     [
@@ -8625,22 +8881,118 @@ def test_line_lyrics_fill_or_glitch_as_one_line():
     assert len(ghosts) == 2 and all(ghost.split(",")[2] == "0:00:01.15" for ghost in ghosts)
 
 
+def test_lyric_words_take_their_own_size_font_and_beats(monkeypatch):
+    monkeypatch.setattr(media_tools, "_lyric_font_measure", lambda *_args: lambda text, size: len(text) * size / 2)
+    # "night" is belted and held: auto emphasis picks it over the quieter "light".
+    words = (media_tools.SubtitleWord(1.0, 1.3, "We", -24), media_tools.SubtitleWord(1.3, 1.7, "light", -18),
+             media_tools.SubtitleWord(1.7, 1.9, "the", -24), media_tools.SubtitleWord(1.9, 2.8, "night", -9))
+    cue = media_tools.SubtitleCue(1, 1.0, 3.2, "We light the night", "dialogue", words=words)
+    look = {"reveal": "word", "entrance": "pop", "entrance_ms": 200, "exit": "fade", "exit_ms": 200,
+            "font_size": 100, "emphasis_scale": 1.4, "small_scale": 0.6, "auto_emphasis": True,
+            "emphasis_font_name": "Kaushan Script", "emphasis_bold": False,
+            "beat_hit": "pulse", "beat_strength": 1.0, "beats": [1.1, [1.6, 1.0], [2.4, 2.0], 3.1]}
+
+    ass = media_tools._render_animated_lyrics_ass([cue], look, canvas_width=1920, canvas_height=1080)
+    enters = {event.rsplit("}", 1)[1]: event for event in ass.splitlines()
+              if event.startswith("Dialogue: 1,") and "\\fad(0," not in event}
+
+    # Small words at 60 %, the key word at 140 % in the second font; "light" keeps the font size.
+    assert "\\fs60" in enters["We"] and "\\fs60" in enters["the"] and "\\fs100" in enters["light"]
+    assert "\\fs140" in enters["night"] and "\\fnKaushan Script\\b0" in enters["night"]
+    assert "\\fn" not in enters["light"]
+    # "light" enters at 1.3 s and settles 200 ms later: the 1.6 s beat hits 300 ms in; the 1.1 s
+    # beat came before it, and the 3.1 s beat falls in the exit.
+    assert "\\t(300,370,\\fscx110\\fscy110)\\t(370,560,\\fscx100\\fscy100)" in enters["light"]
+    assert enters["light"].count("\\fscx110") == 1
+    # The key word hits harder on the strong 2.4 s beat (capped at an eighth larger).
+    assert "\\t(500,570,\\fscx112\\fscy112)" in enters["night"]
+    # The small word never touches the large one: the space before "night" is the 140 px font's space.
+    centres = {text: int(re.search(r"\\pos\((\d+),", event).group(1)) for text, event in enters.items()}
+    assert centres["night"] - 350 / 2 - (centres["the"] + 90 / 2) == pytest.approx(70, abs=1)
+
+
+def test_held_lyric_words_stretch_into_room_left_for_them(monkeypatch):
+    monkeypatch.setattr(media_tools, "_lyric_font_measure", lambda *_args: lambda text, size: len(text) * size / 2)
+    words = (media_tools.SubtitleWord(0.5, 0.8, "so"), media_tools.SubtitleWord(0.8, 2.0, "long"))
+    cue = media_tools.SubtitleCue(1, 0.5, 2.5, "so long", "dialogue", words=words)
+    look = {"reveal": "word", "entrance": "fade", "entrance_ms": 200, "font_size": 100, "long_note": "stretch"}
+
+    enters = {event.rsplit("}", 1)[1]: event for event in media_tools._render_animated_lyrics_ass(
+        [cue], look, canvas_width=1920, canvas_height=1080).splitlines()
+        if event.startswith("Dialogue: 1,") and "\\fad(200" in event}
+    held = enters["long"]
+
+    # Held from 0.8 s to 2.0 s: it widens once its 200 ms fade-in is done, then returns.
+    assert "\\t(200,1200,\\fscx112)\\t(1200,1380,\\fscx100\\fscy100)" in held
+    # "so" (100 wide) and "long" (200 wide, laid out at 224) are spaced by one 50 px space.
+    so, long = (int(re.search(r"\\pos\((\d+),", enters[text]).group(1)) for text in ("so", "long"))
+    assert long - so == 50 + 224 / 2 + 100 / 2
+
+
+def test_follow_camera_words_ride_the_beat_at_their_zoom(monkeypatch):
+    monkeypatch.setattr(media_tools, "_lyric_font_measure", lambda *_args: lambda text, size: len(text) * size / 2)
+    words = (media_tools.SubtitleWord(1.0, 1.6, "Shine"), media_tools.SubtitleWord(1.6, 2.4, "on"))
+    cue = media_tools.SubtitleCue(1, 1.0, 3.0, "Shine on", "dialogue", words=words)
+
+    ass = media_tools._render_animated_lyrics_ass(
+        [cue], {"reveal": "word", "camera": "follow", "camera_tilts": [3], "font_size": 100, "entrance_ms": 200,
+                "camera_ms": 200, "beat_hit": "punch", "beat_strength": 1.0, "beats": [1.4, 1.55]},
+        canvas_width=1920, canvas_height=1080)
+    shine = next(event for event in ass.splitlines() if event.startswith("Dialogue: 1,0:00:01.00,"))
+    zoom = int(re.findall(r"\\fscx(\d+)", shine)[1])
+
+    # The beat 400 ms in pulses the word from the camera's zoom and rocks it about the line's tilt;
+    # the one 50 ms before the camera moves on to "on" is left out.
+    assert f"\\t(400,470,\\fscx{round(zoom * 1.1)}\\fscy{round(zoom * 1.1)})" in shine
+    assert "\\t(400,450,\\frz10.0)\\t(450,510,\\frz-1.2)\\t(510,600,\\frz3)" in shine
+    assert "\\t(550," not in shine
+
+
+def test_picture_lyric_colours_take_the_most_vivid_hue():
+    grey = bytes([90, 90, 90]) * 2000
+    # A small magenta sign on a large dull brown wall still sets the colour.
+    sign = grey[:-300 * 3] + bytes([120, 90, 70]) * 200 + bytes([255, 40, 210]) * 100
+    hue, saturation = media_tools._vivid_picture_hue(sign)
+
+    assert media_tools._vivid_picture_hue(grey) is None
+    assert 0.85 < hue < 0.9 and saturation > 0.8
+    colors = media_tools._picture_lyric_colors(hue, saturation, ["accent_color", "outline_color"])
+    assert set(colors) == {"accent_color", "outline_color"}
+    red, green, blue = (int(colors["accent_color"][i:i + 2], 16) for i in (1, 3, 5))
+    assert max(red, green, blue) == 255 and green < red and green < blue
+    assert max(int(colors["outline_color"][i:i + 2], 16) for i in (1, 3, 5)) < 80
+
+
 @pytest.mark.asyncio
-async def test_align_subtitles_animates_lyrics_timed_from_the_song(monkeypatch, tmp_path):
+@pytest.mark.parametrize(("cue_start", "expected_span", "expected_clock"), [
+    (1.0, (119.0, 126.0), "0:00:01"),
+    (601.0, (719.0, 726.0), "0:10:01"),
+], ids=["near-start", "late-first-cue"])
+async def test_align_subtitles_animates_lyrics_timed_from_the_song(
+    monkeypatch, tmp_path, cue_start, expected_span, expected_clock,
+):
     monkeypatch.setattr(media_tools, "_lyric_font_measure", lambda *_args: None)
     (tmp_path / "lyric-cues.json").write_text(json.dumps({"cues": [
-        {"start": 1.0, "end": 4.0, "text": "We light the night, we don't look back and we never stop",
+        {"start": cue_start, "end": cue_start + 3.0, "text": "We light the night, we don't look back and we never stop",
          "emphasis": ["night"], "type": "dialogue", "timing_source": "whisper_segments"},
     ]}), encoding="utf-8")
     (tmp_path / "song.mp3").write_bytes(b"audio")
     output_path = tmp_path / "lyrics.ass"
     transcribed = []
 
+    spans = []
+
+    async def fake_span(audio_bytes, *, start_seconds, end_seconds):
+        spans.append((audio_bytes, start_seconds, end_seconds))
+        return b"span-mp3"
+
     async def fake_stt(**kwargs):
-        transcribed.append(kwargs["audio_path"])
-        # Song clock: the video starts 120 s into the song.
-        return SimpleNamespace(words=[{"text": "we", "start": 121.2, "end": 121.4},
-                                      {"text": "light", "start": 121.4, "end": 121.9}], segments=[], model="whisper-1")
+        transcribed.append(Path(kwargs["audio_path"]).read_bytes())
+        # The span starts two seconds before the first cue, even after a long instrumental intro.
+        return SimpleNamespace(words=[{"text": "we", "start": 2.2, "end": 2.4},
+                                      {"text": "light", "start": 2.4, "end": 2.9}], segments=[], model="whisper-1")
+
+    monkeypatch.setattr("packages.core.services.audio_conversion.speech_audio_bytes", fake_span)
 
     async def fake_target(**kwargs):
         assert kwargs["ext"] == ".ass"
@@ -8672,7 +9024,9 @@ async def test_align_subtitles_animates_lyrics_timed_from_the_song(monkeypatch, 
     ))
 
     assert (result["status"], result["format"], result["cue_count"]) == ("completed", "ass", 1)
-    assert transcribed == [str(tmp_path / "song.mp3")]
+    # Prod 2026-11-02: the whole 39 MB song went to STT and its upload limit refused it. Only the
+    # span the cues cover (with 2 s either side) is heard, as compact speech audio.
+    assert spans == [(b"audio", *expected_span)] and transcribed == [b"span-mp3"]
     written = output_path.read_text(encoding="utf-8")
     # A vertical picture; one long sung line stays one event laid out on several lines.
     assert "PlayResX: 1080" in written and "PlayResY: 1920" in written
@@ -8681,9 +9035,83 @@ async def test_align_subtitles_animates_lyrics_timed_from_the_song(monkeypatch, 
     rows = {line.split("\\move(", 1)[1].split(",")[3] for line in events if "\\move(" in line}
     assert len(rows) >= 2
     event, second = events[0], events[2]
-    assert second.startswith("Dialogue: 1,0:00:01.40,") and second.endswith("}light")
-    # Each word's own event starts on its measured time: 121.2 s and 121.4 s in the song.
-    assert event.startswith("Dialogue: 1,0:00:01.20,") and event.endswith("}We")
+    assert second.startswith(f"Dialogue: 1,{expected_clock}.40,") and second.endswith("}light")
+    # Each word's own event starts on its measured time on the video's clock.
+    assert event.startswith(f"Dialogue: 1,{expected_clock}.20,") and event.endswith("}We")
+
+
+@pytest.mark.asyncio
+async def test_align_subtitles_sizes_the_loudest_word_and_colours_lines_from_the_picture(monkeypatch, tmp_path):
+    from array import array
+
+    monkeypatch.setattr(media_tools, "_lyric_font_measure", lambda *_args: None)
+    (tmp_path / "lyric-cues.json").write_text(json.dumps({"cues": [
+        {"start": 1.0, "end": 3.0, "text": "Hold the light", "type": "dialogue"},
+    ]}), encoding="utf-8")
+    (tmp_path / "song.mp3").write_bytes(b"audio")
+    (tmp_path / "picture.mp4").write_bytes(b"video")
+    output_path = tmp_path / "lyrics.ass"
+    reads = []
+
+    async def fake_span(_audio_bytes, *, start_seconds, end_seconds):
+        assert (start_seconds, end_seconds) == (9.0, 15.0)
+        return b"span-mp3"
+
+    async def fake_stt(**_kwargs):
+        # On the span's clock, which starts 9 s into the song.
+        return SimpleNamespace(words=[{"text": "hold", "start": 2.0, "end": 2.5}, {"text": "the", "start": 2.5,
+                                       "end": 2.7}, {"text": "light", "start": 2.7, "end": 3.2}], segments=[])
+
+    monkeypatch.setattr("packages.core.services.audio_conversion.speech_audio_bytes", fake_span)
+
+    async def fake_ffmpeg(args, **_kwargs):
+        reads.append(args)
+        if "s16le" in args:
+            # 8 kHz from 11.0 s: "hold" is quiet, "light" is sung at full voice.
+            quiet, loud = array("h", [800, -800] * 2400), array("h", [20000, -20000] * 2400)
+            return quiet.tobytes() + loud.tobytes()
+        return bytes([30, 30, 30]) * 1900 + bytes([20, 220, 255]) * 404
+
+    async def fake_target(**_kwargs):
+        return SimpleNamespace(abs_dir=str(tmp_path), abs_path=str(output_path), rel_path="lyrics.ass",
+                               filename="lyrics.ass")
+
+    def fake_write(_entity_id, _rel_path, data, **_kwargs):
+        output_path.write_bytes(data)
+        return str(output_path)
+
+    async def no_op(**_kwargs):
+        return "doc-1"
+
+    monkeypatch.setattr("packages.core.services.entity_fs.get_entity_root", lambda _entity_id: str(tmp_path))
+    monkeypatch.setattr("packages.core.services.entity_fs.write_entity_file_atomic", fake_write)
+    monkeypatch.setattr(media_tools, "_assert_audio_path", lambda _path: None)
+    monkeypatch.setattr(media_tools, "_transcribe_narration_audio", fake_stt)
+    monkeypatch.setattr(media_tools, "_ffmpeg_raw", fake_ffmpeg)
+    monkeypatch.setattr(media_tools, "_build_media_target", fake_target)
+    monkeypatch.setattr(media_tools, "_register_file_artifact", no_op)
+    monkeypatch.setattr(media_tools, "_bind_artifact_to_workspace", no_op)
+
+    result = json.loads(await media_tools._align_subtitles_handler(
+        entity_id="entity-1", cues_path="lyric-cues.json", output_name="lyrics.ass", aspect_ratio="16:9",
+        animation={"reveal": "word", "font_size": 100, "emphasis_scale": 1.5, "auto_emphasis": True,
+                   "picture_colors": {"path": "picture.mp4", "keys": ["accent_color"]}},
+        word_timing={"audio_path": "song.mp3", "offset_seconds": 10},
+    ))
+
+    assert result["status"] == "completed"
+    # The sung span is read once from the song (11.0 s on), and the picture at the line's middle.
+    assert reads[0][:2] == ["-ss", "11.000"] and reads[1][:2] == ["-ss", "2.000"]
+    enters = {line.rsplit("}", 1)[1]: line for line in output_path.read_text(encoding="utf-8").splitlines()
+              if line.startswith("Dialogue: 1,") and "\\fad(" in line and "\\fad(0," not in line}
+    # The loud word is the key word, in the picture's cyan.
+    assert "\\fs150" in enters["light"] and "\\fs100" in enters["Hold"]
+    accent = re.search(r"\\1c&H([0-9A-F]{6})&", enters["light"]).group(1)
+    blue, green, red = (int(accent[i:i + 2], 16) for i in (0, 2, 4))
+    assert blue == 255 and red < green
+    # A dark rim of that hue keeps the key word readable over the colour it came from.
+    rim = re.search(r"\\3c&H([0-9A-F]{6})&\\bord8", enters["light"]).group(1)
+    assert max(int(rim[i:i + 2], 16) for i in (0, 2, 4)) < 80 and "\\bord" not in enters["Hold"]
 
 
 @pytest.mark.parametrize(
@@ -8984,6 +9412,8 @@ async def test_merge_videos_accepts_single_clip_for_clean_master(tmp_path, monke
     assert payload["document_id"] == "doc_clean"
     assert payload["fs_path"] == "project/final/clean-picture-master.mp4"
     assert payload["source_audio_stripped"] is True
+    # The master's audio is silence merge_videos wrote, so a review need not measure it.
+    assert payload["audio_track"] == "generated_silence"
     assert captured["resolve_paths"] == ["project/clips/shot-01.mp4"]
     assert captured["input_count"] == 1
     assert captured["include_source_audio"] is False

@@ -1,0 +1,340 @@
+.account-ai-edit-section {
+  margin-top: 28px;
+  padding-top: 28px;
+  border-top: 0.5px solid var(--border-subtle);
+}
+
+.account-ai-edit-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  margin-bottom: 18px;
+}
+
+.account-ai-edit-heading > div:nth-child(2) {
+  min-width: 0;
+}
+
+.account-ai-edit-heading h3 {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: 16px;
+  line-height: 1.25;
+  font-weight: 800;
+}
+
+.account-ai-edit-heading p {
+  margin: 5px 0 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.account-ai-edit-saving {
+  margin-left: auto;
+  padding-top: 3px;
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.account-ai-edit-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.account-ai-edit-card {
+  min-height: 188px;
+}
+
+.account-ai-edit-card:disabled {
+  cursor: wait;
+  opacity: 0.68;
+}
+
+.account-ai-edit-card:disabled:hover {
+  transform: none;
+}
+
+.account-ai-edit-preview {
+  position: relative;
+  height: 92px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 14px;
+  background: #111817;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.account-ai-edit-preview__chrome {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 1px;
+}
+
+.account-ai-edit-preview__chrome i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.26);
+}
+
+.account-ai-edit-preview__line {
+  position: relative;
+  display: block;
+  width: 62%;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 3px;
+  background: rgba(232, 240, 237, 0.22);
+}
+
+.account-ai-edit-preview__line.is-short {
+  width: 38%;
+}
+
+.account-ai-edit-preview__line.is-long {
+  width: 76%;
+}
+
+.account-ai-edit-preview[data-ai-edit-preview="live"] .is-change {
+  width: 56%;
+  background: rgba(91, 188, 172, 0.34);
+}
+
+.account-ai-edit-preview[data-ai-edit-preview="live"] .is-change::after {
+  content: "";
+  position: absolute;
+  top: -2px;
+  right: -3px;
+  width: 2px;
+  height: 11px;
+  border-radius: 999px;
+  background: #8ce3d4;
+  opacity: 0.7;
+}
+
+.account-ai-edit-card.is-active .account-ai-edit-preview[data-ai-edit-preview="live"] .is-change::after {
+  animation: account-ai-edit-caret 0.85s step-end infinite;
+}
+
+.account-ai-edit-preview[data-ai-edit-preview="instant_preview"] .is-change {
+  width: 66%;
+  background: rgba(202, 93, 83, 0.46);
+}
+
+.account-ai-edit-preview[data-ai-edit-preview="instant_preview"] .is-long {
+  width: 72%;
+  background: rgba(84, 181, 130, 0.48);
+}
+
+.account-ai-edit-preview__footer {
+  position: absolute;
+  right: 10px;
+  bottom: 8px;
+  display: flex;
+  gap: 4px;
+}
+
+.account-ai-edit-preview__footer i {
+  width: 24px;
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.account-ai-edit-preview__footer i:last-child {
+  background: rgba(92, 188, 172, 0.72);
+}
+
+@media (prefers-reduced-motion: reduce) {
+.account-ai-edit-card.is-active .account-ai-edit-preview[data-ai-edit-preview="live"] .is-change::after {
+    animation: none;
+  }
+}
+
+.account-ai-section--settings {
+  max-width: 1120px;
+}
+
+.account-ai-section-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.account-ai-section--settings .account-ai-role-list {
+  gap: 8px !important;
+}
+
+.account-ai-section--settings .account-ai-role-card {
+  border-radius: 14px !important;
+  border: 0.5px solid var(--border-subtle) !important;
+  background: var(--surface-panel) !important;
+  box-shadow: none !important;
+}
+
+.account-ai-section--settings .account-ai-role-card:hover {
+  border-color: var(--card-hover-border) !important;
+  background: var(--card-hover-bg) !important;
+  box-shadow: var(--card-hover-shadow) !important;
+}
+
+.account-ai-section--settings .account-ai-role-header {
+  padding: 14px 16px !important;
+  gap: 12px !important;
+  min-height: 74px;
+}
+
+.account-ai-section--settings .account-ai-role-header > div:first-child {
+  width: 34px !important;
+  height: 34px !important;
+  border-radius: 10px !important;
+  background: var(--surface-muted) !important;
+  border: 0.5px solid var(--border-subtle) !important;
+}
+
+.account-ai-section--settings .account-ai-role-header > div:first-child svg {
+  stroke: var(--accent) !important;
+}
+
+.account-ai-section--settings .account-ai-role-label {
+  flex-basis: 190px !important;
+}
+
+.account-ai-section--settings .account-ai-role-label p:first-child {
+  color: var(--text-strong) !important;
+  font-size: 14px !important;
+  font-weight: 760 !important;
+}
+
+.account-ai-section--settings .account-ai-role-label p:last-child {
+  color: var(--text-muted) !important;
+  font-size: 12px !important;
+  line-height: 1.35 !important;
+}
+
+.account-ai-section--settings .account-ai-model-options > div {
+  border: 0.5px solid var(--border-subtle) !important;
+  background: var(--surface-muted) !important;
+  border-radius: 9px !important;
+  padding: 5px 9px !important;
+}
+
+.account-ai-section--settings .account-ai-model-options span {
+  color: var(--text-default) !important;
+}
+
+.account-ai-section--settings .account-ai-model-options span + span {
+  background: rgba(127, 127, 127, 0.14) !important;
+  color: var(--text-muted) !important;
+}
+
+.account-ai-section--settings .account-ai-role-actions button {
+  border: 1px solid var(--border-default) !important;
+  background: var(--surface-muted) !important;
+  color: var(--text-default) !important;
+  box-shadow: none !important;
+}
+
+.account-ai-section--settings .account-ai-role-actions button:hover {
+  border-color: var(--border-strong) !important;
+  background: var(--surface-panel) !important;
+}
+
+.account-ai-section--settings .account-ai-role-card > div:nth-child(2) {
+  border-top: 0.5px solid var(--border-subtle) !important;
+  background: var(--surface-muted) !important;
+}
+
+html[data-theme="dark"] .account-ai-section--settings .account-ai-role-card {
+  background: rgba(255, 255, 255, 0.035) !important;
+  border-color: rgba(255, 255, 255, 0.11) !important;
+}
+
+html[data-theme="dark"] .account-ai-section--settings .account-ai-role-card:hover {
+  background: rgba(255, 255, 255, 0.055) !important;
+  border-color: rgba(255, 255, 255, 0.24) !important;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.22) !important;
+}
+
+html[data-theme="dark"] .account-ai-section--settings .account-ai-role-header > div:first-child {
+  background: rgba(255, 255, 255, 0.06) !important;
+  border-color: rgba(255, 255, 255, 0.12) !important;
+}
+
+html[data-theme="dark"] .account-ai-section--settings .account-ai-model-options > div,
+html[data-theme="dark"] .account-ai-section--settings .account-ai-role-actions button {
+  background: rgba(255, 255, 255, 0.06) !important;
+  border-color: rgba(255, 255, 255, 0.12) !important;
+}
+
+html[data-theme="dark"] .account-ai-section--settings .account-ai-role-actions button:hover {
+  background: rgba(255, 255, 255, 0.1) !important;
+  border-color: rgba(255, 255, 255, 0.22) !important;
+}
+
+@media (max-width: 820px) {
+.account-ai-role-header {
+    align-items: flex-start !important;
+    flex-wrap: wrap;
+    gap: 10px !important;
+    padding: 14px !important;
+  }
+.account-ai-role-label {
+    flex: 1 1 calc(100% - 54px) !important;
+  }
+.account-ai-model-options {
+    flex: 1 1 100% !important;
+    order: 3;
+  }
+.account-ai-role-actions {
+    flex: 1 1 100% !important;
+    justify-content: space-between;
+    order: 4;
+  }
+.account-ai-role-actions > div:first-child {
+    text-align: left !important;
+  }
+}
+
+@media (max-width: 560px) {
+.account-ai-role-header {
+    flex-direction: column !important;
+  }
+.account-ai-role-label,
+  .account-ai-model-options,
+  .account-ai-role-actions {
+    width: 100% !important;
+    flex-basis: auto !important;
+  }
+.account-ai-role-actions {
+    align-items: stretch !important;
+    flex-direction: column;
+  }
+.account-ai-role-actions button {
+    width: 100%;
+    justify-content: center;
+  }
+.account-ai-key-grid {
+    grid-template-columns: 1fr !important;
+    max-width: none !important;
+  }
+}
+
+.account-ai-edit-preview {
+  border: 0;
+  background: var(--surface-muted);
+  box-shadow: none;
+}
+
+.account-ai-edit-preview[data-ai-edit-preview] .is-change,
+.account-ai-edit-preview__footer i:last-child {
+  background: rgba(128, 128, 128, 0.5);
+}

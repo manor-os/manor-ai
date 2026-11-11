@@ -8,6 +8,8 @@ Public functions:
   - validate_redirect_uri(client, redirect_uri) -> bool
   - create_authorization_code(client, user, redirect_uri, scope, state) -> str
   - exchange_code_for_token(code, client_id, client_secret, redirect_uri) -> dict
+  - refresh_access_token(refresh_token, client_id, client_secret) -> dict
+  - revoke_refresh_token(token, client) -> None
   - seed_clients_from_env(db) -> dict[client_id, action]
 """
 from __future__ import annotations
@@ -19,8 +21,10 @@ import re
 import logging
 import os
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from urllib.parse import unquote
 
 import bcrypt
 from urllib.parse import urlsplit
@@ -38,15 +42,58 @@ logger = logging.getLogger(__name__)
 # How long an authorization code lives before it can no longer be redeemed
 AUTHORIZATION_CODE_TTL_MINUTES = 10
 
-# Public (native) clients keep a session alive with rotating refresh tokens.
+# Clients keep a session alive with rotating refresh tokens.
 REFRESH_TOKEN_TTL_DAYS = 30
 
 # Audience of tokens issued to dynamically registered clients: the hosted MCP
 # endpoint accepts it, every REST route rejects it.
 MCP_TOKEN_AUDIENCE = "manor-mcp"
 
+# Scopes of the MCP resource. ``mcp`` reaches every tool; ``mcp:read`` only the
+# read-only ones. A token without a scope claim predates scopes and means ``mcp``.
+MCP_SCOPE = "mcp"
+MCP_READ_SCOPE = "mcp:read"
+
+# Some clients ask for this to be given a refresh token. Every grant already gets
+# one, so it is accepted and never stored.
+OFFLINE_ACCESS_SCOPE = "offline_access"
+
 REGISTRATION_SOURCE_CONFIGURED = "configured"
 REGISTRATION_SOURCE_DYNAMIC = "dynamic"
+# A Client ID Metadata Document client (see oauth_client_metadata).
+REGISTRATION_SOURCE_METADATA_DOCUMENT = "metadata_document"
+# Clients created on demand and swept once unused.
+_ON_DEMAND_SOURCES = (REGISTRATION_SOURCE_DYNAMIC, REGISTRATION_SOURCE_METADATA_DOCUMENT)
+
+
+def granted_mcp_scopes(requested: list[str]) -> list[str]:
+    """The MCP scope a sign-in grants: the widest known one requested, ``mcp`` by default.
+
+    ``mcp`` already allows everything ``mcp:read`` does. Unknown values are
+    dropped rather than refused (RFC 6749 §3.3 lets the server grant less).
+    """
+    base = MCP_SCOPE if MCP_SCOPE in requested or MCP_READ_SCOPE not in requested else MCP_READ_SCOPE
+    return list(dict.fromkeys([base, *(value for value in requested
+        if value in MCP_SCOPES and value not in (MCP_SCOPE, MCP_READ_SCOPE))]))
+
+
+def mcp_token_scopes(claims: dict) -> set[str]:
+    """Use typed grants, accepting the older resource-scoped string claim too."""
+    typed = claims.get("scp")
+    if typed:
+        return set(typed)
+    scope = claims.get("scope")
+    return set(scope.split()) if isinstance(scope, str) and scope.strip() else {MCP_SCOPE}
+
+
+def mcp_read_only(claims: dict) -> bool:
+    """True when an MCP token grants only the read-only tools.
+
+    Tokens issued before scopes existed carry none (or an empty one) and keep
+    the full ``mcp`` grant their user consented to.
+    """
+    granted = mcp_token_scopes(claims)
+    return MCP_READ_SCOPE in granted and MCP_SCOPE not in granted
 
 
 def is_public_client(client: OAuthClientApp) -> bool:
@@ -114,6 +161,11 @@ def _loopback_without_port(uri: str) -> Optional[tuple[str, str, str]]:
     return host, parts.path or "/", parts.query
 
 
+def is_loopback_redirect(uri: str) -> bool:
+    """An http loopback callback: only the user's own machine can receive it."""
+    return _loopback_without_port(uri) is not None
+
+
 def validate_redirect_uri(client: OAuthClientApp, redirect_uri: str) -> bool:
     """Match the redirect URI against the client's whitelist.
 
@@ -133,19 +185,89 @@ def validate_redirect_uri(client: OAuthClientApp, redirect_uri: str) -> bool:
 
 # ── Dynamic client registration (RFC 7591) ──
 
-# Hosted (non-loopback) callbacks a self-registered client may use. Loopback
-# http URIs are always allowed: only the user's own machine can receive them.
-_DEFAULT_DYNAMIC_REDIRECT_URIS = (
+# Hosted (non-loopback) callbacks a self-registered client may use: the hosts'
+# own sign-in callbacks, so a code issued there only ever reaches that host.
+# Loopback http URIs are always allowed: only the user's own machine can
+# receive them. MANOR_OAUTH_DYNAMIC_REDIRECT_URIS replaces this list; each
+# comma-separated rule is an exact URI, ``prefix:<https URI ending in />`` or
+# ``scheme:<name>`` (an RFC 8252 §7.1 private-use scheme of a native app).
+_DEFAULT_DYNAMIC_REDIRECT_RULES = (
     "https://claude.ai/api/mcp/auth_callback",
     "https://claude.com/api/mcp/auth_callback",
+    "https://chatgpt.com/connector_platform_oauth_redirect",
+    "https://teams.microsoft.com/api/platform/v1.0/oAuthRedirect",
 )
 
+# Schemes a ``scheme:`` rule may never name: they are not private to an app.
+_SHARED_SCHEMES = frozenset({"http", "https", "javascript", "data", "file", "about", "blob", "vbscript", "ftp"})
+_SCHEME_NAME = re.compile(r"[a-z][a-z0-9+.-]*\Z")
 
-def dynamic_redirect_allowlist() -> tuple[str, ...]:
+
+@dataclass(frozen=True)
+class RedirectRule:
+    kind: str  # "exact" | "prefix" | "scheme"
+    value: str
+
+    def matches(self, uri: str) -> bool:
+        if self.kind == "exact":
+            return uri == self.value
+        try:
+            parts = urlsplit(uri)
+            parts.port  # noqa: B018 — raises ValueError on a malformed port
+        except ValueError:
+            return False
+        if parts.fragment or parts.username or parts.password:
+            return False
+        if self.kind == "scheme":
+            return parts.scheme.lower() == self.value
+        # A "prefix" callback must not climb out of the allowed path.
+        if parts.scheme != "https" or any(seg in (".", "..") for seg in unquote(parts.path).split("/")):
+            return False
+        return f"https://{parts.netloc.lower()}{parts.path}".startswith(self.value)
+
+
+def _parse_redirect_rule(text: str) -> Optional[RedirectRule]:
+    if text.startswith("scheme:"):
+        name = text[len("scheme:"):].strip().lower().rstrip(":/")
+        if _SCHEME_NAME.fullmatch(name) and name not in _SHARED_SCHEMES:
+            return RedirectRule("scheme", name)
+    elif text.startswith("prefix:"):
+        prefix = text[len("prefix:"):].strip()
+        parts = urlsplit(prefix)
+        if parts.scheme == "https" and parts.hostname and prefix.endswith("/") and not (parts.query or parts.fragment):
+            return RedirectRule("prefix", f"https://{parts.netloc.lower()}{parts.path}")
+    else:
+        return RedirectRule("exact", text)
+    logger.warning("Ignoring invalid OAuth redirect rule %r", text)
+    return None
+
+
+def dynamic_redirect_rules() -> tuple[RedirectRule, ...]:
     configured = os.getenv("MANOR_OAUTH_DYNAMIC_REDIRECT_URIS")
-    if configured is None:
-        return _DEFAULT_DYNAMIC_REDIRECT_URIS
-    return tuple(u.strip() for u in configured.split(",") if u.strip())
+    texts = _DEFAULT_DYNAMIC_REDIRECT_RULES if configured is None else configured.split(",")
+    rules = (_parse_redirect_rule(t.strip()) for t in texts if t.strip())
+    return tuple(rule for rule in rules if rule is not None)
+
+
+def hosted_redirect_allowed(uri: str) -> bool:
+    return any(rule.matches(uri) for rule in dynamic_redirect_rules())
+
+
+def _redirect_origin(uri: str) -> str:
+    """scheme://host of a refused callback, for the log (never its path or query)."""
+    try:
+        parts = urlsplit(uri)
+        return f"{parts.scheme}://{(parts.hostname or '')[:100]}"
+    except ValueError:
+        return "<unparseable>"
+
+
+def log_refused_redirect(uri: str, client_name) -> None:
+    # Logged so a new host's callback can be reviewed and allowed by config.
+    logger.info(
+        "OAuth registration refused callback %s (client_name=%r)",
+        _redirect_origin(uri), str(client_name or "")[:MAX_CLIENT_NAME],
+    )
 
 
 class ClientRegistrationError(ValueError):
@@ -157,8 +279,8 @@ class ClientRegistrationError(ValueError):
         self.description = description
 
 
-_MAX_CLIENT_NAME = 100
-_MAX_REDIRECT_URIS = 10
+MAX_CLIENT_NAME = 100
+MAX_REDIRECT_URIS = 10
 
 
 async def register_dynamic_client(db: AsyncSession, metadata: dict) -> OAuthClientApp:
@@ -170,12 +292,12 @@ async def register_dynamic_client(db: AsyncSession, metadata: dict) -> OAuthClie
     """
     redirect_uris = metadata.get("redirect_uris")
     if (not isinstance(redirect_uris, list) or not redirect_uris
-            or len(redirect_uris) > _MAX_REDIRECT_URIS
+            or len(redirect_uris) > MAX_REDIRECT_URIS
             or not all(isinstance(u, str) and len(u) <= 2048 for u in redirect_uris)):
         raise ClientRegistrationError("invalid_redirect_uri", "redirect_uris must list 1-10 URIs")
-    hosted = set(dynamic_redirect_allowlist())
     for uri in redirect_uris:
-        if uri not in hosted and _loopback_without_port(uri) is None:
+        if not is_loopback_redirect(uri) and not hosted_redirect_allowed(uri):
+            log_refused_redirect(uri, metadata.get("client_name"))
             raise ClientRegistrationError(
                 "invalid_redirect_uri",
                 "redirect URIs must be http loopback (localhost/127.0.0.1) or an allowed hosted callback",
@@ -192,7 +314,7 @@ async def register_dynamic_client(db: AsyncSession, metadata: dict) -> OAuthClie
         raise ClientRegistrationError("invalid_client_metadata", "unsupported response_types")
 
     name = metadata.get("client_name")
-    name = name.strip()[:_MAX_CLIENT_NAME] if isinstance(name, str) and name.strip() else "MCP client"
+    name = name.strip()[:MAX_CLIENT_NAME] if isinstance(name, str) and name.strip() else "MCP client"
 
     client = OAuthClientApp(
         client_id=f"mcp-{secrets.token_urlsafe(18)}",
@@ -216,7 +338,7 @@ async def register_dynamic_client(db: AsyncSession, metadata: dict) -> OAuthClie
 
 # What the MCP resource offers (advertised in its OAuth metadata).
 MCP_SCOPES: tuple[str, ...] = (
-    "mcp",
+    MCP_SCOPE, MCP_READ_SCOPE,
 )
 
 
@@ -391,11 +513,13 @@ async def exchange_code_for_token(
         raise ValueError("invalid_grant")
 
     result = _token_response(client, user, actor, code_row.scope or [])
-    if is_public_client(client):
-        result["refresh_token"] = await _issue_refresh_token(
-            db, client=client, user=user, entity_id=actor.entity_id,
-            scope=code_row.scope or [], family_id=None,
-        )
+    # Every client keeps its session with a rotating refresh token, whether or
+    # not it asked for offline_access: hosts that don't ask would otherwise be
+    # signed out when the hour-long access token expires.
+    result["refresh_token"] = await _issue_refresh_token(
+        db, client=client, user=user, entity_id=actor.entity_id,
+        scope=code_row.scope or [], family_id=None,
+    )
     return result
 
 
@@ -406,6 +530,10 @@ def _token_response(client: OAuthClientApp, user: User, actor, scope: list[str])
     # first-party web app, bound to the client's resource audience if it has
     # one. Access-token TTLs are capped at 60 minutes.
     ttl_minutes = min(max(1, client.access_token_ttl_minutes or 60), 60)
+    token_scope = None
+    if client.token_audience == MCP_TOKEN_AUDIENCE:
+        scope = granted_mcp_scopes(scope)
+        token_scope = " ".join(scope)
     access_token = create_access_token(
         user.id,
         actor.entity_id,
@@ -415,6 +543,7 @@ def _token_response(client: OAuthClientApp, user: User, actor, scope: list[str])
         audience=client.token_audience,
         scopes=scope,
         authorized_party=client.client_id,
+        scope=token_scope,
     )
     return {
         "access_token": access_token,
@@ -433,7 +562,7 @@ def _token_response(client: OAuthClientApp, user: User, actor, scope: list[str])
     }
 
 
-# ── Refresh tokens (public clients) ──
+# ── Refresh tokens ──
 
 def _hash_refresh_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -482,9 +611,12 @@ async def refresh_access_token(
     client_id: str,
     client_secret: Optional[str] = None,
 ) -> dict:
-    """Rotate a refresh token: revoke-on-reuse, re-admit the user, mint new tokens."""
+    """Rotate a refresh token: revoke-on-reuse, re-admit the user, mint new tokens.
+
+    Confidential clients authenticate with their secret here as at redemption.
+    """
     client = await verify_client_credentials(db, client_id, client_secret)
-    if not client or not is_public_client(client):
+    if not client:
         raise ValueError("invalid_client")
 
     row = (await db.execute(
@@ -506,6 +638,9 @@ async def refresh_access_token(
     expires = row.expires_at if row.expires_at.tzinfo else row.expires_at.replace(tzinfo=timezone.utc)
     if expires <= now:
         raise ValueError("invalid_grant")
+    # The client's current restrictions apply to every renewal, as at redemption.
+    if client.restricted_entity_id and client.restricted_entity_id != row.entity_id:
+        raise ValueError("invalid_grant")
 
     user = (await db.execute(
         select(User).where(User.id == row.user_id).with_for_update()
@@ -513,6 +648,10 @@ async def refresh_access_token(
     )).scalar_one_or_none()
     if user is None or user.status != "active" or int(user.token_version or 0) != int(row.token_version):
         raise ValueError("invalid_grant")
+    from packages.core.services.user_email_proof import email_is_verified
+
+    if client.require_verified_email and not email_is_verified(user):
+        raise ValueError("email_verification_required")
     actor = await resolve_current_user_actor(
         db,
         AuthenticatedUserCredential(
@@ -541,6 +680,25 @@ async def refresh_access_token(
         scope=row.scope or [], family_id=row.family_id,
     )
     return result
+
+
+async def revoke_refresh_token(db: AsyncSession, *, token: str, client: OAuthClientApp) -> None:
+    """RFC 7009: revoke the family of a refresh token the client holds. The caller commits.
+
+    A token that is unknown, already dead or another client's is left alone
+    without saying so (RFC 7009 §2.2), so the endpoint reveals nothing.
+    """
+    row = (await db.execute(
+        select(OAuthRefreshToken).where(OAuthRefreshToken.token_hash == _hash_refresh_token(token or ""))
+    )).scalar_one_or_none()
+    if row is None or row.client_id != client.client_id:
+        return
+    await db.execute(
+        update(OAuthRefreshToken)
+        .where(OAuthRefreshToken.family_id == row.family_id, OAuthRefreshToken.revoked_at.is_(None))
+        .values(revoked_at=datetime.now(timezone.utc))
+        .execution_options(synchronize_session=False)
+    )
 
 
 # ── Connected clients (refresh-token families) ──
@@ -584,6 +742,7 @@ async def list_connected_clients(db: AsyncSession, user: User) -> list[dict]:
             "id": token.family_id,
             "client_id": client.client_id,
             "name": client.name,
+            # A metadata-document client is identified by the host serving it.
             "verified": client.registration_source != REGISTRATION_SOURCE_DYNAMIC,
             "entity_id": token.entity_id,
             "connected_at": first_seen.get(token.family_id) or token.created_at,
@@ -627,10 +786,11 @@ async def cleanup_unused_dynamic_clients(
 ) -> int:
     """Delete self-registered clients nobody is using. The caller commits.
 
-    A dynamic client older than the TTL is unused when it has no live refresh
-    token and no pending authorization code: it either never finished a
-    sign-in or every session it had has expired or been revoked. A client that
-    returns later simply registers again. Configured clients are never touched.
+    A dynamic or metadata-document client older than the TTL is unused when it
+    has no live refresh token and no pending authorization code: it either never
+    finished a sign-in or every session it had has expired or been revoked. A
+    client that returns later simply registers (or is fetched) again.
+    Configured clients are never touched.
     """
     now = now or datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=dynamic_client_unused_ttl_hours())
@@ -644,7 +804,7 @@ async def cleanup_unused_dynamic_clients(
         OAuthAuthorizationCode.expires_at > now,
     )
     unused = (
-        OAuthClientApp.registration_source == REGISTRATION_SOURCE_DYNAMIC,
+        OAuthClientApp.registration_source.in_(_ON_DEMAND_SOURCES),
         OAuthClientApp.created_at < cutoff,
         ~live_token.exists(),
         ~pending_code.exists(),

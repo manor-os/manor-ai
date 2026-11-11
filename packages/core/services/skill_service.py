@@ -1156,12 +1156,27 @@ async def create_skill(
 # ── Update ──
 
 async def update_skill(
-    db: AsyncSession, skill_id: str, entity_id: str, **kwargs,
+    db: AsyncSession, skill_id: str, entity_id: str, *, expected_edit_version: int | None = None, **kwargs,
 ) -> Skill | None:
-    """Update a skill owned by entity_id — DB record + MinIO files."""
-    skill = await get_skill(db, skill_id)
+    """Update a skill owned by entity_id — DB record + MinIO files.
+
+    With ``expected_edit_version`` the row is locked and the save is refused
+    (``StaleRevisionError``) when anyone saved it since that version."""
+    if expected_edit_version is None:
+        skill = await get_skill(db, skill_id)
+    else:
+        skill = (await db.execute(
+            select(Skill).where(Skill.id == skill_id).with_for_update().execution_options(populate_existing=True)
+        )).scalar_one_or_none()
     if not skill or skill.entity_id != entity_id:
         return None
+    if expected_edit_version is not None and int(skill.edit_version or 1) != int(expected_edit_version):
+        from packages.core.revisions import StaleRevisionError
+
+        raise StaleRevisionError(
+            target_kind="skill", target_id=skill.id,
+            expected=int(expected_edit_version), actual=int(skill.edit_version or 1),
+        )
 
     if "name" in kwargs and kwargs["name"] is not None:
         kwargs["name"] = _fallback_skill_name(
@@ -1199,9 +1214,13 @@ async def update_skill(
     )
     content_patch = content_patch_for(skill, kwargs, SKILL_CONTENT_REVISION_FIELDS)
 
+    changed = False
     for key, value in kwargs.items():
         if value is not None and hasattr(skill, key):
+            changed = changed or getattr(skill, key) != value
             setattr(skill, key, value)
+    if changed:
+        skill.edit_version = int(skill.edit_version or 1) + 1
 
     if content_patch:
         await bump_revision(db, skill, patch=content_patch)
@@ -1622,7 +1641,7 @@ async def _invoke_sandbox_skill(
         task_id=task_id or None,
         workflow_run_id=str(context.get("_workflow_run_id_from_context") or "") or None,
         # A prompt skill's nested loop shares the run's identity but cannot
-        # be parked on a reservation; admission must not queue one for it.
+        # be parked on a reservation; admission must not queue a WARM one.
         parent_skill=str(context.get("_runtime_parent_skill_from_context") or "") or None,
         credentials_owner_user_id=(str(getattr(skill, "owner_user_id", None) or "") or None) if env else None,
     )
@@ -1767,6 +1786,46 @@ def running_skill_invocations() -> tuple[RunningSkillInvocation, ...]:
 
 def _skill_slug(skill: Skill) -> str:
     return str(skill.slug or skill.name or "").strip().lower()
+
+
+async def _task_grants_skill(
+    db: AsyncSession,
+    skill: Skill,
+    *,
+    entity_id: str,
+    workspace_id: str | None,
+    user_id: str | None,
+    task_id: str | None,
+) -> bool:
+    """A Task's own declared Skill is an execution grant for that Task only.
+
+    A scheduled Skill job runs as an agent Task that must invoke the job's
+    Skill, which its owner chose but never bound to the agent. The Task's
+    ``required_skills`` carries that choice; the acting user must still be
+    able to read the Skill, as without an agent binding.
+    """
+    if not task_id:
+        return False
+    from packages.core.models.task import Task
+
+    required = await db.scalar(select(Task.required_skills).where(
+        Task.id == task_id,
+        Task.entity_id == entity_id,
+    ))
+    declared = {str(value) for value in (required or []) if str(value or "").strip()}
+    if not declared & {str(skill.id), str(skill.slug or "")}:
+        return False
+    from packages.core.ai.runtime.skills import runtime_skill_is_eligible
+
+    eligible, _ = await runtime_skill_is_eligible(
+        db,
+        skill,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        user_id=user_id,
+        enforce_user_access=bool(user_id),
+    )
+    return eligible
 
 
 def _skill_invocation_stack_error(skill: Skill, bound_skill_id: str) -> dict | None:
@@ -2123,7 +2182,16 @@ async def invoke_skill(
                 agent_subscription_id=agent_subscription_id,
             )
         )
-        if bound_skill_id not in {item.id for item in available}:
+        if bound_skill_id not in {item.id for item in available} and not (
+            await _task_grants_skill(
+                db,
+                skill,
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                user_id=user_id,
+                task_id=task_id,
+            )
+        ):
             return {
                 "error": (
                     f"Skill '{skill.slug or skill.name}' is not available to this "

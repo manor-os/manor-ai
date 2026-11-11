@@ -40,7 +40,7 @@ from packages.core.services.workspace_setup_service import (
 
 READ_TOOLS = {"read_file", "list_files", "glob_files", "grep_files"}
 WRITE_TOOLS = {"generate_file", "patch_file", "replace_file", "code_project"}
-FILE_WRITE_CATALOG_TOOLS = {"generate_file", "patch_file", "replace_file", "import_free_music"}
+FILE_WRITE_CATALOG_TOOLS = {"generate_file", "patch_file", "replace_file"}
 
 
 def _spec(entry):
@@ -70,6 +70,7 @@ def test_file_write_and_existing_generate_binding_do_not_grant_reads():
     assert catalog_tools == FILE_WRITE_CATALOG_TOOLS
     assert READ_TOOLS.isdisjoint(catalog_tools)
     assert "code_project" not in catalog_tools
+    assert task_runtime_capability_tools(["media.music"]) == {"search_free_music", "import_free_music"}
     for name in READ_TOOLS:
         assert not runtime_tool_visible_for_profile(
             name, bound_tool_names={"generate_file"}, is_master=False,

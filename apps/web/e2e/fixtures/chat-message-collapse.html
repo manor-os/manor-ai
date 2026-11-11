@@ -10,10 +10,20 @@
       import CollapsibleSentMessage from "/src/components/chat/CollapsibleSentMessage.tsx";
       import ChatMarkdown from "/src/components/ChatMarkdown.tsx";
       import AssistantMessageBlocks from "/src/components/AssistantMessageBlocks.tsx";
+      import { CsvPreview } from "/src/components/file-preview/CsvPreview.tsx";
       import "/src/index.css";
 
       const h = React.createElement;
+      // A user message folds past 20 lines; an agent reply only past about 60.
       const longText = Array.from({ length: 18 }, (_, i) => `第 ${i + 1} 笔记录：这是一条用于验证长消息显示的测试内容。`).join("\n\n");
+      const longUserText = Array.from({ length: 30 }, (_, i) => `第 ${i + 1} 笔记录：这是一条用于验证长消息显示的测试内容。`).join("\n\n");
+      const longAssistantText = Array.from({ length: 90 }, (_, i) => `第 ${i + 1} 行：这是一条用于验证很长回复的测试内容。`).join("\n");
+      // The reported case: ten-odd lines used to show only partly behind "Show all".
+      const tenLineAssistantText = Array.from({ length: 14 }, (_, i) => `- Step ${i + 1}: checked and recorded.`).join("\n");
+      // A 70-item numbered checklist, one item with a nested bullet list, then a bullet list.
+      const numberedText = ["Here is the checklist:", "", ...Array.from({ length: 70 }, (_, i) => `${i + 1}. Check item ${i + 1}`),
+        "    - nested detail A", "    - nested detail B", "", "Notes:", "", "- first note", "- second note"].join("\n");
+      const csv = (rows) => ["账号,平台,粉丝,近 14 天 Reels,平均播放,互动率,状态,备注", ...Array.from({ length: rows }, (_, i) => `@creator.${i + 1},Instagram,${(48.2 - i).toFixed(1)}k,${6 + (i % 3)},21.4k,4.8%,正常,这一列的内容比较长，不应在对话里换成碎字`)].join("\n");
       const shortText = "已完成，文件已经保存，可以直接查看。";
       const moderateAssistantText = [
         "The draft is ready for review.",
@@ -45,7 +55,7 @@
         });
       }
       function HistoricalFinal() {
-        const text = `Canonical final answer.\n\n${longText}`;
+        const text = `Canonical final answer.\n\n${longAssistantText}`;
         return h(AssistantMessageBlocks, {
           blocks: [
             { id: "history-opening", type: "text", phase: "opening", text: "Inspecting the brief." },
@@ -70,7 +80,7 @@
       }
       function App() {
         const [streaming, setStreaming] = useState(true);
-        const [changingText, setChangingText] = useState(longText);
+        const [changingText, setChangingText] = useState(longAssistantText);
         const [addedRows, setAddedRows] = useState(false);
         return h(MemoryRouter, {},
           h("main", { style: { maxWidth: 800, margin: "24px auto", padding: 16 } },
@@ -79,23 +89,27 @@
             h(Example, { id: "moderate-ai", title: "AI 中等长度回复：应完整显示" }, h(Final, { id: "moderate-final", text: moderateAssistantText })),
             h(Example, { id: "long-source", title: "Markdown 原文很长，但显示只有一行：不应折叠" },
               h(Final, { id: "source-final", text: `[查看文档](https://example.com/${"long-path-".repeat(120)})` })),
-            h(Example, { id: "long-ai", title: "AI 长回复：与用户消息同一规则" }, h(Final, { id: "long-final", text: longText })),
-            h(Example, { id: "trailing-cta", title: "长回复收起后仍露出结尾行动块" }, h(Final, { id: "trailing-final", text: `${longText}\n\n## Summary\n\n- First item recorded\n- Second item recorded\n- File attached\n- Notes attached\n\nReply with the next file, or tell me to skip this step.` })),
-            h(Example, { id: "medium-overlap", title: "中等长度单段消息：收起不得重复中间行" },
+            h(Example, { id: "ten-lines-ai", title: "AI 十几行回复：完整显示" }, h(Final, { id: "ten-lines-final", text: tenLineAssistantText })),
+            h(Example, { id: "medium-ai", title: "AI 中长回复（约 30 行）：完整显示" }, h(Final, { id: "medium-final", text: longText })),
+            h(Example, { id: "long-ai", title: "AI 很长回复：先显示 40 行" }, h(Final, { id: "long-final", text: longAssistantText })),
+            h(Example, { id: "numbered-ai", title: "AI 70 项编号清单：显示编号，折叠后编号连续" }, h(Final, { id: "numbered-final", text: numberedText })),
+            h(Example, { id: "medium-overlap", title: "用户中等长度单段消息：完整显示" },
               h("div", { style: { maxWidth: 420 } }, h(CollapsibleSentMessage, { text: mediumOverlapText }, h(ChatMarkdown, { content: mediumOverlapText, isUser: true })))),
             h(Example, { id: "historical-final", title: "历史消息：最终内容只显示一次，保留处理过程" }, h(HistoricalFinal)),
+            h(Example, { id: "short-table", title: "16 行表格：完整显示" }, h(CsvPreview, { content: csv(16), compact: true })),
+            h(Example, { id: "long-table", title: "40 行表格：先显示 10 行，横向滑动" }, h(CsvPreview, { content: csv(40), compact: true })),
             h(Example, { id: "long-user", title: "用户长消息", user: true },
-              h(CollapsibleSentMessage, { text: longText }, h(ChatMarkdown, { content: longText, isUser: true }))),
+              h(CollapsibleSentMessage, { text: longUserText }, h(ChatMarkdown, { content: longUserText, isUser: true }))),
             h(Example, { id: "responsive", title: "宽屏能完整显示、窄屏自动判断换行高度" },
-              h(Final, { id: "responsive-final", text: "这是一段用于验证响应式显示的内容，宽屏只需要几行，而窄屏会自动换行。".repeat(12) })),
+              h(Final, { id: "responsive-final", text: "这是一段用于验证响应式显示的内容，宽屏只需要几行，而窄屏会自动换行。".repeat(200) })),
             h("button", { className: "btn-ghost", onClick: () => setStreaming(!streaming) }, streaming ? "完成输出" : "重新开始输出"),
-            h(Example, { id: "streaming", title: "输出中保持完整，完成后才折叠" }, h(Final, { id: "stream-final", text: longText, streaming })),
-            h("button", { className: "btn-ghost", onClick: () => setChangingText(changingText === longText ? shortText : longText) }, "切换长短内容"),
+            h(Example, { id: "streaming", title: "输出中保持完整，完成后才折叠" }, h(Final, { id: "stream-final", text: longAssistantText, streaming })),
+            h("button", { className: "btn-ghost", onClick: () => setChangingText(changingText === longAssistantText ? shortText : longAssistantText) }, "切换长短内容"),
             h(Example, { id: "changing", title: "同一组件内容变化后重新判断" }, h(Final, { id: "changing-final", text: changingText })),
             h("button", { className: "btn-ghost", onClick: () => setAddedRows(!addedRows) }, "切换异步内容"),
             h(Example, { id: "async", title: "原文不变，子内容高度变化后重新判断" },
               h(CollapsibleSentMessage, { text: "stable", tone: "assistant" },
-                h("div", {}, ...(addedRows ? Array.from({ length: 18 }, (_, i) => h("p", { key: i, style: { marginBottom: 8 } }, `异步行 ${i + 1}`)) : [h("p", { key: "short" }, shortText)])))),
+                h("div", {}, ...(addedRows ? Array.from({ length: 70 }, (_, i) => h("p", { key: i, style: { marginBottom: 8 } }, `异步行 ${i + 1}`)) : [h("p", { key: "short" }, shortText)])))),
           ),
         );
       }

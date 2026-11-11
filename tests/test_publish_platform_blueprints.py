@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+
 import pytest
 
 
@@ -73,7 +74,11 @@ def _no_builtin_skill_seed(monkeypatch: pytest.MonkeyPatch) -> None:
     async def seed_builtin_skills(_db: object) -> list[object]:
         return []
 
+    async def seed_known_flags(_db: object) -> int:
+        return 0
+
     monkeypatch.setattr(publisher, "seed_builtin_skills", seed_builtin_skills)
+    monkeypatch.setattr(publisher, "seed_known_flags", seed_known_flags)
 
 
 @pytest.mark.asyncio
@@ -116,17 +121,25 @@ async def test_publish_platform_blueprints_commits_and_reports_fingerprints(
         events.append("skills_seeded")
         return [object(), object()]
 
+    async def seed_known_flags(db: _FakeSession) -> int:
+        assert db is session
+        events.append("flags_seeded")
+        return 1
+
     monkeypatch.setattr(publisher, "async_session", lambda: session_context)
     monkeypatch.setattr(publisher, "seed_builtin_skills", seed_builtin_skills)
+    monkeypatch.setattr(publisher, "seed_known_flags", seed_known_flags)
     monkeypatch.setattr(publisher, "seed_platform_blueprints", seed_platform_blueprints)
     monkeypatch.setattr(publisher, "print", record_print, raising=False)
 
     await publisher.publish_platform_blueprints()
 
     assert session.committed is True
-    # Built-in Skills seed in the same transaction, before the Blueprints.
+    # Built-in Skills and known flags seed in the same transaction, before
+    # the Blueprints.
     assert events == [
-        "enter", "skills_seeded", "seed_complete", "execute", "commit", "exit", "print",
+        "enter", "skills_seeded", "flags_seeded", "seed_complete",
+        "execute", "commit", "exit", "print",
     ]
     assert len(session.statements) == 1
     compiled = session.statements[0].compile()
@@ -135,6 +148,7 @@ async def test_publish_platform_blueprints_commits_and_reports_fingerprints(
     assert slug_params == [["alpha-workspace-v1", "zeta-workspace-v1"]]
     assert json.loads(printed[0]) == {
         "builtin_skills": 2,
+        "registered_flags": 1,
         "published_blueprints": [
             {
                 "content_fingerprint": "alpha-fingerprint",
@@ -257,3 +271,5 @@ async def test_publish_platform_blueprints_rejects_invalid_seed_evidence_before_
 
     assert session.committed is False
     assert capsys.readouterr().out == ""
+
+

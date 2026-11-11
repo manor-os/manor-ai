@@ -1,6 +1,10 @@
 """Inspect and edit a live Workspace: identity, operation drafts, workflows, skills, knowledge."""
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
+import time
 from dataclasses import replace
 from typing import Any
 
@@ -10,13 +14,15 @@ from apps.api.mcp import transfers
 from apps.api.mcp.manor_api import ManorApiError
 from apps.api.mcp.registry import Tool, ToolContext, ToolError, boolean, obj, require, string
 from apps.api.mcp.workspace_operation_schemas import OPERATION_PAYLOAD_SCHEMAS
-from packages.core.ai.runtime.capability_search import SKILL_DESCRIPTION_MAX_CHARS
+from packages.core.models.base import generate_ulid
 from packages.core.services.workspace_operation_service import (
     OPERATION_PATCH_OP_CATALOG,
     operation_draft_review_fingerprint,
 )
 
 _WS = "/api/v1/workspaces"
+
+logger = logging.getLogger(__name__)
 
 # Supplement only MCP's public descriptors; the in-product catalog and runtime
 # validation retain their own contracts. Undescribed internal operations cannot
@@ -55,7 +61,7 @@ async def whoami(ctx: ToolContext, args: dict) -> Any:
 
 
 async def list_workspaces(ctx: ToolContext, args: dict) -> Any:
-    rows = await ctx.api.get(_WS, initialize=False)
+    rows = await ctx.api.get(_WS, initialize=False, view="summary")
     return [{key: row.get(key) for key in _LIST_KEYS} for row in rows]
 
 
@@ -120,24 +126,123 @@ async def stage_change(ctx: ToolContext, args: dict) -> Any:
     }
 
 
-async def design_app_view(ctx: ToolContext, args: dict) -> Any:
-    ws_id = require(args, "workspace_id")
-    body = {"brief": require(args, "brief")}
-    for key in ("feedback", "draft_id"):
-        if args.get(key):
-            body[key] = args[key]
-    result = await ctx.api.post(f"{_WS}/{ws_id}/app-view/design", body)
+async def app_view_audience(ctx: ToolContext, args: dict) -> Any:
+    return await ctx.api.get(f"{_WS}/{require(args, 'workspace_id')}/app-view/design/audience")
+
+
+async def test_app_view(ctx: ToolContext, args: dict) -> Any:
+    params = {"draft_id": args["draft_id"]} if args.get("draft_id") else {}
+    return await ctx.api.get(f"{_WS}/{require(args, 'workspace_id')}/app-view/test", **params)
+
+
+# A design takes one to a few minutes, longer than many MCP clients wait for a
+# call. It runs as the REST route in a task of its own that outlives the call;
+# its state is kept in Redis so any API process can answer the caller's poll.
+_DESIGNS: set[asyncio.Task] = set()
+_DESIGN_KEY = "mcp:app_design:"
+_DESIGN_TTL_SECONDS = 3600
+# One design runs at most one designer wave (15 minutes); one still working
+# after this was cut off with the API process that ran it.
+_DESIGN_STALE_SECONDS = 1200
+# Under the ~60 s some clients give a call (Claude Code on staging gave up on a
+# reply sent at 60.05 s); the Architect turn waits as long.
+_DEFAULT_DESIGN_WAIT_SECONDS = 30
+_MAX_DESIGN_WAIT_SECONDS = 90
+
+
+async def _design_redis():
+    from packages.core.cache import _get_redis
+
+    return await _get_redis()
+
+
+def _design_result(result: dict) -> dict:
     draft = result["draft"]
     return {
+        "status": "done",
         "draft_id": draft["id"],
         "candidate": result.get("candidate"),
         "recipes": result.get("recipes"),
         "warnings": result.get("warnings"),
         "design_notes": result.get("design_notes"),
+        "self_check": result.get("self_check"),
         "validation": draft.get("validation"),
         "diff": draft.get("diff"),
         "review_fingerprint": operation_draft_review_fingerprint(draft),
     }
+
+
+def _design_failure(exc: BaseException) -> dict:
+    detail = exc.detail if isinstance(exc, ManorApiError) else None
+    if isinstance(exc, ManorApiError) and exc.status_code < 500:
+        detail = detail if isinstance(detail, dict) else {"error": str(detail or exc)}
+        return {"status": "failed", "error": detail.get("error") or str(exc), "design_notes": detail.get("design_notes")}
+    return {"status": "failed", "error": "The design stopped for a technical reason; call design_workspace_app_view again."}
+
+
+def _design_waiting(design_id: str, ws_id: str) -> dict:
+    return {"design_id": design_id, "status": "working",
+            "next_step": (f"The App designer is still working. Call get_workspace_app_design with "
+                          f"workspace_id={ws_id} and design_id={design_id} until status is not working; "
+                          "do not call design_workspace_app_view again meanwhile.")}
+
+
+async def design_app_view(ctx: ToolContext, args: dict) -> Any:
+    ws_id = require(args, "workspace_id")
+    body = {"brief": require(args, "brief")}
+    for key in ("feedback", "draft_id", "audience"):
+        if args.get(key):
+            body[key] = args[key]
+    call = ctx.api.post(f"{_WS}/{ws_id}/app-view/design", body)
+    redis = await _design_redis()
+    if redis is None:  # Nowhere to read a later answer from: wait for this one.
+        return _design_result(await call)
+    design_id = generate_ulid()
+    key = _DESIGN_KEY + design_id
+    owner = {"user_id": ctx.user_id, "entity_id": ctx.entity_id, "workspace_id": ws_id}
+    await redis.set(key, json.dumps({**owner, "status": "working", "started_at": time.time()}),
+                    ex=_DESIGN_TTL_SECONDS)
+
+    async def run() -> dict:
+        try:
+            state = _design_result(await call)
+        except Exception as exc:
+            # A refused design is the caller's to read; log what is not.
+            if not (isinstance(exc, ManorApiError) and exc.status_code < 500):
+                logger.warning("App design from MCP failed: %r", exc)
+            state = _design_failure(exc)
+        await redis.set(key, json.dumps({**owner, **state}, ensure_ascii=False), ex=_DESIGN_TTL_SECONDS)
+        return state
+
+    task = asyncio.get_running_loop().create_task(run())
+    _DESIGNS.add(task)
+    task.add_done_callback(_DESIGNS.discard)
+    wait = min(max(float(args.get("wait_seconds", _DEFAULT_DESIGN_WAIT_SECONDS) or 0), 0), _MAX_DESIGN_WAIT_SECONDS)
+    done, _ = await asyncio.wait({task}, timeout=wait)
+    if not done:
+        return _design_waiting(design_id, ws_id)
+    state = task.result()
+    if state["status"] == "failed":
+        raise ToolError(json.dumps({key: state[key] for key in ("error", "design_notes") if state.get(key)},
+                                   ensure_ascii=False))
+    return {**state, "design_id": design_id}
+
+
+async def get_app_design(ctx: ToolContext, args: dict) -> Any:
+    ws_id, design_id = require(args, "workspace_id"), require(args, "design_id")
+    redis = await _design_redis()
+    raw = await redis.get(_DESIGN_KEY + design_id) if redis is not None and len(design_id) <= 64 else None
+    state = json.loads(raw) if raw else None
+    if not state or (state.get("user_id"), state.get("entity_id"), state.get("workspace_id")) != (
+            ctx.user_id, ctx.entity_id, ws_id):
+        raise ToolError(f"No App design {design_id} for this Workspace; designs are kept for an hour.")
+    if state["status"] == "working":
+        if time.time() - float(state.get("started_at") or 0) > _DESIGN_STALE_SECONDS:
+            return {"design_id": design_id, "status": "stopped",
+                    "next_step": "The design was cut off before it finished; call design_workspace_app_view again."}
+        return _design_waiting(design_id, ws_id)
+    return {"design_id": design_id, **{key: value for key, value in state.items()
+                                       if key not in {"user_id", "entity_id", "workspace_id", "started_at"}}}
 
 
 async def apply_change(ctx: ToolContext, args: dict) -> Any:
@@ -166,19 +271,26 @@ _WORKFLOW_FIELDS = ("name", "description", "steps", "trigger_type", "trigger_con
 
 
 async def upsert_workflow(ctx: ToolContext, args: dict) -> Any:
-    from packages.core.services.workflow_service import validate_workflow_steps
+    from packages.core.services.workflow_service import validate_workflow_steps, workflow_variable_names
 
     workflow_id = args.get("workflow_id")
     steps = args.get("steps")
     if steps is not None:
-        report = validate_workflow_steps(steps)
+        report = validate_workflow_steps(steps, variable_names=workflow_variable_names(args.get("variables")))
         if args.get("dry_run") or not report.get("valid"):
             return {"saved": False, "validation": report}
     elif args.get("dry_run"):
         raise ToolError("dry_run validates 'steps'; pass them")
     body = {key: args[key] for key in _WORKFLOW_FIELDS if key in args}
+    if isinstance(body.get("variables"), list):
+        if any(not isinstance(row, dict) or not isinstance(row.get("key"), str) or not row["key"].strip()
+               for row in body["variables"]):
+            raise ToolError("Each Workflow variable requires a nonempty key")
+        body["variables"] = {row["key"]: row.get("default") for row in body["variables"]}
     if workflow_id:
         body.pop("workspace_id", None)
+        if args.get("expected_version") is not None:
+            body["expected_version"] = args["expected_version"]
         workflow = await ctx.api.put(f"/api/v1/workflows/{workflow_id}", {**body, "validate_steps": True})
     else:
         require(args, "name")
@@ -193,6 +305,7 @@ async def run_workflow(ctx: ToolContext, args: dict) -> Any:
         "variables": args.get("variables") or {},
         "trigger_data": args.get("trigger_data") or {},
         "execute": args.get("wait", True),
+        "queue": not args.get("wait", True),
     })
 
 
@@ -210,6 +323,15 @@ async def get_workflow_run(ctx: ToolContext, args: dict) -> Any:
     return await ctx.api.get(f"/api/v1/workflows/runs/{run_id}", detail=bool(args.get("detail", True)))
 
 
+async def retry_workflow_run(ctx: ToolContext, args: dict) -> Any:
+    run_id = require(args, "run_id")
+    body: dict[str, Any] = {"execute": args.get("execute", True)}
+    for key in ("from_step_id", "variables", "supplied_output"):
+        if args.get(key) is not None:
+            body[key] = args[key]
+    return await ctx.api.post(f"/api/v1/workflows/runs/{run_id}/retry", body)
+
+
 _SKILL_FIELDS = ("name", "display_name", "description", "system_prompt", "slug", "tools",
                  "input_schema", "output_format", "category", "tags", "version", "config",
                  "type", "scripts", "requirements", "extra_files", "workspace_id", "visibility")
@@ -220,6 +342,8 @@ async def upsert_skill(ctx: ToolContext, args: dict) -> Any:
     body = {key: args[key] for key in _SKILL_FIELDS if key in args}
     if skill_id:
         body.pop("workspace_id", None)
+        if args.get("expected_edit_version") is not None:
+            body["expected_edit_version"] = args["expected_edit_version"]
         return await ctx.api.put(f"/api/v1/skills/{skill_id}", body)
     require(args, "name")
     require(args, "system_prompt")
@@ -342,33 +466,73 @@ TOOLS = [
          "Batch the explicitly enumerated Workspace configuration operations into one draft, or append "
          "them to an open draft. These same operations each have an individual stage_workspace_* tool. "
          "Return validation, diff and review_fingerprint; live configuration is unchanged until the reviewed "
-         "draft is committed with apply_workspace_change. An empty patches list refreshes an open draft's review.",
+         "draft is committed with apply_workspace_change. An empty patches list refreshes an open draft's review. Disconnected integration bindings may be staged with integration_pending_connection warnings; their work waits for connection.",
          stage_change,
          properties={"workspace_id": _WORKSPACE_ID,
                      "patches": {"type": "array", "items": _PATCH_SCHEMA,
                                  "description": "Explicitly typed public operation patches, applied in order to this draft."},
                      "draft_id": string("Add to this open draft instead of starting a new one.")},
          required=("workspace_id", "patches")),
+    Tool("get_workspace_app_audience", "Get Workspace App audience",
+         "Who a Workspace's App page could be for, to ask the customer before designing it: the Workspace's "
+         "purpose, its people (Workspace role, declared roles, whether they approve), the roles its work names, "
+         "approval rules, requests waiting on a person, its projects by stage with the fields they actually fill, "
+         "which App entries people start and what they keep asking for in Workspace chat, and the current page. "
+         "Requires management access to this Workspace.",
+         app_view_audience, properties={"workspace_id": _WORKSPACE_ID},
+         required=("workspace_id",), read_only=True, idempotent=True),
     Tool("design_workspace_app_view", "Design Workspace App page",
          "Command Manor's App design sub-agent to design the Workspace's App page from what it runs (Workflows, "
-         "services, Agents, Stats, Automations), using the App module schematic and recipes: entries, card actions "
-         "such as Make this episode and Remake, data views and sections. Returns the checked candidate, its recipes "
-         "and design notes, staged as an app_view.update draft with validation, diff and review_fingerprint. "
+         "services, Agents, Stats, Automations) and who uses it, using the App module schematic and recipes: entries, "
+         "card actions such as Make this episode and Remake, data views and sections. Pass audience (who the page is "
+         "for and what they act on first, chosen with get_workspace_app_audience) so its first screen serves that "
+         "person. Returns the checked candidate, its recipes, design notes and self_check (see "
+         "test_workspace_app_view), staged as an app_view.update draft with validation, diff and review_fingerprint. "
+         "A design takes one to a few minutes: this waits up to wait_seconds, then returns status working and a "
+         "design_id while the design goes on; read it with get_workspace_app_design, and never call this again "
+         "meanwhile, which would design twice. "
          "Nothing changes until apply_workspace_change commits it; to send it back call again with feedback and "
-         "its draft_id (the earlier draft is discarded). Requires management access to this Workspace; "
+         "its draft_id: the designer revises that draft's page, and the earlier draft is discarded. Requires management access to this Workspace; "
          "a collaborator may design only within their live-granted Workspace. Runs a model using the "
          "deployment's configured provider and billing policy.",
          design_app_view,
          properties={"workspace_id": _WORKSPACE_ID,
                      "brief": string("What the person wants to do from the App, in their words.", maxLength=4000),
                      "feedback": string("Why the last design was sent back and what to change.", maxLength=4000),
-                     "draft_id": string("The earlier design draft this one replaces.")},
+                     "draft_id": string("The earlier design draft this one replaces."),
+                     "audience": string("Who the page is for and what they act on first, as the customer chose it.",
+                                        maxLength=1000),
+                     "wait_seconds": {"type": "number", "minimum": 0, "maximum": _MAX_DESIGN_WAIT_SECONDS,
+                                      "default": _DEFAULT_DESIGN_WAIT_SECONDS,
+                                      "description": "How long to wait for the design before returning status working."}},
          required=("workspace_id", "brief")),
+    Tool("get_workspace_app_design", "Get Workspace App design",
+         "Read an App design that design_workspace_app_view returned as working: status working (call again "
+         "shortly), done (the same result design_workspace_app_view returns, with draft_id and review_fingerprint), "
+         "failed (why, with the designer's notes) or stopped (cut off; design again). Designs are kept for an hour "
+         "and only for the person who started them.",
+         get_app_design,
+         properties={"workspace_id": _WORKSPACE_ID,
+                     "design_id": string("design_id from design_workspace_app_view.")},
+         required=("workspace_id", "design_id"), read_only=True, idempotent=True),
+    Tool("test_workspace_app_view", "Test Workspace App page",
+         "Self-check a Workspace's App page, saved or as an open draft stages it (draft_id). A plan generated from "
+         "the page and what the Workspace runs lists every entry, data view, block, context, section and source and "
+         "what each must satisfy. It reports the App design checks, then reads every view through the App read routes "
+         "as you, failing a view whose cards would show people an unfilled template, an id, an internal key or raw "
+         "data. Read-only: it proves reads work, not that clicking works, so nothing is clicked, started or approved. "
+         "A row is passed, failed (its message says which view, why and how to fix it), no_data (nothing to read "
+         "yet, which is not a failure) or not_run. Requires management access to this Workspace.",
+         test_app_view,
+         properties={"workspace_id": _WORKSPACE_ID, "draft_id": string("An open draft whose page to test.")},
+         required=("workspace_id",), read_only=True, idempotent=True),
     Tool("apply_workspace_change", "Apply Workspace change",
          "Atomically commit the exact reviewed draft containing only the individually published Workspace "
          "operations. Pass its latest review_fingerprint after reviewing the validation and diff with the user. "
          "May replace configuration, remove bindings or rules, change budgets, start schedules, or create tasks "
-         "as explicitly shown in that draft. A changed or stale draft is rejected before any effects.",
+         "as explicitly shown in that draft. A changed draft is rejected before any effects. If someone else "
+         "changed the Workspace since the draft was staged, the draft's own changes are applied on top of theirs; "
+         "only when both changed the same setting is it rejected, naming those settings. pending_connections names newly bound integrations whose account setup still blocks their work.",
          apply_change, properties={"workspace_id": _WORKSPACE_ID, "draft_id": _DRAFT_ID,
                                   "review_fingerprint": string("Fingerprint from the exact stage result reviewed by the user.",
                                                                pattern="^[0-9a-f]{64}$")},
@@ -379,19 +543,29 @@ TOOLS = [
          required=("workspace_id", "draft_id"), destructive=True, idempotent=True),
     Tool("upsert_workflow", "Create or update workflow",
          "Validate workflow steps and create (no workflow_id) or update a workflow. Invalid steps "
-         "are never saved; dry_run=true only validates. Updating replaces supplied fields, including the steps graph. "
+         "are never saved; dry_run=true only validates. Updating replaces supplied fields, including the steps graph. References use {{name}} or {{step_id.field}}, without inputs./steps. prefixes; an agent step returns the fields later steps read from it, but one with its own output_schema needs output_format json and must list every field read. An approval wait's own id has no fields: its answer is {{<response_variable>.choice}} and .note. For editable final-post review, review must be exactly one variable reference; review_editable_fields lists editable string or string-array fields, and review_revision_field supplies the revise note. Other review fields remain immutable and the approved Workflow must consume that same variable. Agent config.expects declares required files/effects. workflow_project uses create, claim, get, list, lease_due, complete_lease, patch or delete (permanent: project_id, project_type, optional children [{project_type, parent_state_key}]; refused while another open run owns one); list_appends {path, key, items}, list_upserts and history_event apply only on a patch. "
+         "Patching a project's current_stage to ended or cancelled stops its owned schedules and blocks their Run now; "
+         "the project and job history remain. completed may retain scheduled follow-up work. "
          "A workflow that makes something (a video scene by scene, a song, slides) can declare config.production "
          "on its trigger step so its runs show as stages, units and the finished result: {media: video|audio|image "
          "(default video; what the run makes and how its result plays), unit: {name}, "
          "units_from: dotted path to the planned "
          "units in run variables, final_from: dotted path to the finished file ({document_id}), "
          "unit_fields: {id, title, duration}, lanes: [{key, label, from}], stages: "
-         "[{label, steps: [step ids], counts_units, weight}], revise: {from_step, notes_input, versions_input} "
+         "[{label, steps: [step ids], counts_units, weight}], revise: {from_step, notes_input, versions_input, context_inputs} "
          "(a finished result can be changed: its next version starts again from from_step with the person's notes "
-         "and chosen unit versions in those declared run inputs; earlier versions are kept)}. "
-         "Attach a saved workflow with stage_workspace_workflow_binding_attach, then review and apply the draft.",
+         "and chosen unit versions in those declared run inputs; earlier versions are kept). context_inputs "
+         "optionally maps declared input/variable names to previous result variable names, carrying only those "
+         "values from the finished run. Declare targets in variables or hidden run_inputs; __ runtime fields "
+         "and the notes/version input names are forbidden}. "
+         "Attach a saved workflow with stage_workspace_workflow_binding_attach, then review and apply the draft. "
+         "When updating, pass expected_version (the workflow's version from your last read or save): if anyone "
+         "saved it since, nothing is saved and the call fails with workflow.error.edited_elsewhere; read it "
+         "again and reapply your change.",
          upsert_workflow,
          properties={"workflow_id": string("Update this workflow; omit to create."),
+                     "expected_version": {"type": "integer", "minimum": 1,
+                                          "description": "Update only if the workflow is still at this version."},
                      "name": string("Workflow name (required to create)."),
                      "description": string("What the workflow does."),
                      "steps": {"type": "array", "items": obj("Workflow step"),
@@ -405,17 +579,20 @@ TOOLS = [
                      "dry_run": boolean("Only validate the steps.", False)}, destructive=True),
     Tool("run_workflow", "Run workflow",
          "Execute a workflow with run inputs. Its configured steps may modify data, spend credits, send messages "
-         "or call external services; this is not a dry run. wait=true (default) runs to completion or its first pause.",
+         "or call external services; this is not a dry run. wait=true (default) runs to completion or its first pause; "
+         "wait=false starts it on a worker and returns at once.",
          run_workflow,
          properties={"workflow_id": string("Workflow id."),
-                     "variables": obj("Run input values by variable name."),
+                     "variables": obj("Run input values by variable name; an input that picks several "
+                                      "records takes a list of the ids list_run_input_choices gives."),
                      "trigger_data": obj("Trigger payload, for event/webhook workflows."),
-                     "wait": boolean("Execute now and wait for the result.", True)},
+                     "wait": boolean("Wait for the result; false starts it on a worker and returns at once.", True)},
          required=("workflow_id",), destructive=True, open_world=True),
     Tool("list_run_input_choices", "List run input choices",
-         "The records a record_select run input currently offers, as {value, label, description}. "
-         "Pass the values (record keys, never labels) to run_workflow; a run with a key the source "
-         "does not offer is rejected.",
+         "The records a picker run input currently offers, as {value, label, description}: Ledger record "
+         "keys for record_select, Workspace record (project) ids for workflow_project_select. Pass the "
+         "values (never labels) to run_workflow: one value for a string input, a list of values for an "
+         "array input that picks several. A run with a value the input does not offer is rejected.",
          list_run_input_choices,
          properties={"workflow_id": string("Workflow id."),
                      "input_key": string("The run input's key."),
@@ -427,16 +604,44 @@ TOOLS = [
          properties={"run_id": string("Run id from run_workflow."),
                      "detail": boolean("Include per-step detail.", True)},
          required=("run_id",), read_only=True, idempotent=True),
+    Tool("retry_workflow_run", "Retry workflow run",
+         "Start a new attempt of a failed or cancelled run from its checkpoint (the run's own retry point, "
+         "or from_step_id). When the deliverable was already made outside the run and saved as Knowledge "
+         "Documents, pass supplied_output {step_id, output, document_ids, note}: output must match that "
+         "step's output_schema and name each document id; the step does not run again and every step after "
+         "it, its QA and reviews included, runs as usual. Steps after the checkpoint may modify data, spend "
+         "credits, send messages or call external services.",
+         retry_workflow_run,
+         properties={"run_id": string("The failed or cancelled run."),
+                     "from_step_id": string("Checkpoint step to resume at (optional)."),
+                     "variables": obj("Changed run inputs (not with supplied_output)."),
+                     "supplied_output": {
+                         "type": "object",
+                         "description": "Finished work that stands in for one step's result.",
+                         "properties": {
+                             "step_id": string("The producing step; it must declare an output_schema."),
+                             "output": obj("The step's result, matching its output_schema."),
+                             "document_ids": {"type": "array", "items": {"type": "string"},
+                                              "description": "Knowledge Documents in the run's Workspace holding the work."},
+                             "note": string("How the work was made, for the run's audit."),
+                         },
+                         "required": ["step_id", "output", "document_ids"],
+                     },
+                     "execute": boolean("Queue the new attempt now.", True)},
+         required=("run_id",), destructive=True, open_world=True),
     Tool("upsert_skill", "Create or update skill",
          "Create (no skill_id) or update a Skill: system_prompt, tools, input schema and bundled "
          "files. On update, 'scripts' and 'extra_files' replace the whole file set; files you leave "
-         "out are deleted.",
+         "out are deleted. When updating, pass expected_edit_version (edit_version from your last read "
+         "or save): if anyone saved the Skill since, nothing is saved and the call fails with "
+         "skill.error.edited_elsewhere.",
          upsert_skill,
          properties={"skill_id": string("Update this skill; omit to create."),
+                     "expected_edit_version": {"type": "integer", "minimum": 1,
+                                               "description": "Update only if the Skill is still at this edit_version."},
                      "name": string("Skill name (required to create)."),
                      "display_name": string("Display name."),
-                     "description": string("When an agent should use the skill, and any params callers must pass. "
-                                            "Callers read only this.", maxLength=SKILL_DESCRIPTION_MAX_CHARS),
+                     "description": string("When an agent should use the skill."),
                      "system_prompt": string("The skill's instructions (required to create)."),
                      "tools": {"type": "array", "items": {"type": "string"}},
                      "input_schema": obj("JSON schema of the skill's inputs."),

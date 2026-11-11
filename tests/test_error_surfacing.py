@@ -489,3 +489,103 @@ def test_escalated_streak_starts_over():
         "count": 7, "first_failed_at": now.isoformat(), "exhausted": True,
     }}
     assert advance_transient_retry(spent, now=now).count == 1
+
+
+def _outage_cases():
+    from types import SimpleNamespace
+
+    from packages.core.ai.runtime.output_policy import (
+        BYOK_PROVIDER_ERROR_CODE,
+        LLM_PROVIDER_UNAVAILABLE_ERROR_CODE,
+        runtime_public_byok_failure_message,
+        runtime_public_provider_unavailable_message,
+    )
+    from packages.core.ai.workflow_runner import _agent_loop_failure_message
+
+    def workflow_failure(code, message, transient=True):
+        return _agent_loop_failure_message(SimpleNamespace(
+            stop_reason="error",
+            error=code,
+            error_detail={"code": code, "message": message, "transient": transient},
+            content="",
+        ))
+
+    byok_detail = "{status} from api.foo.com (model gpt-4o)"
+    byok_outage = runtime_public_byok_failure_message(
+        byok_detail.format(status="no response"), transient=True
+    )
+
+    return [
+        ("LLM rate limited; retry after 3s", "llm_rate_limited"),
+        (
+            {
+                "message": (
+                    "Sorry, the request failed before the model could respond. "
+                    "Please check the selected model and API key configuration."
+                    "\n\nError detail: HTTP 503: Service temporarily unavailable"
+                )
+            },
+            "provider_down",
+        ),
+        ("ACCESS_DENIED from the connected app", "app_permission_denied"),
+        ({"detail": "ACCESS_DENIED"}, "app_permission_denied"),
+        (
+            runtime_public_provider_unavailable_message("HTTP 503 after 4 attempts over 60s"),
+            "provider_down",
+        ),
+        (runtime_public_byok_failure_message(transient=True), "byok_provider_down"),
+        # A permanent BYOK failure is a bad key or setting unless the status
+        # says the provider was down.
+        (runtime_public_byok_failure_message(), None),
+        (runtime_public_byok_failure_message(byok_detail.format(status="HTTP 401")), None),
+        (
+            runtime_public_byok_failure_message(byok_detail.format(status="HTTP 503")),
+            "byok_provider_down",
+        ),
+        (
+            workflow_failure(
+                LLM_PROVIDER_UNAVAILABLE_ERROR_CODE,
+                runtime_public_provider_unavailable_message("HTTP 503 after 4 attempts over 60s"),
+            ),
+            "provider_down",
+        ),
+        # The workflow wording wraps the BYOK sentence: the BYOK pattern must win.
+        (workflow_failure(BYOK_PROVIDER_ERROR_CODE, byok_outage), "byok_provider_down"),
+        ({"code": LLM_PROVIDER_UNAVAILABLE_ERROR_CODE, "message": "x"}, "provider_down"),
+        ({"code": BYOK_PROVIDER_ERROR_CODE, "message": "x"}, None),
+        ({"code": BYOK_PROVIDER_ERROR_CODE, "message": "x", "transient": True}, "byok_provider_down"),
+        ({"code": 123, "message": "Publisher returned 500"}, None),
+        ({"code": [LLM_PROVIDER_UNAVAILABLE_ERROR_CODE], "message": "x"}, None),
+        # Non-transient: may be the account's own key, so it stays uncategorized.
+        ("Model provider request failed before producing a response.", None),
+        ("Publisher returned 500", None),
+        (None, None),
+    ]
+
+
+@pytest.mark.parametrize(("error", "code"), _outage_cases())
+def test_failure_code_names_a_known_failure_without_its_text(error, code):
+    from packages.core.governance.error_signatures import failure_code
+
+    assert failure_code(error) == code
+
+
+def test_outage_wording_stays_out_of_the_hint_table():
+    """Counting an outage must not change its card or retry behaviour."""
+    from packages.core.ai.runtime.output_policy import (
+        runtime_public_provider_unavailable_message,
+    )
+    from packages.core.governance.error_signatures import classify_execution_error
+
+    assert classify_execution_error(
+        {"message": runtime_public_provider_unavailable_message()}
+    ) is None
+
+
+def test_every_failure_signature_has_its_own_code():
+    from packages.core.governance.error_signatures import _SIGNATURES, PLATFORM_FAILURE_CODES
+
+    codes = [hint.code for _, hint in _SIGNATURES]
+    assert all(codes)
+    assert len(codes) == len(set(codes))
+    assert PLATFORM_FAILURE_CODES <= set(codes)

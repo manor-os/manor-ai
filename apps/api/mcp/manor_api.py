@@ -15,6 +15,7 @@ import httpx
 from starlette.types import ASGIApp
 
 from packages.core.services.auth_service import create_access_token
+from packages.core.services.oauth_provider_service import mcp_token_scopes
 
 _INTERNAL_TOKEN_MINUTES = 5
 # Tool calls such as Blueprint installs or synchronous workflow runs can be slow.
@@ -47,8 +48,10 @@ class ManorApi:
             mfa_authenticated="mfa" in (claims.get("amr") or []),
             # The REST route sees an agent acting for the user, with what the
             # user granted it (a token from before scopes means just "mcp").
-            scopes=list(claims.get("scp") or ["mcp"]),
+            scopes=sorted(mcp_token_scopes(claims)),
             actor=f"mcp:{claims.get('azp') or 'client'}",
+            # The REST routes see which client is acting (request.state.auth_client).
+            authorized_party=claims.get("azp"),
         )
 
     async def _send(
@@ -115,6 +118,12 @@ class ManorApi:
 
     async def get(self, path: str, **params: Any) -> Any:
         return await self.request("GET", path, params=params)
+
+    async def get_with_headers(self, path: str, **params: Any) -> tuple[Any, httpx.Headers]:
+        """A route's body and headers, for one that says something in a header."""
+        response = await self._send("GET", path, params=params)
+        self._raise_for_status(response)
+        return self._body(response), response.headers
 
     async def post(self, path: str, body: Any = None, **kwargs: Any) -> Any:
         return await self.request("POST", path, json_body=body, **kwargs)

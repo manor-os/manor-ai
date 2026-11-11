@@ -184,6 +184,35 @@ def test_a_later_successful_call_resolves_the_platform_fault():
 
 
 @pytest.mark.parametrize(
+    ("code", "kwargs", "platform_fault"),
+    [
+        ("DOCUMENT_SYNC_FAILED", {}, True),
+        ("FILESYSTEM_UNAVAILABLE", {}, True),
+        ("WORKSPACE_SCOPE_UNAVAILABLE", {}, True),
+        ("QUALITY_GATE_BLOCKED", {"internal_error": True}, True),
+        # A file that fails its quality gate is the agent's to repair.
+        ("QUALITY_GATE_BLOCKED", {}, False),
+        ("READ_FAILED", {}, False),
+    ],
+)
+def test_save_failures_manor_caused_are_platform_faults(code, kwargs, platform_fault):
+    """A save the platform failed must reach step resilience as a platform
+    fault (2026-10-27: a Word deliverable the gate passed was "not saved", the
+    step ended unmet and nothing retried it)."""
+    from packages.core.ai.runtime.composite_tools import SandboxToolErrorCode
+    from packages.core.ai.tools.sandbox_tools import _sandbox_error
+
+    evidence = RuntimeToolEvidence()
+    error = _sandbox_error(SandboxToolErrorCode[code], "x", **kwargs)
+    evidence.observe_tool_result("sandbox", "call-1", error, {"action": "save_result"})
+    fault = runtime_unresolved_platform_error(evidence.checkpoint_state())
+    if platform_fault:
+        assert fault["code"] == SandboxToolErrorCode[code].value and fault["tool"] == "sandbox"
+    else:
+        assert fault is None
+
+
+@pytest.mark.parametrize(
     "result",
     [
         # retryable:false alone is a blocker the user can resolve, not a platform fault.

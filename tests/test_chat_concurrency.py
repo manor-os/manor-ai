@@ -306,6 +306,137 @@ async def test_wrapped_stream_stops_and_releases_capacity_when_renewal_stalls():
     assert gate.local_active == 0
 
 
+def _stream_gate(redis: FakeLuaRedis) -> ChatConcurrencyGate:
+    return ChatConcurrencyGate(
+        redis_getter=lambda: redis,
+        config=ChatConcurrencyConfig(
+            enabled=True,
+            global_limit=4,
+            per_instance_limit=4,
+            wait_timeout_seconds=0,
+            slot_ttl_seconds=900,
+            heartbeat_interval_seconds=0.01,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream_position", ["waiting_for_source", "blocked_on_send"])
+async def test_client_disconnect_releases_slot_and_cancels_the_stream_work(stream_position):
+    """Regression: on ``http.disconnect`` (uvicorn speaks ASGI 2.3) Starlette
+    cancels the response and abandons its body. A cleanup awaited inside the
+    cancelled scope stopped at its first await, and a body left suspended at
+    ``yield`` only cleaned up when garbage-collected, so the slot stayed held
+    and the stuck Architect turn behind the stream kept running."""
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.routing import Route
+
+    from apps.api.streaming_concurrency import LeasedStreamingResponse
+
+    redis = FakeLuaRedis()
+    gate = _stream_gate(redis)
+    lease = await gate.acquire(scope="workspace-draft")
+    work_cancelled = asyncio.Event()
+    responses = []  # keeps the abandoned body alive, as a busy process does
+
+    async def stuck_turn():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            work_cancelled.set()
+            raise
+
+    async def source():  # the shape of workspace_drafts._stream_turn
+        yield "event: start\ndata: {}\n\n"
+        work = asyncio.create_task(stuck_turn())
+        try:
+            while True:
+                await asyncio.sleep(0.01)
+                yield "event: keepalive\ndata: {}\n\n"
+        finally:
+            work.cancel()
+            await asyncio.gather(work, return_exceptions=True)
+
+    class Passthrough(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            return await call_next(request)
+
+    async def endpoint(_request):
+        response = LeasedStreamingResponse(lease.wrap(source()), media_type="text/event-stream")
+        responses.append(response)
+        return response
+
+    # Behind BaseHTTPMiddleware the body keeps being pulled until the cancel
+    # lands in it; without it a send blocked on a slow client is cancelled
+    # while the body waits at ``yield``, and nothing ever resumes it.
+    middleware = [Middleware(Passthrough)] if stream_position == "waiting_for_source" else []
+    app = Starlette(routes=[Route("/", endpoint, methods=["POST"])], middleware=middleware)
+    first_frame = asyncio.Event()
+
+    async def send(message):
+        if message.get("body"):
+            if first_frame.is_set() and stream_position == "blocked_on_send":
+                await asyncio.Event().wait()  # a client that stopped reading
+            first_frame.set()
+
+    async def receive():
+        await first_frame.wait()
+        await asyncio.sleep(0.05)
+        return {"type": "http.disconnect"}
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1", "method": "POST", "scheme": "http", "path": "/", "raw_path": b"/",
+        "root_path": "", "query_string": b"", "headers": [], "server": ("test", 80), "client": ("test", 1),
+    }
+    await asyncio.wait_for(app(scope, receive, send), 5)
+
+    await asyncio.wait_for(work_cancelled.wait(), 2)
+    for _ in range(100):
+        if not redis.zsets[gate.config.key]:
+            break
+        await asyncio.sleep(0.01)
+    assert redis.zsets[gate.config.key] == {}
+    assert gate.local_active == 0
+    assert responses
+
+@pytest.mark.asyncio
+async def test_stream_without_progress_is_stopped_visibly_and_releases_its_slot():
+    redis = FakeLuaRedis()
+    gate = _stream_gate(redis)
+    closed = asyncio.Event()
+
+    async def source(progress_frames: int):
+        try:
+            for _ in range(progress_frames):
+                await asyncio.sleep(0.02)
+                yield "event: token\n\n"
+            while True:  # a stuck turn: keepalives renew nothing any more
+                await asyncio.sleep(0.01)
+                yield "event: keepalive\n\n"
+        finally:
+            closed.set()
+
+    lease = await gate.acquire(scope="workspace-draft")
+    frames = [
+        frame async for frame in lease.wrap(
+            source(progress_frames=5),
+            stall_timeout_seconds=0.1,
+            is_progress=lambda frame: not frame.startswith("event: keepalive"),
+            stalled_chunk=lambda: "event: error\n\n",
+        )
+    ]
+
+    # Progress kept the stream alive past the stall window; silence ended it.
+    assert frames.count("event: token\n\n") == 5
+    assert frames[-1] == "event: error\n\n"
+    assert closed.is_set()
+    assert redis.zsets[gate.config.key] == {}
+    assert gate.local_active == 0
+
+
 @pytest.mark.asyncio
 async def test_non_streaming_call_renews_beyond_ttl_and_during_cancelled_cleanup():
     redis, now = FakeLuaRedis(), 1_000.0

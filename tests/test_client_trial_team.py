@@ -4,19 +4,22 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import func, select
+from fastapi import HTTPException
+from sqlalchemy import event, func, select
 from sqlalchemy.exc import IntegrityError
 
 from test_client_workspace_delivery import register
 from test_collaborator_boundary import BROWSER
 from test_workspace_collaboration import accepted, derived
+from packages.core.models.base import generate_ulid
 from packages.core.models.browser_session import BrowserSession
 from packages.core.models.client_delivery import ClientWorkspaceDelivery
-from packages.core.models.user import User, UserMembership
+from packages.core.models.user import Entity, User, UserMembership
 from packages.core.models.workspace import Workspace, WorkspaceActivity, WorkspaceStaff
 from packages.core.models.workspace_collaboration import WorkspaceCollaboration
 from packages.core.services.auth_service import create_access_token, decode_token
 from packages.core.services.user_email_proof import mark_email_verified
+from packages.core.services.workspace_collaboration import issuer_fingerprint, live_boundary, live_grant_ids
 
 JOINED = "Provider team member joined the trial"
 
@@ -199,6 +202,130 @@ async def test_the_team_role_follows_the_phase_and_the_customers_decision(client
         ), opened.text
     [mine] = await grants_of(db_session, delivery["id"], s.id)
     assert (mine.role, mine.status, mine.expires_at) == ("maintainer", "active", None)
+
+
+async def _customer_grant(db, *, manages=True):
+    """A live provider grant on a customer's Workspace, issued by that customer's owner."""
+    entity = Entity(id=generate_ulid(), name=f"Customer {generate_ulid()}")
+    db.add(entity)
+    await db.flush()
+    role = "owner" if manages else "member"
+    issuer = User(id=generate_ulid(), entity_id=entity.id, email=f"u-{generate_ulid()}@example.com",
+                  password_hash="x", role=role, status="active")
+    ws = Workspace(id=generate_ulid(), entity_id=entity.id, name="Trial", status="active", settings={})
+    db.add_all([issuer, ws, UserMembership(user_id=issuer.id, entity_id=entity.id, role=role, status="active")])
+    await db.flush()
+    grant = WorkspaceCollaboration(
+        entity_id=entity.id, workspace_id=ws.id, email="provider@example.com", role="provider_trial",
+        status="active", user_id=generate_ulid(), authorized_by=issuer.id,
+        authority_fingerprint=await issuer_fingerprint(db, ws, issuer.id),
+    )
+    db.add(grant)
+    await db.flush()
+    return grant, ws, entity, issuer
+
+
+async def _membership_of(db, issuer):
+    return await db.scalar(select(UserMembership).where(UserMembership.user_id == issuer.id))
+
+
+async def _refresh_authority(db, grant, ws, issuer):
+    await db.flush()
+    grant.authority_fingerprint = await issuer_fingerprint(db, ws, issuer.id)
+
+
+async def _inactive_membership(db, grant, ws, entity, issuer):
+    # Fingerprint renewed each time, so only the check under test can refuse.
+    (await _membership_of(db, issuer)).status = "inactive"
+    await _refresh_authority(db, grant, ws, issuer)
+
+
+async def _company_role_downgraded(db, grant, ws, entity, issuer):
+    issuer.role = "member"
+    (await _membership_of(db, issuer)).role = "member"
+    await _refresh_authority(db, grant, ws, issuer)
+
+
+async def _authority_changed(db, grant, ws, entity, issuer):
+    db.add(WorkspaceStaff(workspace_id=ws.id, user_id=issuer.id, role="viewer", status="active"))
+
+
+async def _seat_owner_instead_of_company_admin(db, grant, ws, entity, issuer):
+    # Still manages, through the Workspace seat, as user_can_manage_workspace allows.
+    db.add(WorkspaceStaff(workspace_id=ws.id, user_id=issuer.id, role="owner", status="active"))
+    await _company_role_downgraded(db, grant, ws, entity, issuer)
+
+
+async def _workspace_of_another_company(db, grant, ws, entity, issuer):
+    ws.entity_id = (await _customer_grant(db))[2].id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("change", "passes"), [
+    pytest.param(None, True, id="untouched"),
+    pytest.param(lambda db, g, w, e, i: setattr(w, "deleted_at", datetime.now(timezone.utc)), False, id="workspace-deleted"),
+    pytest.param(lambda db, g, w, e, i: setattr(e, "deleted_at", datetime.now(timezone.utc)), False, id="company-deleted"),
+    pytest.param(_workspace_of_another_company, False, id="workspace-of-another-company"),
+    pytest.param(lambda db, g, w, e, i: setattr(g, "status", "revoked"), False, id="grant-revoked"),
+    pytest.param(lambda db, g, w, e, i: setattr(g, "expires_at", datetime.now(timezone.utc) - timedelta(hours=1)), False, id="grant-expired"),
+    pytest.param(lambda db, g, w, e, i: setattr(i, "deleted_at", datetime.now(timezone.utc)), False, id="issuer-deleted"),
+    pytest.param(lambda db, g, w, e, i: setattr(i, "status", "inactive"), False, id="issuer-disabled"),
+    pytest.param(_inactive_membership, False, id="issuer-left-the-company"),
+    pytest.param(_authority_changed, False, id="authority-changed-since-issuing"),
+    pytest.param(_company_role_downgraded, False, id="issuer-no-longer-manages"),
+    pytest.param(_seat_owner_instead_of_company_admin, True, id="issuer-manages-through-a-seat"),
+    pytest.param(lambda db, g, w, e, i: setattr(g, "authorized_by", None), True, id="no-issuer-to-check"),
+])
+async def test_the_batched_check_agrees_with_live_boundary(db_session, change, passes):
+    # Catches: the list's batched read drifting from the check that guards
+    # opening a trial, which would offer access that then refuses, or hide it.
+    grant, ws, entity, issuer = await _customer_grant(db_session)
+    if change:
+        result = change(db_session, grant, ws, entity, issuer)
+        if result is not None:
+            await result
+    await db_session.flush()
+
+    try:
+        await live_boundary(db_session, grant, lock=False)
+        one_at_a_time = True
+    except HTTPException:
+        one_at_a_time = False
+    assert one_at_a_time is passes
+    assert (grant.id in await live_grant_ids(db_session, [grant])) is passes
+
+
+@pytest.mark.asyncio
+async def test_reading_many_grants_does_not_query_for_each_one(db_session):
+    # Catches: a list of accepted deliveries going back to a query per row, which
+    # was nine statements each. Grants share a customer here; each further issuer
+    # at another customer adds only the manage check, decided once for that pair.
+    grant, ws, entity, issuer = await _customer_grant(db_session)
+    grants = [grant]
+    for index in range(5):
+        other = Workspace(id=generate_ulid(), entity_id=entity.id, name=f"Trial {index}", status="active", settings={})
+        db_session.add(other)
+        await db_session.flush()
+        row = WorkspaceCollaboration(
+            entity_id=entity.id, workspace_id=other.id, email="provider@example.com", role="provider_trial",
+            status="active", user_id=generate_ulid(), authorized_by=issuer.id,
+            authority_fingerprint=await issuer_fingerprint(db_session, other, issuer.id),
+        )
+        db_session.add(row)
+        grants.append(row)
+    await db_session.flush()
+    statements = []
+
+    def record(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    engine = db_session.bind.sync_engine
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        assert await live_grant_ids(db_session, grants) == {row.id for row in grants}
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    assert len(statements) <= 8
 
 
 @pytest.mark.asyncio

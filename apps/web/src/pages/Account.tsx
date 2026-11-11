@@ -8,15 +8,17 @@ import { useToastStore } from "../stores/toast";
 import { useDisplayPreferences } from "../stores/displayPreferences";
 import StatusBadge from "../components/ui/StatusBadge";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
+import { ConfigBlock, ConfigGroup, ConfigPage, ConfigRow } from "../components/ui/GroupedList";
 import Modal from "../components/ui/Modal";
 import PageHeader from "../components/ui/PageHeader";
 import Button from "../components/ui/Button";
 import Select from "../components/ui/Select";
 import Checkbox from "../components/ui/Checkbox";
 import WorkingHoursEditor, { WORKING_HOURS_TIME_OPTIONS } from "../components/ui/WorkingHoursEditor";
-import { IconBuilding, IconCalendar, IconCopy, IconEdit, IconExternalLink, IconLink, IconPalette, IconPlus, IconTrash } from "../components/icons";
+import { IconBuilding, IconCalendar, IconCopy, IconDashboard, IconEdit, IconExternalLink, IconLink, IconPalette, IconPlus, IconTrash } from "../components/icons";
 import NangoConnectButton from "../components/integrations/NangoConnectButton";
 import { clearAuthBrowserState } from "../lib/authToken";
+import { leaveSessionOrLogout } from "../lib/signOut";
 import { deviceTimeZone, getPreferredTimeZone, setPreferredTimeZoneForUser } from "../lib/format";
 import { useAuthStore } from "../stores/auth";
 import { COLLABORATOR_ROLE } from "../lib/collaboratorSession";
@@ -35,11 +37,8 @@ import {
 
 import { t } from "../lib/i18n";
 import { userAvatarImage } from "../lib/userAvatar";
+import "./Account.css";
 
-async function leaveSessionOrLogout() {
-  await useAuthStore.getState().logout();
-  window.location.href = "/login";
-}
 
 function invalidateEntityScopedQueries(queryClient: ReturnType<typeof useQueryClient>) {
   const queryKeys = [
@@ -187,7 +186,7 @@ export function AppearanceSection({ embedded = false }: { embedded?: boolean }) 
           <IconPalette size={18} />
         </div>
         <div>
-          <h2>{t("page.account.appearance")}</h2>
+          <h2>{embedded ? t("settings.theme") : t("page.account.appearance")}</h2>
           <p>{t("page.account.appearance_description")}</p>
         </div>
       </div>
@@ -224,27 +223,47 @@ export function AppearanceSection({ embedded = false }: { embedded?: boolean }) 
       <div className="account-ai-edit-section">
         <div className="account-ai-edit-heading">
           <div className="account-appearance-icon" aria-hidden="true">
-            <IconPalette size={18} />
+            <IconDashboard size={18} />
           </div>
           <div>
             <h3>{t("page.account.interface_mode")}</h3>
             <p>{t("page.account.interface_mode_saved_locally")}</p>
           </div>
         </div>
-        <Select
-          value={interfaceMode}
-          onChange={(mode) => setInterfaceMode(mode === "simple" ? "simple" : "professional")}
-          ariaLabel={t("page.account.interface_mode")}
-          options={[
-            { value: "simple", label: t("page.account.interface_mode_simple") },
-            { value: "professional", label: t("page.account.interface_mode_professional") },
-          ]}
-        />
-        <p className="text-xs text-stone-500" aria-live="polite">
-          {t(interfaceMode === "simple"
-            ? "page.account.interface_mode_simple_description"
-            : "page.account.interface_mode_professional_description")}
-        </p>
+        {/* Two choices, each shown with what it looks like: cards, like the theme and AI Edit pickers. */}
+        <div className="account-ai-edit-grid" role="radiogroup" aria-label={t("page.account.interface_mode")}>
+          {(["simple", "professional"] as const).map((mode) => {
+            const active = interfaceMode === mode;
+            return (
+              <button
+                key={mode}
+                type="button"
+                className={`account-theme-card account-ai-edit-card${active ? " is-active" : ""}`}
+                role="radio"
+                aria-checked={active}
+                onClick={() => setInterfaceMode(mode)}
+              >
+                <span className="account-ai-edit-preview account-mode-preview" data-mode-preview={mode} aria-hidden="true">
+                  {mode === "professional" && <span className="account-mode-preview__nav"><i /><i /><i /><i /></span>}
+                  <span className="account-mode-preview__chat">
+                    <i className="is-them" />
+                    <i className="is-me" />
+                    <i className="is-them is-long" />
+                    <b />
+                  </span>
+                  {mode === "professional" && <span className="account-mode-preview__panel"><i /><i /><i /></span>}
+                </span>
+                <span className="account-theme-copy">
+                  <strong>{t(`page.account.interface_mode_${mode}`)}</strong>
+                  <span>{t(`page.account.interface_mode_${mode}_description`)}</span>
+                </span>
+                <span className="account-theme-check" aria-hidden="true">
+                  {active ? "✓" : ""}
+                </span>
+              </button>
+            );
+          })}
+        </div>
       </div>
 
       <div className="account-ai-edit-section">
@@ -413,18 +432,7 @@ function IDCard({ user }: { user: any }) {
     : "Recently";
 
   return (
-    <div
-      className="account-id-card glass-card"
-      style={{
-        width: 280,
-        flexShrink: 0,
-        padding: "36px 28px",
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        borderRadius: 28,
-      }}
-    >
+    <div className="account-identity">
       {/* Avatar */}
       <div
         onClick={() => fileRef.current?.click()}
@@ -436,7 +444,7 @@ function IDCard({ user }: { user: any }) {
           cursor: "pointer",
           position: "relative",
           background: user.avatar_url
-            ? "#f5f5f4"
+            ? "#f5f5f7"
             : "linear-gradient(135deg, #436b65, #5f928a)",
           display: "flex",
           alignItems: "center",
@@ -515,84 +523,13 @@ function IDCard({ user }: { user: any }) {
         />
       </div>
 
-      {/* Name */}
-      <h2
-        style={{
-          fontSize: 20,
-          fontWeight: 800,
-          color: "#1c1917",
-          margin: "0 0 4px",
-          textAlign: "center",
-          lineHeight: 1.3,
-        }}
-      >
-        {user.display_name || user.email}
-      </h2>
-      <p
-        style={{
-          fontSize: 13,
-          color: "#a8a29e",
-          margin: "0 0 14px",
-          textAlign: "center",
-          wordBreak: "break-all",
-        }}
-      >
-        {user.email}
-      </p>
-
-      {/* Role */}
-      <div style={{ marginBottom: 24 }}>
-        <StatusBadge
-          type={
-            user.role === "owner" || user.role === "admin" ? "purple" : "info"
-          }
-        >
+      <div className="account-identity-copy">
+        <h2>{user.display_name || user.email}</h2>
+        <p>
           {user.role === "owner" ? t("page.users.role_admin") : user.role}
-        </StatusBadge>
+          {joined ? ` · ${t("page.account.joined")} ${joined}` : ""}
+        </p>
       </div>
-
-      {/* Joined */}
-      <div
-        className="glass-card-sm"
-        style={{
-          width: "100%",
-          padding: "14px 18px",
-          marginBottom: 24,
-          background: "rgba(242,246,245,0.6)",
-          border: "1px solid rgba(79,125,117,0.1)",
-        }}
-      >
-        <div
-          style={{
-            fontSize: 11,
-            fontWeight: 600,
-            color: "#78716c",
-            textTransform: "uppercase",
-            letterSpacing: "0.05em",
-          }}
-        >
-          {t("page.account.joined")}
-        </div>
-        <div
-          style={{
-            fontSize: 14,
-            fontWeight: 700,
-            color: "#1c1917",
-            marginTop: 4,
-          }}
-        >
-          {joined}
-        </div>
-      </div>
-
-      {/* Logout */}
-      <button
-        className="btn-manor-danger"
-        onClick={leaveSessionOrLogout}
-        style={{ width: "100%" }}
-      >
-        {t("action.logout")}
-      </button>
     </div>
   );
 }
@@ -754,13 +691,13 @@ function CompanyCard({
               style={{
                 fontSize: 14,
                 fontWeight: 700,
-                color: "#1c1917",
+                color: "var(--text-strong)",
                 margin: "0 0 2px",
               }}
             >
               {entity?.name || activeMembership?.entity_name || "—"}
             </p>
-            <p style={{ fontSize: 12, color: "#a8a29e", margin: 0 }}>
+            <p style={{ fontSize: 12, color: "var(--text-muted)", margin: 0 }}>
               {entity?.address || t("page.account.no_address_set")}
             </p>
             <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 7 }}>
@@ -800,8 +737,8 @@ function CompanyCard({
           marginTop: 10,
           maxWidth: 560,
         }}>
-          <p style={{ margin: "0 0 2px", fontSize: 11, fontWeight: 800, color: "#78716c", textTransform: "uppercase" }}>
-            Pending invitations
+          <p style={{ margin: "0 0 2px", fontSize: 11, fontWeight: 800, color: "var(--text-muted)", }}>
+            {t("ui.pending_invitations")}
           </p>
           {pendingInvites.map((invite) => {
             const focused = Boolean(focusInviteToken && invite.invite_token === focusInviteToken);
@@ -823,10 +760,10 @@ function CompanyCard({
                 }}
               >
                 <div style={{ minWidth: 0 }}>
-                  <p style={{ margin: 0, fontSize: 13, fontWeight: 800, color: "#292524" }}>
+                  <p style={{ margin: 0, fontSize: 13, fontWeight: 800, color: "var(--text-strong)" }}>
                     {invite.entity_name || invite.entity_id}
                   </p>
-                  <p style={{ margin: "2px 0 0", fontSize: 11, color: "#a8a29e" }}>
+                  <p style={{ margin: "2px 0 0", fontSize: 11, color: "var(--text-muted)" }}>
                     {invite.role_name || "Team member"} · {invite.email}
                   </p>
                 </div>
@@ -838,7 +775,7 @@ function CompanyCard({
                     onClick={() => handleInviteAction(invite.invite_id, "decline")}
                     style={{ padding: "6px 10px", fontSize: 12, opacity: busy ? 0.55 : 1 }}
                   >
-                    Decline
+                    {t("ui.decline")}
                   </button>
                   <button
                     type="button"
@@ -885,11 +822,11 @@ function CompanyCard({
                 }}
               >
                 <div style={{ minWidth: 0 }}>
-                  <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: "#292524" }}>
+                  <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: "var(--text-strong)" }}>
                     {membership.entity_name || membership.entity_id}
                   </p>
                   {/* Raw role names are capitalized; the translated label keeps its own casing. */}
-                  <p style={{ margin: "2px 0 0", fontSize: 11, color: "#a8a29e", textTransform: membership.role === COLLABORATOR_ROLE ? undefined : "capitalize" }}>
+                  <p style={{ margin: "2px 0 0", fontSize: 11, color: "var(--text-muted)", textTransform: membership.role === COLLABORATOR_ROLE ? undefined : "capitalize" }}>
                     {membership.role === COLLABORATOR_ROLE
                       ? t("collaboration.external_membership")
                       : membership.staff_role_name || membership.role || "member"}
@@ -943,7 +880,7 @@ function CompanyCard({
               }}
             >
               <span>{invite.entity_name || invite.entity_id}</span>
-              <span>Declined</span>
+              <span>{t("ui.declined")}</span>
             </div>
           ))}
         </div>
@@ -952,7 +889,7 @@ function CompanyCard({
       <Modal
         open={showInvitePrompt}
         onClose={closeInvitePrompt}
-        title="Join team invitation"
+        title={t("ui.join_team_invitation")}
         maxWidth="440px"
         footer={
           <>
@@ -963,7 +900,7 @@ function CompanyCard({
               onClick={() => handlePromptInviteAction("decline")}
               style={{ opacity: inviteActionId === focusedInvite?.invite_id ? 0.55 : 1 }}
             >
-              Decline
+              {t("ui.decline")}
             </button>
             <button
               type="button"
@@ -997,15 +934,15 @@ function CompanyCard({
                 <IconBuilding size={20} style={{ color: "#436b65" }} />
               </div>
               <div style={{ minWidth: 0 }}>
-                <p style={{ margin: 0, fontSize: 15, fontWeight: 800, color: "#1c1917" }}>
+                <p style={{ margin: 0, fontSize: 15, fontWeight: 800, color: "var(--text-strong)" }}>
                   {focusedInvite.entity_name || "Company team"}
                 </p>
-                <p style={{ margin: "3px 0 0", fontSize: 12, color: "#a8a29e" }}>
+                <p style={{ margin: "3px 0 0", fontSize: 12, color: "var(--text-muted)" }}>
                   {focusedInvite.role_name || "Team member"} · {focusedInvite.email}
                 </p>
               </div>
             </div>
-            <p style={{ margin: 0, fontSize: 13, lineHeight: 1.6, color: "#57534e" }}>
+            <p style={{ margin: 0, fontSize: 13, lineHeight: 1.6, color: "var(--text-muted)" }}>
               You were invited to join this company workspace. Accepting will switch you into the company context and use the company team permissions.
             </p>
           </div>
@@ -1458,6 +1395,7 @@ export function AIModelSection({
       unit: "token",
     },
     "openai/gpt-image-2": { in: 5.0, out: 30.0, unit: "token" },
+    "openai/gpt-image-2.6-sunburst": { in: 5.0, out: 30.0, unit: "token" },
     "google/gemini-3.1-flash-tts-preview": {
       in: 1.0,
       out: 20.0,
@@ -1563,11 +1501,12 @@ export function AIModelSection({
       style={{
         marginTop: settingsSurface ? 0 : 32,
         paddingTop: settingsSurface ? 0 : 28,
-        borderTop: settingsSurface ? "none" : "1px solid rgba(28,25,23,0.06)",
+        borderTop: settingsSurface ? "none" : "0.5px solid rgba(29, 29, 31,0.06)",
       }}
     >
       <div className="account-ai-section-heading">
-        <h3 className="manor-section-title">{t("page.account.ai_models")}</h3>
+        {/* In Settings the page heading already says "AI models". */}
+        {!settingsSurface && <h3 className="manor-section-title">{t("page.account.ai_models")}</h3>}
         {byokUpgradeRequired && (
           <button
             type="button"
@@ -1738,7 +1677,7 @@ export function AIModelSection({
                     style={{
                       fontSize: 13,
                       fontWeight: 600,
-                      color: "#1c1917",
+                      color: "var(--text-strong)",
                       margin: 0,
                     }}
                   >
@@ -1747,7 +1686,7 @@ export function AIModelSection({
                   <p
                     style={{
                       fontSize: 10,
-                      color: "#a8a29e",
+                      color: "var(--text-faint)",
                       margin: "2px 0 0",
                       lineHeight: 1.3,
                     }}
@@ -1766,9 +1705,9 @@ export function AIModelSection({
                       style={{
                         padding: "4px 8px",
                         borderRadius: 6,
-                        background: "#fafaf9",
+                        background: "var(--surface-muted)",
                         fontSize: 10,
-                        color: "#78716c",
+                        color: "var(--text-muted)",
                         display: "flex",
                         alignItems: "center",
                         gap: 4,
@@ -1949,7 +1888,7 @@ export function AIModelSection({
               {isOwnExpanded && !role.locked && (
                 <div
                   style={{
-                    borderTop: "1px solid rgba(28,25,23,0.06)",
+                    borderTop: "0.5px solid rgba(29, 29, 31,0.06)",
                     background: "rgba(248,250,255,0.6)",
                   }}
                 >
@@ -1957,7 +1896,7 @@ export function AIModelSection({
                   <div
                     style={{
                       display: "flex",
-                      borderBottom: "1px solid rgba(28,25,23,0.06)",
+                      borderBottom: "0.5px solid rgba(29, 29, 31,0.06)",
                       padding: "0 18px",
                     }}
                   >
@@ -2003,7 +1942,7 @@ export function AIModelSection({
                               ? "2px solid #6d6fb2"
                               : "2px solid transparent",
                             background: "transparent",
-                            color: active ? "#6d6fb2" : "#78716c",
+                            color: active ? "#6d6fb2" : "#8e8e93",
                             opacity:
                               tab.key === "custom" && !byokAllowed ? 0.48 : 1,
                             display: "flex",
@@ -2046,7 +1985,7 @@ export function AIModelSection({
                         <p
                           style={{
                             fontSize: 11,
-                            color: "#78716c",
+                            color: "var(--text-muted)",
                             margin: 0,
                           }}
                         >
@@ -2097,7 +2036,7 @@ export function AIModelSection({
                                     background: active
                                       ? `${role.color}08`
                                       : "#fff",
-                                    color: active ? role.color : "#57534e",
+                                    color: active ? role.color : "#6e6e73",
                                     opacity: isSaving && !active ? 0.6 : 1,
                                   }}
                                 >
@@ -2120,10 +2059,10 @@ export function AIModelSection({
                                           borderRadius: 4,
                                           background: active
                                             ? `${role.color}15`
-                                            : "#f5f5f4",
+                                            : "#f5f5f7",
                                           color: active
                                             ? role.color
-                                            : "#a8a29e",
+                                            : "#aeaeb2",
                                         }}
                                       >
                                         {opt.tag}
@@ -2144,7 +2083,7 @@ export function AIModelSection({
                                           fontSize: 8,
                                           fontWeight: 600,
                                           color:
-                                            tierColors[opt.tier] || "#a8a29e",
+                                            tierColors[opt.tier] || "#aeaeb2",
                                         }}
                                       >
                                         {priceTierDollar(opt.id, opt.tier)}
@@ -2169,8 +2108,8 @@ export function AIModelSection({
                                                 )
                                                   ? active
                                                     ? role.color
-                                                    : "#a8a29e"
-                                                  : "#e7e5e4",
+                                                    : "#aeaeb2"
+                                                  : "#e5e5ea",
                                             }}
                                           />
                                         ))}
@@ -2185,7 +2124,7 @@ export function AIModelSection({
                           <p
                             style={{
                               fontSize: 11,
-                              color: "#a8a29e",
+                              color: "var(--text-faint)",
                               margin: 0,
                             }}
                           >
@@ -2223,11 +2162,11 @@ export function AIModelSection({
                           <p
                             style={{
                               fontSize: 11,
-                              color: "#78716c",
+                              color: "var(--text-muted)",
                               margin: 0,
                               padding: 10,
                               borderRadius: 8,
-                              background: "rgba(28,25,23,0.04)",
+                              background: "rgba(29, 29, 31,0.04)",
                             }}
                           >
                             {t("page.account.custom_media_model_hint")}
@@ -2406,7 +2345,7 @@ export function AIModelSection({
                                   background: "none",
                                   border: "none",
                                   cursor: "pointer",
-                                  color: "#a8a29e",
+                                  color: "var(--text-faint)",
                                   padding: 2,
                                 }}
                               >
@@ -2447,7 +2386,7 @@ export function AIModelSection({
                                     color: "#437f6b",
                                     marginTop: 2,
                                     display: "block",
-                                    fontFamily: "monospace",
+                                    fontFamily: "var(--font-mono)",
                                   }}
                                 >
                                   {savedApiKey}
@@ -2476,7 +2415,7 @@ export function AIModelSection({
                                 <span
                                   style={{
                                     fontSize: 9,
-                                    color: "#78716c",
+                                    color: "var(--text-muted)",
                                     marginTop: 2,
                                     display: "block",
                                   }}
@@ -2505,7 +2444,7 @@ export function AIModelSection({
                                       ["maxOutputTokens", "page.account.model_max_output_tokens", "16384"],
                                     ] as const
                                   ).map(([field, label, placeholder]) => (
-                                    <label key={field} style={{ fontSize: 10, color: "#78716c" }}>
+                                    <label key={field} style={{ fontSize: 10, color: "var(--text-muted)" }}>
                                       {t(label)}
                                       <input
                                         className="manor-input"
@@ -2529,7 +2468,7 @@ export function AIModelSection({
                                     </label>
                                   ))}
                                 </div>
-                                <span style={{ fontSize: 9, color: "#78716c", marginTop: 2, display: "block" }}>
+                                <span style={{ fontSize: 9, color: "var(--text-muted)", marginTop: 2, display: "block" }}>
                                   {t("page.account.model_limits_hint")}
                                 </span>
                               </div>
@@ -2537,7 +2476,7 @@ export function AIModelSection({
                           <p
                             style={{
                               fontSize: 10,
-                              color: "#78716c",
+                              color: "var(--text-muted)",
                               margin: "4px 0 0",
                             }}
                           >
@@ -2673,9 +2612,9 @@ export function AIModelSection({
 
 /* ─── Calendar & Booking ─── */
 const CALENDAR_PROVIDER_OPTIONS = [
-  { value: "", label: "Not connected" },
-  { value: "google_calendar", label: "Google Calendar" },
-  { value: "ms_calendar", label: "Outlook Calendar" },
+  { value: "", label: t("ui.not_connected") },
+  { value: "google_calendar", label: t("ui.google_calendar") },
+  { value: "ms_calendar", label: t("ui.outlook_calendar") },
 ];
 
 const CALENDAR_PROVIDER_LABELS: Record<string, string> = {
@@ -2684,11 +2623,11 @@ const CALENDAR_PROVIDER_LABELS: Record<string, string> = {
 };
 
 const BOOKING_LOCATION_OPTIONS = [
-  { value: "video", label: "Video" },
-  { value: "phone", label: "Phone" },
-  { value: "in_person", label: "In person" },
-  { value: "custom", label: "Custom" },
-  { value: "none", label: "None" },
+  { value: "video", label: t("ui.video") },
+  { value: "phone", label: t("ui.phone") },
+  { value: "in_person", label: t("ui.in_person") },
+  { value: "custom", label: t("ui.custom") },
+  { value: "none", label: t("ui.none") },
 ];
 
 function defaultWorkingHours(): CalendarWorkingHourWindow[] {
@@ -3209,31 +3148,19 @@ export function CalendarBookingSection({ user }: { user: any }) {
       }}
     >
       <div className="calendar-booking-header" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16, marginBottom: 12 }}>
-        <div>
-          <h3 className="manor-section-title" style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <IconCalendar size={18} /> Calendar & booking
-          </h3>
-          <p className="manor-section-subtitle">Calendar connection, availability, and booking links.</p>
-        </div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <Button
-            variant="ghost"
-            onClick={() => (showLinkForm ? resetLinkForm() : setShowLinkForm(true))}
-            style={{ display: "inline-flex", alignItems: "center", gap: 6, whiteSpace: "nowrap" }}
-          >
-            {showLinkForm ? "Cancel" : <><IconPlus size={14} /> New booking link</>}
-          </Button>
+        {/* The Settings heading already says "Calendar"; this row only carries its actions. */}
+        <div style={{ display: "flex", gap: 8, alignItems: "center", marginLeft: "auto" }}>
           <Button
             disabled={savingSettings || isLoading || !conflictCalendarsReady}
             onClick={saveSettings}
           >
-            {savingSettings ? "Saving..." : "Save"}
+            {savingSettings ? t("page.account.saving") : t("action.save")}
           </Button>
         </div>
       </div>
 
       {isLoading ? (
-        <div style={{ padding: "18px 0", display: "flex", alignItems: "center", gap: 10, color: "#78716c", fontSize: 13 }}>
+        <div style={{ padding: "18px 0", display: "flex", alignItems: "center", gap: 10, color: "var(--text-muted)", fontSize: 13 }}>
           <LoadingSpinner size={16} /> Loading calendar settings
         </div>
       ) : (
@@ -3247,7 +3174,7 @@ export function CalendarBookingSection({ user }: { user: any }) {
             }}
           >
             <div>
-              <label className="manor-label">Calendar app</label>
+              <label className="manor-label">{t("ui.calendar_app")}</label>
               <Select
                 value={provider}
                 onChange={(nextProvider) => {
@@ -3261,7 +3188,7 @@ export function CalendarBookingSection({ user }: { user: any }) {
             {provider && providerConnections.length > 0 && (
               <div>
                 <div style={{ minHeight: 24, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-                  <label className="manor-label" style={{ marginBottom: 0 }}>Connected account</label>
+                  <label className="manor-label" style={{ marginBottom: 0 }}>{t("ui.connected_account")}</label>
                   {calendarConnectButton("Add account", "sm")}
                 </div>
                 <Select
@@ -3270,10 +3197,10 @@ export function CalendarBookingSection({ user }: { user: any }) {
                     setConnectionId(nextConnectionId);
                     setDefaultCalendarId("primary");
                   }}
-                  selectedOptionColor="#292524"
+                  selectedOptionColor="#2c2c2e"
                   selectedOptionCheckColor="#5f928a"
                   options={[
-                    { value: "", label: "Default account" },
+                    { value: "", label: t("ui.default_account") },
                     ...providerConnections.map((conn) => ({
                       value: conn.id,
                       label: calendarConnectionLabel(conn),
@@ -3293,8 +3220,8 @@ export function CalendarBookingSection({ user }: { user: any }) {
                 }}
               >
                 {calendarConnectButton(`Connect ${selectedProviderLabel}`)}
-                <span style={{ fontSize: 12, color: "#a8a29e", fontWeight: 650 }}>
-                  Connect an account to check availability and create booking events.
+                <span style={{ fontSize: 12, color: "var(--text-muted)", fontWeight: 650 }}>
+                  {t("ui.connect_an_account_to_check_availability_and_cre")}
                 </span>
               </div>
             )}
@@ -3310,7 +3237,7 @@ export function CalendarBookingSection({ user }: { user: any }) {
               }}
             >
               <div>
-                <label className="manor-label">Default booking calendar</label>
+                <label className="manor-label">{t("ui.default_booking_calendar")}</label>
                 <Select
                   value={defaultCalendarId}
                   disabled={calendarOptionsQuery.isLoading || writableCalendarOptions.length === 0}
@@ -3337,10 +3264,10 @@ export function CalendarBookingSection({ user }: { user: any }) {
               }}
             >
               <legend className="manor-label" style={{ padding: 0 }}>
-                Check conflicts across accounts
+                {t("ui.check_conflicts_across_accounts")}
               </legend>
               <p style={{ margin: "2px 0 12px", color: "var(--text-muted)", fontSize: 12, lineHeight: 1.5 }}>
-                Selected busy times are combined before booking slots are shown.
+                {t("ui.selected_busy_times_are_combined_before_booking_")}
               </p>
               <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
                 {conflictAccounts.map((account, index) => {
@@ -3409,65 +3336,6 @@ export function CalendarBookingSection({ user }: { user: any }) {
             </fieldset>
           )}
 
-          {showLinkForm && (
-            <div
-              className="booking-link-form"
-              style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 180px), 1fr))",
-                gap: 10,
-                maxWidth: 860,
-                alignItems: "end",
-                padding: "12px",
-                borderRadius: 14,
-                border: "1px solid rgba(79,125,117,0.18)",
-                background: "rgba(79,125,117,0.055)",
-              }}
-            >
-              <div>
-                <label className="manor-label">Name</label>
-                <input className="manor-input" value={linkName} onChange={(e) => setLinkName(e.target.value)} placeholder="Discovery call" />
-              </div>
-              <div>
-                <label className="manor-label">Duration</label>
-                <input
-                  className="manor-input"
-                  type="number"
-                  min={5}
-                  max={480}
-                  value={linkDuration}
-                  onChange={(e) => setLinkDuration(e.target.value)}
-                />
-              </div>
-              <div>
-                <label className="manor-label">Location</label>
-                <Select value={linkLocationType} onChange={(v) => setLinkLocationType(v as BookingLink["location_type"])} options={BOOKING_LOCATION_OPTIONS} />
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <Button
-                disabled={!linkName.trim() || !linkDurationValid || linkBusy || !calendarAccountReady}
-                ariaDescribedBy={bookingLinkAccountHint ? "booking-link-account-hint" : undefined}
-                onClick={createLink}
-                style={{ flex: 1, height: 40, justifyContent: "center", whiteSpace: "nowrap" }}
-              >
-                <IconPlus size={14} /> Create
-                </Button>
-                <Button variant="ghost" onClick={resetLinkForm} style={{ height: 40 }}>
-                  Cancel
-                </Button>
-              </div>
-              {bookingLinkAccountHint && (
-                <p
-                  id="booking-link-account-hint"
-                  role="status"
-                  style={{ gridColumn: "1 / -1", margin: 0, color: "var(--text-muted)", fontSize: 12, lineHeight: 1.5 }}
-                >
-                  {bookingLinkAccountHint}
-                </p>
-              )}
-            </div>
-          )}
-
           <WorkingHoursEditor
             value={workingHours.length ? workingHours : defaultWorkingHours()}
             onChange={(next) => setWorkingHours(next)}
@@ -3475,17 +3343,81 @@ export function CalendarBookingSection({ user }: { user: any }) {
 
           <div>
             <div className="booking-links-heading" style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-              <IconLink size={14} style={{ color: "#78716c" }} />
-              <span style={{ fontSize: 13, fontWeight: 800, color: "#292524" }}>Booking links</span>
+              <IconLink size={14} style={{ color: "var(--text-muted)" }} />
+              <span style={{ fontSize: 13, fontWeight: 600, color: "var(--text-strong)" }}>{t("ui.booking_links")}</span>
+              <Button
+                variant="ghost"
+                onClick={() => (showLinkForm ? resetLinkForm() : setShowLinkForm(true))}
+                style={{ display: "inline-flex", alignItems: "center", gap: 6, whiteSpace: "nowrap", marginLeft: "auto" }}
+              >
+                {showLinkForm ? t("action.cancel") : <><IconPlus size={14} /> {t("ui.new_booking_link")}</>}
+              </Button>
             </div>
+
+              {showLinkForm && (
+                <div
+                  className="booking-link-form"
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 180px), 1fr))",
+                    gap: 10,
+                    maxWidth: 860,
+                    alignItems: "end",
+                    padding: "12px",
+                    borderRadius: 14,
+                    border: "1px solid rgba(79,125,117,0.18)",
+                    background: "rgba(79,125,117,0.055)",
+                  }}
+                >
+                  <div>
+                    <label className="manor-label">{t("ui.name")}</label>
+                    <input className="manor-input" value={linkName} onChange={(e) => setLinkName(e.target.value)} placeholder={t("ui.discovery_call")} />
+                  </div>
+                  <div>
+                    <label className="manor-label">{t("ui.duration")}</label>
+                    <input
+                      className="manor-input"
+                      type="number"
+                      min={5}
+                      max={480}
+                      value={linkDuration}
+                      onChange={(e) => setLinkDuration(e.target.value)}
+                    />
+                  </div>
+                  <div>
+                    <label className="manor-label">{t("ui.location")}</label>
+                    <Select value={linkLocationType} onChange={(v) => setLinkLocationType(v as BookingLink["location_type"])} options={BOOKING_LOCATION_OPTIONS} />
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <Button
+                    disabled={!linkName.trim() || !linkDurationValid || linkBusy || !calendarAccountReady}
+                    ariaDescribedBy={bookingLinkAccountHint ? "booking-link-account-hint" : undefined}
+                    onClick={createLink}
+                    style={{ flex: 1, height: 40, justifyContent: "center", whiteSpace: "nowrap" }}
+                  >
+                    <IconPlus size={14} /> Create
+                    </Button>
+                    <Button variant="ghost" onClick={resetLinkForm} style={{ height: 40 }}>
+                      {t("ui.cancel")}
+                    </Button>
+                  </div>
+                  {bookingLinkAccountHint && (
+                    <p
+                      id="booking-link-account-hint"
+                      role="status"
+                      style={{ gridColumn: "1 / -1", margin: 0, color: "var(--text-muted)", fontSize: 12, lineHeight: 1.5 }}
+                    >
+                      {bookingLinkAccountHint}
+                    </p>
+                  )}
+                </div>
+              )}
+
 
             <div className="booking-links-list" style={{ display: "flex", flexDirection: "column", gap: 8, maxWidth: 900, marginTop: 12 }}>
               {bookingLinks.length === 0 && (
-                <div className="booking-links-empty" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, padding: "12px 14px", borderRadius: 12, background: "rgba(245,245,244,0.72)", color: "#78716c", fontSize: 12, fontWeight: 600 }}>
-                  <span>No booking links yet.</span>
-                  <button className="btn-manor-ghost" type="button" onClick={() => setShowLinkForm(true)} style={{ height: 30, padding: "0 10px", fontSize: 11 }}>
-                    New
-                  </button>
+                <div className="booking-links-empty" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, padding: "12px 14px", borderRadius: 12, background: "rgba(245,245,244,0.72)", color: "var(--text-muted)", fontSize: 12, fontWeight: 600 }}>
+                  <span>{t("ui.no_booking_links_yet")}</span>
                 </div>
               )}
               {bookingLinks.map((link) => (
@@ -3505,34 +3437,34 @@ export function CalendarBookingSection({ user }: { user: any }) {
                 >
                   <div style={{ minWidth: 0, flex: "1 1 180px" }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <span style={{ width: 8, height: 8, borderRadius: 99, background: link.enabled ? "#4f9c84" : "#a8a29e", flexShrink: 0 }} />
-                      <span style={{ fontSize: 13, fontWeight: 800, color: "#292524", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{link.name}</span>
+                      <span style={{ width: 8, height: 8, borderRadius: 99, background: link.enabled ? "#4f9c84" : "#aeaeb2", flexShrink: 0 }} />
+                      <span style={{ fontSize: 13, fontWeight: 800, color: "var(--text-strong)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{link.name}</span>
                     </div>
-                    <span style={{ fontSize: 11, fontWeight: 600, color: "#a8a29e" }}>
+                    <span style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)" }}>
                       {link.duration_minutes} min · {link.location_type.replace("_", " ")}
                       {link.availability_mode === "custom" ? " · custom hours" : ""}
                       {bookingLinkExclusionSummary(link)}
                     </span>
                   </div>
                   <div style={{ minWidth: 0, flex: "2 1 220px", display: "flex", alignItems: "center", gap: 8 }}>
-                    <code className="booking-link-url" style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11, color: "#57534e", background: "#f5f5f4", padding: "6px 8px", borderRadius: 8 }}>
+                    <code className="booking-link-url" style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11, color: "var(--text-muted)", background: "var(--surface-muted)", padding: "6px 8px", borderRadius: 8 }}>
                       {bookingUrl(link)}
                     </code>
                   </div>
                   <div style={{ display: "flex", alignItems: "center", gap: 6, flex: "0 0 auto" }}>
-                    <button className="btn-manor-ghost" title="Edit" aria-label={`Edit ${link.name}`} onClick={() => openLinkEditor(link)} style={{ width: 30, height: 30, padding: 0, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>
+                    <button className="btn-manor-ghost" title={t("action.edit")} aria-label={`${t("action.edit")} ${link.name}`} onClick={() => openLinkEditor(link)} style={{ width: 30, height: 30, padding: 0, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>
                       <IconEdit size={13} />
                     </button>
-                    <button className="btn-manor-ghost" title="Copy" onClick={() => copyLink(link)} style={{ width: 30, height: 30, padding: 0, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>
+                    <button className="btn-manor-ghost" title={t("action.copy")} onClick={() => copyLink(link)} style={{ width: 30, height: 30, padding: 0, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>
                       <IconCopy size={13} />
                     </button>
-                    <a className="btn-manor-ghost" title="Open" href={bookingUrl(link)} target="_blank" rel="noreferrer" style={{ width: 30, height: 30, padding: 0, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>
+                    <a className="btn-manor-ghost" title={t("ui.open")} href={bookingUrl(link)} target="_blank" rel="noreferrer" style={{ width: 30, height: 30, padding: 0, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>
                       <IconExternalLink size={13} />
                     </a>
                     <button className="btn-manor-ghost" onClick={() => toggleLink(link)} style={{ height: 30, padding: "0 9px", fontSize: 11, fontWeight: 800 }}>
                       {link.enabled ? "On" : "Off"}
                     </button>
-                    <button className="btn-manor-ghost" title="Delete" onClick={() => deleteLink(link)} style={{ width: 30, height: 30, padding: 0, display: "inline-flex", alignItems: "center", justifyContent: "center", color: "#c14a44" }}>
+                    <button className="btn-manor-ghost" title={t("action.delete")} onClick={() => deleteLink(link)} style={{ width: 30, height: 30, padding: 0, display: "inline-flex", alignItems: "center", justifyContent: "center", color: "#c14a44" }}>
                       <IconTrash size={13} />
                     </button>
                   </div>
@@ -3546,17 +3478,17 @@ export function CalendarBookingSection({ user }: { user: any }) {
       <Modal
         open={Boolean(editingLink && linkDraft)}
         onClose={closeLinkEditor}
-        title="Edit booking link"
+        title={t("ui.edit_booking_link")}
         maxWidth="880px"
         className="booking-link-editor-dialog"
         bodyClassName="booking-link-editor-body"
         footer={
           <>
             <Button variant="ghost" disabled={savingLink} onClick={closeLinkEditor}>
-              Cancel
+              {t("ui.cancel")}
             </Button>
             <Button loading={savingLink} disabled={!linkDraftValid} onClick={saveLink}>
-              Save link
+              {t("ui.save_link")}
             </Button>
           </>
         }
@@ -3565,7 +3497,7 @@ export function CalendarBookingSection({ user }: { user: any }) {
           <div className="booking-link-editor-content">
             <div className="booking-link-editor-details">
               <div>
-                <label className="manor-label" htmlFor="booking-link-edit-name">Name</label>
+                <label className="manor-label" htmlFor="booking-link-edit-name">{t("ui.name")}</label>
                 <input
                   id="booking-link-edit-name"
                   className="manor-input"
@@ -3574,7 +3506,7 @@ export function CalendarBookingSection({ user }: { user: any }) {
                 />
               </div>
               <div>
-                <label className="manor-label" htmlFor="booking-link-edit-duration">Duration</label>
+                <label className="manor-label" htmlFor="booking-link-edit-duration">{t("ui.duration")}</label>
                 <input
                   id="booking-link-edit-duration"
                   className="manor-input"
@@ -3589,7 +3521,7 @@ export function CalendarBookingSection({ user }: { user: any }) {
                 />
               </div>
               <div>
-                <label className="manor-label">Location</label>
+                <label className="manor-label">{t("ui.location")}</label>
                 <Select
                   value={linkDraft.location_type}
                   onChange={(value) => setLinkDraft({
@@ -3601,7 +3533,7 @@ export function CalendarBookingSection({ user }: { user: any }) {
               </div>
               {writableCalendarOptions.length > 0 && (
                 <div>
-                  <label className="manor-label">Add bookings to</label>
+                  <label className="manor-label">{t("ui.add_bookings_to")}</label>
                   <Select
                     value={linkDraft.calendar_id || defaultCalendarId || "primary"}
                     disabled={!calendarAccountSelectionSaved}
@@ -3621,7 +3553,7 @@ export function CalendarBookingSection({ user }: { user: any }) {
             </div>
 
             <div className="booking-link-editor-availability">
-              <label className="manor-label">Availability</label>
+              <label className="manor-label">{t("ui.availability")}</label>
               <Select
                 value={linkDraft.availability_mode}
                 onChange={(value) => setLinkDraft({
@@ -3632,16 +3564,16 @@ export function CalendarBookingSection({ user }: { user: any }) {
                     : cloneWorkingHours(workingHours.length ? workingHours : defaultWorkingHours()),
                 })}
                 options={[
-                  { value: "default", label: "Use default working hours" },
-                  { value: "custom", label: "Custom hours for this link" },
+                  { value: "default", label: t("ui.use_default_working_hours") },
+                  { value: "custom", label: t("ui.custom_hours_for_this_link") },
                 ]}
               />
             </div>
 
             {linkDraft.availability_mode === "custom" && (
-              <section className="booking-link-editor-panel booking-link-editor-hours" aria-label="Weekly hours for this booking link">
+              <section className="booking-link-editor-panel booking-link-editor-hours" aria-label={t("ui.weekly_hours_for_this_booking_link")}>
                 <WorkingHoursEditor
-                  title="Weekly hours"
+                  title={t("ui.weekly_hours")}
                   value={linkDraft.working_hours}
                   onChange={(nextWorkingHours) => setLinkDraft({
                     ...linkDraft,
@@ -3659,15 +3591,15 @@ export function CalendarBookingSection({ user }: { user: any }) {
             <section className="booking-link-editor-panel booking-link-editor-exclusions" aria-labelledby="booking-link-time-exclusions-title">
               <div className="booking-link-editor-section-heading">
                 <h3 id="booking-link-time-exclusions-title">
-                  Time exclusions
+                  {t("ui.time_exclusions")}
                 </h3>
                 <p id="booking-link-time-exclusions-hint">
-                  Remove a one-time range in your calendar timezone.
+                  {t("ui.remove_a_one_time_range_in_your_calendar_timezon")}
                 </p>
               </div>
               <div className="booking-link-exclusion-controls">
                 <div>
-                  <label className="manor-label" htmlFor="booking-link-exclusion-date">Date</label>
+                  <label className="manor-label" htmlFor="booking-link-exclusion-date">{t("ui.date")}</label>
                   <input
                     id="booking-link-exclusion-date"
                     className="manor-input"
@@ -3677,12 +3609,12 @@ export function CalendarBookingSection({ user }: { user: any }) {
                   />
                 </div>
                 <div>
-                  <label className="manor-label">From</label>
+                  <label className="manor-label">{t("ui.from")}</label>
                   <Select
                     value={unavailableStart}
                     onChange={setUnavailableStart}
                     options={WORKING_HOURS_TIME_OPTIONS}
-                    ariaLabel="Exclusion start time"
+                    ariaLabel={t("ui.exclusion_start_time")}
                     dropdownMinWidth={150}
                     dropdownStyle={{ maxHeight: 220 }}
                   />
@@ -3693,7 +3625,7 @@ export function CalendarBookingSection({ user }: { user: any }) {
                     value={unavailableEnd}
                     onChange={setUnavailableEnd}
                     options={WORKING_HOURS_TIME_OPTIONS}
-                    ariaLabel="Exclusion end time"
+                    ariaLabel={t("ui.exclusion_end_time")}
                     dropdownMinWidth={150}
                     dropdownStyle={{ maxHeight: 220 }}
                   />
@@ -3709,7 +3641,7 @@ export function CalendarBookingSection({ user }: { user: any }) {
                 </Button>
               </div>
               {linkDraft.unavailable_dates.length === 0 && linkDraft.unavailable_times.length === 0 ? (
-                <p className="booking-link-exclusions-empty">No exclusions for this link.</p>
+                <p className="booking-link-exclusions-empty">{t("ui.no_exclusions_for_this_link")}</p>
               ) : (
                 <div className="booking-link-exclusion-list">
                   {linkDraft.unavailable_dates.map((excludedDate) => (
@@ -3772,11 +3704,11 @@ export function FilePermissionSection() {
 
 /* ─── Security Section ─── */
 export function SecuritySection() {
+  const [success, setSuccess] = useState("");
   const [currentPwd, setCurrentPwd] = useState("");
   const [newPwd, setNewPwd] = useState("");
   const [confirmPwd, setConfirmPwd] = useState("");
   const [error, setError] = useState("");
-  const [success, setSuccess] = useState("");
   const [loading, setLoading] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -3812,10 +3744,10 @@ export function SecuritySection() {
       style={{
         marginTop: 32,
         paddingTop: 28,
-        borderTop: "1px solid rgba(28,25,23,0.06)",
+        borderTop: "0.5px solid rgba(29, 29, 31,0.06)",
       }}
     >
-      <h3 className="manor-section-title">{t("page.account.security")}</h3>
+      <h3 className="manor-section-title">{t("page.account.change_password")}</h3>
       <p className="manor-section-subtitle">
         {t("page.account.update_your_password_to_keep_your_account_secure")}
       </p>
@@ -3901,7 +3833,6 @@ export default function Account() {
   const [timezone, setTimezone] = useState("UTC");
   const [timezoneChosen, setTimezoneChosen] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [success, setSuccess] = useState("");
   const [formError, setFormError] = useState("");
   const [inited, setInited] = useState(false);
 
@@ -3928,10 +3859,9 @@ export default function Account() {
     setInited(true);
   }
 
-  const handleSave = async () => {
+  const handleSave = async (overrides?: { timezone?: string }) => {
     setSaving(true);
     setFormError("");
-    setSuccess("");
     try {
       const displayName =
         [firstName, lastName].filter(Boolean).join(" ") || undefined;
@@ -3941,7 +3871,7 @@ export default function Account() {
         phone: phone || undefined,
         display_name: displayName,
         // Only a pick fixes the zone; otherwise it keeps following the device.
-        timezone: timezoneChosen ? timezone : undefined,
+        timezone: overrides?.timezone ?? (timezoneChosen ? timezone : undefined),
       });
       setPreferredTimeZoneForUser(updatedUser);
       localStorage.setItem("manor_user", JSON.stringify(updatedUser));
@@ -3953,12 +3883,16 @@ export default function Account() {
       }
       setTimezoneChosen(false);
       queryClient.invalidateQueries({ queryKey: ["auth-me"] });
-      setSuccess("Profile saved");
-      setTimeout(() => setSuccess(""), 3000);
     } catch (err) {
       setFormError(err instanceof ApiError ? err.message : "Failed to save");
     }
     setSaving(false);
+  };
+
+  const saveIfChanged = () => {
+    if (saving || !user) return;
+    if (firstName === (user.first_name || "") && lastName === (user.last_name || "") && phone === (user.phone || "")) return;
+    void handleSave();
   };
 
   if (isLoading || !user) {
@@ -3969,7 +3903,7 @@ export default function Account() {
           alignItems: "center",
           justifyContent: "center",
           height: "100%",
-          color: "#a8a29e",
+          color: "var(--text-faint)",
         }}
       >
         <LoadingSpinner size={28} />
@@ -3977,226 +3911,79 @@ export default function Account() {
     );
   }
 
+  const logout = leaveSessionOrLogout;
+
   return (
-    <div
-      className="account-page"
-      style={{
-        height: "100%",
-        overflowY: "auto",
-        padding: 0,
-        animation: "fade-in 0.3s ease-out",
-      }}
-    >
-      {/* Page header — global component */}
-      <PageHeader
-        title={t("page.account.my_account")}
-        subtitle={t(
-          "page.account.manage_your_profile_company_and_security_setting",
-        )}
-        actions={(
-          <button
-            className="btn-manor"
-            onClick={handleSave}
-            disabled={saving}
-            style={{ opacity: saving ? 0.5 : 1 }}
-          >
-            {saving
-              ? t("page.task_collections.saving")
-              : t("page.account.save_changes")}
-          </button>
-        )}
-      />
-
-      {success && (
-        <div
-          style={{
-            marginBottom: 16,
-            padding: "10px 16px",
-            borderRadius: 12,
-            background: "rgba(79,156,132,0.08)",
-            border: "1px solid rgba(79,156,132,0.2)",
-            color: "#437f6b",
-            fontSize: 13,
-            fontWeight: 600,
-          }}
-        >
-          {success}
-        </div>
-      )}
-      {formError && (
-        <div
-          style={{
-            marginBottom: 16,
-            padding: "10px 16px",
-            borderRadius: 12,
-            background: "rgba(193,74,68,0.06)",
-            border: "1px solid rgba(193,74,68,0.15)",
-            color: "#c14a44",
-            fontSize: 13,
-            fontWeight: 600,
-          }}
-        >
-          {formError}
-        </div>
-      )}
-
-      <div
-        className="account-layout"
-        style={{
-          display: "flex",
-          gap: 22,
-          alignItems: "flex-start",
-        }}
-      >
+    <div className="account-page" style={{ height: "100%", overflowY: "auto", padding: "16px 16px 0" }}>
+      <ConfigPage title={t("page.account_profile.title")}>
         <IDCard user={user} />
 
-        {/* Right: Account settings */}
-        <div
-          className="account-main-column"
-          style={{
-            flex: 1,
-            minWidth: 0,
-            display: "flex",
-            flexDirection: "column",
-            gap: 18,
-          }}
-        >
-          <div
-            className="account-form-panel glass-panel"
-            style={{
-              padding: "32px 36px",
-              borderRadius: 28,
-            }}
-          >
-            <h2
-              style={{
-                fontSize: 18,
-                fontWeight: 800,
-                color: "#1c1917",
-                margin: "0 0 20px",
-              }}
-            >
-              {t("page.account.personal_information")}
-            </h2>
-
-            <div
-              className="account-field-grid"
-              style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 240px), 1fr))",
-                gap: 16,
-                maxWidth: 560,
-              }}
-            >
-              <div>
-                <label className="manor-label">
-                  {t("page.account.first_name")}
-                </label>
-                <input
-                  className="manor-input"
-                  value={firstName}
-                  onChange={(e) => setFirstName(e.target.value)}
-                  placeholder={t("page.account.john")}
-                />
-              </div>
-              <div>
-                <label className="manor-label">
-                  {t("page.account.last_name")}
-                </label>
-                <input
-                  className="manor-input"
-                  value={lastName}
-                  onChange={(e) => setLastName(e.target.value)}
-                  placeholder={t("page.account.doe")}
-                />
-              </div>
-            </div>
-
-            <div style={{ marginTop: 20 }}>
-              <label className="manor-label" style={{ marginBottom: 10 }}>
-                {t("page.account.company")}
-              </label>
-              <CompanyCard
-                user={user}
-                context={peopleContext}
-                focusInviteToken={focusInviteToken}
+        <ConfigGroup title={t("page.account_profile.me")} note={formError || undefined}>
+          <ConfigRow
+            label={t("page.account.first_name")}
+            htmlFor="account-first-name"
+            control={<input id="account-first-name" className="config-input" value={firstName} onChange={(e) => setFirstName(e.target.value)} onBlur={saveIfChanged} placeholder={t("page.account.john")} />}
+          />
+          <ConfigRow
+            label={t("page.account.last_name")}
+            htmlFor="account-last-name"
+            control={<input id="account-last-name" className="config-input" value={lastName} onChange={(e) => setLastName(e.target.value)} onBlur={saveIfChanged} placeholder={t("page.account.doe")} />}
+          />
+          <ConfigRow label={t("page.account.email_address")} control={<span className="config-value">{user.email}</span>} />
+          <ConfigRow
+            label={t("page.account.phone_number")}
+            htmlFor="account-phone"
+            control={<input id="account-phone" className="config-input" value={phone} onChange={(e) => setPhone(e.target.value)} onBlur={saveIfChanged} placeholder="+1 (555) 000-0000" />}
+          />
+          <ConfigRow
+            label={t("page.account.timezone")}
+            note={!user.timezone_user_set && !timezoneChosen ? t("page.account.timezone_follows_device") : undefined}
+            control={(
+              <Select
+                value={timezone}
+                onChange={(value) => {
+                  setTimezone(value);
+                  setTimezoneChosen(true);
+                  void handleSave({ timezone: value });
+                }}
+                filterable
+                options={Array.from(new Set([
+                  timezone,
+                  "UTC",
+                  "America/New_York",
+                  "America/Chicago",
+                  "America/Denver",
+                  "America/Los_Angeles",
+                  "Europe/London",
+                  "Europe/Paris",
+                  "Europe/Berlin",
+                  "Asia/Shanghai",
+                  "Asia/Tokyo",
+                  "Asia/Singapore",
+                  "Asia/Dubai",
+                  "Asia/Riyadh",
+                  "Australia/Sydney",
+                ]))}
+                placeholder={t("page.account.select_timezone")}
+                ariaLabel={t("page.account.timezone")}
               />
-              <LeaveTeamSection user={user} context={peopleContext} />
-            </div>
+            )}
+          />
+        </ConfigGroup>
 
-            <div style={{ maxWidth: 560, marginTop: 16 }}>
-              <label className="manor-label">
-                {t("page.account.email_address")}
-              </label>
-              <input
-                className="manor-input"
-                value={user.email}
-                disabled
-                style={{ opacity: 0.5, cursor: "not-allowed" }}
-              />
-            </div>
+        <ConfigGroup title={t("page.account.company")}>
+          <ConfigBlock>
+            <CompanyCard user={user} context={peopleContext} focusInviteToken={focusInviteToken} />
+          </ConfigBlock>
+        </ConfigGroup>
 
-            <div
-              className="account-field-grid"
-              style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 240px), 1fr))",
-                gap: 16,
-                maxWidth: 560,
-                marginTop: 16,
-              }}
-            >
-              <div>
-                <label className="manor-label">
-                  {t("page.account.phone_number")}
-                </label>
-                <input
-                  className="manor-input"
-                  value={phone}
-                  onChange={(e) => setPhone(e.target.value)}
-                  placeholder="+1 (555) 000-0000"
-                />
-              </div>
-              <div>
-                <label className="manor-label">
-                  {t("page.account.timezone")}
-                </label>
-                <Select
-                  value={timezone}
-                  onChange={(value) => {
-                    setTimezone(value);
-                    setTimezoneChosen(true);
-                  }}
-                  filterable
-                  options={Array.from(new Set([
-                    timezone,
-                    "UTC",
-                    "America/New_York",
-                    "America/Chicago",
-                    "America/Denver",
-                    "America/Los_Angeles",
-                    "Europe/London",
-                    "Europe/Paris",
-                    "Europe/Berlin",
-                    "Asia/Shanghai",
-                    "Asia/Tokyo",
-                    "Asia/Singapore",
-                    "Asia/Dubai",
-                    "Asia/Riyadh",
-                    "Australia/Sydney",
-                  ]))}
-                  placeholder={t("page.account.select_timezone")}
-                />
-                {!user.timezone_user_set && !timezoneChosen && (
-                  <p className="mt-1 text-xs text-stone-500">{t("page.account.timezone_follows_device")}</p>
-                )}
-              </div>
-            </div>
 
-            <DangerZoneSection user={user} />
-          </div>
-        </div>
-      </div>
+        <ConfigGroup title={t("page.account_profile.account")}>
+          <ConfigRow label={t("action.logout")} onClick={logout} />
+          <LeaveTeamSection user={user} context={peopleContext} />
+          <DangerZoneSection user={user} />
+        </ConfigGroup>
+      </ConfigPage>
     </div>
   );
 }
@@ -4239,47 +4026,14 @@ function LeaveTeamSection({
 
   return (
     <>
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          flexWrap: "wrap",
-          gap: 16,
-          maxWidth: 560,
-          marginTop: 10,
-          padding: "12px 14px",
-          borderRadius: 12,
-          background: "rgba(250,250,249,0.72)",
-          border: "1px solid rgba(28,25,23,0.06)",
+      <ConfigRow
+        label={t("page.account.leave_team")}
+        note={t("page.account.leave_team_description")}
+        onClick={() => {
+          setConfirmOpen(true);
+          setError("");
         }}
-      >
-        <div style={{ flex: "1 1 240px", minWidth: 0 }}>
-          <p
-            style={{
-              fontSize: 13,
-              fontWeight: 700,
-              color: "#44403c",
-              margin: "0 0 2px",
-            }}
-          >
-            {t("page.account.leave_team")}
-          </p>
-          <p style={{ fontSize: 12, color: "#a8a29e", margin: 0 }}>
-            {t("page.account.leave_team_description")}
-          </p>
-        </div>
-        <button
-          className="btn-manor-secondary"
-          onClick={() => {
-            setConfirmOpen(true);
-            setError("");
-          }}
-          style={{ flexShrink: 0, marginLeft: "auto" }}
-        >
-          {t("page.account.leave_team")}
-        </button>
-      </div>
+      />
 
       <Modal
         open={confirmOpen}
@@ -4304,7 +4058,7 @@ function LeaveTeamSection({
           </div>
         }
       >
-        <p style={{ fontSize: 14, color: "#57534e", lineHeight: 1.6 }}>
+        <p style={{ fontSize: 14, color: "var(--text-muted)", lineHeight: 1.6 }}>
           {t("page.account.leave_team_confirm_description")}
         </p>
         {error && (
@@ -4364,38 +4118,23 @@ function DangerZoneSection({ user }: { user: any }) {
   };
 
   return (
-    <div
-      style={{
-        marginTop: 32,
-        paddingTop: 28,
-        borderTop: "1px solid rgba(236,200,197,0.6)",
-      }}
-    >
-      <h3 className="manor-section-title" style={{ color: "#a23e38" }}>
-        {t("page.account.danger_zone")}
-      </h3>
-      <p className="manor-section-subtitle">
-        {t("page.account.move_your_account_to_trash_restorable_via_the_lo")}{" "}
-        {graceDays} {t("page.account.days_then_permanently_deleted")}
-        {isAdmin
-          ? t(
-              "page.account.if_you_re_the_only_admin_in_this_organization_the_enti",
-            )
-          : t(
-              "page.account.tasks_and_conversations_you_created_stay_in_the_worksp",
-            )}
-      </p>
-      <button
-        className="btn-manor-danger"
+    <div>
+      <ConfigRow
+        label={t("page.account.delete_my_account")}
+        note={<>
+          {t("page.account.move_your_account_to_trash_restorable_via_the_lo")}{" "}
+          {graceDays} {t("page.account.days_then_permanently_deleted")}
+          {isAdmin
+            ? t("page.account.if_you_re_the_only_admin_in_this_organization_the_enti")
+            : t("page.account.tasks_and_conversations_you_created_stay_in_the_worksp")}
+        </>}
+        danger
         onClick={() => {
           setConfirmOpen(true);
           setTypedEmail("");
           setError("");
         }}
-        style={{ marginTop: 12 }}
-      >
-        {t("page.account.delete_my_account")}
-      </button>
+      />
 
       <Modal
         open={confirmOpen}
@@ -4422,7 +4161,7 @@ function DangerZoneSection({ user }: { user: any }) {
           </div>
         }
       >
-        <p style={{ fontSize: 14, color: "#57534e", lineHeight: 1.6 }}>
+        <p style={{ fontSize: 14, color: "var(--text-muted)", lineHeight: 1.6 }}>
           {t("page.account.this_soft_deletes_your_account_you_can_sign_in_a")}{" "}
           {graceDays}{" "}
           {t("page.account.days_to_recover_it_after_that_your_account_is_pe")}

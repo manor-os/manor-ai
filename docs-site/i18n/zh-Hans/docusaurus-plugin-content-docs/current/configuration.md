@@ -155,8 +155,8 @@ PgBouncer 客户端预算应计入副本 × 进程 × 事务额度、独立探�
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `RATE_LIMIT_ENABLED` | `false` | 通用 API 限流总开关。 |
-| `API_RATE_LIMIT_REQUESTS` | `200` | 每窗口每客户端允许的请求数。 |
+| `RATE_LIMIT_ENABLED` | `false` | 按 IP 限流(`RATE_LIMIT_PER_MINUTE`,默认 `100`)。同时开启 `CHAT_RATE_LIMIT_ENABLED` 时,已登录请求跳过它,改用按用户的额度。 |
+| `API_RATE_LIMIT_REQUESTS` | `600` | 每窗口每个已登录用户(未登录时按 IP)允许的 API 请求数。需开启 `CHAT_RATE_LIMIT_ENABLED`。 |
 | `API_RATE_LIMIT_WINDOW_SECONDS` | `60` | 通用限流窗口长度。 |
 | `CHAT_RATE_LIMIT_ENABLED` | `false` | 聊天路由(成本最高)的独立限流器。 |
 | `CHAT_RATE_LIMIT_REQUESTS` | `30` | 每窗口允许的聊天请求数。 |

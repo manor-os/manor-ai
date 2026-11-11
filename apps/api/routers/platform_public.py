@@ -19,7 +19,7 @@ from apps.api.deps import get_current_user
 from packages.core.database import get_db
 from packages.core.models.feature_flag import FeatureFlag
 from packages.core.models.user import User
-from packages.core.services.feature_flags import is_enabled
+from packages.core.services.feature_flags import enabled_flags
 
 logger = logging.getLogger(__name__)
 
@@ -73,11 +73,7 @@ async def my_flags(
     if not flag_rows:
         return PublicFlagsResponse(flags={})
 
-    out: dict[str, bool] = {}
-    for f in flag_rows:
-        out[f.key] = await is_enabled(
-            db, f.key,
-            entity_id=user.entity_id, user_id=user.id,
-            fallback=bool(f.default_enabled),
-        )
+    out = await enabled_flags(
+        db, flag_rows, entity_id=user.entity_id, user_id=user.id,
+    )
     return PublicFlagsResponse(flags=out)

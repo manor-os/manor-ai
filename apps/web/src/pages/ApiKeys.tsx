@@ -171,7 +171,7 @@ export default function ApiKeys({ embedded = false }: { embedded?: boolean } = {
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, gap: 12 }}>
           <div>
             <h3 className="manor-section-title" style={{ margin: "0 0 4px" }}>{t("page.api_keys.title")}</h3>
-            <p style={{ margin: 0, fontSize: 12, color: "var(--ink-3, #78716c)" }}>{t("page.api_keys.subtitle")}</p>
+            <p style={{ margin: 0, fontSize: 12, color: "var(--ink-3, #8e8e93)" }}>{t("page.api_keys.subtitle")}</p>
           </div>
           <PageHeaderAddButton label={t("page.api_keys.add_key")} onClick={openCreate} />
         </div>
@@ -214,22 +214,22 @@ export default function ApiKeys({ embedded = false }: { embedded?: boolean } = {
               <tbody>
                 {filtered.map((key) => (
                   <tr key={key.id}>
-                    <td style={{ padding: "12px 16px", fontWeight: 600, color: "#292524" }}>{key.name}</td>
+                    <td style={{ padding: "12px 16px", fontWeight: 600, color: "var(--text-strong)" }}>{key.name}</td>
                     <td style={{ padding: "12px 16px" }}>
                       <span style={{
                         padding: "2px 8px",
                         borderRadius: 6,
                         fontSize: 11,
                         fontWeight: 600,
-                        background: "#f5f5f4",
-                        color: "#57534e",
+                        background: "var(--surface-muted)",
+                        color: "var(--text-muted)",
                         textTransform: "capitalize",
                       }}>
                         {key.provider}
                       </span>
                     </td>
-                    <td style={{ padding: "12px 16px", fontFamily: "monospace", fontSize: 12, color: "#78716c" }}>{key.key_prefix}...</td>
-                    <td style={{ padding: "12px 16px", color: "#78716c", fontSize: 12 }}>{key.default_model || "--"}</td>
+                    <td style={{ padding: "12px 16px", fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--text-muted)" }}>{key.key_prefix}...</td>
+                    <td style={{ padding: "12px 16px", color: "var(--text-muted)", fontSize: 12 }}>{key.default_model || "--"}</td>
                     <td style={{ padding: "12px 16px" }}>
                       {key.is_default ? (
                         <StatusBadge type="teal" dot>{t("page.api_keys.default")}</StatusBadge>
@@ -241,9 +241,9 @@ export default function ApiKeys({ embedded = false }: { embedded?: boolean } = {
                             borderRadius: 8,
                             fontSize: 11,
                             fontWeight: 600,
-                            background: "#fafaf9",
-                            border: "1px solid rgba(28,25,23,0.06)",
-                            color: "#a8a29e",
+                            background: "var(--surface-muted)",
+                            border: "0.5px solid rgba(29, 29, 31,0.06)",
+                            color: "var(--text-faint)",
                             cursor: "pointer",
                             transition: "all 0.2s",
                           }}
@@ -255,20 +255,20 @@ export default function ApiKeys({ embedded = false }: { embedded?: boolean } = {
                     <td style={{ padding: "12px 16px" }}>
                       <StatusBadge type={statusBadgeType(key.status)} dot>{key.status}</StatusBadge>
                     </td>
-                    <td style={{ padding: "12px 16px", color: "#78716c", fontSize: 12 }}>{key.usage_count}</td>
-                    <td style={{ padding: "12px 16px", color: "#78716c", fontSize: 12 }}>{relativeTime(key.last_used_at)}</td>
+                    <td style={{ padding: "12px 16px", color: "var(--text-muted)", fontSize: 12 }}>{key.usage_count}</td>
+                    <td style={{ padding: "12px 16px", color: "var(--text-muted)", fontSize: 12 }}>{relativeTime(key.last_used_at)}</td>
                     <td style={{ padding: "12px 16px", textAlign: "right" }}>
                       <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 4 }}>
                         <button
                           onClick={() => openEdit(key)}
-                          style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "#a8a29e", transition: "all 0.2s" }}
+                          style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "var(--text-muted)", transition: "all 0.2s" }}
                           title={t("action.edit")}
                         >
                           <IconEdit size={16} />
                         </button>
                         <button
                           onClick={() => { const newKey = prompt(t("page.api_keys.enter_new_api_key")); if (newKey) rotateMutation.mutate({ id: key.id, newKey }); }}
-                          style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "#a8a29e", transition: "all 0.2s" }}
+                          style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "var(--text-muted)", transition: "all 0.2s" }}
                           title={t("page.api_keys.rotate_key")}
                         >
                           <IconRefresh size={16} />
@@ -276,14 +276,14 @@ export default function ApiKeys({ embedded = false }: { embedded?: boolean } = {
                         <button
                           onClick={() => { setTestingId(key.id); testMutation.mutate(key.id); }}
                           disabled={testingId === key.id}
-                          style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: testingId === key.id ? "#4f7d75" : "#a8a29e", transition: "all 0.2s" }}
+                          style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: testingId === key.id ? "#4f7d75" : "#aeaeb2", transition: "all 0.2s" }}
                           title={t("page.api_keys.test_key")}
                         >
                           <IconPlay size={16} />
                         </button>
                         <button
                           onClick={() => setDeleteTarget(key.id)}
-                          style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "#a8a29e", transition: "all 0.2s" }}
+                          style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "var(--text-muted)", transition: "all 0.2s" }}
                           title={t("action.delete")}
                         >
                           <IconTrash size={16} />
@@ -330,7 +330,7 @@ export default function ApiKeys({ embedded = false }: { embedded?: boolean } = {
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
           <Input label={t("page.api_keys.name")} value={formName} onChange={(e) => setFormName(e.target.value)} placeholder={t("page.api_keys.name_placeholder")} />
           <div>
-            <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: "#78716c", marginBottom: 4 }}>{t("page.api_keys.provider")}</label>
+            <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: "var(--text-muted)", marginBottom: 4 }}>{t("page.api_keys.provider")}</label>
             <select value={formProvider} onChange={(e) => setFormProvider(e.target.value)} className="manor-input">
               {PROVIDERS.map((p) => (
                 <option key={p} value={p}>{p.charAt(0).toUpperCase() + p.slice(1)}</option>

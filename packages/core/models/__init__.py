@@ -42,6 +42,7 @@ from packages.core.models.workspace_collaboration import WorkspaceCollaboration,
 from packages.core.models.usage import TokenUsageLog, ToolCallLog
 from packages.core.models.metrics import MetricsDailyUsage, MetricsDailyToolCalls
 from packages.core.models.workspace_health import MetricsWorkspaceDaily, WorkspaceHealthSnapshot
+from packages.core.models.attention import AttentionItem
 from packages.core.models.system_metrics import SystemMetricsSample
 from packages.core.models.http_stats import HttpRequestHourly
 from packages.core.models.user_session import (
@@ -156,7 +157,7 @@ from packages.core.models.permission import (
     PendingStatus,
 )
 from packages.core.models.connection_use import IntegrationConnectionUse
-from packages.core.models.oauth_provider import OAuthClientApp, OAuthAuthorizationCode, OAuthRefreshToken
+from packages.core.models.oauth_provider import OAuthClientApp, OAuthAuthorizationCode, OAuthRefreshToken, PersonalAccessToken
 from packages.core.models.client_error import ClientErrorEvent
 from packages.core.models.tool_path_memory import ToolIntentPath
 from packages.core.models.runtime_run import (
@@ -193,6 +194,7 @@ __all__ = [
     "TokenUsageLog", "ToolCallLog", "UserSessionLog", "UserSessionLease", "UserPageViewLog",
     "MetricsDailyUsage", "MetricsDailyToolCalls",
     "MetricsWorkspaceDaily", "WorkspaceHealthSnapshot",
+    "AttentionItem",
     "SystemMetricsSample",
     "HttpRequestHourly",
     "ExecutionPlan", "ExecutionStep", "RuntimeExecutionClaim",
@@ -259,7 +261,7 @@ __all__ = [
     "ResourceType", "SubjectType", "Capability",
     "Visibility", "Classification",
     "GrantStatus", "PendingStatus",
-    "OAuthClientApp", "OAuthAuthorizationCode", "OAuthRefreshToken",
+    "OAuthClientApp", "OAuthAuthorizationCode", "OAuthRefreshToken", "PersonalAccessToken",
     "ClientErrorEvent",
     "WebchatResidentBinding",
     "ResidentCreateGrant", "ResidentMaintenanceDraft",

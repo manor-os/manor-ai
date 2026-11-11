@@ -1,15 +1,15 @@
 import { useQuery } from "@tanstack/react-query";
-import { Link } from "react-router-dom";
+import { displayReadInterval } from "../../lib/readRefreshPolicy";
+import { useAfterStartup } from "../../lib/useAfterStartup";
+import { usePageVisible } from "../../lib/usePageVisible";
 import { api } from "../../lib/api";
 import { t } from "../../lib/i18n";
-import { integrationSetupHref } from "../../lib/integrationSetupLinks";
 import { workspaceConnectionRefetchInterval } from "../../lib/workspaceLiveRefresh";
 import { useAuthStore } from "../../stores/auth";
-import { useDisplayPreferences } from "../../stores/displayPreferences";
 import { IconChevronRight, IconRefresh, IconWarning } from "../icons";
 import Button from "../ui/Button";
+import IntegrationConnectRow from "../integrations/IntegrationConnectRow";
 import AnchoredPopover from "../ui/AnchoredPopover";
-import InlineIntegrationLink from "../InlineIntegrationLink";
 import "./WorkspaceConnectionNotice.css";
 
 /** One live setup notice for both creation paths, in details and main chat. */
@@ -21,63 +21,43 @@ export default function WorkspaceConnectionNotice({
   variant?: "banner" | "icon";
 }) {
   const user = useAuthStore((state) => state.user);
-  const simpleMode = useDisplayPreferences((state) => state.interfaceMode === "simple");
-  const setupSuffix = simpleMode ? "&setup=1" : "";
+  const visible = usePageVisible();
+  const startupSettled = useAfterStartup();
   const status = useQuery({
     queryKey: ["workspace-connection-status", user?.entity_id, user?.id, workspaceId],
     queryFn: ({ signal }) => api.workspaces.connectionStatus(workspaceId, signal),
-    enabled: Boolean(user && workspaceId),
+    enabled: visible && startupSettled && Boolean(user && workspaceId),
     refetchInterval: (query) => {
       const current = query.state.data;
-      return workspaceConnectionRefetchInterval({
+      return displayReadInterval(query.state, workspaceConnectionRefetchInterval({
         hasData: Boolean(current),
         isError: query.state.status === "error",
         hasRequiredIssue: Boolean(current?.requirements.some(
           (item) => item.required && !item.ready,
         )),
-      });
+      }));
     },
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: "always",
     staleTime: 0,
-    retry: 1,
+    retry: false,
   });
   const issues = status.data?.requirements.filter((item) => item.required && !item.ready) ?? [];
-  if (!user || (!status.isPending && !status.isError && issues.length === 0)) return null;
-  const noticeState = status.isError ? "error" : status.isPending ? "checking" : "warning";
+  if (!user || status.isPending || (!status.isError && issues.length === 0)) return null;
+  const noticeState = status.isError ? "error" : "warning";
   const noticeTitle = status.isError
     ? t("workspace.connections.check_failed")
-    : status.isPending
-      ? t("workspace.connections.checking")
-      : t("workspace.connections.required_issues", { count: issues.length });
+    : t("workspace.connections.required_issues", { count: issues.length });
   const statusCopy = (
     <span className="workspace-connection-notice-status">
       <span className="workspace-connection-notice-indicator" data-state={noticeState} aria-hidden="true" />
       <strong role="status" aria-live="polite">{noticeTitle}</strong>
     </span>
   );
-  const issueList = issues.length > 0 ? (
-    <ul className="workspace-connection-notice-list">
-      {issues.map((item) => (
-        <li key={item.key}>
-          <div>
-            <strong>{item.label || item.provider}</strong>
-            <p>{item.reason}</p>
-            {item.service_keys.length > 0 && <small>{item.service_keys.join(" · ")}</small>}
-          </div>
-          {(item.kind !== "channel" || item.setup_kind === "platform_access") && item.setup_kind !== "mcp_binding" ? (
-            <InlineIntegrationLink provider={item.provider} label={t("workspace.connections.fix")} />
-          ) : <Link to={item.kind === "channel"
-            ? `/workspaces/${workspaceId}?tab=channels${setupSuffix}`
-            : item.setup_kind === "mcp_binding"
-              ? `/workspaces/${workspaceId}?tab=capabilities${setupSuffix}`
-              : "/integrations"}>
-              {t("workspace.connections.fix")}
-            </Link>}
-        </li>
-      ))}
-    </ul>
-  ) : null;
+  // The same connection row as everywhere: connect in place, then this notice checks again.
+  const issueRows = issues.map((item) => <IntegrationConnectRow key={item.key} requirement={item} workspaceId={workspaceId}
+    hint={item.reason || undefined} onConnected={() => void status.refetch()} />);
+  const issueList = issues.length > 0 ? <ul className="integration-connect-list workspace-connection-notice-list">{issueRows}</ul> : null;
 
   if (variant === "icon") {
     return (
@@ -101,7 +81,7 @@ export default function WorkspaceConnectionNotice({
         <div className="workspace-connection-popover-header">
           <div className="workspace-connection-popover-heading">
             <strong>{t("workspace.connections.title")}</strong>
-            {!status.isPending && !status.isError && (
+            {!status.isError && (
               <span className="workspace-connection-popover-count" aria-hidden="true">
                 {issues.length}
               </span>
@@ -121,28 +101,7 @@ export default function WorkspaceConnectionNotice({
         </div>
         <span className="sr-only" role="status" aria-live="polite">{noticeTitle}</span>
         {issues.length > 0 ? (
-          <ul className="workspace-connection-popover-list">
-            {issues.map((item) => (
-              <li key={item.key}>
-                <div className="workspace-connection-popover-copy">
-                  <strong>{item.label || item.provider}</strong>
-                  <span>{t("page.workspace_detail.needs_setup_2")}</span>
-                  <span className="sr-only">{item.reason}</span>
-                </div>
-                <Link
-                  className="workspace-connection-popover-setup"
-                  to={item.kind === "channel" && item.setup_kind !== "platform_access"
-                    ? `/workspaces/${workspaceId}?tab=channels${setupSuffix}`
-                    : item.setup_kind === "mcp_binding"
-                      ? `/workspaces/${workspaceId}?tab=capabilities${setupSuffix}`
-                      : integrationSetupHref(item.provider)}
-                >
-                  {t("workspace.connections.fix")}
-                  <IconChevronRight size={13} aria-hidden="true" />
-                </Link>
-              </li>
-            ))}
-          </ul>
+          <ul className="integration-connect-list workspace-connection-popover-list">{issueRows}</ul>
         ) : (
           <div className="workspace-connection-popover-state" data-state={noticeState}>
             <span aria-hidden="true" />

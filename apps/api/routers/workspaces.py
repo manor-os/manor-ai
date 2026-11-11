@@ -1,11 +1,12 @@
 """Workspace endpoints — CRUD, operating model, agent mappings, activity, setup."""
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import and_, select, delete as sa_delete, or_, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,7 +36,7 @@ from packages.core.services.entity_service import (
     ProtectedWorkspaceSettingsError,
     WORKSPACE_PURGE_GRACE_DAYS,
     list_workspaces, get_workspace, create_workspace, update_workspace,
-    soft_delete_workspace, restore_workspace, list_trashed_workspaces,
+    soft_delete_workspace, restore_workspace, list_trashed_workspaces, purge_workspace,
 )
 from packages.core.services.workspace_dashboard_service import (
     get_workspace_stats,
@@ -290,6 +291,18 @@ class WorkspaceResponse(BaseModel):
     deleted_at: datetime | None = None
 
 
+class WorkspaceRestoreUnmappedAgent(BaseModel):
+    agent_id: str
+    agent_name: str | None = None
+    service_key: str | None = None
+
+
+class WorkspaceRestoreResponse(WorkspaceResponse):
+    #: Mappings dropped on restore because their Agent was deleted while the
+    #: Workspace was in the trash; those service roles are now unassigned.
+    unmapped_agents: list[WorkspaceRestoreUnmappedAgent] = Field(default_factory=list)
+
+
 class WorkspaceSetupStatusResponse(BaseModel):
     ready: bool
     status: str
@@ -542,6 +555,8 @@ class AppViewDesignRequest(BaseModel):
     feedback: str | None = Field(default=None, max_length=4000)
     # The earlier design this one replaces (it is discarded).
     draft_id: str | None = None
+    # Who the page is for and what they act on first, as the person chose it.
+    audience: str | None = Field(default=None, max_length=1000)
 
 
 class OperationApplyRequest(BaseModel):
@@ -669,7 +684,7 @@ def _workspace_blueprint_id(settings: Any) -> str:
     return ""
 
 
-async def _blueprint_payloads_for(db: AsyncSession, workspaces) -> dict[str, tuple]:
+async def _blueprint_payloads_for(db: AsyncSession, workspaces, *, digests: bool = False) -> dict[str, tuple]:
     """Map each workspace to the blueprint payload it would upgrade toward.
 
     Every current blueprint lives in ``workspace_blueprints``; a client
@@ -677,6 +692,9 @@ async def _blueprint_payloads_for(db: AsyncSession, workspaces) -> dict[str, tup
     their recorded durable id; a display slug is not provenance.
 
     One query for all of them: this feeds the workspace list.
+
+    ``digests=True`` gives a ``workspace_blueprints`` release's
+    ``BlueprintDigest`` in place of its payload: enough for the update badge.
     """
     from packages.core.blueprints.freshness import (
         BLUEPRINT_ID_KEY,
@@ -685,14 +703,18 @@ async def _blueprint_payloads_for(db: AsyncSession, workspaces) -> dict[str, tup
     from packages.core.blueprints.seed import (
         BlueprintRowReference,
         PLATFORM_BLUEPRINT_ID_PREFIX,
+        blueprint_payload_digests,
         resolve_blueprint_rows,
     )
 
     from packages.core.models.client_delivery import DELIVERY_BLUEPRINT_ID_PREFIX
 
+    from packages.core.blueprints.team_packages import is_team_package_ref, team_package_owner
+
     payloads: dict[str, tuple] = {}
     references: dict[str, BlueprintRowReference] = {}
     deliveries: dict[str, Any] = {}
+    team_packages: dict[str, str] = {}
 
     for ws in workspaces:
         settings = ws.settings if isinstance(getattr(ws, "settings", None), dict) else {}
@@ -703,7 +725,11 @@ async def _blueprint_payloads_for(db: AsyncSession, workspaces) -> dict[str, tup
         if record.get("source") == "raw_payload":
             continue
         blueprint_id = str(record.get(BLUEPRINT_ID_KEY) or "").strip() or None
-        if blueprint_id and blueprint_id.startswith(DELIVERY_BLUEPRINT_ID_PREFIX):
+        if is_team_package_ref(blueprint_id):
+            # A team's own package: its latest release, and only for that team.
+            if team_package_owner(blueprint_id) == ws.entity_id:
+                team_packages[ws.id] = blueprint_id
+        elif blueprint_id and blueprint_id.startswith(DELIVERY_BLUEPRINT_ID_PREFIX):
             # A client delivery is a release source too: the provider's latest
             # published export of their own Workspace.
             deliveries[ws.id] = ws
@@ -736,18 +762,38 @@ async def _blueprint_payloads_for(db: AsyncSession, workspaces) -> dict[str, tup
 
     if references:
         try:
-            rows = await resolve_blueprint_rows(db, references)
+            rows = await resolve_blueprint_rows(db, references, load_payload=not digests)
             from packages.core.constants.blueprints import BlueprintStatus
 
+            # Only a published row is an update release. Archived/draft
+            # content is editable and must never leak through upgrade preview
+            # or be applied to an installed Workspace.
+            rows = {
+                workspace_id: row for workspace_id, row in rows.items()
+                if row.status == BlueprintStatus.PUBLISHED
+            }
+            row_digests = (
+                await blueprint_payload_digests(db, {row.id for row in rows.values()}) if digests else {}
+            )
             for workspace_id, row in rows.items():
-                payload = row.payload if isinstance(row.payload, dict) else None
-                # Only a published row is an update release. Archived/draft
-                # content is editable and must never leak through upgrade preview
-                # or be applied to an installed Workspace.
-                if payload and row.status == BlueprintStatus.PUBLISHED:
-                    payloads[workspace_id] = (payload, row.content_version, row.id)
+                if digests:
+                    if (release := row_digests.get(row.id)) is not None:
+                        digest, content_version = release
+                        payloads[workspace_id] = (digest, content_version, row.id)
+                else:
+                    payload = row.payload if isinstance(row.payload, dict) else None
+                    if payload:
+                        payloads[workspace_id] = (payload, row.content_version, row.id)
         except Exception:
             logger.warning("blueprint freshness: payload lookup failed", exc_info=True)
+
+    if team_packages:
+        from packages.core.blueprints.registry import latest_release
+
+        for workspace_id, ref in team_packages.items():
+            release = await latest_release(db, ref)
+            if release is not None and isinstance(release.payload, dict):
+                payloads[workspace_id] = (release.payload, release.version, ref)
 
     return await _with_release_ranges(db, workspaces, payloads)
 
@@ -839,6 +885,8 @@ def _to_response(
     can_manage: bool = False,
     can_delete: bool = False,
 ) -> WorkspaceResponse:
+    from packages.core.blueprints.registry import settings_without_package_alias
+
     creator_summary = _coerce_user_summary(creator)
     return WorkspaceResponse(
         id=ws.id, entity_id=ws.entity_id, name=ws.name,
@@ -848,7 +896,7 @@ def _to_response(
         operating_context=ws.operating_context,
         primary_work=ws.primary_work,
         operating_model=ws.operating_model or {},
-        settings=ws.settings or {}, status=ws.status,
+        settings=settings_without_package_alias(ws.settings or {}), status=ws.status,
         blueprint_update=_blueprint_update_for(ws, blueprint_payload),
         created_at=ws.created_at, updated_at=getattr(ws, "updated_at", None),
         created_by_user_id=(creator_summary or {}).get("id"),
@@ -1093,11 +1141,29 @@ async def _ensure_user_staff_id(db: AsyncSession, user: User) -> str:
 
 # ── CRUD ─────────────────────────────────────────────────────────────────────
 
+# All a Workspace list reads from the two JSON columns that grow with the
+# Workspace. A Blueprint install record alone can run to tens of kilobytes per
+# Workspace; GET /workspaces/{id} still returns the full values.
+_LIST_SUMMARY_SETTINGS_KEYS = ("access_mode", "sandbox")
+
+
+def _workspace_list_summary_columns(settings: Any, operating_model: Any) -> tuple[dict, dict]:
+    settings = settings if isinstance(settings, dict) else {}
+    model = operating_model if isinstance(operating_model, dict) else {}
+    app_view = model.get("app_view")
+    open_as = app_view.get("open_as") if isinstance(app_view, dict) else None
+    return (
+        {key: settings[key] for key in _LIST_SUMMARY_SETTINGS_KEYS if key in settings},
+        {"app_view": {"open_as": open_as}} if open_as else {},
+    )
+
+
 @router.get("", response_model=list[WorkspaceResponse])
 async def list_my_workspaces(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     initialize: bool = True,
+    view: Literal["full", "summary"] = "full",
 ):
     from sqlalchemy import func
     from packages.core.models.task import Task
@@ -1267,7 +1333,7 @@ async def list_my_workspaces(
             stats_map[wid]["hitl_tasks"] = len(task_ids)
 
     creator_map = await _workspace_creator_summaries(db, workspaces)
-    blueprint_payloads = await _blueprint_payloads_for(db, workspaces)
+    blueprint_payloads = await _blueprint_payloads_for(db, workspaces, digests=True)
     final_authorized = await ResourcePermissionGate.authorize_workspace_batch_read(
         db,
         credential=credential,
@@ -1299,6 +1365,10 @@ async def list_my_workspaces(
             can_manage=ws.id in manageable_workspace_ids,
             can_delete=ws.id in deletable_workspace_ids,
         )
+        if view == "summary":
+            resp.settings, resp.operating_model = _workspace_list_summary_columns(
+                resp.settings, resp.operating_model,
+            )
         data = resp.model_dump() if hasattr(resp, "model_dump") else resp.__dict__.copy()
         data["stats"] = stats_map.get(ws.id, {})
         data["last_chat_at"] = last_chat_by_workspace.get(ws.id)
@@ -1394,15 +1464,17 @@ async def list_trash(
     restorable_ids = await _restorable_workspace_ids(db, rows, credential=credential)
     rows = [ws for ws in rows if ws.id in restorable_ids]
     creator_map = await _workspace_creator_summaries(db, rows)
-    payloads = await _blueprint_payloads_for(db, rows)
+    payloads = await _blueprint_payloads_for(db, rows, digests=True)
     # Metadata reads can wait; filter again using current actor and ownership.
     restorable_ids = await _restorable_workspace_ids(db, rows, credential=credential)
+    deletable_ids = await _deletable_workspace_ids(db, user, manageable_ids=restorable_ids)
     return [
         _to_response(
             ws,
             creator=creator_map.get(ws.id),
             blueprint_payload=payloads.get(ws.id),
             can_manage=True,
+            can_delete=ws.id in deletable_ids,
         )
         for ws in rows
         if ws.id in restorable_ids
@@ -1414,6 +1486,122 @@ async def get_grace_days():
     """Surface the configured grace window so the UI can render
     accurate "X days until permanent deletion" copy."""
     return {"grace_days": WORKSPACE_PURGE_GRACE_DAYS}
+
+
+class WorkspaceTrashPurgeRequest(BaseModel):
+    workspace_ids: list[str] = Field(min_length=1, max_length=100)
+
+
+class WorkspaceTrashPurgeFailure(BaseModel):
+    workspace_id: str
+    reason: str
+
+
+class WorkspaceTrashPurgeResponse(BaseModel):
+    purged: list[str] = Field(default_factory=list)
+    failed: list[WorkspaceTrashPurgeFailure] = Field(default_factory=list)
+
+
+async def _permanently_delete_trashed_workspace(
+    db: AsyncSession,
+    user: User,
+    workspace_id: str,
+    *,
+    credential: AuthenticatedUserCredential,
+) -> None:
+    """Hard-delete one Workspace from the trash now, as the nightly purge would.
+
+    Raises ``HTTPException`` with the refusal reason when the Workspace is not
+    in the caller's trash, the caller may not delete it, or provider work is
+    still pending. Callers own the transaction and must commit or roll back.
+    """
+    from packages.core.services.reusable_resource_locks import lock_reusable_resource_lifecycle
+
+    # Same lock order as restore: lifecycle, Workspace boundary, recipient.
+    await lock_reusable_resource_lifecycle(db, entity_id=user.entity_id)
+    ws = await lock_workspace_access_boundary(
+        db, workspace_id=workspace_id, entity_id=user.entity_id,
+    )
+    if not ws or ws.deleted_at is None:
+        raise HTTPException(404, "Workspace not found in trash")
+    await lock_workspace_recipient_authorization(
+        db, workspace_id=workspace_id, entity_id=user.entity_id, user_id=user.id,
+    )
+    if workspace_id not in await _restorable_workspace_ids(db, [ws], credential=credential):
+        raise HTTPException(404, "Workspace not found in trash")
+    if workspace_id not in await _deletable_workspace_ids(db, user, manageable_ids={workspace_id}):
+        raise HTTPException(
+            403, "Only a workspace owner or an authorized organization owner/admin can delete this workspace",
+        )
+    if not await purge_workspace(db, workspace_id, expected_deleted_at=ws.deleted_at):
+        raise HTTPException(
+            409, "This workspace still has provider work in progress; try again after it settles",
+        )
+
+
+async def _finish_trash_purge(db: AsyncSession, user: User, workspace_ids: list[str]) -> None:
+    """Run the same post-purge cleanup as the nightly sweep for these Workspaces."""
+    from packages.core.services.plan_gate import invalidate_gate_cache
+    from packages.core.services.workspace_artifact_purge import drain_all_workspace_artifact_purge_jobs
+
+    invalidate_gate_cache(user.entity_id)
+    for workspace_id in workspace_ids:
+        _invalidate_workspace_context(workspace_id)
+    await drain_all_workspace_artifact_purge_jobs(db, entity_id=user.entity_id)
+
+
+@router.delete("/trash/{workspace_id}", status_code=204)
+async def permanently_delete_trashed_workspace(
+    workspace_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Permanently delete one Workspace from the trash before its grace window ends.
+
+    Independently stored and reused Knowledge documents are retained,
+    matching the nightly purge."""
+    credential = AuthenticatedUserCredential.from_user(user)
+    try:
+        await _permanently_delete_trashed_workspace(
+            db, user, workspace_id, credential=credential,
+        )
+    except HTTPException:
+        await db.rollback()
+        raise
+    await db.commit()
+    await _finish_trash_purge(db, user, [workspace_id])
+
+
+@router.post("/trash/purge", response_model=WorkspaceTrashPurgeResponse)
+async def permanently_delete_trashed_workspaces(
+    req: WorkspaceTrashPurgeRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Permanently delete several trashed Workspaces, one transaction each.
+
+    A refused Workspace is reported in ``failed`` and does not stop the rest."""
+    credential = AuthenticatedUserCredential.from_user(user)
+    purged: list[str] = []
+    failed: list[WorkspaceTrashPurgeFailure] = []
+    for workspace_id in dict.fromkeys(req.workspace_ids):
+        try:
+            await _permanently_delete_trashed_workspace(
+                db, user, workspace_id, credential=credential,
+            )
+        except HTTPException as exc:
+            # Rollback expires the signed-in user; reload it before the next item.
+            await db.rollback()
+            await db.refresh(user)
+            failed.append(WorkspaceTrashPurgeFailure(
+                workspace_id=workspace_id, reason=str(exc.detail),
+            ))
+            continue
+        await db.commit()
+        purged.append(workspace_id)
+    if purged:
+        await _finish_trash_purge(db, user, purged)
+    return WorkspaceTrashPurgeResponse(purged=purged, failed=failed)
 
 
 @router.get("/{workspace_id}", response_model=WorkspaceResponse)
@@ -1428,7 +1616,7 @@ async def get_one_workspace(
         db, workspace_id, user, credential=credential, initialize_artifact_folder=initialize,
     )
     creator_map = await _workspace_creator_summaries(db, [ws])
-    blueprint_payload = (await _blueprint_payloads_for(db, [ws])).get(ws.id)
+    blueprint_payload = (await _blueprint_payloads_for(db, [ws], digests=True)).get(ws.id)
     final_authorized = await ResourcePermissionGate.authorize_workspace_read(
         db,
         credential=credential,
@@ -1451,6 +1639,21 @@ async def get_one_workspace(
     )
 
 
+async def _app_view_workspace(db: AsyncSession, workspace: Workspace, user: User, draft_id: str | None):
+    """The Workspace an App read shows: with ``draft_id``, the page that open
+    design draft stages, for the people who may approve it."""
+    if not draft_id:
+        return workspace
+    from packages.core.services.workspace_app_view import app_view_draft_preview
+
+    if not await user_can_manage_workspace(db, workspace_id=workspace.id, user_id=user.id, entity_role=user.role):
+        raise HTTPException(403, "Only people who manage this Workspace can preview its page changes")
+    preview = await app_view_draft_preview(db, workspace, draft_id)
+    if preview is None:
+        raise HTTPException(404, "App page draft not found")
+    return preview
+
+
 @router.get("/{workspace_id}/app-view")
 async def get_workspace_app_view(
     workspace_id: str,
@@ -1458,10 +1661,11 @@ async def get_workspace_app_view(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     initialize: bool = True,
+    draft_id: str | None = Query(default=None, max_length=26),
 ):
-    workspace = await _require_workspace_read(
+    workspace = await _app_view_workspace(db, await _require_workspace_read(
         db, workspace_id, user, initialize_artifact_folder=initialize,
-    )
+    ), user, draft_id)
     from packages.core.services.workspace_app_view import app_cover, load_workspace_app_view
     from packages.core.services.workspace_access import user_can_write_workspace_artifacts
     from packages.core.models.blueprint import WorkspaceBlueprint
@@ -1488,7 +1692,7 @@ async def get_workspace_app_view(
         **view,
         "cover_image_url": cover_image_url,
         "cover_source": cover_source,
-        "can_start": can_start,
+        "can_start": can_start and not draft_id,
     }
 
 
@@ -1498,6 +1702,8 @@ async def get_workspace_app_component_contexts(
     component_key: str,
     cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
+    draft_id: str | None = Query(default=None, max_length=26),
+    request: Request = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1506,13 +1712,16 @@ async def get_workspace_app_component_contexts(
     This is a read surface: workspace readers retain access when execution is
     paused or setup is incomplete, independently from ``can_start``.
     """
-    workspace = await _require_workspace_read(db, workspace_id, user)
+    workspace = await _app_view_workspace(db, await _require_workspace_read(db, workspace_id, user), user, draft_id)
+    from packages.core.services.media_urls import media_url_scope, signer_for_request
     from packages.core.services.workspace_app_data import AppDataError, component_contexts
     try:
         from packages.core.i18n import get_locale
 
-        return await component_contexts(db, workspace, user=user, component_key=component_key,
-                                        cursor=cursor, limit=limit, locale=get_locale())
+        # Browser sessions get signed cover thumbnails; other callers' payload is unchanged.
+        with media_url_scope(signer_for_request(request, user)):
+            return await component_contexts(db, workspace, user=user, component_key=component_key,
+                                            cursor=cursor, limit=limit, locale=get_locale())
     except AppDataError as exc:
         raise HTTPException(404 if exc.code == "component_not_found" else 422, exc.payload()) from exc
 
@@ -1527,16 +1736,39 @@ async def get_workspace_app_component_data(
     cursor: str | None = Query(default=None, max_length=128),
     limit: int = Query(default=50, ge=1, le=100),
     window: str | None = Query(default=None, max_length=64),
+    draft_id: str | None = Query(default=None, max_length=26),
+    filters: str | None = Query(default=None, max_length=1000, description="JSON object: a list block's filter index -> chosen value"),
+    q: str | None = Query(default=None, max_length=100),
+    parent: str | None = Query(default=None, min_length=1, max_length=26, description="A tree block: the record whose projects to read"),
+    level: int | None = Query(default=None, ge=1, le=2, description="A tree block: 1 for a record's projects, 2 for theirs"),
+    request: Request = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Resolve one configured App component without accepting a query DSL."""
-    workspace = await _require_workspace_read(db, workspace_id, user)
+    chosen: dict[str, str] | None = None
+    if filters:
+        try:
+            parsed = json.loads(filters)
+        except ValueError:
+            parsed = None
+        if not isinstance(parsed, dict) or len(parsed) > 3 or any(
+                not isinstance(key, str) or not isinstance(value, str) for key, value in parsed.items()):
+            raise HTTPException(422, {"code": "invalid_filters", "message": "filters is an object of up to three chosen values."})
+        chosen = parsed
+    workspace = await _app_view_workspace(db, await _require_workspace_read(db, workspace_id, user), user, draft_id)
+    from packages.core.services.media_urls import media_url_scope, signer_for_request
     from packages.core.services.workspace_app_data import AppDataError, component_data
     try:
-        return await component_data(db, workspace, user=user, component_key=component_key,
-                                    context_kind=context_kind, context_id=context_id,
-                                    block_key=block, cursor=cursor, limit=limit, window=window)
+        from packages.core.i18n import get_locale
+
+        # Browser sessions get signed media thumbnails; other callers' payload is unchanged.
+        with media_url_scope(signer_for_request(request, user)):
+            return await component_data(db, workspace, user=user, component_key=component_key,
+                                        context_kind=context_kind, context_id=context_id,
+                                        block_key=block, cursor=cursor, limit=limit, window=window,
+                                        locale=get_locale(), filters=chosen, query=q,
+                                        tree_parent=parent, tree_level=level)
     except AppDataError as exc:
         raise HTTPException(404 if exc.code in {"component_not_found", "context_not_found"} else 422,
                             exc.payload()) from exc
@@ -1546,11 +1778,12 @@ async def get_workspace_app_component_data(
 async def get_workspace_app_section(
     workspace_id: str,
     section_id: str,
+    draft_id: str | None = Query(default=None, max_length=26),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """One App section's data; the section's source comes from the saved page."""
-    workspace = await _require_workspace_read(db, workspace_id, user)
+    workspace = await _app_view_workspace(db, await _require_workspace_read(db, workspace_id, user), user, draft_id)
     from packages.core.services.workspace_app_sections import AppSectionNotFound, load_workspace_app_section
 
     try:
@@ -1567,10 +1800,16 @@ async def get_workspace_app_section(
 )
 async def get_workspace_setup_status(
     workspace_id: str,
+    workflow_id: str | None = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return the live Blueprint setup gate, not its install-time snapshot."""
+    """Return the live Blueprint setup gate, not its install-time snapshot.
+
+    With ``workflow_id``, ``ready`` says whether that Workflow may start: setup
+    it never reaches (a connection only other Workflows use) does not hold it up.
+    The incomplete checks are the Workspace's either way.
+    """
 
     workspace = await _require_workspace_read(db, workspace_id, user)
     from packages.core.services.workspace_readiness import (
@@ -1578,7 +1817,8 @@ async def get_workspace_setup_status(
         evaluate_workspace_automatic_setup_status,
     )
 
-    status = await evaluate_workspace_blocking_setup(db, workspace)
+    # What this person can start depends on their own connections (their own paired Chrome).
+    status = await evaluate_workspace_blocking_setup(db, workspace, actor_user_id=user.id)
     if status is None:
         return WorkspaceSetupStatusResponse(
             ready=True,
@@ -1589,8 +1829,16 @@ async def get_workspace_setup_status(
     automatic_state, automatic_task_id = await evaluate_workspace_automatic_setup_status(
         db, workspace, incomplete_checks,
     )
+    ready = not status.blocks_work
+    if not ready and workflow_id:
+        from packages.core.models.workflow import WorkflowDefinition
+        from packages.core.services.workspace_readiness import blocking_setup_blocks_workflow
+
+        definition = await db.get(WorkflowDefinition, workflow_id)
+        steps = definition.steps if definition is not None and definition.entity_id == workspace.entity_id else None
+        ready = not blocking_setup_blocks_workflow(status, steps)
     return WorkspaceSetupStatusResponse(
-        ready=not status.blocks_work,
+        ready=ready,
         status=status.status,
         summary=status.summary,
         incomplete_checks=incomplete_checks,
@@ -1822,7 +2070,7 @@ async def update_one_workspace(
     return _to_response(
         ws,
         creator=creator_map.get(ws.id),
-        blueprint_payload=(await _blueprint_payloads_for(db, [ws])).get(ws.id),
+        blueprint_payload=(await _blueprint_payloads_for(db, [ws], digests=True)).get(ws.id),
         can_manage=True,
         can_delete=ws.id in await _deletable_workspace_ids(db, user, manageable_ids={ws.id}),
     )
@@ -1872,7 +2120,7 @@ async def delete_one_workspace(
     _invalidate_workspace_context(workspace_id)
 
 
-@router.post("/{workspace_id}/restore", response_model=WorkspaceResponse)
+@router.post("/{workspace_id}/restore", response_model=WorkspaceRestoreResponse)
 async def restore_one_workspace(
     workspace_id: str,
     user: User = Depends(get_current_user),
@@ -1923,12 +2171,16 @@ async def restore_one_workspace(
     invalidate_gate_cache(user.entity_id)
     _invalidate_workspace_context(workspace_id)
     creator_map = await _workspace_creator_summaries(db, [ws])
-    return _to_response(
+    response = _to_response(
         ws,
         creator=creator_map.get(ws.id),
-        blueprint_payload=(await _blueprint_payloads_for(db, [ws])).get(ws.id),
+        blueprint_payload=(await _blueprint_payloads_for(db, [ws], digests=True)).get(ws.id),
         can_manage=True,
         can_delete=ws.id in await _deletable_workspace_ids(db, user, manageable_ids={ws.id}),
+    )
+    return WorkspaceRestoreResponse(
+        **response.model_dump(),
+        unmapped_agents=list(getattr(ws, "_restore_unmapped_agents", ())),
     )
 
 
@@ -1936,11 +2188,11 @@ async def restore_one_workspace(
 
 _WORKSPACE_LIFECYCLE_BODIES = {
     ("start", "completed"):
-        "Workspace automation started · AI is tracking goals and preparing the next tasks.",
+        "Now working on its own · it reviews, plans and prepares the next tasks.",
     ("start_without_goals", "completed"):
-        "Workspace automation started without goals · AI is autonomously preparing the next tasks.",
+        "Now working on its own · it reviews, plans and prepares the next tasks.",
     ("pause", "completed"):
-        "Workspace automation paused · no new Strategist or Goal schedules will be created.",
+        "Set to manual · it only does what you ask; workflow schedules keep running.",
 }
 
 
@@ -2477,13 +2729,47 @@ async def design_workspace_app_view_endpoint(
 
     result = await design_workspace_app_view(
         db, workspace_id=workspace_id, entity_id=user.entity_id, user_id=user.id,
-        brief=req.brief, feedback=req.feedback, replaces_draft_id=req.draft_id,
+        brief=req.brief, feedback=req.feedback, replaces_draft_id=req.draft_id, audience=req.audience,
     )
     if not result.get("ok"):
         await db.rollback()
         raise HTTPException(422, {"error": result.get("error"), "design_notes": result.get("design_notes")})
     await db.commit()
-    return {key: result[key] for key in ("draft", "candidate", "recipes", "warnings", "design_notes")}
+    return {key: result[key] for key in ("draft", "candidate", "recipes", "warnings", "design_notes", "self_check")}
+
+
+@router.get("/{workspace_id}/app-view/test")
+async def test_workspace_app_view_endpoint(
+    workspace_id: str,
+    draft_id: str | None = Query(default=None, max_length=26),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """The App page's self-check, saved or as an open draft stages it: read-only, and it proves reads, not clicks."""
+    workspace = await _require_workspace_read(db, workspace_id, user, initialize_artifact_folder=False)
+    if not await user_can_manage_workspace(db, workspace_id=workspace.id, user_id=user.id, entity_role=user.role):
+        raise HTTPException(403, "Only people who manage this Workspace can test its page")
+    from packages.core.services.workspace_app_selfcheck import self_check_app_page
+
+    return await self_check_app_page(db, await _app_view_workspace(db, workspace, user, draft_id), user=user)
+
+
+@router.get("/{workspace_id}/app-view/design/audience")
+async def workspace_app_view_audience_endpoint(
+    workspace_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Who the App page could be for: purpose, people, roles, what waits on them and usage."""
+    workspace = await _require_workspace_read(db, workspace_id, user)
+    if not await user_can_manage_workspace(db, workspace_id=workspace.id, user_id=user.id, entity_role=user.role):
+        raise HTTPException(403, "Only people who manage this Workspace can design its page")
+    from packages.core.services.workspace_app_designer import workspace_app_audience
+
+    audience = await workspace_app_audience(db, workspace_id=workspace_id, entity_id=user.entity_id)
+    if audience is None:
+        raise HTTPException(404, "Workspace not found")
+    return audience
 
 
 @router.post("/{workspace_id}/operation/repair")
@@ -2962,6 +3248,25 @@ async def update_rules(
     ws = await _require_workspace(db, workspace_id, user.entity_id)
     await db.commit()
     return ws
+
+
+# ── Attention ────────────────────────────────────────────────────────────────
+
+@router.get("/{workspace_id}/attention-items")
+async def list_workspace_attention_items(
+    workspace_id: str,
+    limit: int = Query(default=50, ge=1, le=200),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Open situations that may need a person: most urgent first, then oldest."""
+    from packages.core.attention.query import list_open_attention, serialize_attention_item
+
+    await _require_workspace_read(db, workspace_id, user)
+    items = await list_open_attention(
+        db, entity_id=user.entity_id, workspace_id=workspace_id, limit=limit,
+    )
+    return {"items": [serialize_attention_item(item) for item in items], "count": len(items)}
 
 
 # ── Activity ─────────────────────────────────────────────────────────────────
@@ -6196,7 +6501,7 @@ async def _preview_blueprint_reconfiguration(*, workspace_id, variable_values, c
         from packages.core.blueprints.reconfigure import _state, active_runs
 
         state = await _state(db, ws)
-        point = (state.restore_point if state else None) or (ws.settings or {}).get("_blueprint", {}).get("restore_point")
+        point = state.restore_point if state else None
         return {
             "upgrade_protocol_version": 3, "variables_ready": False,
             "setup_preview": _payload_setup_preview(usable).model_dump(),
@@ -6306,8 +6611,68 @@ async def apply_blueprint_reconfiguration(
         raise HTTPException(403, str(exc)) from exc
     except (ValueError, InstallError) as exc:
         raise HTTPException(409, str(exc)) from exc
+    from packages.core.services.workspace_update_offer import UPDATE_CHOICE, close_update_cards
+
+    # However it was applied, an offered release is no longer waiting.
+    await close_update_cards(db, entity_id=ws.entity_id, workspace_id=ws.id, user_id=user.id, resolution={
+        "choice": UPDATE_CHOICE, "payload": {
+            "version": version, "updated": len(result.get("updated") or []),
+            "kept": len(result.get("kept_yours") or []), "can_revert": bool(result.get("can_revert")),
+        },
+    })
     await db.commit()
     return result
+
+
+class BlueprintRecommendedUpgradeRequest(BaseModel):
+    target_version: str | None = Field(None, min_length=1, max_length=64)
+
+
+@router.post("/{workspace_id}/blueprint/upgrade/v3/recommended")
+async def apply_recommended_blueprint_upgrade(
+    workspace_id: str, req: BlueprintRecommendedUpgradeRequest,
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    """Update in one step with the upgrade dialog's default choices: the
+    author's changes are taken and the Workspace's own edits are kept.
+
+    Anything that needs a person (runs still open, setup or Blueprint
+    variables to fill in) is a 409 ``upgrade_needs_review`` naming it, and the
+    caller opens the upgrade dialog instead.
+    """
+    from packages.core.services.workspace_update_offer import default_resolutions
+
+    preview = await _preview_blueprint_reconfiguration(
+        workspace_id=workspace_id, variable_values={}, channel_config_ids={}, user=user, db=db,
+        target_version=req.target_version,
+    )
+    items = preview.get("items") or []
+    resolutions = default_resolutions(items)
+    runtime = next((item for item in items if item["key"] == "runtime_requirements"), None)
+    keeps_runtime = runtime is not None and (
+        runtime["current_content"] != runtime["new_content"] if runtime["action"] == "unchanged"
+        else next(r["resolution"] for r in resolutions if r["key"] == runtime["key"]) == "keep_yours"
+    )
+    preflight = (preview.get("kept_setup_preflight") if keeps_runtime else None) or preview.get("setup_preflight") or {}
+    reason = (
+        "active_runs" if preview.get("active_runs")
+        else "variables" if not preview.get("variables_ready")
+        else "setup" if not preflight.get("ready")
+        else None
+    )
+    if reason:
+        raise HTTPException(409, {
+            "code": "upgrade_needs_review", "reason": reason,
+            "active_runs": preview.get("active_runs") or [],
+            "message": "This update needs a review before it can be applied.",
+        })
+    result = await apply_blueprint_reconfiguration(workspace_id, BlueprintReconfigurationApplyRequest(
+        target_version=req.target_version,
+        expected_blueprint_fingerprint=preview["blueprint_fingerprint"],
+        expected_plan_fingerprint=preview["plan_fingerprint"],
+        configuration_resolutions=resolutions,
+    ), user, db)
+    return {**result, "version": preview.get("current_version")}
 
 
 async def _release_range_for(db: AsyncSession, ws, package_ref: str | None) -> dict[str, Any]:
@@ -6653,13 +7018,15 @@ async def revert_blueprint_upgrade(
     from packages.core.blueprints.upgrade import (
         BlueprintUpgradeAccessDeniedError,
         BlueprintUpgradePlanChangedError,
+        legacy_restore_point,
         revert,
     )
 
     from packages.core.blueprints.reconfigure import _state, revert as revert_configuration
 
     state = await _state(db, ws)
-    use_v3 = state is not None and state.restore_point is not None
+    use_v3 = state is not None and state.restore_point is not None and not legacy_restore_point(state)
+    undone_version = (state.restore_point or {}).get("to_version") if use_v3 else None
 
     try:
         result = await (revert_configuration if use_v3 else revert)(
@@ -6674,5 +7041,128 @@ async def revert_blueprint_upgrade(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if undone_version:
+        from packages.core.services.workspace_update_offer import mark_update_undone
+
+        await mark_update_undone(db, entity_id=ws.entity_id, workspace_id=ws.id, version=undone_version)
     await db.commit()
     return result
+
+
+@router.post("/{workspace_id}/blueprint/releases")
+async def publish_workspace_package_release(
+    workspace_id: str,
+    file: UploadFile = File(...),
+    release_notes: str | None = Form(None, max_length=4000),
+    dry_run: bool = Form(False),
+    adopt: bool = Form(False),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Make a Blueprint file — a ``.manor`` package or its JSON, built in any
+    environment — the next release of this Workspace's own package.
+
+    Nothing in the Workspace changes here: it then shows the update and takes
+    it through the ordinary upgrade review (``/blueprint/upgrade/v3``). A
+    Workspace installed before it had a package adopts one with ``adopt``:
+    its matching components are linked and its current content becomes the
+    merge base. ``dry_run`` reports the version, the changes and, for an
+    adoption, which components were matched, without writing anything.
+    """
+    import json
+
+    from packages.core.blueprints.freshness import installed_blueprint_record
+    from packages.core.blueprints.package import MAX_PACKAGE_BYTES, PackageError, is_package, restore_assets, store_assets, unpack
+    from packages.core.blueprints.payload import PayloadError, validate_payload
+    from packages.core.blueprints.freshness import blueprint_content_fingerprint
+    from packages.core.blueprints.registry import (
+        BlueprintVersionConflictError, latest_release, next_release_version, release_for_fingerprint,
+    )
+    from packages.core.blueprints.release_diff import diff_releases
+    from packages.core.blueprints.team_packages import (
+        TeamPackageError, adopt_package, check_release_file, declared_package, describe_match, is_team_package_ref,
+        match_components, package_name, package_scope, release_team_package, team_package_owner, team_package_ref,
+    )
+    from packages.core.services.reusable_resource_locks import lock_reusable_resource_lifecycle
+
+    data = await file.read(MAX_PACKAGE_BYTES + 1)
+    if len(data) > MAX_PACKAGE_BYTES:
+        raise HTTPException(413, "The file is larger than a Blueprint package may be")
+    try:
+        payload, assets = unpack(data) if is_package(data) else (json.loads(data.decode("utf-8")), [])
+    except (PackageError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, f"Not a Blueprint package or payload: {exc}") from exc
+
+    await lock_reusable_resource_lifecycle(db, entity_id=user.entity_id)
+    ws = await _require_workspace_manage(db, workspace_id, user)
+    record = installed_blueprint_record(ws.settings)
+    ref = str(record.get("blueprint_id") or "").strip()
+    linked = is_team_package_ref(ref) and team_package_owner(ref) == ws.entity_id
+    if not linked and ref and record.get("source") != "raw_payload":
+        raise HTTPException(409, {
+            "code": "blueprint_source_elsewhere",
+            "message": "This Workspace updates from the Blueprint it was installed from; publish the new version there.",
+        })
+    if not linked and not adopt:
+        raise HTTPException(409, {
+            "code": "package_adoption_required",
+            "message": "This Workspace has no package yet. Send the file with adopt to make it this Workspace's package.",
+        })
+
+    try:
+        if linked:
+            current = await latest_release(db, ref)
+            name = ref.split(":", 2)[2]
+            payload = check_release_file(current.payload if current else None, payload, name=name)
+        else:
+            validate_payload(payload)
+    except (TeamPackageError, PayloadError, ValueError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if release_notes:
+        payload.setdefault("manifest", {})["release_notes"] = release_notes
+
+    try:
+        if not linked:
+            name = package_name(payload, scope=await package_scope(db, payload, ws.entity_id))
+            ref = team_package_ref(ws.entity_id, name)
+            current = await latest_release(db, ref)
+        if dry_run:
+            changes = diff_releases(current.payload, payload) if current and current.payload else None
+            existing = await release_for_fingerprint(db, ref, blueprint_content_fingerprint(payload))
+            version = existing.version if existing else declared_package(payload).get("version") or (
+                await next_release_version(
+                    db, ref, payload, current_version=current.version,
+                    stored_fingerprint=current.content_fingerprint,
+                ) if current else "1.0.0"
+            )
+            result = {
+                "dry_run": True, "package": {"ref": ref, "name": name},
+                "current_version": current.version if current else None,
+                "version": version, "would_publish": existing is None,
+                "level": changes["min_bump"] if changes else None,
+                "reasons": changes["reasons"] if changes else [],
+                "components": changes["components"] if changes else None,
+            }
+            if not linked:
+                result["adoption"] = describe_match(await match_components(db, workspace=ws, payload=payload))
+            return result
+        if assets:
+            payload = restore_assets(payload, await store_assets(ws.entity_id, list(assets)))
+        ref, release = await release_team_package(
+            db, entity_id=ws.entity_id, payload=payload, package_ref=ref,
+            changelog=release_notes or None, published_by=user.id,
+        )
+        adoption = None
+        if not linked:
+            adoption = await adopt_package(
+                db, workspace=ws, payload=release.payload, package_ref=ref, release=release, by_user_id=user.id,
+            )
+    except (TeamPackageError, BlueprintVersionConflictError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    await db.commit()
+    return {
+        "dry_run": False, "package": {"ref": ref, "name": name},
+        "version": release.version,
+        "published": current is None or current.version != release.version,
+        "adoption": adoption,
+    }

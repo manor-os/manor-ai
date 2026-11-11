@@ -221,9 +221,14 @@ task — e.g. a direction confirmation before committing budget, sign-off that
 is blocking progress, information only the operator has, or an offline action
 no agent can perform. Each entry needs: `request_key` (stable snake_case,
 unique in this proposal), `request_kind` (decision | review | input |
-manual_work), `question` (the concrete question or request, self-contained),
+manual_work), `question` (the concrete question or request, self-contained,
+one or two plain sentences; name a file by its title, never by a document ID
+or path),
 and optionally `role_required` (workspace role expected to answer),
-`expected_by_hours` (soft deadline in hours), and `context`. Human requests
+`expected_by_hours` (soft deadline in hours), and `context`. Every request
+that asks a question recommends an answer: `recommended` (the answer you would
+give, in the user's language) with a one-sentence `recommendation_reason`, and
+up to 3 short `options` when the answer is a choice. Human requests
 are created automatically without approval and appear as Need Input;
 the addressee may decline. Never ask for this in workspace chat.
 Never use a human_request for work an agent service could do — propose a
@@ -310,6 +315,10 @@ Preserve the complete request in source_brief and use only declared input keys.
 Treat the briefing's Workflow runs as execution evidence:
   * Never propose a fresh run of a Flow that already has a pending, running,
     or paused run. It is work already in flight, even when it needs input.
+  * Such a run owns its project and every file in that project's folder. Never
+    propose a Task that drafts, edits, finishes, reviews or replaces them, or
+    asks a person to approve another version of them: the run's own steps and
+    approval do that.
   * Never duplicate a completed scheduled Flow from the current review window
     unless the evidence explicitly calls for an intentional rerun.
   * For a failed or blocked run, address the recorded blocker with a human
@@ -390,11 +399,14 @@ RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT_V2 = {
             "request_kind": "decision | review | input | manual_work",
             "role_required": "workspace role expected to answer, or null",
             "question": (
-                "The concrete question or request for the human "
-                "(self-contained, >= 8 chars)."
+                "The concrete question or request for the human: self-contained, "
+                "one or two plain sentences; a file named by its title, never by an ID."
             ),
             "expected_by_hours": 48,
             "context": "Optional short context the human needs to answer.",
+            "options": ["Up to 3 short answers when it is a choice, or omit"],
+            "recommended": "The answer you recommend.",
+            "recommendation_reason": "One sentence on why.",
         }
     ],
     "experiments": [

@@ -18,7 +18,9 @@ logger = logging.getLogger(__name__)
 CHAT_RATE_LIMIT_ENABLED = os.getenv("CHAT_RATE_LIMIT_ENABLED", "false").lower() == "true"
 CHAT_RATE_LIMIT_REQUESTS = int(os.getenv("CHAT_RATE_LIMIT_REQUESTS", "30"))
 CHAT_RATE_LIMIT_WINDOW = int(os.getenv("CHAT_RATE_LIMIT_WINDOW_SECONDS", "60"))
-API_RATE_LIMIT_REQUESTS = int(os.getenv("API_RATE_LIMIT_REQUESTS", "200"))
+# Per signed-in user across every tab and pod: one app page polls ~20 reads, and
+# a user with several Workspace tabs open measured ~250 requests per minute.
+API_RATE_LIMIT_REQUESTS = int(os.getenv("API_RATE_LIMIT_REQUESTS", "600"))
 API_RATE_LIMIT_WINDOW = int(os.getenv("API_RATE_LIMIT_WINDOW_SECONDS", "60"))
 REDIS_RATE_LIMIT_ENABLED = os.getenv("REDIS_RATE_LIMIT_ENABLED", "false").lower() in ("1", "true", "yes", "on")
 
@@ -145,9 +147,9 @@ def is_chat_read_request(method: str, path: str) -> bool:
     return not (len(parts) >= 8 and parts[4] == "rooms" and parts[6] == "files")
 
 
-def authenticated_chat_user_id(request: Request) -> str | None:
-    """Verify identity before assigning a per-user chat rate-limit bucket."""
-    if not request.url.path.startswith("/api/v1/chat/"):
+def authenticated_user_id(request: Request) -> str | None:
+    """Verify identity before assigning a per-user rate-limit bucket."""
+    if not request.url.path.startswith("/api/"):
         return None
     scheme, _, token = request.headers.get("authorization", "").partition(" ")
     if scheme.lower() != "bearer" or not token:
@@ -201,8 +203,8 @@ class ChatRateLimitMiddleware(BaseHTTPMiddleware):
 
 
         # Dependencies authenticate after middleware. Verify the bearer token
-        # here so users behind one IP do not share a chat rate-limit budget.
-        user_id = authenticated_chat_user_id(request) or getattr(request.state, "user_id", None)
+        # here so users behind one IP do not share a rate-limit budget.
+        user_id = authenticated_user_id(request) or getattr(request.state, "user_id", None)
         ip = client_ip(request)
         key = f"user:{user_id}" if user_id else f"ip:{ip}"
 

@@ -1,14 +1,16 @@
 # Blueprint concept covers
 
-Fourteen AI-generated editorial illustrations. Ten were produced with the built-in
+Fifteen AI-generated editorial illustrations. Ten were produced with the built-in
 image_gen tool on 2026-09-11; JR AI Music First Release was added on 2026-09-22
 Video Studio on 2026-10-02 and Video Series Studio on 2026-10-25 (OpenRouter
-`google/gemini-3-pro-image`) in the same visual system. They identify each Blueprint's purpose; they are
+`google/gemini-3-pro-image`) in the same visual system. GIF Studio was added on
+2026-11-06 using GPT Image 2.6 Sunburst through Manor's image generation flow.
+They identify each Blueprint's purpose; they are
 not product screenshots, customer evidence or verified Workspace outputs.
 
 They follow the existing Blueprint visual system:
 fine Japanese editorial ink linework, selective crosshatching, aged paper and
-one restrained accent hue. Nine covers use relevant work scenes and objects;
+one restrained accent hue. Ten covers use relevant work scenes and objects;
 five use an optional Manor character. Neither a person nor an M mark is
 required for a scene-only cover. The rejected paper-craft batch is not shipped.
 
@@ -32,8 +34,18 @@ filename matches its Blueprint slug; the corresponding manifest lives under
 `packages/core/blueprints/configs/creative`, `recording`, `solo_company` or
 `video_studio`.
 
-Verification: all fourteen images were decoded and visually inspected. Automated
+Verification: all fifteen images were decoded and visually inspected. Automated
 checks preserve the existing evidence galleries and confirm that cover URLs do
 not enter the installable runtime sections. JR AI Music First Release and
 Video Studio are cloud-only catalogue listings; the remaining covers do not change
 public/self-hosted availability of any Blueprint.
+
+## GIF Studio
+
+`creative-gif-v1.webp` replaces the earlier SVG/PNG design with an AI-generated
+animation workbench: a loop of sequential drawings, a flipbook and a restrained
+vermilion accent. The Podcast and Video Series covers supplied the style
+references. The selected 1672 × 941 PNG was encoded at WebP quality 85 without
+resizing, cropping, compositing or added text. Its prompt, model, Document
+reference and source/final hashes are recorded in `docs/blueprint-cover-prompts.json`.
+The cover is a static concept illustration, not evidence of a generated GIF.

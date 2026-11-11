@@ -29,6 +29,18 @@ def test_failed_action_is_unconfirmed():
     assert runtime_tool_effect_state("generate_file", {"kind": "document"}, result) is EffectState.UNCONFIRMED
 
 
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("sandbox_exec", {"command": "make"}),
+        ("sandbox", {"action": "exec", "params": {"command": "make"}}),
+    ],
+)
+def test_sandbox_command_timeout_does_not_confirm_its_effects(tool, arguments):
+    result = json.dumps({"status": "error", "error": "Command timed out"})
+    assert runtime_tool_effect_state(tool, arguments, result) is EffectState.UNCONFIRMED
+
+
 def test_read_only_tool_never_has_an_effect():
     ok = json.dumps({"content": "hello"})
     failed = json.dumps({"status": "error", "error": "not_found"})

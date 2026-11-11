@@ -2,7 +2,8 @@ import { useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import type { NavigateFunction } from "react-router-dom";
-import { api, type WorkspaceAppMetric, type WorkspaceStatDefinition, type WorkspaceStatObservation } from "../../lib/api";
+import { api, type WorkspaceAppChartData, type WorkspaceAppMetric, type WorkspaceStatDefinition, type WorkspaceStatObservation } from "../../lib/api";
+import WorkspaceAppChart from "./WorkspaceAppChart";
 import { viewerPathForDocumentId } from "../../lib/fileReferences";
 import { getPreferredTimeZone, relativeTime } from "../../lib/format";
 import { goalProgressPercent } from "../../lib/goalNumbers";
@@ -45,23 +46,17 @@ function readingFromObservation(row: WorkspaceStatObservation): Reading {
   };
 }
 
-function TrendChart({ points }: { points: Array<{ at: string; value: number }> }) {
+/** The readings over time on a scale: an axis of values, each reading's time and value on hover, the goal's target as a line. */
+function TrendChart({ points, metric }: { points: Array<{ at: string; value: number }>; metric: WorkspaceAppMetric }) {
   if (points.length < 2) return null;
-  const values = points.map((point) => point.value);
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const span = max - min || 1;
-  const coords = values.map((value, index) => [index / (values.length - 1) * 300, 92 - (value - min) / span * 80]);
-  const line = coords.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
-  return <figure className="workspace-app-metric-detail__chart">
-    <svg viewBox="0 0 300 100" preserveAspectRatio="none" role="img" aria-label={t("component.workspace_app_view.metric_trend")}>
-      <line x1="0" x2="300" y1="12" y2="12" />
-      <line x1="0" x2="300" y1="92" y2="92" />
-      <polygon points={`0,100 ${line} 300,100`} />
-      <polyline points={line} vectorEffect="non-scaling-stroke" />
-    </svg>
-    <figcaption><span>{when(points[0].at)}</span><span>{when(points[points.length - 1].at)}</span></figcaption>
-  </figure>;
+  const target = metric.goal?.target;
+  const chart: WorkspaceAppChartData = {
+    kind: "area", format: "number", unit: metric.value_type === "percent" ? "%" : metric.unit, records: points.length,
+    categories: points.map((point, index) => ({ key: `${index}:${point.at}`, label: when(point.at) })),
+    series: [{ key: "value", label: metric.title, values: points.map((point) => point.value) }],
+    ...(typeof target === "number" ? { target: { value: target, label: t("component.workspace_app_view.metric_goal") } } : {}),
+  };
+  return <figure className="workspace-app-metric-detail__chart"><WorkspaceAppChart chart={chart} title={t("component.workspace_app_view.metric_trend")} /></figure>;
 }
 
 function RecordReading({ workspaceId, metric }: { workspaceId: string; metric: WorkspaceAppMetric }) {
@@ -122,7 +117,13 @@ function MetricDetailBody({ workspaceId, metric, canStart }: { workspaceId: stri
   const assessment = metric.assessment;
 
   return <div className="workspace-app-metric-detail">
-    <TrendChart points={chartPoints.length >= 2 ? chartPoints : metric.series} />
+    <TrendChart points={chartPoints.length >= 2 ? chartPoints : metric.series} metric={metric} />
+
+    {metric.description && <section>
+      <h4>{t("component.workspace_app_view.metric_how_measured")}</h4>
+      <p className="workspace-app-metric-detail__muted">{metric.description}</p>
+      {metric.window && <p className="workspace-app-metric-detail__muted">{t("component.workspace_app_view.metric_window", { window: metric.window.replace(/_/g, " ") })}</p>}
+    </section>}
 
     {goal && goal.target !== null && <section>
       <h4>{t("component.workspace_app_view.metric_goal")}</h4>
@@ -215,7 +216,7 @@ export function openMetricDetail({ workspaceId, metric, canStart, navigate, quer
     ? { label: t("component.workspace_app_view.metric_open_goals"), icon: <IconTrendingUp size={16} />,
       onClick: () => { closeDetail(); navigate(`/workspaces/${workspaceId}?tab=goals`); } }
     : { label: t("component.workspace_app_view.metric_manage"), icon: <IconSettings size={16} />,
-      onClick: () => { closeDetail(); navigate(`/workspaces/${workspaceId}?tab=overview#workspace-stats`); } };
+      onClick: () => { closeDetail(); navigate(`/workspaces/${workspaceId}?tab=records&view=data#workspace-stats`); } };
   openDetail({
     key: `workspace-app-metric:${metric.kind}:${metric.id}`,
     title: metric.title,

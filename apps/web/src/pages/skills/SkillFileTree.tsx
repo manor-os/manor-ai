@@ -111,7 +111,7 @@ function FileRow({
         borderRadius: 8,
         cursor: "pointer",
         background: selected ? "var(--modal-sunken-bg)" : "transparent",
-        boxShadow: selected ? "0 1px 2px rgba(28,25,23,0.06)" : "none",
+        boxShadow: selected ? "0 1px 2px rgba(29, 29, 31,0.06)" : "none",
         color: selected ? "var(--text-strong)" : "var(--text-muted)",
       }}
     >
@@ -122,7 +122,6 @@ function FileRow({
           width: 18,
           fontSize: 10,
           fontWeight: 600,
-          letterSpacing: "0.02em",
           color: "var(--text-muted)",
           fontFamily:
             "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",

@@ -182,15 +182,17 @@ async def test_install_payload_binds_only_an_exact_published_platform_release(
         json={"payload": edited_payload, "mode": "simulate"},
     )
     assert edited.status_code == 201, edited.text
-    assert edited.json()["blueprint_id"] is None
+    # Not the published release: the edited file is the team's own package.
+    assert edited.json()["blueprint_id"].startswith("team-package:")
 
     edited_workspace = await db_session.get(Workspace, edited.json()["workspace_id"])
     assert edited_workspace.kind == edited_payload["manifest"]["kind"]
     edited_record = edited_workspace.settings[BLUEPRINT_SETTINGS_KEY]
-    assert edited_record["blueprint_id"] is None
+    assert edited_record["blueprint_id"] != release_id
+    assert edited_record["blueprint_id"].startswith(f"team-package:{entity.id}:")
     assert edited_record["blueprint_slug"] == slug
-    assert edited_record["source"] == "raw_payload"
-    assert edited_record[BLUEPRINT_VERSION_KEY] is None
+    assert edited_record["source"] == "team_package"
+    assert edited_record[BLUEPRINT_VERSION_KEY] == "1.0.0"
 
 
 async def test_payload_preflight_validates_typed_setup_without_creating_workspace(

@@ -13,6 +13,7 @@ import VersionRefreshManager from "./VersionRefreshManager";
 import { initializeClientErrorCapture } from "./lib/clientErrors";
 import { shouldRetryApiQuery } from "./lib/api";
 import { applyThemePreference, getStoredThemePreference } from "./lib/theme";
+import { loadWebFonts } from "./lib/webFonts";
 
 initializeClientErrorCapture("web");
 applyThemePreference(getStoredThemePreference());
@@ -34,6 +35,8 @@ const queryClient = new QueryClient({
   },
 });
 
+
+loadWebFonts();
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

@@ -52,6 +52,8 @@ DOCUMENT_DERIVED_TREE_CACHE_ROOTS = (
     ".slide-cache",
     ".slide-object-cache",
     ".doc-thumb-cache",
+    # Versioned display variants served by manor-media (services/media_variants).
+    ".manor-media",
 )
 DOCUMENT_VERSION_SNAPSHOT_ROOT = ".versions/documents"
 _ARTIFACT_CLEANUP_KINDS = {
@@ -792,6 +794,31 @@ async def drain_workspace_artifact_purge_jobs(
     return cleaned, failed
 
 
+async def drain_all_workspace_artifact_purge_jobs(
+    db: AsyncSession,
+    *,
+    entity_id: str | None = None,
+    batch_size: int = 500,
+) -> tuple[int, int]:
+    """Drain due cleanup jobs until a pass makes no progress.
+
+    Large Workspace purges enqueue more files than one batch can remove. Failed
+    jobs keep their backoff, so a pass that cleans nothing ends the loop.
+    """
+    total_cleaned = 0
+    total_failed = 0
+    while True:
+        cleaned, failed = await drain_workspace_artifact_purge_jobs(
+            db,
+            limit=batch_size,
+            entity_id=entity_id,
+        )
+        total_cleaned += cleaned
+        total_failed += failed
+        if cleaned == 0:
+            return total_cleaned, total_failed
+
+
 __all__ = [
     "ARTIFACT_CLEANUP_KIND_EMPTY_DIRECTORY",
     "ARTIFACT_CLEANUP_KIND_FILE",
@@ -802,6 +829,7 @@ __all__ = [
     "document_derived_file_cleanup_bases",
     "document_derived_tree_cleanup_bases",
     "document_version_snapshot_cleanup_bases",
+    "drain_all_workspace_artifact_purge_jobs",
     "drain_workspace_artifact_purge_jobs",
     "enqueue_artifact_cleanup_jobs",
     "purge_entity_knowledge",

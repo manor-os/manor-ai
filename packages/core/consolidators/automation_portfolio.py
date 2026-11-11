@@ -52,6 +52,8 @@ class AutomationPortfolioConsolidator:
         jobs = list((await db.execute(
             select(ScheduledJob).where(
                 ScheduledJob.enabled.is_(True),
+                # Initiative drivers are owned by the Initiative lifecycle.
+                ScheduledJob.agent_initiative_id.is_(None),
                 or_(
                     ScheduledJob.workspace_id == ws_id,
                     ScheduledJob.execution_target["workspace_id"].astext == ws_id,

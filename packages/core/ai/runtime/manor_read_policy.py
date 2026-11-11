@@ -22,7 +22,6 @@ class ManorReadCapability(StrEnum):
     BILLING = Permission.ADMIN_BILLING.value
     SETTINGS = Permission.ADMIN_SETTINGS.value
     CHAT = Permission.CHAT_USE.value
-    CONVERSATIONS = Permission.CHAT_VIEW_ALL.value
 
 
 class ManorReadCapabilityFactory:
@@ -57,7 +56,10 @@ class ManorReadCapabilityFactory:
         "get_skill": ManorReadCapability.DISCOVERY,
         "list_scheduled_jobs": ManorReadCapability.SETTINGS,
         "list_notifications": ManorReadCapability.CHAT,
-        "list_conversations": ManorReadCapability.CONVERSATIONS,
+        "list_conversations": ManorReadCapability.CHAT,
+        "search_conversation_messages": ManorReadCapability.CHAT,
+        "read_conversation_messages": ManorReadCapability.CHAT,
+        "read_memory": ManorReadCapability.CHAT,
         "list_channel_bindings": ManorReadCapability.INTEGRATIONS,
         "list_staff": ManorReadCapability.PEOPLE,
         "get_staff": ManorReadCapability.PEOPLE,

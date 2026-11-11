@@ -757,13 +757,15 @@
    "chat history",
    "threads",
    "dialogues",
-   "past messages"
+   "group chats",
+   "private chats",
+   "rooms"
   ],
   "examples": [
-   "list chats for an agent",
-   "show user conversations",
-   "find past conversations by user",
-   "recent chat threads of agent"
+   "list my chats",
+   "show my group chats and private chats",
+   "which conversations can I read",
+   "recent chat threads"
   ]
  },
  "manor_action:list_crm_followups": {
@@ -1139,6 +1141,33 @@
    "take service out of workspace"
   ]
  },
+ "manor_action:read_conversation_messages": {
+  "terms": [
+   "chat transcript",
+   "conversation messages",
+   "chat record",
+   "message history"
+  ],
+  "examples": [
+   "read the messages of a conversation",
+   "show the chat transcript",
+   "read messages around a search hit"
+  ]
+ },
+ "manor_action:read_memory": {
+  "terms": [
+   "memory",
+   "remember",
+   "profile card",
+   "preferences",
+   "what you know about me"
+  ],
+  "examples": [
+   "what do you remember about me",
+   "read this Workspace's memory",
+   "show my profile card"
+  ]
+ },
  "manor_action:rename_document_folder": {
   "terms": [
    "change folder name",
@@ -1189,6 +1218,21 @@
    "trigger automation manually",
    "force run background job",
    "execute cron job immediately"
+  ]
+ },
+ "manor_action:search_conversation_messages": {
+  "terms": [
+   "chat history",
+   "chat records",
+   "group chat messages",
+   "past messages",
+   "what was said"
+  ],
+  "examples": [
+   "search my chat history",
+   "find what we said in the group chat",
+   "search past messages across conversations",
+   "what did someone say in the chat"
   ]
  },
  "manor_action:search_documents": {
@@ -1646,11 +1690,14 @@
    "creators",
    "influencer",
    "social media posts",
-   "budget quote"
+   "budget quote",
+   "youtube video views",
+   "tiktok video views"
   ],
   "examples": [
    "search instagram creators",
    "collect recent reels from instagram",
+   "scrape youtube and tiktok view counts with apify",
    "quote instagram scrape cost",
    "get status of instagram collection"
   ]
@@ -2168,24 +2215,6 @@
    "adjust inventory stock count",
    "create square customer",
    "search catalog items in square"
-  ]
- },
- "provider:stripe": {
-  "terms": [
-   "payments",
-   "billing",
-   "charge",
-   "refund",
-   "checkout link",
-   "revenue",
-   "chargeback",
-   "subscription cancel"
-  ],
-  "examples": [
-   "refund stripe charge",
-   "create payment link for product",
-   "list customer subscriptions",
-   "check stripe account balance"
   ]
  },
  "provider:tavily": {
@@ -2861,6 +2890,8 @@
    "teammate agent",
    "parallel agents",
    "ask another agent",
+   "specialist agent",
+   "research delegation",
    "multi-agent"
   ],
   "examples": [
@@ -3866,27 +3897,13 @@
    "get contact interaction history"
   ]
  },
- "tool:read_stickman_topic_ledger": {
-  "terms": [
-   "topic history",
-   "past topics",
-   "video ideas",
-   "avoid duplicate topics",
-   "content calendar"
-  ],
-  "examples": [
-   "read stickman topic history",
-   "check previously used video topics",
-   "avoid repeating past topics",
-   "get topic ledger before brainstorming"
-  ]
- },
  "tool:read_youtube_public_metrics": {
   "terms": [
    "views",
    "likes",
    "comments count",
    "video stats",
+   "youtube video stats",
    "analytics",
    "performance"
   ],
@@ -3967,23 +3984,6 @@
    "add relationship event for vendor"
   ]
  },
- "tool:record_stickman_topic_ledger": {
-  "terms": [
-   "youtube topic",
-   "video topic",
-   "stick figure",
-   "content calendar",
-   "topic dedupe",
-   "reserve topic",
-   "history"
-  ],
-  "examples": [
-   "reserve stickman video topic",
-   "record uploaded video in topic ledger",
-   "import historical topics with evidence",
-   "avoid repeating video topics"
-  ]
- },
  "tool:record_youtube_publication": {
   "terms": [
    "youtube upload",
@@ -3997,21 +3997,6 @@
    "save youtube video as latest publication",
    "verify youtube video url after publishing",
    "log that video went live on youtube"
-  ]
- },
- "tool:record_youtube_workspace_metrics": {
-  "terms": [
-   "youtube",
-   "views",
-   "likes",
-   "channel stats",
-   "video stats"
-  ],
-  "examples": [
-   "record latest youtube video metrics",
-   "log youtube views to workspace metrics",
-   "track public youtube stats",
-   "how many videos published on youtube"
   ]
  },
  "tool:render_frame_samples": {
@@ -4081,6 +4066,21 @@
    "atomically replace target file"
   ]
  },
+ "tool:remember": {
+  "terms": [
+   "remember",
+   "save to memory",
+   "note this",
+   "from now on",
+   "keep in mind",
+   "forget that"
+  ],
+  "examples": [
+   "remember that I prefer replies in Chinese",
+   "from now on show me drafts before sending",
+   "don't remember that"
+  ]
+ },
  "tool:request_input": {
   "terms": [
    "ask user",
@@ -4126,6 +4126,20 @@
    "continue workflow after approval",
    "unpause stuck run",
    "provide event variables to resume"
+  ]
+ },
+ "tool:retry_workflow_run": {
+  "terms": [
+   "retry failed run",
+   "continue failed workflow",
+   "accept finished file",
+   "use the video I made",
+   "supplied output"
+  ],
+  "examples": [
+   "retry the failed workflow run from its checkpoint",
+   "accept the video made in chat as the step's output and run QA",
+   "continue a failed run with a file that already exists"
   ]
  },
  "tool:run_agent_initiative_now": {
@@ -4558,21 +4572,6 @@
    "validate output file set"
   ]
  },
- "tool:verify_stickman_final_media": {
-  "terms": [
-   "video qa",
-   "final video check",
-   "subtitle check",
-   "pre publish verification",
-   "narration quality"
-  ],
-  "examples": [
-   "verify final stickman video before publishing",
-   "check video subtitles and narration quality",
-   "validate final mp4 against target duration",
-   "qa final video before upload"
-  ]
- },
  "tool:video_edit": {
   "terms": [
    "video editor",
@@ -4858,7 +4857,8 @@
    "cron",
    "event based",
    "routine",
-   "draft automation"
+   "draft automation",
+   "daily recurring workflow"
   ],
   "examples": [
    "propose recurring automation for draft workspace",
@@ -4946,6 +4946,34 @@
    "refresh all current statistics",
    "run the native collectors for these stats",
    "gather latest measurements for this workspace"
+  ]
+ },
+ "tool:record_workspace_stat_observations": {
+  "terms": [
+   "record metric values",
+   "write measured counts",
+   "save statistic readings",
+   "store api metrics"
+  ],
+  "examples": [
+   "record the view counts a workflow just measured",
+   "write these measured values to workspace stats",
+   "save readings from an API on manual statistics",
+   "store measured counts without an agent assessment"
+  ]
+ },
+ "tool:delete_workspace_stats": {
+  "terms": [
+   "delete metrics",
+   "remove statistics",
+   "wipe tracking data",
+   "clear recorded counts"
+  ],
+  "examples": [
+   "delete the stats of a removed project",
+   "remove every statistic for this campaign",
+   "wipe the tracking data under this key prefix",
+   "clear all counts recorded for a deleted project"
   ]
  },
  "tool:configure_workspace_stat": {
@@ -5058,6 +5086,33 @@
    "propose workflow steps for this automation",
    "create a portable workflow in the draft",
    "replace the draft workflow blueprint"
+  ]
+ },
+ "tool:ws_propose_record_collection": {
+  "terms": [
+   "kept by hand",
+   "menu items",
+   "product catalogue",
+   "add edit take off"
+  ],
+  "examples": [
+   "add flows to add, change and take off menu dishes",
+   "let the owner keep the product list by hand in the draft",
+   "a collection the person edits from the app"
+  ]
+ },
+ "tool:ws_propose_source_watch": {
+  "terms": [
+   "new messages",
+   "customer dms",
+   "new emails",
+   "new comments",
+   "watch inbox"
+  ],
+  "examples": [
+   "look for new customer messages every hour and start the reply flow",
+   "start a flow for each new email in the draft",
+   "answer new instagram comments"
   ]
  },
  "tool:ws_read_source": {
@@ -5203,6 +5258,19 @@
    "set warning score threshold"
   ]
  },
+ "tool:ws_apply_blueprint": {
+  "terms": [
+   "use template",
+   "install blueprint into draft",
+   "start from blueprint",
+   "customize template"
+  ],
+  "examples": [
+   "apply blueprint to workspace draft",
+   "fill the draft from the chosen template",
+   "start the workspace draft from a blueprint"
+  ]
+ },
  "tool:ws_suggest_blueprint": {
   "terms": [
    "template",
@@ -5343,6 +5411,22 @@
    "show goal progress for this workspace",
    "check workspace targets",
    "goal status this month"
+  ]
+ },
+ "workspace_action:list_attention": {
+  "terms": [
+   "needs attention",
+   "waiting on me",
+   "what needs me",
+   "pending approvals",
+   "attention list",
+   "what are you watching"
+  ],
+  "examples": [
+   "what is waiting on me in this workspace",
+   "show what needs my attention",
+   "list open approvals and blocked work",
+   "what are you watching right now"
   ]
  },
  "workspace_action:get_stat_status": {
@@ -5717,18 +5801,16 @@
  },
  "workspace_operation:governance_policy.update": {
   "terms": [
-   "auto approve",
-   "without asking",
-   "approval policy",
+   "risk ceiling",
    "risk level",
-   "never allow",
-   "permissions"
+   "per-kind budget",
+   "spending limit"
   ],
   "examples": [
-   "let agents act without asking me for small things",
-   "auto approve low risk actions",
-   "require approval for high risk actions",
-   "never allow deleting customer data"
+   "set workspace risk ceilings and per-kind budgets",
+   "lower the maximum allowed risk level",
+   "change the workspace per-kind budget caps",
+   "set spending limits for each action kind"
   ]
  },
  "workspace_operation:heartbeat_policy.update": {
@@ -6030,6 +6112,46 @@
    "design app page entries for a series workspace"
   ]
  },
+ "tool:ws_design_workflows": {
+  "terms": [
+   "workflow design",
+   "workflows designer",
+   "content calendar workflow",
+   "publishing workflow",
+   "report workflow"
+  ],
+  "examples": [
+   "command the workflows designer for this draft",
+   "design a content calendar with scheduled publishing",
+   "design a weekly report workflow that records numbers"
+  ]
+ },
+ "tool:ws_commit_build_spec": {
+  "terms": [
+   "build spec",
+   "workspace build plan",
+   "part briefs",
+   "shared names and references"
+  ],
+  "examples": [
+   "commit the build spec for this draft",
+   "plan the agents workflows and automations before designing them",
+   "decide whether this workspace is built solo or by part designers"
+  ]
+ },
+ "tool:ws_design_parts": {
+  "terms": [
+   "part designers",
+   "design workspace parts",
+   "parallel design wave",
+   "agents knowledge automations design"
+  ],
+  "examples": [
+   "run the next wave of part designers",
+   "send the agents design back with feedback",
+   "design the automations and app after the workflows are accepted"
+  ]
+ },
  "tool:ws_accept_app_view": {
   "terms": [
    "accept app design",
@@ -6040,6 +6162,75 @@
    "accept the app page candidate",
    "accept the designed workspace app page",
    "approve the app designer candidate page"
+  ]
+ },
+ "tool:ws_accept_parts": {
+  "terms": [
+   "accept part designs",
+   "accept designer candidates",
+   "accept workspace parts"
+  ],
+  "examples": [
+   "accept the app candidate",
+   "accept the designed workspace parts",
+   "accept the part designers' candidates"
+  ]
+ },
+ "manor_action:list_always_allow": {
+  "terms": [
+   "always allow",
+   "saved always allow",
+   "runs without asking",
+   "standing permission"
+  ],
+  "examples": [
+   "what did I always allow",
+   "show my always allow choices",
+   "which actions run without asking me",
+   "list my always allow permissions"
+  ]
+ },
+ "manor_action:stop_always_allow": {
+  "terms": [
+   "ask me again",
+   "revoke always allow",
+   "undo always allow",
+   "stop always allowing"
+  ],
+  "examples": [
+   "ask me before sending again",
+   "stop always allowing this action",
+   "undo always allow",
+   "revoke my always allow permission"
+  ]
+ },
+ "tool:ws_ask_user": {
+  "terms": [
+   "follow-up question",
+   "suggested answers",
+   "recommended answer",
+   "clarifying question"
+  ],
+  "examples": [
+   "ask a follow-up question while drafting a workspace",
+   "offer suggested answers in workspace setup",
+   "clarifying question with recommended answer for new workspace"
+  ]
+ },
+ "tool:ws_flag_missing_integration": {
+  "terms": [
+   "integration not connected",
+   "connect later",
+   "pending connection",
+   "needs setup",
+   "missing integration",
+   "waiting for connection"
+  ],
+  "examples": [
+   "record an integration the user has not connected yet",
+   "mark gmail as waiting for connection",
+   "flag analytics platform the workspace needs",
+   "keep a not yet connected integration on the draft"
   ]
  }
 }

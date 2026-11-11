@@ -28,6 +28,7 @@ from packages.core.services.external_collaboration_access import (
 from packages.core.services.workspace_access import (
     lock_workspace_access_boundary,
     lock_workspace_recipient_authorization,
+    manageable_workspace_ids_for_user,
     user_can_manage_workspace,
 )
 
@@ -204,10 +205,7 @@ async def live_boundary(db, row, *, lock=True):
             .execution_options(populate_existing=True)
         )
     entity = await db.scalar(select(Entity.id).where(Entity.id == row.entity_id, Entity.deleted_at.is_(None)))
-    if ws is None or ws.deleted_at is not None or entity is None:
-        raise HTTPException(410, "Workspace is no longer available")
-    if row.status == "revoked" or grant_expired(row):
-        raise HTTPException(410, "Collaboration expired or revoked")
+    _require_live_grant(row, ws, entity)
     if row.authorized_by:
         if lock:
             await lock_workspace_recipient_authorization(
@@ -235,6 +233,91 @@ async def live_boundary(db, row, *, lock=True):
         ):
             raise HTTPException(410, "The issuing manager is no longer authorized")
     return ws
+
+
+def _require_live_grant(row, ws, entity) -> None:
+    if ws is None or ws.deleted_at is not None or entity is None:
+        raise HTTPException(410, "Workspace is no longer available")
+    if row.status == "revoked" or grant_expired(row):
+        raise HTTPException(410, "Collaboration expired or revoked")
+
+
+async def live_grant_ids(db, grants) -> set[str]:
+    """The grants ``live_boundary(db, row, lock=False)`` would pass, without its
+    queries for each one: for reading many, as a list does.
+
+    Same checks and same reads. The Workspace, company, issuer, membership and
+    seat are read once for all of them; whether an issuer manages a Workspace is
+    decided once per issuer and company.
+    """
+    grants = list(grants)
+    if not grants:
+        return set()
+    workspaces = {
+        row.id: row
+        for row in await db.execute(
+            select(Workspace.id, Workspace.entity_id, Workspace.deleted_at)
+            .where(Workspace.id.in_({grant.workspace_id for grant in grants}))
+        )
+    }
+    entities = set(await db.scalars(
+        select(Entity.id).where(Entity.id.in_({grant.entity_id for grant in grants}), Entity.deleted_at.is_(None))
+    ))
+    issuer_ids = {grant.authorized_by for grant in grants if grant.authorized_by}
+    issuers, memberships, seats = set(), {}, {}
+    if issuer_ids:
+        issuers = set(await db.scalars(
+            select(User.id).where(User.id.in_(issuer_ids), User.status == "active", User.deleted_at.is_(None))
+        ))
+        memberships = {
+            (row.user_id, row.entity_id): row
+            for row in await db.execute(
+                select(UserMembership.user_id, UserMembership.entity_id, *_MEMBERSHIP_AUTHORITY)
+                .where(UserMembership.user_id.in_(issuer_ids), UserMembership.entity_id.in_(entities))
+            )
+        }
+        seats = {
+            (row.workspace_id, row.user_id): row
+            for row in await db.execute(
+                select(WorkspaceStaff.workspace_id, WorkspaceStaff.user_id, *_SEAT_AUTHORITY)
+                .where(WorkspaceStaff.workspace_id.in_(list(workspaces)), WorkspaceStaff.user_id.in_(issuer_ids))
+            )
+        }
+
+    def active_role(user_id, entity_id):
+        row = memberships.get((user_id, entity_id))
+        return row.role if row is not None and row.status == "active" and row.deleted_at is None else None
+
+    # Everything that can refuse without a query goes first.
+    live, to_decide = set(), {}
+    for grant in grants:
+        ws = workspaces.get(grant.workspace_id)
+        if ws is not None and ws.entity_id != grant.entity_id:
+            ws = None
+        try:
+            _require_live_grant(grant, ws, grant.entity_id if grant.entity_id in entities else None)
+        except HTTPException:
+            continue
+        issuer = grant.authorized_by
+        if not issuer:
+            live.add(grant.id)
+            continue
+        membership = memberships.get((issuer, ws.entity_id))
+        seat = seats.get((ws.id, issuer))
+        if (
+            grant.authority_fingerprint == _authority_fingerprint(membership and membership[2:], seat and seat[2:])
+            and issuer in issuers
+            and active_role(issuer, ws.entity_id) is not None
+        ):
+            to_decide.setdefault((issuer, ws.entity_id), []).append((grant, ws))
+
+    for (issuer, entity_id), pairs in to_decide.items():
+        managed = await manageable_workspace_ids_for_user(
+            db, workspaces=[ws for _, ws in pairs], entity_id=entity_id, user_id=issuer,
+            entity_role=active_role(issuer, entity_id),
+        )
+        live.update(grant.id for grant, ws in pairs if ws.id in managed)
+    return live
 
 
 async def guest_grant(db, user, grant_id, *, active=True, for_update=False):
@@ -633,38 +716,41 @@ async def phase(db, user, workspace_id, action, note, provider=None):
     return {"phase": delivery.phase, "acceptance": delivery.acceptance}
 
 
-async def issuer_fingerprint(db, ws, user_id):
+#: What an issuer's authority is pinned to, in the order the fingerprint hashes it.
+_MEMBERSHIP_AUTHORITY = (
+    UserMembership.id, UserMembership.role, UserMembership.status, UserMembership.updated_at, UserMembership.deleted_at,
+)
+_SEAT_AUTHORITY = (
+    WorkspaceStaff.id, WorkspaceStaff.role, WorkspaceStaff.status, WorkspaceStaff.expires_at, WorkspaceStaff.updated_at,
+)
+
+
+def _authority_fingerprint(membership, workspace_member) -> str:
     import hashlib
     import json
 
-    membership = (
-        await db.execute(
-            select(
-                UserMembership.id,
-                UserMembership.role,
-                UserMembership.status,
-                UserMembership.updated_at,
-                UserMembership.deleted_at,
-            ).where(UserMembership.user_id == user_id, UserMembership.entity_id == ws.entity_id)
-        )
-    ).one_or_none()
-    workspace_member = (
-        await db.execute(
-            select(
-                WorkspaceStaff.id,
-                WorkspaceStaff.role,
-                WorkspaceStaff.status,
-                WorkspaceStaff.expires_at,
-                WorkspaceStaff.updated_at,
-            ).where(WorkspaceStaff.workspace_id == ws.id, WorkspaceStaff.user_id == user_id)
-        )
-    ).one_or_none()
     return hashlib.sha256(
         json.dumps(
             [list(membership) if membership else None, list(workspace_member) if workspace_member else None],
             default=str,
         ).encode()
     ).hexdigest()
+
+
+async def issuer_fingerprint(db, ws, user_id):
+    membership = (
+        await db.execute(
+            select(*_MEMBERSHIP_AUTHORITY)
+            .where(UserMembership.user_id == user_id, UserMembership.entity_id == ws.entity_id)
+        )
+    ).one_or_none()
+    workspace_member = (
+        await db.execute(
+            select(*_SEAT_AUTHORITY)
+            .where(WorkspaceStaff.workspace_id == ws.id, WorkspaceStaff.user_id == user_id)
+        )
+    ).one_or_none()
+    return _authority_fingerprint(membership, workspace_member)
 
 
 async def fresh_actor(db, user, *, verified=False, for_update=False):

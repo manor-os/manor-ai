@@ -206,9 +206,13 @@ and often `manor_hint`; apply those. Write the source so these never fire:
   animate an inner wrapper.
 - `gsap_timeline_set_initial_hide`: author initial hidden states in CSS or
   `gsap.set()`, not `tl.set(..., 0)`.
-- Fonts: `font_family_without_font_face` and `google_fonts_import` fail; ship
-  the font file under `assets/` with `@font-face`. `system_font_will_alias`
-  and `timed_element_missing_visibility_hidden` are info only.
+- Fonts: `font_family_without_font_face` and `google_fonts_import` fail. Declare
+  a font installed in the Sandbox (motion-design lists them) with `src: local()`:
+  `@font-face { font-family: "Noto Sans CJK SC"; font-weight: 700; src: local("Noto Sans CJK SC Bold"); }`.
+  It needs no file, license record or glyph check, so never stop for one. Ship any
+  other face as a font file under `assets/` with `@font-face`.
+  `system_font_will_alias` and `timed_element_missing_visibility_hidden` are info
+  only.
 - Media: every `<video>`/`<audio>` has `src`, `data-start` and a unique `id`;
   a timed `<video>` is `muted` (sound via a separate `<audio>`) unless
   `data-has-audio="true"`; no `preload="none"`.

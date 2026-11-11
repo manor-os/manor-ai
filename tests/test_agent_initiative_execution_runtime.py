@@ -30,6 +30,7 @@ from packages.core.services.agent_initiative_delivery import (
     _delivery_retry_at,
     _publish_surface_event,
     initiative_notification_body,
+    initiative_notification_channels,
     initiative_notification_link,
     initiative_quiet_hours_active,
 )
@@ -747,6 +748,21 @@ def test_quiet_hours_keep_inapp_policy_server_owned() -> None:
     ) is True
 
 
+def test_owner_setting_for_initiative_updates_wins_over_initiative_channels() -> None:
+    configured = ["inapp", "email"]
+    assert initiative_notification_channels(configured, None) == configured
+
+    def prefs(override):
+        return {"notifications": {"by_kind": {"agent_initiative_update": override}}}
+
+    # Switched off: the bell only, as for every other catalogued kind.
+    assert initiative_notification_channels(configured, prefs({"enabled": False})) == ["inapp"]
+    assert initiative_notification_channels(
+        configured, prefs({"enabled": True, "channels": ["telegram"]}),
+    ) == ["inapp", "telegram"]
+    assert initiative_notification_channels(configured, prefs({"enabled": True})) == configured
+
+
 @pytest.mark.asyncio
 async def test_successful_scheduled_one_shot_completes_and_closes_driver(
     monkeypatch,
@@ -901,6 +917,58 @@ async def test_manual_scheduler_settlement_does_not_disable_delete_after_driver(
 
     assert auto_paused is False
     assert job.enabled is True
+
+
+@pytest.mark.parametrize("job_id, execution_type, pauses", [
+    ("sr:workspace-1", "strategist_review", False),
+    ("oe:workspace-1", "outcome_evaluation", False),
+    ("cie:workspace-1", "chat_insight_extraction", False),
+    ("gm:goal-1", "goal_measurement", False),
+    ("weekly_report-1", "workflow", True),
+])
+@pytest.mark.asyncio
+async def test_a_workspace_runtime_schedule_backs_off_instead_of_pausing(
+    monkeypatch, job_id: str, execution_type: str, pauses: bool,
+) -> None:
+    """Staging 2026-11-03: one budget-check outage paused review jobs, and three Workspaces went unwatched for a month."""
+    from packages.core.services import scheduler_service
+
+    runs = [SimpleNamespace(id=f"run-{index}", status="error", trigger_type="cron") for index in range(3)]
+    job = SimpleNamespace(
+        job_id=job_id, execution_type=execution_type, execution_target={}, agent_initiative_id=None,
+        delete_after_run=False, enabled=True, consecutive_errors=2, last_status="running",
+        next_run_at=datetime.now(timezone.utc), entity_id="e", workspace_id="w",
+    )
+
+    class Result:
+        def scalars(self):
+            return runs
+
+    class DB:
+        sync_session = None
+
+        async def execute(self, _statement):
+            return Result()
+
+    applied: list[dict] = []
+
+    async def apply_locked(_db, _job, values, **_kwargs):
+        applied.append(values)
+
+    reported: list[object] = []
+    monkeypatch.setattr(scheduler_service.ScheduledJobMutationFactory, "apply_locked", apply_locked)
+    monkeypatch.setattr(scheduler_service, "_report_initiative_failures_after_commit",
+                        lambda _db, failing: reported.append(failing))
+    before = job.next_run_at
+
+    auto_paused = await scheduler_service.reconcile_scheduled_job_run_projection(
+        DB(), job, finalized_run_id=runs[0].id,
+    )
+
+    assert auto_paused is pauses
+    assert applied == ([{"enabled": False}] if pauses else [])
+    if not pauses:
+        assert job.next_run_at > before and reported == [job]
 
 
 def test_delivery_recovery_has_bounded_attempts_lease_and_backoff() -> None:

@@ -33,6 +33,7 @@
     "get_workflow_run",
     "cancel_workflow_run",
     "resume_workflow_run",
+    "retry_workflow_run",
     "import_workflow"
   ],
   "workspace_operations": {

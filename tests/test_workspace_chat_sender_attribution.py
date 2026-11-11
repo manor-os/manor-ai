@@ -20,7 +20,6 @@ from packages.core.models.workspace import WorkspaceStaff
 from packages.core.services import conversation_history
 from packages.core.services import workspace_runtime
 from packages.core.services.workspace_runtime import (
-    process_workspace_chat_message,
     process_workspace_task_comment,
 )
 from tests.test_document_permissions import _create_entity_user
@@ -36,7 +35,7 @@ async def test_two_same_name_members_keep_distinct_persisted_authors(
     monkeypatch.setattr(
         workspace_chat,
         "_schedule_workspace_chat_processing",
-        lambda **kwargs: scheduled.append(kwargs),
+        AsyncMock(side_effect=lambda **kwargs: scheduled.append(kwargs)),
     )
 
     registered = await client.post("/api/v1/auth/register", json={
@@ -299,32 +298,50 @@ async def test_two_same_name_members_keep_distinct_persisted_authors(
 
 
 @pytest.mark.asyncio
-async def test_workspace_processing_identifies_the_exact_persisted_request(
-    monkeypatch,
-) -> None:
-    runtime = AsyncMock()
+async def test_a_posted_message_runs_as_a_durable_turn_the_chat_can_see(client, db_session, monkeypatch) -> None:
+    """Staging 2026-11-03: a turn from POST /chat/messages ran 10 minutes inside the API process and read as idle."""
+    from packages.core.models.runtime_run import RuntimeRun
+    from packages.core.models.task import Message
+    from packages.core.tasks import runtime_tasks
 
-    @asynccontextmanager
-    async def fake_session():
-        yield object()
+    published: list[str] = []
 
-    monkeypatch.setattr("packages.core.database.async_session", fake_session)
-    monkeypatch.setattr("packages.core.ai.runtime.runtime_run_chat_turn", runtime)
+    async def publish(run_id):
+        published.append(run_id)
+        return True
 
-    await process_workspace_chat_message(
-        conversation_id="conversation-1",
-        workspace_id="workspace-1",
-        entity_id="entity-1",
-        user_id="user-2",
-        message="Please wait for legal review.",
-        message_id="message-2",
-    )
+    monkeypatch.setattr(runtime_tasks, "publish_runtime_run_outbox_now", publish)
+    registered = await client.post("/api/v1/auth/register", json={
+        "email": "ws-durable-post@example.com", "password": "test-password-123", "entity_name": "Durable post",
+    })
+    headers = {"Authorization": f"Bearer {registered.json()['access_token']}"}
+    workspace = (await client.post("/api/v1/workspaces", headers=headers, json={"name": "Durable"})).json()
+    url = f"/api/v1/workspaces/{workspace['id']}/chat/messages"
 
-    assert runtime.await_count == 1
-    assert runtime.await_args.kwargs["user_id"] == "user-2"
-    assert runtime.await_args.kwargs["runtime_metadata"] == {
-        "origin_user_message_id": "message-2",
-    }
+    posted = await client.post(url, headers=headers, json={"body": "Draft five ideas", "audience": "ai"})
+    assert posted.status_code == 201, posted.text
+    [run] = (await db_session.execute(select(RuntimeRun).where(RuntimeRun.workspace_id == workspace["id"]))).scalars().all()
+    assert published == [run.id] and run.status == "queued"
+    assert run.execution_payload["message"] == "Draft five ideas"
+    assert run.execution_payload["surface"] == "workspace_chat"
+    assert run.execution_payload["runtime_metadata"] == {"origin_user_message_id": posted.json()["id"]}
+    placeholder = await db_session.get(Message, run.assistant_message_id)
+    assert placeholder.role == "assistant" and placeholder.meta["stream_status"] == "running"
+
+    page = (await client.get(f"{url}/page", headers=headers)).json()
+    assert page["has_active_runtime_run"] in (True, None)
+
+    # One turn at a time; the refused message is not kept.
+    again = await client.post(url, headers=headers, json={"body": "And five more", "audience": "ai"})
+    assert again.status_code == 409, again.text
+    bodies = [row.content for row in (await db_session.execute(
+        select(Message).where(Message.conversation_id == run.conversation_id, Message.role == "user"))).scalars()]
+    assert "And five more" not in bodies
+
+    # A note for the team starts no turn.
+    team = await client.post(url, headers=headers, json={"body": "FYI", "audience": "team"})
+    assert team.status_code == 201, team.text
+    assert published == [run.id]
 
 
 @pytest.mark.asyncio

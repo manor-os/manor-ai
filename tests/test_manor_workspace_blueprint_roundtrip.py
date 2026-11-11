@@ -47,6 +47,20 @@ def test_roundtrip_reports_workflow_graph_change() -> None:
     assert _MODULE.compare(source, installed)
 
 
+@pytest.mark.parametrize("step_type", ["end", "stop"])
+def test_roundtrip_accepts_empty_terminal_routes_and_still_compares_edges(step_type: str) -> None:
+    source = {
+        "recipe": {"workflows": [{"slug": "daily", "steps": [{"id": "finish", "type": step_type}]}]},
+    }
+    installed = deepcopy(source)
+    terminal = installed["recipe"]["workflows"][0]["steps"][0]
+    terminal["next"] = []
+    assert _MODULE.compare(source, installed) == []
+
+    terminal["next"] = ["another_step"]
+    assert _MODULE.compare(source, installed)
+
+
 def test_roundtrip_reports_portable_step_id_change() -> None:
     source = {"recipe": {"workflows": [{"slug": "daily", "steps": [{"id": "produce", "next": []}]}]}}
     installed = {"recipe": {"workflows": [{"slug": "daily", "steps": [{"id": "publish", "next": []}]}]}}

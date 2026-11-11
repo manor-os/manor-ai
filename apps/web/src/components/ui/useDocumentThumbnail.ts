@@ -30,7 +30,11 @@ export function useDocumentThumbnail(documentId: string | null | undefined, name
     },
     enabled: Boolean(enabled && kind && documentId),
     staleTime: Infinity,
-    retry: false,
+    // A just-made file's preview is rendered on the first ask and can take a
+    // while (a deck goes through LibreOffice); ask again a few times instead
+    // of keeping the plain icon until the page reloads.
+    retry: 4,
+    retryDelay: (attempt) => Math.min(30_000, 4_000 * 2 ** attempt),
   });
   return { kind, src: thumbnail.data };
 }

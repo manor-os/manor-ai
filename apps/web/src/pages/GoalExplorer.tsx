@@ -72,7 +72,7 @@ const STATUS_BADGE: Record<string, { type: "info" | "success" | "warning" | "dan
 const STEP_COLORS: Record<string, { border: string; bg: string; dot: string }> = {
   completed: { border: "#34d399", bg: "#f1f6f3", dot: "#44895f" },
   running: { border: "#8aa9d1", bg: "#f3f6fa", dot: "#4869ac" },
-  pending: { border: "#d6d3d1", bg: "#fafaf9", dot: "#a8a29e" },
+  pending: { border: "#d1d1d6", bg: "#fafafa", dot: "#aeaeb2" },
   failed: { border: "#d18b86", bg: "#f8f0ef", dot: "#c14a44" },
   waiting: { border: "#ddbb63", bg: "#faf7ef", dot: "#b27c34" },
 };
@@ -102,7 +102,7 @@ function JsonView({ data, label }: { data: unknown; label: string }) {
           gap: 4,
           fontSize: 12,
           fontWeight: 600,
-          color: "#78716c",
+          color: "var(--text-muted)",
           background: "transparent",
           border: "none",
           cursor: "pointer",
@@ -123,7 +123,7 @@ function JsonView({ data, label }: { data: unknown; label: string }) {
         {label}
       </button>
       {expanded && (
-        <pre style={{ marginTop: 4, padding: 12, background: "rgba(245,245,244,0.6)", borderRadius: 12, fontSize: 12, color: "#57534e", overflow: "auto", maxHeight: 192 }}>
+        <pre style={{ marginTop: 4, padding: 12, background: "rgba(245,245,244,0.6)", borderRadius: 12, fontSize: 12, color: "var(--text-muted)", overflow: "auto", maxHeight: 192 }}>
           {JSON.stringify(data, null, 2)}
         </pre>
       )}
@@ -159,7 +159,7 @@ function CreateGoalContent({ onSave }: { onSave: (text: string, workspaceId?: st
           placeholder={t("page.goal_explorer.describe_the_goal_you_want_to_achieve")}
         />
         <div>
-          <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: "#44403c", marginBottom: 4 }}>{t("page.goal_explorer.workspace_optional")}</label>
+          <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: "var(--text-default)", marginBottom: 4 }}>{t("page.goal_explorer.workspace_optional")}</label>
           <select
             value={workspaceId}
             onChange={(e) => setWorkspaceId(e.target.value)}
@@ -196,10 +196,10 @@ function StepDetailPanel({
       style={{ width: "min(100%, 350px)", flex: "1 1 280px", padding: 20, overflowY: "auto" }}
     >
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
-        <h3 style={{ fontSize: 14, fontWeight: 700, color: "#292524", margin: 0 }}>{t("page.goal_explorer.step_details")}</h3>
+        <h3 style={{ fontSize: 14, fontWeight: 700, color: "var(--text-strong)", margin: 0 }}>{t("page.goal_explorer.step_details")}</h3>
         <button
           onClick={onClose}
-          style={{ color: "#a8a29e", background: "transparent", border: "none", cursor: "pointer" }}
+          style={{ color: "var(--text-muted)", background: "transparent", border: "none", cursor: "pointer" }}
         >
           <IconClose size={16} />
         </button>
@@ -207,17 +207,17 @@ function StepDetailPanel({
 
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
         <div>
-          <span style={{ fontSize: 11, color: "#a8a29e" }}>{t("page.task_collections.name")}</span>
-          <p style={{ fontSize: 13, fontWeight: 600, color: "#292524", margin: "2px 0 0 0" }}>{step.name}</p>
+          <span style={{ fontSize: 11, color: "var(--text-muted)" }}>{t("page.task_collections.name")}</span>
+          <p style={{ fontSize: 13, fontWeight: 600, color: "var(--text-strong)", margin: "2px 0 0 0" }}>{step.name}</p>
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
           <div>
-            <span style={{ fontSize: 11, color: "#a8a29e" }}>{t("page.custom_fields.type")}</span>
-            <p style={{ fontSize: 13, color: "#44403c", margin: "2px 0 0 0" }}>{step.type}</p>
+            <span style={{ fontSize: 11, color: "var(--text-muted)" }}>{t("page.custom_fields.type")}</span>
+            <p style={{ fontSize: 13, color: "var(--text-default)", margin: "2px 0 0 0" }}>{step.type}</p>
           </div>
           <div>
-            <span style={{ fontSize: 11, color: "#a8a29e" }}>{t("page.agent_dashboard.status")}</span>
+            <span style={{ fontSize: 11, color: "var(--text-muted)" }}>{t("page.agent_dashboard.status")}</span>
             <div style={{ marginTop: 2 }}>
               <StatusBadge type={badge.type} dot>{badge.label}</StatusBadge>
             </div>
@@ -226,17 +226,17 @@ function StepDetailPanel({
 
         {step.duration_ms !== undefined && (
           <div>
-            <span style={{ fontSize: 11, color: "#a8a29e" }}>{t("page.agent_dashboard.duration")}</span>
-            <p style={{ fontSize: 13, color: "#44403c", margin: "2px 0 0 0" }}>{formatDuration(step.duration_ms)}</p>
+            <span style={{ fontSize: 11, color: "var(--text-muted)" }}>{t("page.agent_dashboard.duration")}</span>
+            <p style={{ fontSize: 13, color: "var(--text-default)", margin: "2px 0 0 0" }}>{formatDuration(step.duration_ms)}</p>
           </div>
         )}
 
         {step.token_usage && Object.keys(step.token_usage).length > 0 && (
           <div>
-            <span style={{ fontSize: 11, color: "#a8a29e" }}>{t("page.goal_explorer.token_usage")}</span>
+            <span style={{ fontSize: 11, color: "var(--text-muted)" }}>{t("page.goal_explorer.token_usage")}</span>
             <div style={{ display: "flex", gap: 12, marginTop: 4 }}>
               {Object.entries(step.token_usage).map(([k, v]) => (
-                <span key={k} style={{ fontSize: 12, color: "#57534e" }}>
+                <span key={k} style={{ fontSize: 12, color: "var(--text-muted)" }}>
                   {k}: <strong>{v.toLocaleString()}</strong>
                 </span>
               ))}
@@ -257,10 +257,10 @@ function StepDetailPanel({
         )}
 
         {step.requires_human_input && step.status === "waiting" && (
-          <div style={{ borderTop: "1px solid rgba(28,25,23,0.06)", paddingTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+          <div style={{ borderTop: "0.5px solid rgba(29, 29, 31,0.06)", paddingTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
             <span style={{ fontSize: 12, fontWeight: 600, color: "#b27c34" }}>{t("page.goal_explorer.human_input_required")}</span>
             {step.human_prompt && (
-              <p style={{ fontSize: 13, color: "#44403c" }}>{step.human_prompt}</p>
+              <p style={{ fontSize: 13, color: "var(--text-default)" }}>{step.human_prompt}</p>
             )}
             <Textarea
               value={hitlInput}
@@ -324,7 +324,7 @@ function GoalDetail({ goalId }: { goalId: string }) {
       <div style={{ marginBottom: 24 }}>
         <button
           onClick={() => navigate("/goals")}
-          style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 13, color: "#78716c", background: "transparent", border: "none", cursor: "pointer", marginBottom: 12 }}
+          style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 13, color: "var(--text-muted)", background: "transparent", border: "none", cursor: "pointer", marginBottom: 12 }}
         >
           <IconChevronLeft size={16} />
           {t("page.goal_explorer.back_to_goals")}
@@ -332,13 +332,13 @@ function GoalDetail({ goalId }: { goalId: string }) {
         <div className="glass-panel" style={{ padding: "24px 28px" }}>
           <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between" }}>
             <div>
-              <h1 style={{ fontSize: 22, fontWeight: 800, color: "#292524", margin: 0 }}>{goal.goal_text}</h1>
+              <h1 style={{ fontSize: 22, fontWeight: 800, color: "var(--text-strong)", margin: 0 }}>{goal.goal_text}</h1>
               <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 8 }}>
                 <StatusBadge type={badge.type} dot pulse={goal.status === "running"}>
                   {badge.label}
                 </StatusBadge>
-                <span style={{ fontSize: 12, color: "#a8a29e" }}>{Math.round(goal.progress)}{t("page.goal_explorer.percent_complete")}</span>
-                <span style={{ fontSize: 12, color: "#a8a29e" }}>{formatDate(goal.created_at)}</span>
+                <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{Math.round(goal.progress)}{t("page.goal_explorer.percent_complete")}</span>
+                <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{formatDate(goal.created_at)}</span>
               </div>
             </div>
             {goal.status === "running" && (
@@ -357,10 +357,10 @@ function GoalDetail({ goalId }: { goalId: string }) {
       {/* Progress bar */}
       <div className="glass-card" style={{ padding: 16, marginBottom: 24 }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-          <span style={{ fontSize: 12, fontWeight: 600, color: "#78716c" }}>{t("page.goal_explorer.progress")}</span>
-          <span style={{ fontSize: 12, fontWeight: 700, color: "#44403c" }}>{Math.round(goal.progress)}%</span>
+          <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text-muted)" }}>{t("page.goal_explorer.progress")}</span>
+          <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-default)" }}>{Math.round(goal.progress)}%</span>
         </div>
-        <div style={{ height: 8, background: "#f5f5f4", borderRadius: 99, overflow: "hidden" }}>
+        <div style={{ height: 8, background: "var(--surface-muted)", borderRadius: 99, overflow: "hidden" }}>
           <div
             style={{
               height: "100%",
@@ -378,7 +378,7 @@ function GoalDetail({ goalId }: { goalId: string }) {
         <div style={{ flex: 1, minWidth: 0 }}>
           {/* Step pipeline */}
           <div className="glass-card" style={{ padding: 20, marginBottom: 24 }}>
-            <h3 style={{ fontSize: 14, fontWeight: 700, color: "#292524", margin: "0 0 16px 0" }}>
+            <h3 style={{ fontSize: 14, fontWeight: 700, color: "var(--text-strong)", margin: "0 0 16px 0" }}>
               {t("page.goal_explorer.steps")}{sortedSteps.length})
             </h3>
             <StepGraph
@@ -401,8 +401,8 @@ function GoalDetail({ goalId }: { goalId: string }) {
           {/* Context */}
           {goal.context && Object.keys(goal.context).length > 0 && (
             <div className="glass-card" style={{ padding: 20, marginBottom: 24 }}>
-              <h3 style={{ fontSize: 14, fontWeight: 700, color: "#292524", margin: "0 0 12px 0" }}>{t("page.memories.context")}</h3>
-              <pre style={{ padding: 12, background: "rgba(245,245,244,0.6)", borderRadius: 12, fontSize: 12, color: "#57534e", overflow: "auto", maxHeight: 192 }}>
+              <h3 style={{ fontSize: 14, fontWeight: 700, color: "var(--text-strong)", margin: "0 0 12px 0" }}>{t("page.memories.context")}</h3>
+              <pre style={{ padding: 12, background: "rgba(245,245,244,0.6)", borderRadius: 12, fontSize: 12, color: "var(--text-muted)", overflow: "auto", maxHeight: 192 }}>
                 {JSON.stringify(goal.context, null, 2)}
               </pre>
             </div>
@@ -487,7 +487,7 @@ function GoalList() {
       ) : goals.length === 0 ? (
         <EmptyState
           icon={
-            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#d6d3d1" strokeWidth={1.5}>
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#d1d1d6" strokeWidth={1.5}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12c0 1.268-.63 2.39-1.593 3.068a3.745 3.745 0 01-1.043 3.296 3.745 3.745 0 01-3.296 1.043A3.745 3.745 0 0112 21c-1.268 0-2.39-.63-3.068-1.593a3.746 3.746 0 01-3.296-1.043 3.745 3.745 0 01-1.043-3.296A3.745 3.745 0 013 12c0-1.268.63-2.39 1.593-3.068a3.745 3.745 0 011.043-3.296 3.746 3.746 0 013.296-1.043A3.746 3.746 0 0112 3c1.268 0 2.39.63 3.068 1.593a3.746 3.746 0 013.296 1.043 3.746 3.746 0 011.043 3.296A3.745 3.745 0 0121 12z" />
             </svg>
           }
@@ -520,12 +520,12 @@ function GoalList() {
                 <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
-                      <h3 style={{ fontSize: 14, fontWeight: 700, color: "#292524", margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{goal.goal_text}</h3>
+                      <h3 style={{ fontSize: 14, fontWeight: 700, color: "var(--text-strong)", margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{goal.goal_text}</h3>
                       <StatusBadge type={badge.type} dot pulse={goal.status === "running"}>
                         {badge.label}
                       </StatusBadge>
                     </div>
-                    <div style={{ display: "flex", alignItems: "center", gap: 16, fontSize: 12, color: "#a8a29e" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 16, fontSize: 12, color: "var(--text-muted)" }}>
                       <span>{goal.step_count} {t("page.flows.step")}{goal.step_count !== 1 ? "s" : ""}</span>
                       <span>{formatDate(goal.created_at)}</span>
                     </div>
@@ -533,9 +533,9 @@ function GoalList() {
                   {/* Progress bar */}
                   <div style={{ width: 128, flexShrink: 0 }}>
                     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
-                      <span style={{ fontSize: 12, color: "#a8a29e" }}>{Math.round(goal.progress)}%</span>
+                      <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{Math.round(goal.progress)}%</span>
                     </div>
-                    <div style={{ height: 6, background: "#f5f5f4", borderRadius: 99, overflow: "hidden" }}>
+                    <div style={{ height: 6, background: "var(--surface-muted)", borderRadius: 99, overflow: "hidden" }}>
                       <div
                         style={{
                           height: "100%",
@@ -548,7 +548,7 @@ function GoalList() {
                     </div>
                   </div>
                   {/* Arrow */}
-                  <span style={{ flexShrink: 0, color: "#d6d3d1" }}>
+                  <span style={{ flexShrink: 0, color: "var(--text-faint)" }}>
                     <IconChevronRight size={20} />
                   </span>
                 </div>

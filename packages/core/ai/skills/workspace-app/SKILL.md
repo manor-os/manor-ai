@@ -1,7 +1,7 @@
 ---
 name: workspace-app
 description: Configure the Workspace App layout, main action, forms and internal links to Agent Chat, Workflow or Automation.
-version: 1.0.8
+version: 1.0.10
 ---
 
 # Workspace App
@@ -18,9 +18,33 @@ the App designer with operation `design_app` and
 `brief:"<what the person wants to do from the App>"`. It reads what the
 Workspace runs, composes the page from the App module schematic and recipes,
 and returns a checked candidate as an `app_view.update` draft with its design
-notes. Review the candidate against the request, then accept it with
-`apply_draft` (the person approves the review card), send it back with
-`design_app`, `feedback` and that `draft_id`, or `discard_draft`.
+notes. It also shows the person the draft's review card, which previews the
+page with their real data; they approve or reject it there. Tell them who the
+page is for and what its first screen shows. If the candidate misses the
+request, call `design_app` again with `feedback` and that `draft_id`: the old
+card closes and a new one replaces it.
+
+The card and the design notes say how the page's self-check went. To run it
+yourself, call operation `test_app`, with `draft_id` for a draft's page. It reads
+every view as this person, without changing anything, and says which one failed,
+why and how to fix it. A view also fails when its cards would show people an
+unfilled `{{...}}` template, a bare id, an internal key such as
+`awaiting_approval` or raw data, and a field showing a Workflow's fixed
+choices (`enum` values) without labels for each: fix the field or the Workflow step that writes it. It proves reads work, not that clicking works, so never
+tell the person a button was tested. A view with `no_data` has nothing to read
+yet, which is not a failure.
+
+Design the page for the people who use it. When the request names neither a
+person nor a change (the App's edit button asks "redesign this page around
+the people who use it"), start with operation `app_audience`. It returns the
+Workspace's purpose, its people and roles, what waits on them, its projects by
+stage and how the page is used. Ask the person with `request_input` who the
+page is mainly for: up to three options, each a person or role with what they
+act on first ("Account owner — pending approvals and finished files first",
+"Editor — drafts waiting for notes"), recommending the one with the most
+waiting on them. Then call `design_app` with the person's request as `brief`
+and the chosen option as `audience`. An explicit change ("put approvals
+first", "hide Research") goes straight to `design_app` without asking.
 
 For small named changes (titles, descriptions, visible/order settings, primary action, input forms
 and internal execution targets), create a configuration draft using `app_view.update`.
@@ -98,6 +122,20 @@ the cards only, never as tiles of their own. A Flow that makes a child again ope
 `{{child.production_root}}`, and records it on the child when done; the card
 then shows only that take. Do not add a section per Workspace for this; configure
 these sources.
+
+A `progress` block (a calendar's scheduled items) takes the same `item_action`.
+A `progress` or `summary` card may carry up to four more in `item_actions`. Each
+one may fill its form from the record (`prefill: {<Flow input>: <source field>}`,
+so an edit starts from the current values) or ask first and then run in place
+(`confirm: "<question>"`, for taking something off or cancelling it).
+A `progress` block over `workflow_projects` that lists records people add by
+hand (a menu, a catalogue) takes `add_action: {action: "workflow:<add flow>",
+label: "Add a dish"}`: an Add button in the list's header that opens that
+entry exactly as its tile does (same form, same approvals). The entry may
+stay a tile too.
+For an action about the item's results (refresh this post's counts), give it a
+`result_action` of the same shape: it shows as a small icon beside the results
+and runs the entry in place, so the entry's other inputs must not need answers.
 
 Project sources may declare `stages:["scheduled","ready"]` and
 `order:{field:["due_at"],type:"datetime",direction:"asc"}`. The ordering field
@@ -194,8 +232,23 @@ record visibility condition if this context should appear before publication.
 Use a separate summary component only for an independent project selection.
 Use fields such as
 `{label:"Target date",field:["timeline","target_at"],format:"date",hide_when_empty:true}`.
-Supported formats are `text`, `status`, `date`, `link`, `link_list`, and
-`document`; `status` may map stored values with `labels`. Link lists are arrays
+Formats include `text`, `status`, `date`, `link`, `link_list`, and
+`document` (the App design guide and `module_catalog` list every one, such as
+`percent`, `duration`, `date_range`, `tags`, `member`, `audio`, `images`,
+`clips` and `timeline`, and the media options such as `aspect` and
+`transcript_field`; a `gallery` block's `media` presentation is described
+there too, and so is `preview`, which shows a `progress`, `records` or
+`gallery` block's records as the posts they will be on Instagram, 小红书, X,
+LinkedIn and the other platforms, with a calendar's `lane_field` for a
+platform × day schedule; so are a `progress` block's `timeline`, `gantt`,
+`places` and `tree` views, its `group_by`, `select`, `export` and `totals`, a
+field's `bar` and the `sparkline` format, the `chart` block (line, bar,
+stacked, donut, funnel, leaderboard, heatmap, scatter over records or Stats,
+with a Goal's target line) and `display.layout: "grid"` for a dashboard);
+`status` may map stored values with `labels`. A field whose
+Workflow saves a fixed choice (an `enum` on a run input, an input wait or the
+`state_schema`) needs `labels` for every value, or `format:"status"` with the
+block's `stage_labels` naming them. Link lists are arrays
 of `{label,url}` and only safe public HTTP(S) URLs render as links. A `document`
 field holds a stored Document ID and opens that Document in the viewer. Summary fields
 must be declared source paths backed by the producer `state_schema`; they cannot

@@ -2851,9 +2851,10 @@ async def test_document_thumbnail_uses_file_type_when_name_has_no_extension(
     settings.MANOR_FS_ROOT = str(tmp_path)
     settings.MANOR_FS_ENABLED = True
 
-    async def fake_open_first_page(file_path: str, cache_dir: str, *, source_ext: str | None = None):
+    async def fake_open_first_page(file_path: str, cache_dir: str, *, dpi: int, source_ext: str | None = None):
         assert file_path.endswith("Personal Deck")
         assert source_ext == ".pptx"
+        assert dpi == 72
         cache_path = tmp_path / "thumbnail.jpg"
         cache_path.write_bytes(b"jpeg" * 300_000)
         return cache_path.open("rb"), str(cache_path)
@@ -3168,6 +3169,7 @@ async def test_delete_document(client: AsyncClient, db_session, monkeypatch, tmp
             ".slide-cache",
             ".slide-object-cache",
             ".doc-thumb-cache",
+            ".manor-media",
         )
     ]
     for cache_base in derived_cache_bases:

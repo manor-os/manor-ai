@@ -58,9 +58,9 @@ const REASON_DEFAULTS: Record<
   },
   no_access: {
     icon: "lock",
-    bg: "#f5f5f4",
-    border: "#a8a29e",
-    fg: "#44403c",
+    bg: "#f5f5f7",
+    border: "#aeaeb2",
+    fg: "#48484a",
     messageKey: "permissions.banner.no_access",
   },
   viewer_only: {

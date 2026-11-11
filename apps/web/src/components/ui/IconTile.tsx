@@ -22,7 +22,7 @@ interface IconTileProps {
 }
 
 export default function IconTile({
-  color = "#78716c",
+  color = "#8e8e93",
   size = 40,
   status,
   title,

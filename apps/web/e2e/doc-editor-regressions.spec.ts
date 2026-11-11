@@ -1,4 +1,4 @@
-import { expect, request as pwRequest, test } from "@playwright/test";
+import { expect, request as pwRequest, test, type Page } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import JSZip from "jszip";
 import PptxGenJS from "pptxgenjs";
@@ -8,6 +8,11 @@ const API = process.env.E2E_API ?? "http://localhost:8000";
 const RUN_DOCKER_E2E = process.env.E2E_DOCKER_DOC_EDITOR === "1";
 
 test.skip(!RUN_DOCKER_E2E, "Set E2E_DOCKER_DOC_EDITOR=1 for the live document editor test");
+
+async function openAiEdit(page: Page) {
+  await page.getByRole("button", { name: "More", exact: true }).click();
+  await page.getByRole("menuitem", { name: "AI edit", exact: true }).click();
+}
 
 test("floating AI Edit rolls back an unaccepted preview and restores its opener", async ({ page }) => {
   test.setTimeout(60_000);
@@ -54,8 +59,7 @@ test("floating AI Edit rolls back an unaccepted preview and restores its opener"
           event.detail.adapter;
       }) as EventListener, { once: true });
     });
-    const aiEditButton = page.getByRole("button", { name: "AI edit", exact: true });
-    await aiEditButton.click();
+    await openAiEdit(page);
 
     const panel = page.locator("#floating-chat-panel");
     const editor = page.locator("textarea.text-editor-page");
@@ -114,7 +118,7 @@ test("floating AI Edit rolls back an unaccepted preview and restores its opener"
     await expect(panel).toHaveAttribute("inert", "");
     await expect(editor).toHaveValue(originalContent);
     await expect(editor).not.toHaveAttribute("readonly", "");
-    await expect(aiEditButton).toBeFocused();
+    await expect(page.getByRole("button", { name: "More", exact: true })).toBeFocused();
     expect(consoleErrors).toEqual([]);
   } finally {
     await api.dispose();
@@ -394,7 +398,7 @@ test("plain-text and AI history restore selections while the media dialog remain
         ).detail.adapter;
       }, { once: true });
     });
-    await page.getByRole("button", { name: "AI edit", exact: true }).click();
+    await openAiEdit(page);
     await expect.poll(() => page.evaluate(() => (
       typeof (window as typeof window & { __docEditorLiveAdapter?: unknown }).__docEditorLiveAdapter
     ))).toBe("object");
@@ -535,7 +539,7 @@ test("plain-text and AI history restore selections while the media dialog remain
         testWindow.__docEditorPresentationAdapter = detail.adapter;
       }, { once: true });
     });
-    await page.getByRole("button", { name: "AI edit", exact: true }).click();
+    await openAiEdit(page);
     await expect.poll(() => page.evaluate(() => (
       typeof (window as typeof window & { __docEditorPresentationAdapter?: unknown }).__docEditorPresentationAdapter
     ))).toBe("object");

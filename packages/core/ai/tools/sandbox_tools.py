@@ -113,19 +113,38 @@ _GENERIC_SANDBOX_FILES = {
 }
 
 
-def _sandbox_error(code: SandboxToolErrorCode, message: str) -> str:
-    """Encode every sandbox failure with the shared machine-readable contract."""
+# Manor's own storage failed the save: no call the agent makes repairs it.
+_PLATFORM_FAULT_ERROR_CODES = frozenset({
+    SandboxToolErrorCode.FILESYSTEM_UNAVAILABLE,
+    SandboxToolErrorCode.WORKSPACE_SCOPE_UNAVAILABLE,
+    SandboxToolErrorCode.DOCUMENT_SYNC_FAILED,
+})
 
-    return json.dumps(
-        {
-            "ok": False,
-            "error": {
-                "code": code.value,
-                "message": message,
-            },
-        },
-        ensure_ascii=False,
-    )
+
+def _sandbox_error(code: SandboxToolErrorCode, message: str, *, internal_error: bool = False) -> str:
+    """Encode every sandbox failure with the shared machine-readable contract.
+
+    A platform fault carries the shared ``internal_error`` marker
+    (``tool_error_payload``): the run records it, and a Workflow step it
+    stopped is retried by the shared step resilience instead of asking anyone.
+    """
+
+    error: dict[str, Any] = {"code": code.value, "message": message}
+    if internal_error or code in _PLATFORM_FAULT_ERROR_CODES:
+        error.update(internal_error=True, requires_human=False, retryable=False)
+    return json.dumps({"ok": False, "error": error}, ensure_ascii=False)
+
+
+def _save_not_applied(error: str) -> str:
+    """A save refused before it wrote anything to Manor: host proof of no effect.
+
+    Minted only where ``save_result`` returns before its file mutation. Gate
+    commands write only their own report inside the sandbox. A failure after
+    the write started stays unconfirmed.
+    """
+    from packages.core.ai.runtime.tool_results import RuntimeSettledToolResult
+
+    return RuntimeSettledToolResult.not_applied(error, "before_save")
 
 
 def _runner_outdated_error(exc: BaseException) -> str:
@@ -2263,6 +2282,9 @@ _SANDBOX_WRITE_FILE_SCHEMA = {
 
 _PPTX_FINAL_GATE_MIN_SCORE = 90
 _DOCX_FINAL_GATE_MIN_SCORE = 90
+# The server picks the gated file and the report path itself, so a report
+# naming another file is a platform fault the agent cannot repair.
+_GATE_REPORT_PATH_MISMATCH = "the report points to a different {kind} path"
 
 
 def _normalized_sandbox_path(path: str) -> PurePosixPath:
@@ -2270,6 +2292,23 @@ def _normalized_sandbox_path(path: str) -> PurePosixPath:
     if not normalized.startswith("/"):
         normalized = f"/skill/{normalized.lstrip('/')}"
     return PurePosixPath(normalized)
+
+
+def _gate_reported_path(path: str, skill_view: str | None) -> PurePosixPath:
+    """The /skill-view path of a file a server-run gate named in its report.
+
+    The runner maps ``/skill`` onto the Skill's own ``/skills/<slot>`` in every
+    command, so the gate sees, and records, the real directory. ``skill_view``
+    is the Skill the gate ran as; without one the runner used its default view
+    (the Skill loaded last), whose slot is not known here.
+    """
+    normalized = _normalized_sandbox_path(path)
+    parts = normalized.parts
+    if len(parts) >= 3 and parts[1] == "skills" and (
+        skill_view is None or parts[2] == runner_skill_slot(skill_view)
+    ):
+        return PurePosixPath("/skill", *parts[3:])
+    return normalized
 
 
 def _pptx_project_export_context(file_path: str, filename: str) -> tuple[str, str, str] | None:
@@ -2316,6 +2355,7 @@ def _pptx_quality_evidence_error(
     content_bytes: bytes,
     gate_exit_code: int,
     report_bytes: bytes | None,
+    skill_view: str | None = None,
 ) -> tuple[str | None, dict[str, Any] | None]:
     """Verify that the server-run gate passed for these exact PPTX bytes."""
     if not report_bytes:
@@ -2408,8 +2448,8 @@ def _pptx_quality_evidence_error(
         return "not every final slide has verified render evidence", payload
 
     reported_path = str(payload.get("pptx") or "")
-    if reported_path and _normalized_sandbox_path(reported_path) != _normalized_sandbox_path(file_path):
-        return "the report points to a different PPTX path", payload
+    if reported_path and _gate_reported_path(reported_path, skill_view) != _normalized_sandbox_path(file_path):
+        return _GATE_REPORT_PATH_MISMATCH.format(kind="PPTX"), payload
     return None, payload
 
 
@@ -2419,6 +2459,7 @@ def _docx_quality_evidence_error(
     content_bytes: bytes,
     gate_exit_code: int,
     report_bytes: bytes | None,
+    skill_view: str | None = None,
 ) -> tuple[str | None, dict[str, Any] | None]:
     """Verify that the server-run gate passed for these exact DOCX bytes."""
     if not report_bytes:
@@ -2466,8 +2507,8 @@ def _docx_quality_evidence_error(
         return "not every final page has verified render evidence", payload
 
     reported_path = str(payload.get("docx") or "")
-    if reported_path and _normalized_sandbox_path(reported_path) != _normalized_sandbox_path(file_path):
-        return "the report points to a different DOCX path", payload
+    if reported_path and _gate_reported_path(reported_path, skill_view) != _normalized_sandbox_path(file_path):
+        return _GATE_REPORT_PATH_MISMATCH.format(kind="DOCX"), payload
     return None, payload
 
 
@@ -2640,6 +2681,10 @@ async def _sandbox_save_result(
                     content_bytes=content_bytes,
                     gate_exit_code=gate_result.exit_code if gate_result is not None else -1,
                     report_bytes=report_bytes,
+                    skill_view=skill_view,
+                )
+                gate_platform_fault = evidence_error == _GATE_REPORT_PATH_MISMATCH.format(
+                    kind=gate_kind.upper()
                 )
                 if (
                     evidence_error
@@ -2654,6 +2699,22 @@ async def _sandbox_save_result(
                         f"scripts/{gate_kind}_quality_gate.py, so no machine quality report "
                         "can be produced; reload the skill or report the missing script"
                     )
+                    gate_platform_fault = True
+                if evidence_error and gate_platform_fault:
+                    logger.error(
+                        "[sandbox] %s quality gate platform fault: sandbox=%s file=%s reason=%s",
+                        gate_kind.upper(),
+                        sandbox_id,
+                        file_path,
+                        evidence_error,
+                    )
+                    return _save_not_applied(_sandbox_error(
+                        SandboxToolErrorCode.QUALITY_GATE_BLOCKED,
+                        f"{gate_kind.upper()}_FINAL_QUALITY_GATE_BLOCKED: {evidence_error}. "
+                        "This is a Manor platform fault, not a defect in the file: do not "
+                        f"change or re-export it. The current {gate_kind.upper()} was not saved.",
+                        internal_error=True,
+                    ))
                 if evidence_error:
                     label = gate_kind.upper()
                     logger.warning(
@@ -2676,22 +2737,22 @@ async def _sandbox_save_result(
                             f"{'slide' if gate_kind == 'pptx' else 'page'}, and call "
                             "sandbox action='save_result' again."
                         )
-                    return _sandbox_error(
+                    return _save_not_applied(_sandbox_error(
                         SandboxToolErrorCode.QUALITY_GATE_BLOCKED,
                         f"{label}_FINAL_QUALITY_GATE_BLOCKED: {evidence_error}. {repair} "
                         f"The current {label} was not saved.",
-                    )
+                    ))
         except Exception as exc:
             expired = await _runner_failure_error(exc, sandbox_id=sandbox_id, scope=scope)
             if expired:
                 return expired
             logger.exception("[sandbox] save_result read failed: %s", exc)
-            return _sandbox_error(
+            return _save_not_applied(_sandbox_error(
                 SandboxToolErrorCode.READ_FAILED,
                 f"Failed to read file from sandbox: {exc}. No file was saved. "
                 "Check that the prior sandbox action='exec' command succeeded and that "
                 f"'{file_path}' actually exists before calling sandbox action='save_result' again.",
-            )
+            ))
     elif url:
         try:
             import httpx
@@ -2754,10 +2815,10 @@ async def _sandbox_save_result(
     # Save to entity filesystem + document store
     entity_dir = runtime_entity_file_root(entity_id)
     if not entity_dir:
-        return _sandbox_error(
+        return _save_not_applied(_sandbox_error(
             SandboxToolErrorCode.FILESYSTEM_UNAVAILABLE,
             "Entity filesystem is not enabled.",
-        )
+        ))
 
     rel_path = safe_filename
     if runtime_context.workspace_id:
@@ -2768,15 +2829,15 @@ async def _sandbox_save_result(
                 task_id=runtime_context.task_id,
             )
         except Exception as exc:  # noqa: BLE001
-            return _sandbox_error(
+            return _save_not_applied(_sandbox_error(
                 SandboxToolErrorCode.WORKSPACE_SCOPE_UNAVAILABLE,
                 f"Workspace artifact scope is unavailable: {exc}",
-            )
+            ))
         if not workspace_base:
-            return _sandbox_error(
+            return _save_not_applied(_sandbox_error(
                 SandboxToolErrorCode.WORKSPACE_SCOPE_UNAVAILABLE,
                 "Workspace artifact scope is unavailable.",
-            )
+            ))
         rel_path = scope_workspace_artifact_path(
             rel_path,
             workspace_base,

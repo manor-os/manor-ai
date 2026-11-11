@@ -25,11 +25,17 @@ step's output) to a list of units; ``final_from`` is the path to the finished
 whole (an object with its Knowledge ``document_id``). ``revise`` lets a
 finished run be changed: ``{from_step, notes_input, versions_input}`` start
 its next version from that step, with the person's notes and the unit
-versions they picked passed in as those run inputs. Each unit's media (``MediaJob`` with the
-run's ``run_id``) is matched to it by ``unit_id``, or else by order.
+versions they picked passed in as those run inputs. Optional ``context_inputs``
+maps declared input/variable names to explicit prior-result variable names;
+ordinary retries still invalidate their outputs. Each unit's media (``MediaJob`` with the
+run's ``run_id``) is matched to it by ``unit_id``, or else by order. A clip the
+run renders locally (a still end card) makes no job; its Knowledge Document's
+generation receipt names the run (``workflow_run_id``) and unit instead, and
+counts the same (see ``workflow_run_local_clips``).
 """
 from __future__ import annotations
 
+from copy import deepcopy
 import re
 from typing import Any
 
@@ -78,7 +84,7 @@ def normalize_workflow_production(value: Any) -> dict[str, Any]:
         # the first it reached (a step added later was never reached by older runs).
         from_steps = revise.get("from_step") if isinstance(revise, dict) else None
         from_steps = [from_steps] if isinstance(from_steps, str) else from_steps
-        if not isinstance(revise, dict) or set(revise) - {"from_step", "notes_input", "versions_input"} \
+        if not isinstance(revise, dict) or set(revise) - {"from_step", "notes_input", "versions_input", "context_inputs"} \
                 or not isinstance(from_steps, list) or not 1 <= len(from_steps) <= 5 \
                 or any(not isinstance(step, str) or not step.strip() for step in from_steps) \
                 or any(not isinstance(revise.get(key), str) or not _FIELD.fullmatch(revise[key])
@@ -89,6 +95,15 @@ def normalize_workflow_production(value: Any) -> dict[str, Any]:
                              "unit versions (versions_input)")
         result["revise"] = {"from_step": [step.strip() for step in from_steps],
                             **{key: revise[key] for key in ("notes_input", "versions_input") if key in revise}}
+        context = revise.get("context_inputs", {})
+        if not isinstance(context, dict) or len(context) > 16 or any(
+            not isinstance(name, str) or not _FIELD.fullmatch(name) or name.startswith("__")
+            for pair in context.items() for name in pair
+        ) or set(context) & {revise.get("notes_input"), revise.get("versions_input")}:
+            raise ValueError("production.revise.context_inputs maps at most 16 declared input names to prior "
+                             "result variable names; runtime fields and notes/version inputs cannot be reused")
+        if context:
+            result["revise"]["context_inputs"] = dict(context)
     fields = value.get("unit_fields") or {}
     if not isinstance(fields, dict) or set(fields) - {"id", "title", "duration"} or any(
         not isinstance(field, str) or not _FIELD.fullmatch(field) for field in fields.values()
@@ -125,6 +140,25 @@ def normalize_workflow_production(value: Any) -> dict[str, Any]:
         result["stages"].append({"label": _text(stage.get("label"), 40, "stage label"), "steps": list(steps),
                                  "counts_units": bool(stage.get("counts_units")), "weight": weight})
     return result
+
+
+def production_revision_inputs(
+    revise: dict[str, Any], previous_variables: dict[str, Any], *, notes: str, unit_versions: dict[str, str],
+) -> dict[str, Any]:
+    """Inputs for an explicitly requested next version of a completed run.
+
+    Only configured prior values are carried. Targets remain ordinary declared
+    Workflow inputs/variables, validated by the existing retry entry point.
+    """
+    inputs = {
+        target: deepcopy(previous_variables[source])
+        for target, source in revise.get("context_inputs", {}).items()
+        if source in previous_variables
+    }
+    inputs[revise["notes_input"]] = notes
+    if revise.get("versions_input"):
+        inputs[revise["versions_input"]] = deepcopy(unit_versions)
+    return inputs
 
 
 def workflow_production_config(steps: Any) -> dict[str, Any] | None:
@@ -171,6 +205,144 @@ def production_units(config: dict[str, Any], variables: Any) -> list[dict[str, A
             "lanes": {lane["key"]: str(item.get(lane["from"]) or "")[:MAX_TEXT] for lane in config["lanes"]},
         })
     return units
+
+
+_TRAILING_NUMBER = re.compile(r"(\d+)\D*$")
+
+
+def _unit_number(text: str) -> int | None:
+    match = _TRAILING_NUMBER.search(text)
+    return int(match.group(1)) if match else None
+
+
+def clip_unit_id(job: dict[str, Any], unit_ids: list[str]) -> str | None:
+    """Which planned unit a clip is: its recorded unit id, or the unit id it was saved under.
+
+    A saved name such as ``song-S05-take2`` names its unit as a whole word; a
+    bare trailing number (``shot-5``) is the unit's number only when no unit id
+    is spelled out.
+    """
+    recorded = str(job.get("unit_id") or "").strip()
+    if recorded in unit_ids:
+        return recorded
+    name = str(job.get("output_name") or "").rsplit("/", 1)[-1]
+    stem = re.sub(r"\.[A-Za-z0-9]+$", "", name)
+    if not stem:
+        return None
+    if stem in unit_ids:
+        return stem
+    named = [unit for unit in unit_ids if re.search(
+        rf"(?<![A-Za-z0-9]){re.escape(unit)}(?![A-Za-z0-9])", stem, flags=re.IGNORECASE)]
+    if len(named) == 1:
+        return named[0]
+    number = _unit_number(re.sub(r"-(r|take)\d+$", "", stem, flags=re.IGNORECASE))
+    numbered = [unit for unit in unit_ids if number is not None and _unit_number(unit) == number]
+    return numbered[0] if len(numbered) == 1 else None
+
+
+def production_progress(config: dict[str, Any], variables: Any, jobs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Which planned units already have a finished clip, across every attempt of one result.
+
+    ``jobs`` are the media jobs of the run and its earlier attempts (dicts with
+    ``status``, ``kind``, ``unit_id``, ``output_name``, ``document_id``,
+    ``result_url``, ``duration_seconds`` and ``created_at``). The newest
+    finished clip of a unit wins. None when the Workflow plans no units.
+    """
+    units = production_units(config, variables)
+    if not units:
+        return None
+    unit_ids = [unit["id"] for unit in units]
+    made: dict[str, dict[str, Any]] = {}
+    for job in sorted(jobs, key=lambda item: str(item.get("created_at") or "")):
+        if job.get("status") != "completed" or job.get("kind") != config["media"]:
+            continue
+        unit_id = clip_unit_id(job, unit_ids)
+        if unit_id is None:
+            continue
+        made[unit_id] = {
+            key: job[key] for key in ("document_id", "result_url", "duration_seconds", "output_name")
+            if job.get(key) not in (None, "")
+        } | {"job_id": job.get("id")}
+    return {
+        "units_made": [{"unit_id": unit["id"], "title": unit["title"], "clip": made[unit["id"]]}
+                       for unit in units if unit["id"] in made],
+        "units_to_make": [{"unit_id": unit["id"], "title": unit["title"]} for unit in units if unit["id"] not in made],
+    }
+
+
+async def workflow_run_local_clips(db: Any, *, entity_id: str, run_ids: list[str]) -> list[dict[str, Any]]:
+    """Clips the runs rendered locally, shaped as the finished media jobs ``production_progress`` reads.
+
+    They are the runs' own Knowledge Documents whose generation receipt names
+    one of the runs; nothing is charged or queued for them.
+    """
+    from sqlalchemy import select
+
+    from packages.core.models.document import Document
+
+    if not run_ids:
+        return []
+    generation = Document.metadata_["generation"]
+    rows = (await db.execute(select(
+        Document.id, Document.name, Document.mime_type, Document.created_at,
+        generation["unit_id"].astext, generation["operation"].astext,
+    ).where(
+        Document.entity_id == entity_id,
+        Document.is_trashed.is_(False),
+        generation["workflow_run_id"].astext.in_(run_ids),
+    ).limit(MAX_UNITS))).all()
+    return [{
+        "id": document_id, "status": "completed",
+        "kind": str(mime_type or "").split("/", 1)[0] or "video",
+        "unit_id": unit_id, "output_name": name, "document_id": document_id,
+        "operation": operation, "created_at": created_at.isoformat() if created_at else "",
+    } for document_id, name, mime_type, created_at, unit_id, operation in rows]
+
+
+def production_active_stage(config: dict[str, Any], steps: Any, current_step_id: str | None) -> str | None:
+    """The label of the stage a run is working in, or None between stages.
+
+    The same rule the run's production view (RunProduction) marks a stage
+    active by: a stage with a failed step is not active; one holding the
+    current step, or a step still running or paused, is.
+    """
+    statuses = {str(step.get("id") or ""): str(step.get("status") or "")
+                for step in steps if isinstance(step, dict)} if isinstance(steps, list) else {}
+    for stage in config.get("stages") or []:
+        found = [statuses[step] for step in stage["steps"] if step in statuses]
+        if "failed" in found:
+            continue
+        if (current_step_id or "") in stage["steps"] or any(value in {"running", "paused"} for value in found):
+            return stage["label"]
+    return None
+
+
+def production_unit_steps(config: dict[str, Any]) -> set[str]:
+    """The steps of the stages that make the units."""
+    return {step for stage in config["stages"] if stage.get("counts_units") for step in stage["steps"]}
+
+
+def production_storage_bytes(steps: Any, variables: Any, step_id: str, previous_result: Any = None) -> int:
+    """About how much storage ``step_id`` will fill if it makes the production's units.
+
+    0 when the step makes no units or their plan does not exist yet. A retry
+    counts only the units its earlier attempts did not finish
+    (``production_progress`` on the step's previous result).
+    """
+    from packages.core.services.storage_capacity import estimate_media_bytes, estimate_units_bytes
+
+    config = workflow_production_config(steps)
+    if config is None or step_id not in production_unit_steps(config):
+        return 0
+    units = production_units(config, variables)
+    progress = previous_result.get("production_progress") if isinstance(previous_result, dict) else None
+    if isinstance(progress, dict) and isinstance(progress.get("units_to_make"), list):
+        to_make = {str(unit.get("unit_id")) for unit in progress["units_to_make"] if isinstance(unit, dict)}
+        units = [unit for unit in units if unit["id"] in to_make]
+    elif not units and not config.get("units_from"):
+        # Made in one go (a song, a single film): one unit of its media.
+        return estimate_media_bytes(config["media"])
+    return estimate_units_bytes(config["media"], units)
 
 
 def workflow_run_production(steps: Any, variables: Any, *, locale: str | None = None) -> dict[str, Any] | None:

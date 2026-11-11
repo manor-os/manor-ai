@@ -274,6 +274,32 @@ async def test_workspace_projects_live_in_the_workspace_home_not_a_task_archive(
 
 
 @pytest.mark.asyncio
+async def test_a_workflow_project_run_makes_its_code_project_in_the_project_folder(fs, monkeypatch):
+    """What a run working on a WorkflowProject makes belongs in that project's
+    folder, where its App view and reviews look, never the Workspace's code/."""
+    async def run_scoped_base(**_kwargs):
+        return "Workspaces/_by_id/F1/projects/onboarding-article"
+
+    monkeypatch.setattr(
+        "packages.core.services.generated_media_naming.resolve_workspace_artifact_base_dir",
+        run_scoped_base,
+    )
+    run = {"_workflow_run_id_from_context": "RUN1", "workspace_id": "ws-1"}
+    created = await call(
+        fs, action="create", name="Landing", profile="static_site",
+        _workflow_project_root_from_context="projects/onboarding-article", **run,
+    )
+    assert created["root_path"] == "Workspaces/_by_id/F1/projects/onboarding-article/landing"
+
+    # A root a Blueprint writes itself is not a project folder; the run keeps code/.
+    plain = await call(
+        fs, action="create", name="Landing", profile="static_site",
+        _workflow_project_root_from_context="briefs/a", **run,
+    )
+    assert plain["root_path"] == "Workspaces/_by_id/F1/code/landing"
+
+
+@pytest.mark.asyncio
 async def test_adopt_existing_folder_is_idempotent(fs):
     (fs.root / "Sites/old").mkdir(parents=True)
     (fs.root / "Sites/old/index.html").write_text("<!doctype html>", encoding="utf-8")
@@ -407,6 +433,45 @@ async def test_workspace_context_lists_code_projects(db_session):
 
     empty = AIRuntimeRequest(surface=ChatSurface.WORKSPACE_CHAT, entity_id=entity_id, workspace_id="ws-none")
     assert await _workspace_code_projects_block(empty) is None
+
+
+@pytest.mark.asyncio
+async def test_a_project_run_step_is_pointed_at_its_project_folder(db_session):
+    """A step in a run working on a WorkflowProject is told to save in that
+    project's folder and is never invited to continue another code project."""
+    from packages.core.ai.runtime.context_blocks import (
+        _workflow_project_folder_block,
+        _workspace_code_projects_block,
+    )
+    from packages.core.ai.runtime.requests import WORKFLOW_PROJECT_FOLDER_METADATA_KEY, AIRuntimeRequest
+    from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.models.code_project import CodeProject
+
+    entity_id = f"ent{uuid4().hex[:20]}"
+    folder = "Workspaces/_by_id/F/projects/onboarding-article"
+    inside = CodeProject(entity_id=entity_id, workspace_id="ws-run", name="Landing", root_path=f"{folder}/landing")
+    db_session.add_all([
+        inside,
+        CodeProject(entity_id=entity_id, workspace_id="ws-run", name="Old article", root_path="Workspaces/_by_id/F/code/old-article"),
+    ])
+    await db_session.commit()
+    request = AIRuntimeRequest(
+        surface=ChatSurface.WORKFLOW_AGENT_STEP, entity_id=entity_id, workspace_id="ws-run",
+        metadata={WORKFLOW_PROJECT_FOLDER_METADATA_KEY: folder},
+    )
+    without_code_project = SimpleNamespace(effective_allowed_tool_names=lambda: {"generate_file"})
+    with_code_project = SimpleNamespace(effective_allowed_tool_names=lambda: {"generate_file", "code_project"})
+
+    told = _workflow_project_folder_block(request, without_code_project)
+    assert f"`{folder}/`" in told.content and "code_project" not in told.content
+    assert "code_project" in _workflow_project_folder_block(request, with_code_project).content
+    assert await _workspace_code_projects_block(request, without_code_project) is None
+    listed = await _workspace_code_projects_block(request, with_code_project)
+    assert f"project_id={inside.id}" in listed.content and "Old article" not in listed.content
+
+    chat = AIRuntimeRequest(surface=ChatSurface.WORKSPACE_CHAT, entity_id=entity_id, workspace_id="ws-run")
+    assert _workflow_project_folder_block(chat, with_code_project) is None
+    assert "Old article" in (await _workspace_code_projects_block(chat, with_code_project)).content
 
 
 # ── review regressions ──────────────────────────────────────────────────────

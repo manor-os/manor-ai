@@ -46,21 +46,40 @@ async def add_conversation_holds(
     return sorted(c for c in held if c)
 
 
-# A sentence in which the user asks to review something before it happens.
+# Require a prospective review instruction. Merely mentioning an approval
+# card (including reporting an earlier approval) must not create a hold.
 _DEMAND = re.compile(
-    r"(必须|需要|需|要|先|得|经过|经我|等我|待我|让我)[^。！？!?\n]{0,16}(审批|批准|确认后|同意)"
-    r"|审批卡|批准卡|确认卡"
+    r"(?:必须|需要|需|得)(?:先|经过|得到|获得|由)?(?:我(?:的)?|人工|手动|用户)?(?:审批|批准|确认|同意)"
+    r"|(?:等我|待我|经我|让我(?:先)?)(?:审批|批准|确认|同意)"
+    r"|(?<!不)要(?:先)?(?:我|人工)?(?:审批|批准|确认|同意)"
+    r"|先(?:审批|批准)(?:后|再)"
+    r"|(?:先停在|停在|停留在|先出示|先展示|先给我)(?:这张|这个)?(?:审批|批准|确认)卡"
     r"|\b(need|needs|require|requires|wait for|until)\b[^.!?\n]{0,24}\b(my )?(approval|sign-?off|review)\b"
     r"|\bask me (first|before)\b|\bstop at the (approval )?card\b",
     re.IGNORECASE,
 )
-_NEGATED = re.compile(r"(不需要|不用|无需|不必|免)[^。！？!?\n]{0,6}(审批|批准|确认)|\bno (approval|review) needed\b", re.IGNORECASE)
+_NEGATED = re.compile(
+    r"(不需要|不用|无需|不必|免)[^。！？!?\n]{0,6}(审批|批准|确认)"
+    r"|不要(?:再|再次)?让我(?:审批|批准|确认)"
+    r"|\bno (approval|review) needed\b|\b(?:don't|do not|never) ask me (first|before)\b",
+    re.IGNORECASE,
+)
+# "If approval is needed, show the diff" describes the existing gate; it
+# does not ask for a new one. Remove that clause, not other demands nearby.
+_CONDITIONAL = re.compile(
+    r"(?:(?:如果|如|若|当|遇到)(?:需(?:要)?|必须|要)(?:我(?:的)?|人工)?(?:审批|批准|确认)"
+    r"|每次(?:需(?:要)?|必须|要)(?:我(?:的)?|人工)?(?:审批|批准|确认)(?=就|时|的话|[，,]))"
+    r"[^。！？!?\n，,；;]*"
+    r"|\bif\s+(?:\w+\s+){0,3}(?:approval|review)\s+(?:is\s+)?(?:needed|required)\b[^,;.!?\n]*",
+    re.IGNORECASE,
+)
 _OBJECTS = {
     "files": re.compile(r"写入|写到|保存|存到|存入|知识库|knowledge|文件|文档|\b(write|save|file|document)s?\b", re.IGNORECASE),
     "publishing": re.compile(r"发布|发帖|上线|\b(publish|post)(ing|s)?\b", re.IGNORECASE),
     "communication": re.compile(r"发送|发给|邮件|短信|消息|通知|\b(send|email|message)s?\b", re.IGNORECASE),
     "deletion": re.compile(r"删除|\b(delete|remove)s?\b", re.IGNORECASE),
     "purchases": re.compile(r"购买|付款|支付|下单|\b(purchase|pay|buy)s?\b", re.IGNORECASE),
+    "workspace": re.compile(r"配置|工作区设置|\b(workspace|workflow|configuration|config)\b", re.IGNORECASE),
 }
 # Writes a demand with no named object most plausibly means.
 _UNNAMED = ("files", "publishing", "communication", "deletion", "purchases")
@@ -74,6 +93,7 @@ def stated_hold_categories(text: str) -> set[str]:
     """
     held: set[str] = set()
     for sentence in re.split(r"[。！？!?\n；;]+", str(text or "")):
+        sentence = _CONDITIONAL.sub("", sentence)
         if not _DEMAND.search(sentence) or _NEGATED.search(sentence):
             continue
         named = {category for category, pattern in _OBJECTS.items() if pattern.search(sentence)}

@@ -63,7 +63,6 @@ class AgentExecutionContext:
     runtime_surface: str | None = None
     runtime_envelope: RuntimeEnvelope | None = None
     llm_metadata: Optional[dict] = None
-    byok: bool = False
 
 
 async def build_agent_context(
@@ -135,7 +134,6 @@ async def build_agent_context(
             db=db,
             workspace_id=workspace_id,
         )
-        ctx.byok = bool(ctx.llm_metadata)
     except Exception:
         from packages.core.services.model_resolver import default_llm_model
         ctx.model = default_llm_model()

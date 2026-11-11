@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import posixpath
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timezone
 
 from sqlalchemy import and_, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from packages.core.models.document import Document, DocumentFolder, DocumentGroup, DocumentGroupMember, VectorStatus
 from packages.core.models.permission import (
@@ -776,25 +778,32 @@ async def _folder_ancestor_ids(
 ) -> list[str]:
     if not folder_id:
         return []
+    # UNION deduplicates folder rows, so recursion stops at cycles without
+    # truncating a valid chain. Follow the returned links in leaf-to-root order.
+    chain = (
+        select(
+            DocumentFolder.id,
+            DocumentFolder.parent_id,
+        )
+        .where(
+            DocumentFolder.id == folder_id,
+            DocumentFolder.entity_id == entity_id,
+        )
+        .cte("folder_chain", recursive=True)
+    )
+    parent = aliased(DocumentFolder)
+    chain = chain.union(
+        select(parent.id, parent.parent_id).where(
+            parent.id == chain.c.parent_id,
+            parent.entity_id == entity_id,
+        )
+    )
+    parents = dict((await db.execute(select(chain.c.id, chain.c.parent_id))).all())
     ids: list[str] = []
-    seen: set[str] = set()
-    current_id = folder_id
-    while current_id and current_id not in seen:
-        seen.add(current_id)
-        row = (
-            await db.execute(
-                select(DocumentFolder.id, DocumentFolder.parent_id)
-                .where(
-                    DocumentFolder.id == current_id,
-                    DocumentFolder.entity_id == entity_id,
-                )
-                .limit(1)
-            )
-        ).first()
-        if not row:
-            break
-        ids.append(row.id)
-        current_id = row.parent_id
+    current_id: str | None = folder_id
+    while current_id and current_id in parents:
+        ids.append(current_id)
+        current_id = parents.pop(current_id)
     return ids
 
 
@@ -3071,6 +3080,86 @@ async def unreadable_document_paths(
     return blocked
 
 
+async def paths_outside_workspace_scope(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    rel_paths: "list[str]",
+    directory_paths: "list[str] | None" = None,
+) -> set[str]:
+    """Entity paths a listing or search that names no location leaves out.
+
+    This is the default reach of an agent working in a Workspace, not access
+    control: callers apply it on top of ``unreadable_document_paths``, and a
+    path the person or the run names keeps going through the ACL alone.
+
+    "In this Workspace" is the same link ``list_visible_documents`` filters on
+    (``document_workspace_ids_batched``): the Workspace's artifact folder and
+    Knowledge attached to it, wherever those files live. A directory is in
+    scope when it holds or leads to one of those, so attached Knowledge in a
+    shared folder stays reachable without exposing that folder's other files.
+    """
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.knowledge_visibility import normalize_rel_path
+    from packages.core.services.workspace_artifacts import workspace_artifact_storage_base
+
+    wanted = {normalize_rel_path(path) for path in rel_paths if path}
+    wanted_dirs = {normalize_rel_path(path) for path in (directory_paths or []) if path}
+    if not wanted and not wanted_dirs:
+        return set()
+    home = workspace_artifact_storage_base(await db.scalar(
+        select(Workspace.artifact_folder_id).where(
+            Workspace.id == workspace_id,
+            Workspace.entity_id == entity_id,
+            Workspace.deleted_at.is_(None),
+        )
+    ))
+
+    def under_home(path: str) -> bool:
+        return bool(home) and (path == home or path.startswith(f"{home}/"))
+
+    outside = {path for path in wanted if not under_home(path)}
+    linked: set[str] = set()
+    ordered = sorted(outside)
+    for start in range(0, len(ordered), 500):
+        documents = list((await db.execute(
+            select(Document).where(
+                Document.entity_id == entity_id,
+                Document.fs_path.in_(ordered[start:start + 500]),
+                Document.is_trashed == False,  # noqa: E712
+            )
+        )).scalars().all())
+        links = await document_workspace_ids_batched(db, documents)
+        linked.update(
+            normalize_rel_path(document.fs_path)
+            for document in documents
+            if workspace_id in links.get(str(document.id), set())
+        )
+    outside -= linked
+
+    outside_dirs = {path for path in wanted_dirs if not under_home(path)}
+    if outside_dirs:
+        attached_paths = (await db.execute(
+            select(Document.fs_path)
+            .join(DocumentGroupMember, DocumentGroupMember.document_id == Document.id)
+            .join(DocumentGroup, DocumentGroup.id == DocumentGroupMember.group_id)
+            .where(
+                DocumentGroup.entity_id == entity_id,
+                DocumentGroup.workspace_id == workspace_id,
+                Document.entity_id == entity_id,
+                Document.is_trashed == False,  # noqa: E712
+                Document.fs_path.isnot(None),
+            )
+        )).scalars().all()
+        for location in (home, *attached_paths):
+            parent = posixpath.dirname(normalize_rel_path(location or ""))
+            while parent and outside_dirs:
+                outside_dirs.discard(parent)
+                parent = posixpath.dirname(parent)
+    return outside | outside_dirs
+
+
 async def _public_workspace_is_available(
     db: AsyncSession, *, entity_id: str, workspace_id: str,
 ) -> bool:
@@ -3349,6 +3438,7 @@ async def list_visible_documents(
     user_id: str | None = None,
     role: str | None = None,
     workspace_id: str | None = None,
+    execution_workspace_id: str | None = None,
     actor_type: str = "user",
     name_search: str | None = None,
     folder_id: str | None = None,
@@ -3369,6 +3459,13 @@ async def list_visible_documents(
     limit: int | None = 100,
     offset: int = 0,
 ) -> tuple[list[Document], int]:
+    """Documents the actor may read, filtered and paged after the ACL.
+
+    ``workspace_id`` limits results to that Workspace. ``execution_workspace_id``
+    does not: it is the Workspace a run reads from when it looks beyond it, so
+    the ACL is judged as in that run and files of other Workspaces, which such
+    a run cannot open, stay out of the results.
+    """
     from packages.core.services.document_service import list_documents
 
     if not user_id and actor_type != "user":
@@ -3428,10 +3525,14 @@ async def list_visible_documents(
                 document
             ).intersection(requested_workspace_ids):
                 continue
+            if execution_workspace_id:
+                linked_workspace_ids = ctx.document_workspace_ids(document)
+                if linked_workspace_ids and execution_workspace_id not in linked_workspace_ids:
+                    continue
             if not await ctx.can_read_document(
                 db,
                 document,
-                workspace_id=workspace_id,
+                workspace_id=workspace_id or execution_workspace_id,
                 actor_type=actor_type,
             ):
                 continue

@@ -1,11 +1,16 @@
-"""Bounded Instagram collection through reviewed Apify Actors.
+"""Bounded public social collection through reviewed Apify Actors.
+
+Instagram supports creator search, profile, Reel and Post reads. Public post
+metrics also cover YouTube videos and TikTok posts by their links.
 
 This module owns input and official MCP contracts only. The calling service owns
 authorization, durable run identity, credit admission, and reconciliation.
 Starting a run is deliberately never retried here.
 
-Provider contracts: https://github.com/apify/apify-mcp-server/tree/master/src/tools
-and https://apify.com/apify/instagram-reel-scraper/input-schema.
+Provider contracts: https://github.com/apify/apify-mcp-server/tree/master/src/tools,
+https://apify.com/apify/instagram-reel-scraper/input-schema,
+https://apify.com/streamers/youtube-scraper/input-schema and
+https://apify.com/clockworks/tiktok-scraper/input-schema.
 """
 
 from __future__ import annotations
@@ -24,7 +29,18 @@ from packages.core.ai.mcp._remote import RemoteMCPClient, RemoteMCPError
 APIFY_MCP_ENDPOINT = "https://mcp.apify.com?tools=call-actor,get-actor-run,get-dataset-items,abort-actor-run"
 _SCRAPER = "apify~instagram-scraper"
 _REELS = "apify~instagram-reel-scraper"
+_YOUTUBE = "streamers~youtube-scraper"
+_TIKTOK = "clockworks~tiktok-scraper"
+# Actors whose pricing rejects a run below this maxTotalChargeUsd.
+_MINIMUM_CHARGE_USD = {_TIKTOK: Decimal("0.50")}
+_MAX_POST_URLS = 20
+# Apify's get-actor-run waits at most this long for a terminal status.
+WAIT_SECONDS_MAX = 45
+_CALL_TIMEOUT_SECONDS = 30.0
 _ID = re.compile(r"[A-Za-z0-9]{1,64}\Z")
+_YOUTUBE_ID = re.compile(r"[A-Za-z0-9_-]{11}\Z")
+_TIKTOK_ID = re.compile(r"[0-9]{1,25}\Z")
+_TIKTOK_HANDLE = re.compile(r"[A-Za-z0-9_.]{1,64}\Z")
 _HANDLE = re.compile(r"[A-Za-z0-9_](?:[A-Za-z0-9_.]{0,28}[A-Za-z0-9_])?\Z")
 _SHORTCODE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 _RESERVED = {
@@ -125,6 +141,129 @@ def _reel_url(value: Any) -> str:
     return f"https://www.instagram.com/reel/{parts[1]}/"
 
 
+def _post_url(value: Any) -> str:
+    # A shared link names a Post or a Reel as /p/; the collector reads either.
+    value = _text(value, field="post_url", maximum=250)
+    parts = _instagram_path(value)
+    if len(parts) != 2 or parts[0] not in {"p", "reel", "tv"} or not _SHORTCODE.fullmatch(parts[1]):
+        raise _invalid("Provide one Instagram URL in the form /p/SHORTCODE/ or /reel/SHORTCODE/.")
+    return f"https://www.instagram.com/{parts[0]}/{parts[1]}/"
+
+
+def _social_path(value: str, *, hosts: set[str], label: str) -> tuple[str, list[str], list[tuple[str, str]]]:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        raise _invalid(f"Use a valid HTTPS {label} URL.") from None
+    host = parsed.netloc.lower()
+    # Exact netloc also excludes credentials, ports, IDNs, and trailing dots.
+    if parsed.scheme != "https" or host not in hosts:
+        raise _invalid(f"Use an HTTPS {label} URL.")
+    if "%" in parsed.path or "\\" in parsed.path:
+        raise _invalid(f"{label} URLs cannot include encoded paths.")
+    # Share links carry tracking queries. The canonical URL is rebuilt from the
+    # path (and YouTube's v), so nothing else is forwarded to Apify.
+    parts = [part for part in parsed.path.split("/") if part]
+    return host, parts, parse_qsl(parsed.query, keep_blank_values=True)
+
+
+def _youtube_url(value: str) -> str:
+    host, parts, query = _social_path(
+        value, hosts={"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}, label="YouTube",
+    )
+    video_id = None
+    if host == "youtu.be" and len(parts) == 1:
+        video_id = parts[0]
+    elif parts == ["watch"]:
+        ids = [item for key, item in query if key == "v"]
+        video_id = ids[0] if len(ids) == 1 else None
+    elif len(parts) == 2 and parts[0] in {"shorts", "live"}:
+        video_id = parts[1]
+    if not isinstance(video_id, str) or not _YOUTUBE_ID.fullmatch(video_id):
+        raise _invalid("Provide a YouTube video, Short or youtu.be link.")
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def _tiktok_url(value: str) -> str:
+    _, parts, _ = _social_path(value, hosts={"tiktok.com", "www.tiktok.com", "m.tiktok.com"}, label="TikTok")
+    if (
+        len(parts) != 3 or not parts[0].startswith("@") or not _TIKTOK_HANDLE.fullmatch(parts[0][1:])
+        or parts[1] not in {"video", "photo"} or not _TIKTOK_ID.fullmatch(parts[2])
+    ):
+        # vm.tiktok.com short links need a redirect to name the post; resolve them first.
+        raise _invalid("Provide a TikTok post URL in the form /@handle/video/ID.")
+    return f"https://www.tiktok.com/{parts[0].lower()}/{parts[1]}/{parts[2]}"
+
+
+_POST_METRICS_PLATFORMS = {
+    "instagram": (_SCRAPER, {"instagram.com", "www.instagram.com"}, _post_url),
+    "youtube": (_YOUTUBE, {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}, _youtube_url),
+    "tiktok": (_TIKTOK, {"tiktok.com", "www.tiktok.com", "m.tiktok.com"}, _tiktok_url),
+}
+
+
+def _post_metrics_url(value: Any) -> tuple[str, str]:
+    value = _text(value, field="post_urls", maximum=250)
+    try:
+        host = urlsplit(value).netloc.lower()
+    except ValueError:
+        raise _invalid("Use valid HTTPS post URLs.") from None
+    for platform, (_, hosts, canonical) in _POST_METRICS_PLATFORMS.items():
+        if host in hosts:
+            return platform, canonical(value)
+    raise _invalid("post_urls must be Instagram, YouTube or TikTok post links.")
+
+
+def _prepare_post_metrics(urls: Any) -> dict:
+    if not isinstance(urls, list) or not 1 <= len(urls) <= _MAX_POST_URLS:
+        raise _invalid(f"post_urls must list between 1 and {_MAX_POST_URLS} post links.")
+    platforms: set[str] = set()
+    canonical: list[str] = []
+    for value in urls:
+        platform, url = _post_metrics_url(value)
+        platforms.add(platform)
+        if url not in canonical:
+            canonical.append(url)
+    if len(platforms) != 1:
+        raise _invalid("One collection reads one platform; quote each platform separately.")
+    platform = platforms.pop()
+    actor_id = _POST_METRICS_PLATFORMS[platform][0]
+    if platform == "instagram":
+        # resultsLimit applies per direct URL.
+        actor_input = {"directUrls": canonical, "resultsType": "posts", "resultsLimit": 1, "addParentData": False}
+    elif platform == "youtube":
+        actor_input = {
+            "startUrls": [{"url": url} for url in canonical],
+            "maxResults": len(canonical),
+            "transcriptionAndSubtitle": "NONE",
+            "aiVideoDescription": False,
+            "aiVideoSummary": False,
+        }
+    else:
+        # Every paid or media add-on stays explicitly off.
+        actor_input = {
+            "postURLs": canonical,
+            "shouldDownloadVideos": False,
+            "shouldDownloadCovers": False,
+            "shouldDownloadSlideshowImages": False,
+            "shouldDownloadAvatars": False,
+            "shouldDownloadMusicCovers": False,
+            "scrapeRelatedVideos": False,
+            "scrapeAdditionalAuthorMeta": False,
+            "downloadSubtitlesOptions": "NEVER_DOWNLOAD_SUBTITLES",
+            "commentsPerPost": 0,
+        }
+    return {
+        "mode": "post_metrics", "platform": platform, "actor_id": actor_id, "actor_input": actor_input,
+        "results_limit": len(canonical), "window": None,
+    }
+
+
+def minimum_charge_usd(spec: dict) -> Decimal | None:
+    """The Actor's own floor for maxTotalChargeUsd; a lower cap cannot start."""
+    return _MINIMUM_CHARGE_USD.get(spec.get("actor_id")) if isinstance(spec, dict) else None
+
+
 def _iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -136,17 +275,23 @@ def prepare_collection(arguments: dict, *, now: datetime) -> dict:
     if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
         raise _invalid("Collection time must include a timezone.")
     mode = arguments.get("mode")
-    if not isinstance(mode, str) or mode not in {"search", "profile", "reel"}:
-        raise _invalid("mode must be search, profile, or reel.")
+    if not isinstance(mode, str) or mode not in {"search", "profile", "reel", "post", "post_metrics"}:
+        raise _invalid("mode must be search, profile, reel, post, or post_metrics.")
+    if mode == "post_metrics":
+        # The link count is the result limit; there is nothing else to choose.
+        if set(arguments) - {"mode", "post_urls"}:
+            raise _invalid("Collection contains unsupported fields for its mode.")
+        return _prepare_post_metrics(arguments.get("post_urls"))
     allowed = {"mode", "results_limit"} | {
         "search": {"query"},
         "profile": {"profile_url", "lookback_days"},
         "reel": {"reel_url", "include_transcript", "include_downloaded_video"},
+        "post": {"post_url"},
     }[mode]
     if set(arguments) - allowed:
         raise _invalid("Collection contains unsupported fields for its mode.")
-    maximum = {"search": 20, "profile": _MAX_ITEMS, "reel": 1}[mode]
-    default = {"search": 10, "profile": 50, "reel": 1}[mode]
+    maximum = {"search": 20, "profile": _MAX_ITEMS, "reel": 1, "post": 1}[mode]
+    default = {"search": 10, "profile": 50, "reel": 1, "post": 1}[mode]
     limit = _integer(arguments.get("results_limit", default), field="results_limit", maximum=maximum)
     window = None
     actor_id = _SCRAPER
@@ -170,6 +315,13 @@ def prepare_collection(arguments: dict, *, now: datetime) -> dict:
             "resultsType": "posts",
             "resultsLimit": limit,
             "onlyPostsNewerThan": window["start"],
+            "addParentData": False,
+        }
+    elif mode == "post":
+        actor_input = {
+            "directUrls": [_post_url(arguments.get("post_url"))],
+            "resultsType": "posts",
+            "resultsLimit": 1,
             "addParentData": False,
         }
     else:
@@ -219,6 +371,11 @@ def _validated_spec(spec: Any) -> dict:
             raise _invalid("The collection window must span 7, 14, or 28 days.")
         args.update(profile_url=urls[0], lookback_days=span.days)
         now = end
+    elif mode == "post":
+        urls = actor_input.get("directUrls")
+        if not isinstance(urls, list) or len(urls) != 1:
+            raise _invalid("The collection must contain one post URL.")
+        args["post_url"] = urls[0]
     elif mode == "reel":
         urls = actor_input.get("username")
         if not isinstance(urls, list) or len(urls) != 1:
@@ -228,6 +385,14 @@ def _validated_spec(spec: Any) -> dict:
             include_transcript=actor_input.get("includeTranscript"),
             include_downloaded_video=actor_input.get("includeDownloadedVideo"),
         )
+    elif mode == "post_metrics":
+        actor_id = spec.get("actor_id")
+        if actor_id == _YOUTUBE:
+            starts = actor_input.get("startUrls")
+            urls = [item.get("url") for item in starts if isinstance(item, dict)] if isinstance(starts, list) else None
+        else:
+            urls = actor_input.get({_SCRAPER: "directUrls", _TIKTOK: "postURLs"}.get(actor_id, ""))
+        args = {"mode": mode, "post_urls": urls}
     canonical = prepare_collection(args, now=now)
     if canonical != spec:
         raise _invalid("Collection specification does not match the reviewed Actor contract.")
@@ -246,8 +411,9 @@ class ApifyClient:
             raise ApifyError("credentials_unavailable", "A valid Apify API token is required.")
         self._token = token.strip()
 
-    async def _call(self, tool: str, arguments: dict, *, starting: bool = False) -> dict:
-        client = RemoteMCPClient(APIFY_MCP_ENDPOINT, self._token, timeout=30.0, token_in="header")
+    async def _call(self, tool: str, arguments: dict, *, starting: bool = False,
+                    timeout: float = _CALL_TIMEOUT_SECONDS) -> dict:
+        client = RemoteMCPClient(APIFY_MCP_ENDPOINT, self._token, timeout=timeout, token_in="header")
         # A failed handshake cannot have started an Actor. Separate it from the
         # one tools/call request so the ledger can release an unspent admission.
         try:
@@ -255,7 +421,7 @@ class ApifyClient:
         except Exception:
             raise ApifyError("provider_unavailable", "Apify MCP connection could not be established.") from None
         try:
-            payload = await client.call_tool(tool, arguments, timeout=30.0)
+            payload = await client.call_tool(tool, arguments, timeout=timeout)
         except RemoteMCPError as exc:
             rejected = exc.code in {-32001, -32601, -32602, 400, 401, 403, 405, 413, 415, 422, 429}
             raise ApifyError(
@@ -344,6 +510,9 @@ class ApifyClient:
             raise _invalid(
                 "max_cost_usd must be a positive decimal up to 5 USD with at most nine decimal places."
             ) from None
+        minimum = minimum_charge_usd(spec)
+        if minimum is not None and cap < minimum:
+            raise _invalid(f"This Actor needs max_cost_usd of at least {minimum} USD.")
         # MCP requires a JSON number. Round the binary float toward zero when
         # necessary, so neither its value nor JSON spelling exceeds the quote.
         numeric_cap = float(cap)
@@ -363,9 +532,15 @@ class ApifyClient:
         # status/cost enrichment is incomplete or temporarily unavailable.
         return self._run(payload, starting=True)
 
-    async def get_run(self, run_id: str) -> dict:
+    async def get_run(self, run_id: str, *, wait_seconds: int = 0) -> dict:
+        """The run's status; with ``wait_seconds`` Apify returns as soon as it finishes."""
         run_id = _resource_id(run_id)
-        return self._run(await self._call("get-actor-run", {"runId": run_id, "waitSecs": 0}), expected_id=run_id)
+        if type(wait_seconds) is not int or not 0 <= wait_seconds <= WAIT_SECONDS_MAX:
+            raise _invalid(f"wait_seconds must be an integer between 0 and {WAIT_SECONDS_MAX}.")
+        wait = wait_seconds
+        payload = await self._call("get-actor-run", {"runId": run_id, "waitSecs": wait},
+                                   timeout=_CALL_TIMEOUT_SECONDS + wait)
+        return self._run(payload, expected_id=run_id)
 
     async def abort_run(self, run_id: str) -> dict:
         run_id = _resource_id(run_id)
@@ -434,6 +609,96 @@ def _public_count(value: Any) -> int | None:
     return int(value)
 
 
+def _instagram_permalink(item: dict) -> str | None:
+    permalink = _https_url(item.get("url"))
+    shortcode = item.get("shortCode")
+    if permalink is not None:
+        try:
+            parts = _instagram_path(permalink)
+            if len(parts) != 2 or parts[0] not in {"p", "reel", "tv"} or not _SHORTCODE.fullmatch(parts[1]):
+                raise _invalid("Invalid media URL.")
+            permalink = f"https://www.instagram.com/{parts[0]}/{parts[1]}/"
+        except ApifyError:
+            permalink = None
+    if permalink is None and isinstance(shortcode, str) and _SHORTCODE.fullmatch(shortcode):
+        prefix = "reel" if str(item.get("productType") or item.get("product_type") or "").lower() == "clips" else "p"
+        permalink = f"https://www.instagram.com/{prefix}/{shortcode}/"
+    return permalink
+
+
+def _post_id(platform: str, url: str) -> str:
+    # Canonical URLs end in the post identity: /p/CODE/, watch?v=ID, /video/ID.
+    return url.split("v=", 1)[1] if platform == "youtube" else url.rstrip("/").split("/")[-1]
+
+
+def _post_metric_entry(platform: str, item: dict) -> dict | None:
+    """One post's public counters in a platform-neutral shape; unknown stays None."""
+    if platform == "instagram":
+        permalink = _instagram_permalink(item)
+        if permalink is None:
+            return None
+        timestamp = _date(item.get("timestamp"))
+        metrics = {
+            "views": _public_count(item.get("videoViewCount")),
+            "plays": _public_count(item.get("videoPlayCount")),
+            "likes": _public_count(item.get("likesCount")),
+            "comments": _public_count(item.get("commentsCount")),
+            "shares": None,
+        }
+        creator, media_type = item.get("ownerUsername"), _media_type(item, permalink)
+        caption = item.get("caption")
+    else:
+        source = item.get("url") if platform == "youtube" else item.get("webVideoUrl")
+        try:
+            permalink = (_youtube_url if platform == "youtube" else _tiktok_url)(source) if isinstance(source, str) else None
+        except ApifyError:
+            permalink = None
+        if permalink is None:
+            return None
+        if platform == "youtube":
+            timestamp = _date(item.get("date"))
+            metrics = {
+                "views": _public_count(item.get("viewCount")),
+                "likes": _public_count(item.get("likes")),
+                "comments": _public_count(item.get("commentsCount")),
+                "shares": None,
+            }
+            creator = item.get("channelName")
+            media_type = "short" if str(item.get("type") or "").lower() == "shorts" else "video"
+            caption = item.get("title")
+        else:
+            timestamp = _date(item.get("createTimeISO"))
+            metrics = {
+                "views": _public_count(item.get("playCount")),
+                "likes": _public_count(item.get("diggCount")),
+                "comments": _public_count(item.get("commentCount")),
+                "shares": _public_count(item.get("shareCount")),
+                "saves": _public_count(item.get("collectCount")),
+            }
+            author = item.get("authorMeta")
+            creator = author.get("name") if isinstance(author, dict) else None
+            media_type = "photo" if "/photo/" in permalink else "video"
+            caption = item.get("text")
+    return {
+        "platform": platform,
+        "post_id": _post_id(platform, permalink),
+        "permalink": permalink,
+        "creator": _bounded_text(creator, 100),
+        "published_at": _iso(timestamp) if timestamp else None,
+        "media_type": media_type,
+        "caption": _bounded_text(caption, 20_000),
+        # Public counts as observed by the provider at collection time.
+        "metrics": metrics,
+    }
+
+
+def _requested_post_urls(spec: dict) -> list[str]:
+    actor_input = spec["actor_input"]
+    if spec["platform"] == "youtube":
+        return [item["url"] for item in actor_input["startUrls"]]
+    return list(actor_input["directUrls" if spec["platform"] == "instagram" else "postURLs"])
+
+
 def normalize_items(spec: dict, items: list) -> dict:
     """Filter/dedupe evidence without ever claiming provider completeness."""
     spec = _validated_spec(spec)
@@ -454,8 +719,11 @@ def normalize_items(spec: dict, items: list) -> dict:
         "invalid_item_count": 0,
     }
     reasons: list[str] = coverage["reasons"]
-    if len(items) > limit or (spec["mode"] != "reel" and len(items) == limit):
+    if len(items) > limit or (spec["mode"] not in {"reel", "post", "post_metrics"} and len(items) == limit):
         reasons.append("result_limit_reached")
+    requested_posts: dict[str, str] = {}
+    if spec["mode"] == "post_metrics":
+        requested_posts = {_post_id(spec["platform"], url): url for url in _requested_post_urls(spec)}
     normalized: list[dict] = []
     seen: set[str] = set()
     window = spec["window"]
@@ -485,27 +753,21 @@ def normalize_items(spec: dict, items: list) -> dict:
                 "media_type": "profile",
             }
             identity = profile
+        elif spec["mode"] == "post_metrics":
+            entry = _post_metric_entry(spec["platform"], item)
+            # A provider row for any post that was not requested is not evidence.
+            if entry is None or entry["post_id"] not in requested_posts:
+                coverage["invalid_item_count"] += 1
+                continue
+            identity = entry["post_id"]
         else:
-            permalink = _https_url(item.get("url"))
-            shortcode = item.get("shortCode")
-            if permalink is not None:
-                try:
-                    parts = _instagram_path(permalink)
-                    if len(parts) != 2 or parts[0] not in {"p", "reel", "tv"} or not _SHORTCODE.fullmatch(parts[1]):
-                        raise _invalid("Invalid media URL.")
-                    permalink = f"https://www.instagram.com/{parts[0]}/{parts[1]}/"
-                except ApifyError:
-                    permalink = None
-            if permalink is None and isinstance(shortcode, str) and _SHORTCODE.fullmatch(shortcode):
-                prefix = (
-                    "reel" if str(item.get("productType") or item.get("product_type") or "").lower() == "clips" else "p"
-                )
-                permalink = f"https://www.instagram.com/{prefix}/{shortcode}/"
+            permalink = _instagram_permalink(item)
             if permalink is None:
                 coverage["invalid_item_count"] += 1
                 continue
-            if spec["mode"] == "reel":
-                requested_shortcode = spec["actor_input"]["username"][0].rstrip("/").split("/")[-1]
+            if spec["mode"] in {"reel", "post"}:
+                requested = spec["actor_input"]["username" if spec["mode"] == "reel" else "directUrls"][0]
+                requested_shortcode = requested.rstrip("/").split("/")[-1]
                 if permalink.rstrip("/").split("/")[-1] != requested_shortcode:
                     coverage["invalid_item_count"] += 1
                     continue
@@ -550,7 +812,14 @@ def normalize_items(spec: dict, items: list) -> dict:
     ):
         if coverage[key]:
             reasons.append(reason)
-    if any(reason in reasons for reason in ("result_limit_reached", "provider_errors", "invalid_items")):
+    if requested_posts:
+        missing = [url for post_id, url in requested_posts.items() if post_id not in seen]
+        coverage["missing_post_urls"] = missing
+        if missing:
+            reasons.append("requested_posts_missing")
+    if any(reason in reasons for reason in (
+        "result_limit_reached", "provider_errors", "invalid_items", "requested_posts_missing",
+    )):
         coverage["status"] = "partial"
     reasons.append("provider_completeness_unverified")
     coverage["returned_count"] = len(normalized)

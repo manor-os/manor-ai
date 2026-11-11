@@ -24,6 +24,11 @@ continue Workspace work, call request_strategist_review. Strategy drives missing
 core facts through Need Input; do not interview the user field-by-field. Extra
 requirements on an existing Task belong on that Task instead of a new review.
 
+For "what needs me / what is waiting / what are you watching", call list_attention
+first: it is the Workspace's current list of open approvals and inputs, undecided
+proposals, accounts to reconnect, unfinished setup, paused automations, budget,
+goals off pace and blocked or overdue work, most urgent first, kept in step every few
+minutes. Report from it; a search does not replace it.
 Inspect Pending Human Requests and Open Task Blockers in the current context.
 When a reply answers human_input/needs_input, call resolve_hitl for its actual
 message_id/hitl_id with inner action="respond" and response (or structured

@@ -139,9 +139,9 @@ def context(workspace=False):
                        active_user_message="Prepare a weekly report")
 
 
-def decision(message_id, scope="preference"):
-    return {"entries": [{"scope": scope, "title": "Report language", "body": "Use Chinese in weekly reports",
-                         "confidence": 0.7, "source_message_id": message_id}]}
+def decision(message_id, scope="preference", layer="preferences"):
+    return {"entries": [{"scope": scope, "layer": layer, "title": "Report language",
+                         "body": "Use Chinese in weekly reports", "confidence": 0.7, "source_message_id": message_id}]}
 
 
 @pytest.mark.asyncio
@@ -149,8 +149,10 @@ def decision(message_id, scope="preference"):
 async def test_original_evidence_receipts_candidates_and_scoped_reload(scoped_memory, monkeypatch, workspace):
     db_module, _ = scoped_memory
     ctx = context(workspace)
+    # The personal chat's own surface, as chat sets it; the layers load from it.
+    ctx.runtime_surface = "workspace_chat" if workspace else "global_owner_chat"
     source_id = "m_" + ctx.conversation_id
-    worker = AsyncMock(return_value=decision(source_id))
+    worker = AsyncMock(return_value=decision(source_id, layer="workspace" if workspace else "preferences"))
     monkeypatch.setattr(compaction, "run_memory_skill", worker)
     original = history() + [{"role": "user", "content": t} for t in (
         "Unverified agent guess", "System generated user-role text", "A generated card", "Fake synthetic message")]
@@ -159,29 +161,20 @@ async def test_original_evidence_receipts_candidates_and_scoped_reload(scoped_me
     assert worker.await_count == 1
     payload = worker.await_args.args[1]
     assert payload["source_message_ids"] == [source_id]
+    assert payload["layers"] == (["workspace"] if workspace else []) + ["profile", "preferences", "private"]
     async with db_module.async_session() as db:
         candidates = (await db.scalars(select(AgentLearningCandidate))).all()
         assert len(candidates) == 1
         candidate = candidates[0]
-        assert candidate.status == "proposed" and candidate.workspace_id == ctx.workspace_id
-        assert candidate.user_id == ctx.user_id
+        # Written at once to the chosen layer, with an audit row; no rule or
+        # stored memory row changes.
+        assert candidate.status == "applied" and candidate.created_by == "extractor"
+        assert candidate.workspace_id == ctx.workspace_id and candidate.user_id == ctx.user_id
+        assert candidate.payload["source_message_id"] == source_id
         receipt = (await db.get(Message, source_id)).meta[compaction.RECEIPTS][compaction._receipt_key(ctx)]
         assert receipt["status"] == "done"
-        # Candidate exists durably, but neither rules nor active memories were
-        # silently changed. Applying via the existing service makes it readable.
         from packages.core.models.memory import AgentMemory
         assert not (await db.scalars(select(AgentMemory))).all()
-        from packages.core.services.runtime_learning import (
-            apply_learning_candidate, apply_queued_learning_candidate, resolve_learning_candidate,
-        )
-        args = dict(entity_id=ctx.entity_id, user_id=ctx.user_id, workspace_id=ctx.workspace_id, candidate_id=candidate.id)
-        with pytest.raises(ValueError, match="accepted"):
-            await apply_learning_candidate(db, **args)
-        await resolve_learning_candidate(db, status="accepted", **args)
-        await apply_learning_candidate(db, **args)
-        await apply_queued_learning_candidate(db, **args)
-        assert candidate.status == "applied"
-        await db.commit()
     ctx.runtime_context_sections = [context_section("agent_identity", "Protected identity"),
                                     context_section("agent_memories", "Old stale memory")]
     bridge = RuntimeContextMemory(ctx)
@@ -202,6 +195,63 @@ async def test_original_evidence_receipts_candidates_and_scoped_reload(scoped_me
         latest = await bridge.refresh(deepcopy(updated))
         assert "Updated approved memory" in latest[0]["content"]
         assert "Use Chinese in weekly reports" not in latest[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_failed_audit_commit_restores_memory_files_and_retries(scoped_memory, monkeypatch):
+    from pathlib import Path
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from packages.core.memory.layers import personal_memory_path
+
+    db_module, _ = scoped_memory
+    ctx = context()
+    source_id = "m_" + ctx.conversation_id
+    receipt_key = compaction._receipt_key(ctx)
+    first = decision(source_id)["entries"][0]
+    second = {**first, "body": "Use short headings"}
+    third = {**first, "body": "Works in publishing", "layer": "profile"}
+    monkeypatch.setattr(compaction, "run_memory_skill", AsyncMock(
+        return_value={"entries": [first, second, third]},
+    ))
+    preferences = Path(personal_memory_path(ctx.entity_id, ctx.user_id, "preferences"))
+    profile = Path(personal_memory_path(ctx.entity_id, ctx.user_id, "profile"))
+    preferences.parent.mkdir(parents=True, exist_ok=True)
+    original = b"# Preferences\n\n- Keep citations\n\n"
+    preferences.write_bytes(original)
+    commit = AsyncSession.commit
+    failed = False
+
+    async def reject_audit_once(session):
+        nonlocal failed
+        if not failed and any(
+            isinstance(row, Message)
+            and (row.meta or {}).get(compaction.RECEIPTS, {}).get(receipt_key, {}).get("status") == "done"
+            for row in session.identity_map.values()
+        ):
+            failed = True
+            assert "Use short headings" in preferences.read_text()
+            assert profile.is_file()
+            raise RuntimeError("audit commit failed")
+        return await commit(session)
+
+    monkeypatch.setattr(AsyncSession, "commit", reject_audit_once)
+    with pytest.raises(RuntimeError, match="audit commit failed"):
+        await compaction.prepare_compaction_memory(ctx, history(), "archive_one")
+    assert preferences.read_bytes() == original
+    assert not profile.exists()
+    async with db_module.async_session() as db:
+        assert not (await db.scalars(select(AgentLearningCandidate))).all()
+        assert (await db.get(Message, source_id)).meta[compaction.RECEIPTS][receipt_key]["status"] == "pending"
+
+    result = await compaction.prepare_compaction_memory(ctx, history(), "archive_one")
+    assert result["extracted"] == 3
+    assert preferences.read_text().count("Use Chinese in weekly reports") == 1
+    assert preferences.read_text().count("Use short headings") == 1
+    assert profile.read_text().count("Works in publishing") == 1
+    async with db_module.async_session() as db:
+        assert len((await db.scalars(select(AgentLearningCandidate))).all()) == 3
+        assert (await db.get(Message, source_id)).meta[compaction.RECEIPTS][receipt_key]["status"] == "done"
 
 
 @pytest.mark.asyncio
@@ -263,8 +313,8 @@ async def test_concurrent_compactions_only_admit_once(scoped_memory, monkeypatch
     await asyncio.gather(*(compaction.prepare_compaction_memory(context(), history()) for _ in range(2)))
     async with db_module.async_session() as db:
         rows = (await db.scalars(select(AgentLearningCandidate))).all()
-        assert len(rows) == 1 and rows[0].status == "proposed"
-        assert rows[0].payload["memory_type"] == "instruction"
+        assert len(rows) == 1 and rows[0].status == "applied"
+        assert rows[0].payload["section"] == "Guidance"
         assert len((await db.scalars(select(RuntimeEvidence))).all()) == 1
 
 

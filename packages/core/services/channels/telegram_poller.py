@@ -117,24 +117,32 @@ async def _poll_one_bot(cc_id: str, bot_token: str, stop_event: asyncio.Event) -
             continue
 
         updates = body.get("result") or []
+        handled = False
         for upd in updates:
-            await _handle_update(cc_id, upd)
+            if not await _handle_update(cc_id, upd):
+                # Not enqueued: keep the offset here so the next poll
+                # delivers it again (its receipt drops what was queued).
+                break
             offset = max(offset, int(upd.get("update_id", 0)) + 1)
+            handled = True
 
-        if updates:
+        if handled:
             await _save_offset(cc_id, offset)
 
 
-async def _handle_update(cc_id: str, update: Dict[str, Any]) -> None:
+async def _handle_update(cc_id: str, update: Dict[str, Any]) -> bool:
     """Normalise a Telegram update and enqueue it via the same path the
-    webhook router uses. Reuses TelegramAdapter.handle_update for parsing."""
+    webhook router uses. Reuses TelegramAdapter.handle_update for parsing.
+
+    False only when the update could not be enqueued: the poller must not
+    move its offset past it, so the next poll delivers it again."""
     try:
         async with async_session() as db:
             cc = (await db.execute(
                 select(ChannelConfig).where(ChannelConfig.id == cc_id)
             )).scalar_one_or_none()
             if not cc:
-                return
+                return True
             from packages.core.services.channel_credentials import lease_channel_credentials
             try:
                 credentials = await lease_channel_credentials(
@@ -142,62 +150,31 @@ async def _handle_update(cc_id: str, update: Dict[str, Any]) -> None:
                 )
             except ValueError:
                 logger.warning("Telegram poller: credential source unavailable config=%s", cc_id)
-                return
+                return True
 
         from packages.core.services.channels.telegram_adapter import TelegramAdapter
         token = credentials.get("bot_token", "")
         if not token:
             logger.warning("Telegram poller: missing bot token config=%s", cc_id)
-            return
+            return True
         adapter = TelegramAdapter(bot_token=token)
         parsed = await adapter.handle_update(update)
         if not parsed:
-            return
+            return True
 
-        # Log the inbound row exactly like the webhook path does
-        from packages.core.services.channel_service import handle_inbound_message
+        # Receipt + dispatch exactly like the webhook path: a replayed update
+        # (a restart before the offset was saved) is acknowledged once.
+        from packages.core.services.channels.telegram_inbound import enqueue_telegram_update
         try:
-            async with async_session() as db:
-                await handle_inbound_message(
-                    db,
-                    entity_id=cc.entity_id,
-                    channel_config_id=cc.id,
-                    payload={
-                        "from": parsed["sender_id"],
-                        "to": str(parsed.get("chat_id", "")),
-                        "content": parsed["content"],
-                        "message_id": parsed.get("msg_id"),
-                        "channel_type": "telegram",
-                        "metadata": {
-                            "message_type": parsed["message_type"],
-                            "sender_name": parsed.get("sender_name", ""),
-                            "chat_id": parsed.get("chat_id"),
-                            "source": "long_poll",
-                        },
-                    },
-                )
-                await db.commit()
-        except Exception:
-            logger.exception("Telegram poller: failed to log inbound")
-
-        # Hand to the gateway via the Celery task, same as webhook path
-        try:
-            from packages.core.tasks.channel_tasks import dispatch_inbound_task
-            dispatch_inbound_task.delay(
-                entity_id=cc.entity_id,
-                channel_config_id=cc.id,
-                channel_type="telegram",
-                sender_id=str(parsed["sender_id"]),
-                sender_name=parsed.get("sender_name"),
-                chat_id=str(parsed.get("chat_id") or parsed["sender_id"]),
-                content=parsed["content"] or "",
-            )
+            await enqueue_telegram_update(cc, parsed, source="long_poll")
         except Exception:
             logger.exception(
                 "Telegram poller: could not enqueue dispatch — Celery down?"
             )
+            return False
     except Exception:
         logger.exception("Telegram poller: _handle_update crashed")
+    return True
 
 
 # ── Offset persistence ──────────────────────────────────────────────────────

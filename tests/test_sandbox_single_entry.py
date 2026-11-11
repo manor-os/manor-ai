@@ -518,11 +518,14 @@ async def test_an_inline_render_on_a_full_runner_fails_fast_and_leaves_no_ticket
     assert tickets == []
 
 
-async def test_a_workflow_step_render_on_a_full_runner_waits_on_its_own_ticket(entry) -> None:
+@pytest.mark.parametrize("parent_skill", [None, "video-edit"])
+async def test_a_workflow_step_render_on_a_full_runner_waits_on_its_own_ticket(entry, parent_skill) -> None:
     """A Workflow agent step has no durable run to park and no task, but it is
     a background requester: it queues a ticket for its run and waits, so an
     on-demand render fleet can scale out, instead of failing at once with
-    capacity_full (staging 2026-10-22: no render runner was ever started)."""
+    capacity_full (staging 2026-10-22: no render runner was ever started).
+    The same holds inside a skill the step invoked: there is still no run to
+    suspend (staging 2026-11-02: four Video Studio reviews failed this way)."""
 
     from packages.core.ai.runtime.sandbox import runtime_workflow_binding_key
     from packages.core.ai.tools import video_edit_tools
@@ -536,7 +539,7 @@ async def test_a_workflow_step_render_on_a_full_runner_waits_on_its_own_ticket(e
         entity_id=ENTITY, user_id="user_entry", agent_id="agent-1", conversation_id=None,
         sandbox_binding_key=runtime_workflow_binding_key(workflow_run_id),
         runtime_run_id=None, runtime_tool_call_id="call-review",
-        task_id=None, workflow_run_id=workflow_run_id, parent_skill=None,
+        task_id=None, workflow_run_id=workflow_run_id, parent_skill=parent_skill,
     )
     entry.fake.exec_handler = lambda sandbox_id, command, container: SimpleNamespace(
         stdout="", stderr="render stub", exit_code=1,
@@ -565,6 +568,47 @@ async def test_a_workflow_step_render_on_a_full_runner_waits_on_its_own_ticket(e
     with contextlib.suppress(video_edit_tools.VideoEditRuntimeUnavailable):
         await asyncio.wait_for(job, timeout=30)
     assert [c["sandbox_id"] for c in entry.fake.created] and entry.fake.live() == set()
+
+
+async def test_a_skill_inside_a_workflow_step_waits_for_its_session_container(entry) -> None:
+    """Video Studio's review path: the step invokes the video-edit skill, whose
+    nested loop starts a session container. With no run to suspend, it waits
+    on a ticket for the Workflow run and gets the container."""
+
+    from packages.core.ai.runtime.sandbox import runtime_workflow_binding_key
+    from packages.core.ai.tools import video_edit_tools
+
+    async with entry.factory() as db:
+        runner = await db.get(SandboxRunner, entry.runner_id)
+        runner.active_count = runner.active_limit
+        await db.commit()
+    workflow_run_id = f"01WF{uuid.uuid4().hex[:22].upper()}"
+    context = SimpleNamespace(
+        entity_id=ENTITY, user_id="user_entry", agent_id="agent-1", conversation_id=None,
+        sandbox_binding_key=runtime_workflow_binding_key(workflow_run_id),
+        runtime_run_id=None, runtime_tool_call_id="call-review",
+        task_id=None, workflow_run_id=workflow_run_id, parent_skill="video-edit",
+    )
+    job = asyncio.create_task(video_edit_tools._admit_video_sandbox(context, session=True))
+    ticket = None
+    for _ in range(200):
+        async with entry.factory() as db:
+            ticket = (await db.execute(select(SandboxReservation).where(
+                SandboxReservation.requester_id == f"workflow-run:{workflow_run_id}",
+            ))).scalars().first()
+        if ticket is not None or job.done():
+            break
+        await asyncio.sleep(0.05)
+    assert not job.done(), "a skill inside a Workflow step must wait for a runner, not fail fast"
+    assert ticket is not None and ticket.status == SandboxReservationStatus.QUEUED.value
+
+    async with entry.factory() as db:
+        runner = await db.get(SandboxRunner, entry.runner_id)
+        runner.active_count = 0
+        await db.commit()
+    assert await _schedule_once(entry) == ticket.id
+    session = await asyncio.wait_for(job, timeout=30)
+    assert session.sandbox_id in {created["sandbox_id"] for created in entry.fake.created}
 
 
 # ── one entry point x one container per scope (sandbox-user-conversation) ──

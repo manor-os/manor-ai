@@ -108,7 +108,7 @@ export function SkillFileContent({
   if (path.toLowerCase().endsWith(".md")) {
     return (
       <div className="skill-doc" style={{ padding: "16px 26px 26px" }}>
-        <ChatMarkdown content={content} enableFileCards={false} />
+        <ChatMarkdown content={content} enableFileCards={false} preserveReferences />
       </div>
     );
   }

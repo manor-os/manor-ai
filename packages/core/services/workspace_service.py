@@ -31,6 +31,8 @@ async def get_workspace_full(
     db: AsyncSession, workspace_id: str, entity_id: str
 ) -> Optional[dict]:
     """Get workspace with full operating model details."""
+    from packages.core.blueprints.registry import settings_without_package_alias
+
     ws = await get_workspace(db, workspace_id, entity_id)
     if not ws:
         return None
@@ -50,7 +52,7 @@ async def get_workspace_full(
         "operating_context": ws.operating_context,
         "primary_work": ws.primary_work,
         "operating_model": om,
-        "settings": ws.settings,
+        "settings": settings_without_package_alias(ws.settings),
         "status": ws.status,
         "agent_mappings": mappings,
         "created_at": ws.created_at.isoformat() if ws.created_at else None,

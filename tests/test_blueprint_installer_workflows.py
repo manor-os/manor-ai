@@ -22,7 +22,7 @@ import copy
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.blueprints.installer import (
@@ -124,16 +124,20 @@ def test_blueprint_condition_routes_do_not_duplicate_dependency_edges():
     assert steps["check"]["false_next"] == ["failed"]
 
 
-def test_blueprint_workflow_install_preserves_canvas_positions():
+def test_blueprint_workflow_install_preserves_canvas_positions_and_translations():
     position = {"x": 320, "y": 140}
+    i18n = {"zh": {"name": "渲染"}}
     values = _blueprint_workflow_definition_values({
         "slug": "positioned-workflow",
-        "steps": [{"id": "render", "type": "agent", "position": position}],
+        "steps": [{"id": "render", "type": "agent", "position": position, "i18n": i18n}],
     })
 
     render = next(step for step in values["steps"] if step["id"] == "render")
     assert render["position"] == position
     assert "position" not in render["config"]
+    # Translations overlay the step, so they must not sink into its config.
+    assert render["i18n"] == i18n
+    assert "i18n" not in render["config"]
 
 
 async def test_install_preflight_resolves_creator_declared_account_requirements(
@@ -1314,6 +1318,13 @@ async def test_subworkflow_targets_and_trigger_state_round_trip(
     assert first_binding.enabled is False
     assert first_binding.status == "inactive"
 
+    # A child built by hand has no installation record; having no binding in
+    # its Workspace is what keeps it out of the App after a reinstall.
+    await db_session.execute(delete(WorkflowTemplateInstallation).where(
+        WorkflowTemplateInstallation.workflow_id == first_child.id,
+    ))
+    await db_session.commit()
+
     exported = await export_workspace(db_session, first.workspace_id, title="Portable")
     exported_by_slug = {
         workflow["slug"]: workflow
@@ -1327,6 +1338,8 @@ async def test_subworkflow_targets_and_trigger_state_round_trip(
     assert portable_subworkflow["config"] == {
         "source_workflow_key": child_slug,
     }
+    assert exported_by_slug[child_slug]["internal"] is True
+    assert exported_parent["internal"] is False
     assert first_child.id not in str(exported)
     assert exported_parent["trigger_config"] == first_binding.trigger_config
     assert exported_parent["enabled"] is False

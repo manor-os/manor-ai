@@ -223,9 +223,9 @@ async def team_access_many(db, deliveries):
 
     Team-level: some grant of the phase's role is live on the customer side.
     One query for all the deliveries' grants, then the customer-side check
-    of the first candidate of each. Plain reads.
+    of all candidates together. Plain reads.
     """
-    from packages.core.services.workspace_collaboration import live_boundary
+    from packages.core.services.workspace_collaboration import live_grant_ids
 
     roles = {
         delivery.id: role
@@ -246,23 +246,16 @@ async def team_access_many(db, deliveries):
             .order_by(WorkspaceCollaboration.created_at, WorkspaceCollaboration.id)
         )
     ).all()
-    access = {}
-    for grant in grants:
-        delivery_id = grant.delivery_id
-        if (
-            delivery_id in access
-            or grant.role != roles[delivery_id]
-            or (grant.workspace_id, grant.entity_id) != targets[delivery_id]
-            or not grant_gives_access(grant)
-            or not grant.authorized_by
-        ):
-            continue
-        try:
-            await live_boundary(db, grant, lock=False)
-        except HTTPException:
-            continue
-        access[delivery_id] = grant.role
-    return access
+    candidates = [
+        grant
+        for grant in grants
+        if grant.role == roles[grant.delivery_id]
+        and (grant.workspace_id, grant.entity_id) == targets[grant.delivery_id]
+        and grant_gives_access(grant)
+        and grant.authorized_by
+    ]
+    live = await live_grant_ids(db, candidates)
+    return {grant.delivery_id: grant.role for grant in candidates if grant.id in live}
 
 
 async def list_client_trials(db, user, source_workspace_id):

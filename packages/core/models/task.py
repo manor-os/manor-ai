@@ -214,6 +214,24 @@ class Conversation(Base, TimestampMixin):
     thread_ref_id: Mapped[Optional[str]] = mapped_column(String(26))
 
 
+# A message that still carries an open decision card: an unresolved pending
+# action, or a HITL request in its metadata that is not resolved. Queries filter
+# with this exact text so the planner can prove ``ix_messages_open_cards``
+# applies; bound parameters in its place hide that, and the query then reads
+# every message's full metadata. The pending-action half alone also implies the
+# index condition, so queries for unresolved pending actions use it too. Each
+# text carries its own outer parentheses: SQLAlchemy does not group text()
+# clauses, and an ungrouped OR would escape the query's tenant filters.
+MESSAGE_OPEN_PENDING_ACTION_CONDITION = (
+    "(messages.resolved_at IS NULL AND (messages.pending_action ->> 'kind') IS NOT NULL)"
+)
+MESSAGE_OPEN_CARD_CONDITION = (
+    f"({MESSAGE_OPEN_PENDING_ACTION_CONDITION}"
+    " OR jsonb_path_exists(messages.metadata,"
+    " '$.hitl_requests[*] ? (exists(@.id) && (!exists(@.resolved) || @.resolved == false))'::jsonpath))"
+)
+
+
 class Message(Base):
     """Conversation message.
 
@@ -239,6 +257,11 @@ class Message(Base):
             "response_surface_event_id",
             unique=True,
             postgresql_where=text("response_surface_event_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_messages_open_cards",
+            "conversation_id",
+            postgresql_where=text(MESSAGE_OPEN_CARD_CONDITION),
         ),
     )
 

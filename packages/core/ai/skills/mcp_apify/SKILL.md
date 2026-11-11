@@ -1,13 +1,17 @@
 ---
 name: mcp_apify
-description: Search other creators' public Instagram profiles and collect recent posts and Reels through Apify's official MCP. Use for creator discovery, reference research, or an Instagram repurposing workflow with a bounded collection budget.
-version: 1.0.0
+description: Search other creators' public Instagram profiles, collect recent posts and Reels, and read public view, like and comment counts for Instagram, YouTube and TikTok post links through Apify's official MCP. Use for creator discovery, reference research, an Instagram repurposing workflow, or tracking published posts with a bounded collection budget.
+version: 1.1.0
 ---
 
-# Apify Instagram Collection
+# Apify Public Social Collection
 
-Use `mcp__apify__*` to collect public Instagram reference material. The supported
-surface is creator search, recent profile content, and individual Reel lookup.
+Use `mcp__apify__*` to collect public social reference material and post
+metrics. The supported surface is Instagram creator search, recent profile
+content, individual Reel lookup, one Post or Reel read from its shared link
+(`post` mode: caption, type, counts, cover), and public counters for a batch of
+post links (`post_metrics` mode: Instagram, YouTube or TikTok).
+The tool names keep their `instagram_collection` suffix for every platform.
 It does not publish content or expose arbitrary Apify Actors.
 
 Manor's four collection tools call the official Apify MCP at
@@ -28,7 +32,7 @@ collection will succeed.
 ## Tools and workflow
 
 1. Call `quote_instagram_collection` for the requested search query, profile,
-   or Reel. For profile collection, use the requested 7, 14, or 28 day window,
+   Reel, or post links. For profile collection, use the requested 7, 14, or 28 day window,
    a bounded result limit, and the user's budget. A quote starts no provider
    run and incurs no collection charge. Read the returned price, budget,
    expiration, and authorization requirements before continuing.
@@ -36,7 +40,9 @@ collection will succeed.
    and budget are authorized. Let the runtime enforce approval and credit
    gates. Do not raise a budget or obtain new quotes to bypass a blocked call.
 3. Keep the returned `collection_id` and use `get_instagram_collection` for
-   status and results. Reuse this collection when polling; do not start a
+   status and results. While it is running, pass `wait_seconds` (up to 45):
+   the call returns as soon as Apify finishes, so there is no fixed delay to
+   guess. Reuse this collection when polling; do not start a
    second run to refresh the first. An ambiguous start or unknown provider
    outcome is not permission to retry the start or create a replacement run.
 4. Use `cancel_instagram_collection` when the user asks to stop. Cancellation
@@ -49,6 +55,25 @@ or partial collection can leave the requested time window incomplete. Report
 the actual coverage; an empty result does not establish that the creator
 posted nothing. Surface expired quotes and authentication or quota failures
 without repeating collection attempts automatically.
+
+## Post metrics
+
+- Pass `mode: post_metrics` with `post_urls`: 1 to 20 public links on one
+  platform. Instagram uses `/p/` or `/reel/` links; YouTube accepts watch,
+  Shorts and `youtu.be` links; TikTok needs the full `/@handle/video/ID` link,
+  not a `vm.tiktok.com` short link. Quote each platform separately and batch
+  every post of that platform into one quote, instead of one run per post.
+- TikTok's Actor refuses a run budget under 0.50 USD, so quote it with
+  `max_cost_usd` of at least `0.50`; the actual charge follows the results.
+- Each item has `platform`, `post_id`, `permalink`, `creator`, `published_at`
+  and `metrics` (`views`, `likes`, `comments`, `shares`, plus `plays` on
+  Instagram and `saves` on TikTok). A `null` counter is hidden or not shown by
+  that platform; never record it as zero.
+- These are public counts at collection time, not the account owner's private
+  analytics, which can differ (for example YouTube Studio lifetime views).
+- `coverage.missing_post_urls` lists requested links the provider returned no
+  valid row for (deleted, private, region-blocked, or a provider failure).
+  Report them as gaps; do not start another run to fill them in the same pass.
 
 ## Repurposing handoff
 

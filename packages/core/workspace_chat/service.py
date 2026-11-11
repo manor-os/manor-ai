@@ -18,17 +18,47 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import and_, desc, event, or_, select
+from sqlalchemy import and_, desc, event, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.base import generate_ulid
-from packages.core.models.task import Conversation, Message, Task
+from packages.core.models.task import (
+    MESSAGE_OPEN_PENDING_ACTION_CONDITION, Conversation, Message, Task,
+)
 
 logger = logging.getLogger(__name__)
 
 _CHAT_EVENT_QUEUE_KEY = "workspace_chat_events_after_commit"
 _CHAT_EVENT_LISTENER_KEY = "workspace_chat_event_listener"
 _CHAT_EVENT_PUBLISH_TASKS: set[asyncio.Task[None]] = set()
+
+
+_AFTER_COMMIT_EVENTS = "workspace_chat_after_commit_events"
+
+
+def _publish_workspace_chat_event_after_commit(db: AsyncSession, entity_id: str, data: dict) -> None:
+    """Queue a realtime event that is sent only if the transaction commits."""
+    import asyncio
+
+    from sqlalchemy import event as sa_event
+
+    session = db.sync_session
+    queued = session.info.setdefault(_AFTER_COMMIT_EVENTS, [])
+    if not queued:
+        def publish(sync_session) -> None:
+            if sync_session.in_nested_transaction():
+                return
+            for loop, owner, payload in sync_session.info.pop(_AFTER_COMMIT_EVENTS, []):
+                if not loop.is_closed():
+                    loop.create_task(_publish_workspace_chat_event(owner, payload))
+
+        def discard(sync_session) -> None:
+            if not sync_session.in_nested_transaction():
+                sync_session.info.pop(_AFTER_COMMIT_EVENTS, None)
+
+        sa_event.listen(session, "after_commit", publish, once=True)
+        sa_event.listen(session, "after_rollback", discard, once=True)
+    queued.append((asyncio.get_running_loop(), entity_id, data))
 
 
 async def _publish_workspace_chat_event(entity_id: str, data: dict) -> None:
@@ -102,6 +132,9 @@ def _workspace_chat_message_event_data(
     conversation_id = str(getattr(message, "conversation_id", None) or "").strip()
     if conversation_id:
         event_data["conversation_id"] = conversation_id
+    if meta.get("simulation_runtime") is True:
+        # The person driving a simulation is looking at it; no toast.
+        event_data["simulation"] = True
     if meta.get("agent_greeting") is True:
         event_data.update({
             "agent_greeting": True,
@@ -353,7 +386,11 @@ async def post_message(
     thread_ref_id: Optional[str] = None,
     publish_event: bool = True,
 ) -> Message:
-    """Post into the right conversation (thread or main). Caller commits."""
+    """Post into the right conversation (thread or main). Caller commits.
+
+    The realtime event is sent after that commit; ``publish_event=False``
+    leaves it to the caller.
+    """
     if thread_ref_kind and thread_ref_id:
         conv = await spawn_thread(
             db,
@@ -383,6 +420,10 @@ async def post_message(
         meta["author_user_id"] = author_user_id
 
     action = pending_action if isinstance(pending_action, dict) and pending_action.get("kind") else None
+    if action is not None:
+        from packages.core.services.decision_recommendation import ensure_recommendation
+
+        action = ensure_recommendation(action)
 
     msg = Message(
         id=generate_ulid(),
@@ -401,10 +442,9 @@ async def post_message(
     await db.flush()
 
     if publish_event:
-        await publish_workspace_chat_message_event(
-            entity_id,
-            workspace_id=workspace_id,
-            message=msg,
+        # Members refetch on the event, so it goes out once the message is readable.
+        queue_workspace_chat_message_event_after_commit(
+            db, entity_id=entity_id, workspace_id=workspace_id, message=msg,
         )
 
     return msg
@@ -453,9 +493,7 @@ def open_pending_action_filters(entity_id: str, workspace_id: str) -> tuple:
     return (
         Conversation.entity_id == entity_id,
         Conversation.workspace_id == workspace_id,
-        Message.pending_action.isnot(None),
-        Message.pending_action["kind"].as_string().isnot(None),
-        Message.resolved_at.is_(None),
+        text(MESSAGE_OPEN_PENDING_ACTION_CONDITION),
     )
 
 
@@ -639,8 +677,13 @@ async def _publish_pending_action_resolution(
             select(Conversation).where(Conversation.id == msg.conversation_id)
         )).scalar_one_or_none()
         if conv and conv.workspace_id:
-            await _publish_workspace_chat_event(conv.entity_id, {
-                "workspace_id": conv.workspace_id,
+            entity_id = conv.entity_id
+            workspace_id = conv.workspace_id
+            # Only a committed decision closes the card on other clients: a
+            # resolve that fails after this point (the Task stopped waiting)
+            # rolls back, and the card must stay open with its options.
+            _publish_workspace_chat_event_after_commit(db, entity_id, {
+                "workspace_id": workspace_id,
                 "conversation_id": msg.conversation_id,
                 "message_id": msg.id,
                 "resolved_message_id": msg.id,

@@ -1575,12 +1575,14 @@ def test_master_always_loaded_tool_schema_budget():
     # growth is attributable. Response surfaces load through search_tools.
     # Reallocate the same overall eager budget for the reviewed Workspace App
     # input/review and native Office contracts; keep the total cap below unchanged.
-    assert baseline_size < 26_000
+    # +1,100 for remember (about 1,070): memory is saved when it is said, so the
+    # tool is eager rather than found through search_tools.
+    assert baseline_size < 27_100
     # JSON pointers, Office structure/format selectors and PDF rotation now
     # share this one native schema rather than separate eager tools.
     # Includes operation-specific cell/row validation to avoid repeated failed writes.
     assert patch_file_size < 4_900
-    assert schema_size - call_tool_size < 30_900
+    assert schema_size - call_tool_size < 32_000
     assert "generate_file" in names
     assert "patch_file" in names
     assert "rag" not in names

@@ -171,7 +171,7 @@ async def test_v11_full_export_install_roundtrip(
     ws_resp = await client.get(f"/api/v1/workspaces/{new_ws_id}", headers=headers)
     assert ws_resp.status_code == 200
     new_ws = ws_resp.json()
-    assert new_ws["name"] == "[SIM] Sandbox X Growth"
+    assert new_ws["name"] == "Sandbox X Growth"
     assert new_ws["kind"] == "social_media"
     assert new_ws["operating_context"] == "Running for {{brand_name}}."
     assert new_ws["primary_work"] == "Draft posts daily."
@@ -1329,7 +1329,7 @@ async def test_v11_workflow_and_post_install_checks(
                             "id": "draft",
                             "kind": "agent_call",
                             "service_key": "x.poster",
-                            "input": "Draft on ${{vars.topic}}",
+                            "input": "Draft on {{topic}}",
                         },
                         {"id": "review", "kind": "hitl_approval", "depends_on": ["draft"], "timeout_minutes": 60},
                         {"id": "post", "kind": "tool_call", "depends_on": ["review"], "tool": "tool.x.post"},

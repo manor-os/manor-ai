@@ -153,8 +153,8 @@ async def test_chat_rate_limit_returns_retry_after(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_chat_reads_have_a_separate_per_user_budget(monkeypatch):
-    """Sidebar and room reads cannot exhaust the write budget or a shared IP bucket."""
+async def test_signed_in_requests_use_per_user_budgets_not_the_ip_bucket(monkeypatch):
+    """Users behind one IP keep separate budgets; chat reads cannot spend the write budget."""
     from httpx import ASGITransport, AsyncClient
     from apps.api.middleware.rate_limit import ChatRateLimitMiddleware, RateLimiter
     import apps.api.middleware.rate_limit as rate_limit
@@ -171,6 +171,10 @@ async def test_chat_reads_have_a_separate_per_user_budget(monkeypatch):
     @app.post("/api/v1/chat/rooms/{room_id}/messages")
     async def send_message(room_id: str):
         return {"room_id": room_id}
+
+    @app.get("/api/v1/workspaces")
+    async def workspaces():
+        return []
 
     monkeypatch.setattr(mw, "_RATE_LIMIT_ENABLED", True)
     monkeypatch.setattr(mw, "RATE_LIMIT_PER_MINUTE", 1)
@@ -204,6 +208,12 @@ async def test_chat_reads_have_a_separate_per_user_budget(monkeypatch):
         assert (await client.post("/api/v1/chat/rooms/room-1/messages", headers=alice)).status_code == 200
         mw._buckets.clear()
         assert (await client.post("/api/v1/chat/rooms/room-1/messages", headers=alice)).status_code == 429
+        # App reads by two users on one IP each get the per-user API budget.
+        for headers in (alice, bob):
+            for _ in range(6):
+                assert (await client.get("/api/v1/workspaces", headers=headers)).status_code == 200
+        assert (await client.get("/api/v1/workspaces", headers=alice)).status_code == 429
+        mw._buckets.clear()
         # Invalid credentials cannot bypass the existing shared-IP global limit.
         assert (await client.get("/api/v1/chat/conversations", headers={"Authorization": "Bearer invalid"})).status_code == 200
         assert (await client.get("/api/v1/chat/conversations", headers={"Authorization": "Bearer invalid"})).status_code == 429

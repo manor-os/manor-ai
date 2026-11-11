@@ -105,14 +105,29 @@ window.workspaceAppUploadFixture = {
 
 let current: any;
 let submitted: unknown;
-api.workspaces.setupStatus = async () => ({ ready: !params.has("setup"), incomplete_checks: params.has("setup") ? [{ kind: "missing_skill", reason: "Connect the required Skill." }] : [] } as any);
+let setupReads = 0;
+let setupState = params.has("failed-setup") ? "failed" : null;
+(window as any).setupPolling = { reads: () => setupReads, retry: () => { setupState = "running"; } };
+api.workspaces.setupStatus = async () => {
+  setupReads++;
+  return { ready: !params.has("setup"), automatic_setup_state: setupState,
+    incomplete_checks: params.has("setup") ? [{ kind: "missing_skill", reason: "Connect the required Skill.", setup_job_id: setupState ? "setup-job" : undefined }] : [] } as any;
+};
 api.workflows.listRuns = async () => [];
+api.mediaJobs.forRun = async () => [];
 api.workflows.getRun = async () => current;
 api.workflows.runBinding = async (bindingId, payload) => {
   submitted = { bindingId, ...payload };
   const action = actions.find((item) => item.binding_id === bindingId)!;
-  current = { id: "fixture-run", workspace_id: workspaceId, workflow_id: action.workflow_id, binding_id: bindingId,
-    status: "completed", variables: { __result: { summary: "The fixture run completed in the App." } } };
+  current = params.has("project-end")
+    // A run that ends by changing a project: its last output is the project, its end says what happened.
+    ? { id: "fixture-run", workspace_id: workspaceId, workflow_id: action.workflow_id, binding_id: bindingId,
+      status: "completed", current_step_id: "post_cancelled",
+      variables: { __result: { project_id: "post-1", project_type: "content_campaign_slot", project_key: "slot:campaign-1:3",
+        state: { queue_key: "campaign-1:youtube:video", due_at: "2026-11-05T04:40:00Z" } } },
+      step_results: { post_cancelled: { status: "completed", completion_message: "This post is cancelled: it will not be made or published." } } }
+    : { id: "fixture-run", workspace_id: workspaceId, workflow_id: action.workflow_id, binding_id: bindingId,
+      status: "completed", variables: { __result: { summary: "The fixture run completed in the App." } } };
   return current;
 };
 function Fixture() {

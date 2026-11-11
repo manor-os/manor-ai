@@ -1060,7 +1060,7 @@ def _runtime_terminal_error_from_frame(frame: str) -> dict[str, str] | None:
     message = data.get("message") if event == "error" else data.get("error")
     if not message:
         return None
-    code = str(data.get("stop_reason") or "runtime_execution_failed").strip()
+    code = str(data.get("error_code") or data.get("stop_reason") or "runtime_execution_failed").strip()
     return {
         "code": (code or "runtime_execution_failed")[:80],
         "message": str(message)[:2000],

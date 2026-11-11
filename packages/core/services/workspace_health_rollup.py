@@ -10,10 +10,19 @@ Replacing (delete + insert) rather than upserting means a Workspace that
 lost all of a day's runs on re-roll loses its row too. Same-day runs are
 serialised with a transaction-scoped advisory lock.
 
+A past day's rows keep the Blueprint version and mode they were first written
+with, so re-rolling history never moves it onto a version installed later. Only
+today follows the Workspace's current settings.
+
+The ``work`` surface counts the same runs as work units. It stays out of
+``RUN_SURFACES``: the task and workflow rows keep counting executions for launch
+review, Stats and health.
+
 This module only reads and counts. Whether a run succeeded, failed or was
 cancelled, and whether a review accepted the work, is decided by the
 classifiers in ``workspace_health_metrics`` — never here — so the daily rows
-mean exactly what the launch review and the Stats library mean.
+mean exactly what the launch review and the Stats library mean. Which runs are
+one piece of work is decided by ``workspace_work_units``.
 """
 from __future__ import annotations
 
@@ -31,6 +40,7 @@ from packages.core.blueprints.freshness import (
     BLUEPRINT_VERSION_KEY,
 )
 from packages.core.constants.task import CancelSource
+from packages.core.governance.error_signatures import failure_code
 from packages.core.models.billing import CreditUsageLog
 from packages.core.models.chat_feedback import ChatMessageFeedback
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
@@ -59,13 +69,28 @@ from packages.core.services.workspace_health_metrics import (
     duration_bucket,
     error_text,
     is_agent_step,
+    latest_task_failure_details,
     platform_stopped_task_ids,
     proposal_item_accepted,
     review_outcome,
     statuses_with,
     step_outcome,
     task_outcome,
+    workflow_run_failure_columns,
+    workflow_run_failure_detail,
     workflow_run_outcome,
+)
+from packages.core.services.workspace_work_units import (
+    runs_inside_tasks,
+    scheduled_run_handed_over_column,
+    scheduled_run_is_work_unit,
+    task_finished_column,
+    task_origin_column,
+    tasks_inside_tasks,
+    workflow_run_is_work_unit,
+    workflow_run_parent_column,
+    workflow_run_task_column,
+    workflow_run_work_facts,
 )
 
 SURFACE_TASK = "task"
@@ -73,6 +98,7 @@ SURFACE_AGENT = "agent"
 SURFACE_WORKFLOW = "workflow"
 SURFACE_AUTOMATION = "automation"
 SURFACE_WORKSPACE = "workspace"
+SURFACE_WORK = "work"
 RUN_SURFACES = (SURFACE_TASK, SURFACE_AGENT, SURFACE_WORKFLOW, SURFACE_AUTOMATION)
 
 MODE_LIVE = "live"
@@ -101,13 +127,15 @@ class _Tally:
     duration_count: int = 0
     buckets: Counter = field(default_factory=Counter)
     errors: Counter = field(default_factory=Counter)
+    error_codes: Counter = field(default_factory=Counter)
     counts: Counter = field(default_factory=Counter)
     """Quality counts and credits, keyed by column name (workspace surface)."""
 
     def add(
         self, outcome: str, *, started_at: Optional[datetime] = None,
         finished_at: Optional[datetime] = None, duration_seconds: Optional[float] = None,
-        error: Any = None, cancel_source: Optional[str] = None, retried: bool = False,
+        error: Any = None, failure_detail: Any = None,
+        cancel_source: Optional[str] = None, retried: bool = False,
     ) -> None:
         if outcome == SUCCEEDED:
             self.succeeded += 1
@@ -121,6 +149,9 @@ class _Tally:
             self.failed += 1
             if error:
                 self.errors[error_text(error)] += 1
+            code = failure_code(failure_detail if failure_detail is not None else error)
+            if code:
+                self.error_codes[code] += 1
         elif outcome == CANCELLED:
             self.cancelled += 1
             if cancel_source == CancelSource.USER.value:
@@ -166,12 +197,12 @@ async def rollup_workspace_day(
     await _quality(db, start, end, tally)
 
     dims = await _workspace_dimensions(db, {ws for ws, _ in tallies})
+    recorded = await _recorded_dimensions(db, day) if day < now.astimezone(timezone.utc).date() else {}
     await db.execute(delete(MetricsWorkspaceDaily).where(MetricsWorkspaceDaily.day == day))
     written = 0
     for (workspace_id, surface), t in sorted(tallies.items()):
-        entity_id, blueprint_key, blueprint_version, mode = dims.get(
-            workspace_id, (None, None, None, MODE_LIVE),
-        )
+        entity_id, *current = dims.get(workspace_id, (None, None, None, MODE_LIVE))
+        blueprint_key, blueprint_version, mode = recorded.get(workspace_id, current)
         # The Workspace's own entity is authoritative; a row's entity only
         # fills in for a Workspace that no longer exists. ScheduledJob's
         # entity_id is nullable, so neither may be known: such a row cannot
@@ -186,6 +217,7 @@ async def rollup_workspace_day(
             user_cancelled=t.user_cancelled,
             duration_sum_s=t.duration_sum_s, duration_count=t.duration_count,
             duration_buckets=dict(t.buckets),
+            error_codes=dict(t.error_codes),
             top_errors=[
                 {"message": message, "count": count}
                 for message, count in t.errors.most_common(TOP_ERROR_LIMIT)
@@ -208,23 +240,21 @@ _WORKFLOW_TERMINAL = statuses_with(WORKFLOW_RUN_OUTCOMES, *_JUDGED)
 
 
 async def _tasks(db: AsyncSession, start: datetime, end: datetime, tally: _TallyFor) -> None:
-    # Task failure text is "Task <status>", not the AI_EXECUTION_FAILED log:
-    # the per-task log lookup is what launch review does for one Workspace,
-    # but across every Workspace for a day it is an N-row subquery for little
-    # gain. Launch review still shows the real reasons.
-    finished = func.coalesce(
-        Task.completed_at, Task.status_changed_at, Task.updated_at, Task.created_at,
-    )
+    # The stored failure text stays "Task <status>": the real reason can carry
+    # customer content. Only its content-free code is kept, taken from the
+    # Task's latest AI_EXECUTION_FAILED log in one query for the day's failures.
+    finished = task_finished_column()
     rows = (await db.execute(select(
         Task.id, Task.workspace_id, Task.entity_id, Task.status, Task.cancel_source,
-        Task.started_at, finished.label("finished_at"),
+        Task.started_at, finished.label("finished_at"), task_origin_column().label("origin_task_id"),
     ).where(
         Task.workspace_id.is_not(None), Task.status.in_(_TASK_TERMINAL),
         finished >= start, finished < end,
     ))).all()
-    stopped = await platform_stopped_task_ids(
-        db, [r.id for r in rows if task_outcome(r.status) == FAILED],
-    )
+    failed_ids = [r.id for r in rows if task_outcome(r.status) == FAILED]
+    stopped = await platform_stopped_task_ids(db, failed_ids)
+    failure_details = await latest_task_failure_details(db, failed_ids)
+    inside_task = await tasks_inside_tasks(db, rows)
     for r in rows:
         outcome = task_outcome(
             r.status, platform_stopped=r.id in stopped, cancel_source=r.cancel_source,
@@ -234,8 +264,14 @@ async def _tasks(db: AsyncSession, start: datetime, end: datetime, tally: _Tally
         tally(r.workspace_id, r.entity_id, SURFACE_TASK).add(
             outcome, started_at=r.started_at, finished_at=r.finished_at,
             error=f"Task {r.status}" if outcome == FAILED else None,
+            failure_detail=failure_details.get(r.id),
             cancel_source=r.cancel_source,
         )
+        if r.id not in inside_task:
+            tally(r.workspace_id, r.entity_id, SURFACE_WORK).add(
+                outcome, started_at=r.started_at, finished_at=r.finished_at,
+                failure_detail=failure_details.get(r.id), cancel_source=r.cancel_source,
+            )
     # A Task retry reopens a stopped run; the journal records each one.
     for r in (await db.execute(select(
         TaskRunJournal.workspace_id, TaskRunJournal.entity_id, func.count().label("n"),
@@ -253,19 +289,34 @@ async def _workflow_runs(
     finished = func.coalesce(
         WorkflowRun.completed_at, WorkflowRun.updated_at, WorkflowRun.created_at,
     )
-    for r in (await db.execute(select(
-        WorkflowRun.workspace_id, WorkflowRun.entity_id, WorkflowRun.status, WorkflowRun.error,
-        WorkflowRun.cancel_source, WorkflowRun.attempt_number, WorkflowRun.started_at,
-        finished.label("finished_at"),
+    rows = (await db.execute(select(
+        WorkflowRun.id, WorkflowRun.workspace_id, WorkflowRun.entity_id, WorkflowRun.status,
+        WorkflowRun.error, WorkflowRun.cancel_source, WorkflowRun.attempt_number,
+        WorkflowRun.started_at, finished.label("finished_at"),
+        workflow_run_task_column().label("task_id"), workflow_run_parent_column().label("parent_run_id"),
+        *workflow_run_failure_columns(), *workflow_run_work_facts(),
     ).where(
         WorkflowRun.workspace_id.is_not(None), WorkflowRun.status.in_(_WORKFLOW_TERMINAL),
         finished >= start, finished < end,
-    ))).all():
+    ))).all()
+    inside_task = await runs_inside_tasks(db, rows)
+    for r in rows:
+        outcome = workflow_run_outcome(r.status)
+        failure_detail = workflow_run_failure_detail(r)
         tally(r.workspace_id, r.entity_id, SURFACE_WORKFLOW).add(
-            workflow_run_outcome(r.status), started_at=r.started_at, finished_at=r.finished_at,
-            error=r.error, cancel_source=r.cancel_source,
+            outcome, started_at=r.started_at, finished_at=r.finished_at,
+            error=r.error, failure_detail=failure_detail, cancel_source=r.cancel_source,
             retried=(r.attempt_number or 1) > 1,
         )
+        if workflow_run_is_work_unit(
+            outcome, later_attempt=r.later_attempt, inside_task=r.id in inside_task,
+            ran_work=r.ran_work, stopped_on_child=r.stopped_on_child,
+            replaced_by_parent_retry=r.replaced_by_parent_retry,
+        ):
+            tally(r.workspace_id, r.entity_id, SURFACE_WORK).add(
+                outcome, started_at=r.started_at, finished_at=r.finished_at,
+                failure_detail=failure_detail, cancel_source=r.cancel_source,
+            )
 
 
 async def _agents(db: AsyncSession, start: datetime, end: datetime, tally: _TallyFor) -> None:
@@ -320,7 +371,7 @@ async def _automations(
     for r in (await db.execute(select(
         ScheduledJob.workspace_id, ScheduledJob.entity_id, ScheduledJobRun.status,
         ScheduledJobRun.error, ScheduledJobRun.duration_ms, ScheduledJobRun.started_at,
-        finished.label("finished_at"),
+        finished.label("finished_at"), scheduled_run_handed_over_column().label("handed_over"),
     ).join(ScheduledJob, ScheduledJob.job_id == ScheduledJobRun.job_id).where(
         ScheduledJob.workspace_id.is_not(None), finished >= start, finished < end,
     ))).all():
@@ -333,6 +384,10 @@ async def _automations(
             duration_seconds=r.duration_ms / 1000.0 if r.duration_ms is not None else None,
             error=r.error,
         )
+        if scheduled_run_is_work_unit(outcome, handed_over=r.handed_over):
+            tally(r.workspace_id, r.entity_id, SURFACE_WORK).add(
+                outcome, started_at=r.started_at, finished_at=r.finished_at, failure_detail=r.error,
+            )
 
 
 # ── Workspace surface: quality signals and credits ───────────────────
@@ -405,6 +460,19 @@ async def _workspace_dimensions(
         for row in (await db.execute(select(
             Workspace.id, Workspace.entity_id, Workspace.kind, Workspace.settings,
         ).where(Workspace.id.in_(ids)))).all()
+    }
+
+
+async def _recorded_dimensions(
+    db: AsyncSession, day: date,
+) -> dict[str, tuple[Optional[str], Optional[str], str]]:
+    """{workspace_id: (blueprint_key, blueprint_version, mode)} as ``day``'s rows hold them."""
+    return {
+        r.workspace_id: (r.blueprint_key, r.blueprint_version, r.mode)
+        for r in (await db.execute(select(
+            MetricsWorkspaceDaily.workspace_id, MetricsWorkspaceDaily.blueprint_key,
+            MetricsWorkspaceDaily.blueprint_version, MetricsWorkspaceDaily.mode,
+        ).where(MetricsWorkspaceDaily.day == day))).all()
     }
 
 

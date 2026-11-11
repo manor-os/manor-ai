@@ -48,6 +48,7 @@ _WORKSPACE_ACTION_DESCRIPTIONS = {
     "record_stat_assessment": "Record an assessment for one Workspace stat.",
     "add_assessed_metrics": "Track video views, comments, likes, followers or active users, assessed by an agent on a schedule.",
     "visualize_ledgers": "Chart this Workspace's ledgers (finance, content, recruiting, relationships).",
+    "list_attention": "List what in this Workspace may need a person now: waiting approvals and inputs, undecided proposals, accounts to reconnect, setup, paused automations, budget, goals off pace, blocked or overdue work.",
 }
 
 

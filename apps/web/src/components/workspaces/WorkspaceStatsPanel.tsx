@@ -14,14 +14,10 @@ import {
   workspaceStatAttentionPresentation,
 } from "../../lib/workspaceStats";
 import { useToastStore } from "../../stores/toast";
-import { IconTrendingUp } from "../icons";
 import Button from "../ui/Button";
 import Chip from "../ui/Chip";
-import CompactCard from "../ui/CompactCard";
 import ConfirmDialog from "../ui/ConfirmDialog";
-import EmptyState from "../ui/EmptyState";
-import GlassCard from "../ui/GlassCard";
-import IconTile from "../ui/IconTile";
+import { ConfigAddRow, ConfigBlock, ConfigGroup, ConfigRow } from "../ui/GroupedList";
 import Input from "../ui/Input";
 import LoadingSpinner from "../ui/LoadingSpinner";
 import Modal from "../ui/Modal";
@@ -116,9 +112,6 @@ export default function WorkspaceStatsPanel({ workspaceId, canManage, context = 
   const heading = context === "goals"
     ? t("page.workspace_stats.measurement_sources")
     : t("page.workspace_stats.title");
-  const description = context === "goals"
-    ? t("page.workspace_stats.measurement_sources_description")
-    : t("page.workspace_stats.description");
 
   const refreshStats = () => queryClient.invalidateQueries({ queryKey: ["workspace-stats", workspaceId] });
 
@@ -234,69 +227,38 @@ export default function WorkspaceStatsPanel({ workspaceId, canManage, context = 
   });
 
   return (
-    <GlassCard
-      id={context === "overview" ? "workspace-stats" : "workspace-goal-measurement-sources"}
-      hoverable={false}
-      className={`workspace-overview-card workspace-overview-stats workspace-overview-stats--${context}`}
-    >
-      <div className="workspace-stats-header" style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, marginBottom: stats.length ? 14 : 0 }}>
-        <div style={{ minWidth: 0 }}>
-          <div className="workspace-overview-section-heading" style={{ fontSize: 12, fontWeight: 800, color: "var(--text-strong)", textTransform: "uppercase", letterSpacing: "0.08em" }}>
-            {heading}
-          </div>
-          <div style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.5, marginTop: 3 }}>
-            {description}
-          </div>
-        </div>
-        {canManage && (
-          <Button variant="outline" size="sm" onClick={() => setAddOpen(true)} style={{ flexShrink: 0, whiteSpace: "nowrap" }}>
-            {t("page.workspace_stats.add")}
-          </Button>
-        )}
-      </div>
-
-      {statsQuery.isLoading ? (
-        <div style={{ display: "flex", justifyContent: "center", padding: 28 }}><LoadingSpinner size={20} /></div>
-      ) : statsQuery.isError ? (
-        <EmptyState
-          title={t("page.workspace_stats.load_failed")}
-          description={errorMessage(statsQuery.error)}
-          action={<Button variant="outline" size="sm" onClick={() => void statsQuery.refetch()}>{t("page.workspace_stats.try_again")}</Button>}
-        />
-      ) : stats.length === 0 ? (
-        <EmptyState
-          title={t("page.workspace_stats.empty")}
-          description={t("page.workspace_stats.empty_description")}
-          action={canManage ? <Button size="sm" onClick={() => setAddOpen(true)}>{t("page.workspace_stats.add_first")}</Button> : undefined}
-        />
-      ) : (
-        <div className="workspace-stats-grid">
-          {stats.map((stat) => {
-            const attentionStatus = workspaceStatAttentionPresentation(stat.freshness_status);
-            const timing = workspaceStatAssessmentNote(stat) || (stat.current_value_updated_at
-              ? `${t("page.workspace_stats.updated")} ${relativeTime(stat.current_value_updated_at)}`
-              : t("page.workspace_stats.waiting_for_value"));
-            return (
-              <CompactCard
-                key={stat.id}
-                className="workspace-stat-card"
-                icon={<IconTile size={36}><IconTrendingUp size={17} /></IconTile>}
-                title={(
-                  <span className="workspace-stat-card-title">
-                    <span>{stat.name}</span>
-                    <strong className="mono">{formatWorkspaceStatValue(stat)}</strong>
-                  </span>
-                )}
-                subtitle={`${stat.window.replace(/_/g, " ")} · ${stat.collector_type.replace(/_/g, " ")} · ${timing}`}
-                meta={attentionStatus ? (
-                  <StatusBadge type={attentionStatus.type} dot>{attentionStatus.label}</StatusBadge>
-                ) : undefined}
-                onClick={() => setSelectedStat(stat)}
-              />
-            );
-          })}
-        </div>
-      )}
+    <>
+      <ConfigGroup id={context === "overview" ? "workspace-stats" : "workspace-goal-measurement-sources"} title={heading}>
+        {statsQuery.isLoading ? (
+          <ConfigBlock><LoadingSpinner size={20} /></ConfigBlock>
+        ) : statsQuery.isError ? (
+          <ConfigRow
+            label={t("page.workspace_stats.load_failed")}
+            control={<Button variant="ghost" size="sm" onClick={() => void statsQuery.refetch()}>{t("page.workspace_stats.try_again")}</Button>}
+          />
+        ) : stats.length === 0 ? (
+          <ConfigBlock><p className="config-empty">{t("page.workspace_stats.empty")}</p></ConfigBlock>
+        ) : stats.map((stat) => {
+          const attentionStatus = workspaceStatAttentionPresentation(stat.freshness_status);
+          const timing = workspaceStatAssessmentNote(stat) || (stat.current_value_updated_at
+            ? `${t("page.workspace_stats.updated")} ${relativeTime(stat.current_value_updated_at)}`
+            : t("page.workspace_stats.waiting_for_value"));
+          return (
+            <ConfigRow
+              key={stat.id}
+              label={stat.name}
+              note={timing}
+              meta={attentionStatus ? (
+                <StatusBadge type={attentionStatus.type} dot>{attentionStatus.label}</StatusBadge>
+              ) : undefined}
+              control={<strong className="mono config-row-value">{formatWorkspaceStatValue(stat)}</strong>}
+              chevron
+              onClick={() => setSelectedStat(stat)}
+            />
+          );
+        })}
+        {canManage && <ConfigAddRow label={t("page.workspace_stats.add")} onClick={() => setAddOpen(true)} />}
+      </ConfigGroup>
 
       <Modal
         open={addOpen}
@@ -376,7 +338,7 @@ export default function WorkspaceStatsPanel({ workspaceId, canManage, context = 
             )}
             {selectedLibrary?.collector_type === "integration" && (
               <div style={{ marginTop: 12 }}>
-                <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-1.5">
+                <label className="block text-xs font-semibold text-stone-500 mb-1.5">
                   {t("page.workspace_stats.integration_connection")}
                 </label>
                 <Select
@@ -425,7 +387,7 @@ export default function WorkspaceStatsPanel({ workspaceId, canManage, context = 
             />
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 150px), 1fr))", gap: 10 }}>
               <div>
-                <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-1.5">{t("page.workspace_stats.value_type")}</label>
+                <label className="block text-xs font-semibold text-stone-500 mb-1.5">{t("page.workspace_stats.value_type")}</label>
                 <Select
                   value={custom.value_type}
                   onChange={(value) => setCustom({ ...custom, value_type: value as WorkspaceStatDefinition["value_type"] })}
@@ -441,7 +403,7 @@ export default function WorkspaceStatsPanel({ workspaceId, canManage, context = 
                 placeholder="leads"
               />
               <div>
-                <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-1.5">{t("page.workspace_stats.window")}</label>
+                <label className="block text-xs font-semibold text-stone-500 mb-1.5">{t("page.workspace_stats.window")}</label>
                 <Select
                   value={custom.window}
                   onChange={(value) => setCustom({ ...custom, window: value })}
@@ -513,14 +475,14 @@ export default function WorkspaceStatsPanel({ workspaceId, canManage, context = 
             </div>
 
             {selectedStat.last_collection_error && (
-              <div style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid var(--border-subtle)", background: "var(--surface-muted)", color: "var(--text-default)", fontSize: 12, lineHeight: 1.5 }}>
+              <div style={{ padding: "10px 12px", borderRadius: 10, border: "0.5px solid var(--border-subtle)", background: "var(--surface-muted)", color: "var(--text-default)", fontSize: 12, lineHeight: 1.5 }}>
                 <strong>{t("page.workspace_stats.collection_error")}</strong> {selectedStat.last_collection_error}
               </div>
             )}
 
             {workspaceStatAssessmentNote(selectedStat) && <p>{workspaceStatAssessmentNote(selectedStat)}</p>}
             {canManage && selectedStat.collector_type !== "agent_review" && (
-              <div style={{ paddingTop: 14, borderTop: "1px solid var(--border-subtle)" }}>
+              <div style={{ paddingTop: 14, borderTop: "0.5px solid var(--border-subtle)" }}>
                 <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-strong)", marginBottom: 8 }}>{t("page.workspace_stats.record_value")}</div>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 160px), 1fr))", gap: 8, alignItems: "end" }}>
                   <Input value={newValue} onChange={(event) => setNewValue(event.target.value)} type="number" step="any" placeholder="0" ariaLabel={t("page.workspace_stats.value")} />
@@ -530,7 +492,7 @@ export default function WorkspaceStatsPanel({ workspaceId, canManage, context = 
               </div>
             )}
 
-            <div style={{ paddingTop: 14, borderTop: "1px solid var(--border-subtle)" }}>
+            <div style={{ paddingTop: 14, borderTop: "0.5px solid var(--border-subtle)" }}>
               <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-strong)", marginBottom: 8 }}>{t("page.workspace_stats.history")}</div>
               {historyQuery.isLoading ? (
                 <div style={{ padding: 18, display: "flex", justifyContent: "center" }}><LoadingSpinner size={18} /></div>
@@ -539,7 +501,7 @@ export default function WorkspaceStatsPanel({ workspaceId, canManage, context = 
               ) : (
                 <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
                   {(historyQuery.data?.items || []).map((observation) => (
-                    <div key={observation.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "8px 0", borderBottom: "1px solid var(--border-subtle)" }}>
+                    <div key={observation.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "8px 0", borderBottom: "0.5px solid var(--border-subtle)" }}>
                       <div>
                         <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text-strong)" }}>{formatWorkspaceStatValue(selectedStat, observation.value)}</div>
                         <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 2 }}>{observation.source.replace(/_/g, " ")}</div>
@@ -574,6 +536,6 @@ export default function WorkspaceStatsPanel({ workspaceId, canManage, context = 
         closeOnConfirm={false}
         error={deleteMutation.isError ? errorMessage(deleteMutation.error) : undefined}
       />
-    </GlassCard>
+    </>
   );
 }

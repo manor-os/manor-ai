@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Optional
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import ARRAY, String, Text, and_, any_, case, cast, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -55,6 +55,10 @@ APPROVAL_BACKLOG_AFTER = timedelta(hours=24)
 """An approval left pending this long means nobody is watching the queue."""
 STALLED_AFTER = timedelta(hours=48)
 """In-progress work with no status change for this long is stuck."""
+_FAILURE_DETAILS_READ_CHARS = 8000
+"""A failed step's ``error_details`` can be a pasted blob; its cause is near the start."""
+_COORDINATOR_OUTCOME_KEY = "coordinator_outcome"
+"""``_OUTCOME_KEY`` in ``task_agent_loop``: the typed outcome of a stopped loop."""
 RUNTIME_MIGRATED_ERROR = "runtime_migrated"
 """Failure code the Plan/Step engine retirement (migration 20261025_10)
 logged on the Tasks it stopped. The platform stopped them; they say nothing
@@ -129,6 +133,12 @@ def workflow_run_outcome(status: Any) -> str:
     return WORKFLOW_RUN_OUTCOMES.get(status, IN_FLIGHT)
 
 
+def ids_param(ids: list[str]) -> Any:
+    """One array parameter instead of an expanding IN: a list of ids can be longer
+    than the bind parameters asyncpg accepts. Compare with ``column == ids_param(ids)``."""
+    return any_(literal(ids, type_=ARRAY(String)))
+
+
 def automation_outcome(status: Any) -> Optional[str]:
     """``None`` for a skipped occurrence (e.g. the Workspace was paused)."""
     if status == ScheduledRunStatus.SKIPPED.value:
@@ -200,6 +210,85 @@ async def platform_stopped_task_ids(db: AsyncSession, task_ids: Iterable[str]) -
     return set((await db.execute(
         select(Task.id).where(Task.id.in_(ids), task_platform_stopped_clause())
     )).scalars().all())
+
+
+def workflow_run_failure_columns() -> tuple[ColumnElement, ...]:
+    """What a failed run's stopping step recorded, as columns of a ``WorkflowRun`` select.
+
+    ``run.error`` is a headline settled down to one sentence, so it can lose or
+    misstate the cause. The step keeps the runtime's typed code and outage flag,
+    and the full text whenever the headline shortened it. Read in the database,
+    since the step can hold a large output, and only for failed runs.
+    """
+    def field(name: str) -> ColumnElement:
+        return case((
+            WorkflowRun.status == WorkflowRunStatus.FAILED.value,
+            func.jsonb_extract_path_text(WorkflowRun.step_results, cast(WorkflowRun.current_step_id, Text), name),
+        ))
+
+    return (
+        field("runtime_error").label("failed_runtime_error"),
+        field("provider_transient").label("failed_provider_transient"),
+        func.left(field("error_details"), _FAILURE_DETAILS_READ_CHARS).label("failed_error_details"),
+    )
+
+
+def workflow_run_failure_detail(row: Any) -> dict[str, Any]:
+    """The shape ``failure_code`` reads, from a row with ``workflow_run_failure_columns``.
+
+    For categorizing only: this text can carry customer content and must not
+    leave the account. ``top_errors`` keeps using ``run.error``."""
+    return {
+        "code": row.failed_runtime_error,
+        "transient": row.failed_provider_transient == "true",
+        "message": row.failed_error_details or row.error,
+    }
+
+
+async def latest_task_failure_details(
+    db: AsyncSession, task_ids: Iterable[str],
+) -> dict[str, dict[str, Any]]:
+    """Each Task's latest execution failure as ``{"code", "message"[, "transient"]}``,
+    the shape ``failure_code`` reads.
+
+    The agent loop logs a failure in three places: ``content`` (the human
+    message), ``meta["error"]`` (its own short block code, e.g.
+    ``agent_loop_error`` for every runtime error) and, for a runtime error, the
+    model runtime's typed ``{code, message, transient}`` under
+    ``meta["coordinator_outcome"]["details"]["error_detail"]``. A typed detail
+    wins for ``code`` and ``transient``; ``message`` joins every part so a
+    signature matches wherever the prose was stored.
+
+    For categorizing only: this text can carry customer content and must not
+    leave the account."""
+    ids = list(dict.fromkeys(task_ids))
+    if not ids:
+        return {}
+    typed = TaskLog.meta[_COORDINATOR_OUTCOME_KEY]["details"]["error_detail"]
+    rows = await db.execute(
+        select(TaskLog.task_id, TaskLog.content, TaskLog.meta["error"].astext, typed)
+        .where(TaskLog.task_id == ids_param(ids), TaskLog.log_type == TaskLogType.AI_EXECUTION_FAILED.value)
+        .distinct(TaskLog.task_id)
+        .order_by(TaskLog.task_id, TaskLog.created_at.desc(), TaskLog.id.desc())
+    )
+    details: dict[str, dict[str, Any]] = {}
+    for task_id, content, error, error_detail in rows.all():
+        detail = error_detail if isinstance(error_detail, dict) else {}
+        typed_code = detail.get("code")
+        typed_message = detail.get("message")
+        message = "\n".join(part for part in (
+            typed_message if isinstance(typed_message, str) else "", content, error,
+        ) if part)
+        if not message and not detail:
+            continue
+        failure: dict[str, Any] = {
+            "code": typed_code if isinstance(typed_code, str) and typed_code else (error or ""),
+            "message": message,
+        }
+        if detail.get("transient") is True:
+            failure["transient"] = True
+        details[task_id] = failure
+    return details
 
 
 def _aware(value: datetime) -> datetime:

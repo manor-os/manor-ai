@@ -11,6 +11,7 @@ from typing import Any
 
 from packages.core.services.workspace_app_view import (
     app_target_kind_and_id,
+    AppViewContractError,
     normalize_app_view_config,
 )
 
@@ -37,6 +38,21 @@ def is_portable_asset_url(value: str) -> bool:
             or is_package_asset_path(value) or is_installed_asset_url(value))
 
 
+def without_local_pictures(value: dict[str, Any]) -> dict[str, Any]:
+    """The page without what only this deployment can open: an uploaded cover
+    and the motion cover made for it."""
+
+    def portable(field: str) -> bool:
+        return not value.get(field) or is_portable_asset_url(value[field])
+
+    page = dict(value)
+    if not portable("cover_image_url"):
+        page.pop("cover_image_url")
+    if not (portable("motion_cover_url") and portable("motion_cover_source_url")):
+        page.update(motion_cover_url=None, motion_cover_source_url=None)
+    return page
+
+
 def remap_app_view(
     value: Any,
     *,
@@ -49,13 +65,18 @@ def remap_app_view(
     config = normalize_app_view_config(value)
     maps = {"workflow": workflows, "agent": agents, "automation": automations,
             "workflow_definition": workflow_definitions or {}}
+    problems: list[str] = []
 
     def reference(kind: str, identity: str) -> str:
         if kind == "agent" and identity == "default":
             return "agent:default"
         resolved = maps[kind].get(identity)
         if not resolved:
-            raise ValueError(f"App {kind} target {identity!r} is not included in this Blueprint")
+            problem = (f"App {kind} target {identity!r} is not included in this Blueprint: "
+                       f"it includes {', '.join(sorted(maps[kind])) or 'none'}")
+            if problem not in problems:
+                problems.append(problem)
+            return f"{kind}:{identity}"
         return f"{kind}:{resolved}"
 
     def action(key: str) -> str:
@@ -80,6 +101,16 @@ def remap_app_view(
         kind, identity = app_target_kind_and_id(key, target)
         targets[action(key)] = reference("agent" if kind == "chat" else kind, identity)
     config["targets"] = targets
+    # An item's own action (remake this episode, script this slot) and a
+    # list's Add button name an App entry like the tiles do.
+    for component in config.get("components", []):
+        for block in component.get("blocks", []):
+            for field in ("item_action", "result_action", "plan_action", "add_action"):
+                if isinstance(block.get(field), dict):
+                    block[field]["action"] = action(block[field]["action"])
+            for item_action in block.get("item_actions") or []:
+                if isinstance(item_action, dict):
+                    item_action["action"] = action(item_action["action"])
     for key, source in config.get("data_sources", {}).items():
         source["producer_workflows"] = [
             reference("workflow_definition", ref.removeprefix("workflow_definition:"))
@@ -90,13 +121,13 @@ def remap_app_view(
         if source["type"] == "workspace_stats":
             missing = set(source["stat_keys"]) - (stat_keys or set())
             if missing:
-                raise ValueError(f"App source {key!r} Stats are not included in this Blueprint: {', '.join(sorted(missing))}")
+                problems.append(f"App source {key!r} Stats are not included in this Blueprint: {', '.join(sorted(missing))}")
     if config["sections"] is not None and stat_keys is not None:
         named = {ref.removeprefix("stat:") for section in config["sections"]
                  for ref in section.get("items") or [] if ref.startswith("stat:")}
         missing = named - stat_keys
         if missing:
-            raise ValueError(f"App metrics name Stats that are not included in this Blueprint: {', '.join(sorted(missing))}")
+            problems.append(f"App metrics name Stats that are not included in this Blueprint: {', '.join(sorted(missing))}")
     if config["sections"] is not None:
         config["sections"] = [
             {**section, "source": reference("workflow", section["source"].removeprefix("workflow:"))}
@@ -109,7 +140,9 @@ def remap_app_view(
     for field in ("cover_image_url", "motion_cover_url", "motion_cover_source_url"):
         url = config.get(field)
         if url and not is_portable_asset_url(url):
-            raise ValueError(f"App {field} needs a portable HTTPS asset URL before export")
+            problems.append(f"App {field} needs a portable HTTPS asset URL before export")
+    if problems:
+        raise AppViewContractError(problems)
     return config
 
 
@@ -132,8 +165,15 @@ def validate_portable_app_view(payload: dict[str, Any]) -> None:
     })
 
 
-async def remap_workspace_app_view(db: Any, workspace: Any, value: Any, *, to_runtime: bool) -> dict[str, Any]:
-    """Project configuration upgrades using the same identities as export."""
+async def remap_workspace_app_view(
+    db: Any, workspace: Any, value: Any, *, to_runtime: bool, keep_local_pictures: bool = False,
+) -> dict[str, Any]:
+    """Project configuration upgrades using the same identities as export.
+
+    ``keep_local_pictures`` is for reading and restoring this Workspace's own
+    page, where an upload is a real part of it; only leaving the deployment
+    needs a picture to be portable.
+    """
     from sqlalchemy import select
     from packages.core.blueprints.exporter import _workspace_workflow_export_rows, _portable_agent_slug
     from packages.core.models.scheduler import ScheduledJob
@@ -187,4 +227,8 @@ async def remap_workspace_app_view(db: Any, workspace: Any, value: Any, *, to_ru
         WorkspaceStat.workspace_id == workspace.id, WorkspaceStat.entity_id == workspace.entity_id,
         WorkspaceStat.status == "active",
     ))).scalars())
-    return remap_app_view(value, **maps, stat_keys=stat_keys)
+    if not keep_local_pictures:
+        return remap_app_view(value, **maps, stat_keys=stat_keys)
+    config = remap_app_view(without_local_pictures(value), **maps, stat_keys=stat_keys)
+    pictures = ("cover_image_url", "motion_cover_url", "motion_cover_source_url")
+    return {**config, **{name: value[name] for name in pictures if value.get(name)}}

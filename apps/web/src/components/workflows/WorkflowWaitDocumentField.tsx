@@ -3,19 +3,42 @@ import { api, type DocumentMediaKind } from "../../lib/api";
 import { t } from "../../lib/i18n";
 import type { Document } from "../../lib/types";
 import { linkWorkflowDocuments, prepareWorkflowDocuments, workflowUploadFolderId, type WorkflowDocumentRef, type WorkflowUpload } from "../../lib/workflowRunInputs";
-import { IconClose, IconDocument, IconFolder, IconUpload } from "../icons";
+import { IconClose, IconDocument, IconFolder, IconImage, IconMicrophone, IconUpload } from "../icons";
 import Button from "../ui/Button";
 import HitlKnowledgePicker from "../ui/HitlKnowledgePicker";
 import LoadingSpinner from "../ui/LoadingSpinner";
 import WorkflowUploadProgress, { type WorkflowUploadStatus } from "./WorkflowUploadProgress";
+import "./WorkflowWaitDocumentField.css";
 
 function documentRef(document: Document): WorkflowDocumentRef {
   return { document_id: document.id, id: document.id, name: document.name, type: "knowledge", viewer_url: `/viewer/${document.id}`, fs_path: document.fs_path };
 }
 
+/**
+ * One file a control made itself (a drawn signature) saved the way this field
+ * saves an upload: into the Workspace's files for a run input, else Knowledge,
+ * and linked to the Workspace's materials.
+ */
+export async function uploadWorkflowFile(file: File, { workspaceId, workflowRunInput = false }: {
+  workspaceId?: string;
+  workflowRunInput?: boolean;
+}): Promise<WorkflowDocumentRef> {
+  const folderId = workflowRunInput ? await workflowUploadFolderId(workspaceId, api.workspaces.get) : null;
+  const document = documentRef(await api.documents.upload(file, folderId, {
+    visibility: "private", classification: "internal", client_visible: false,
+  }, { idempotencyKey: crypto.randomUUID() }));
+  if (workspaceId) {
+    await linkWorkflowDocuments([document], () => api.workspaces.documents(workspaceId),
+      (groupId, ids) => api.workspaces.knowledge.addDocuments(workspaceId, groupId, ids));
+  }
+  return document;
+}
+
 export default function WorkflowWaitDocumentField({
-  id, value, workspaceId, workflowRunInput = false, disabled, compact = false, onChange, onBusyChange, accept,
+  id, value, workspaceId, workflowRunInput = false, disabled, compact = false, onChange, onBusyChange, accept, capture,
 }: {
+  /** Also offer the phone's camera (``"environment"`` / ``"user"``) or, for audio, its microphone. */
+  capture?: "environment" | "user" | boolean;
   id: string;
   value: unknown;
   workspaceId?: string;
@@ -30,7 +53,10 @@ export default function WorkflowWaitDocumentField({
   onBusyChange?: (busy: boolean) => void;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const captureRef = useRef<HTMLInputElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
+  // What the phone takes directly: a recording when the field takes audio only, else a photo.
+  const captureKind = !capture ? null : accept?.length && accept.every((kind) => kind === "audio") ? "audio" : "image";
   const [pickerOpen, setPickerOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
@@ -144,6 +170,10 @@ export default function WorkflowWaitDocumentField({
           status={progress[item.uploadKey] || { phase: item.document ? "uploaded" : "queued" }} />)}
       </div>}
       <div className="workflow-wait-document-actions">
+        {captureKind && <button type="button" disabled={disabled || busy} onClick={() => captureRef.current?.click()}>
+          <span aria-hidden="true">{captureKind === "audio" ? <IconMicrophone size={compact ? 14 : 16} /> : <IconImage size={compact ? 14 : 16} />}</span>
+          {" "}{t(captureKind === "audio" ? "component.workflow_schema.capture_audio" : "component.workflow_schema.capture_photo")}
+        </button>}
         <button type="button" disabled={disabled || busy} onClick={() => inputRef.current?.click()}><span aria-hidden="true"><IconUpload size={compact ? 14 : 16} /></span> {t(compact ? "component.workflow_wait_document.upload_compact" : "component.workflow_file.upload_local")}</button>
         <button ref={buttonRef} type="button" disabled={disabled || busy} onClick={() => setPickerOpen(true)}><span aria-hidden="true"><IconFolder size={compact ? 14 : 16} /></span> {t(compact ? "component.workflow_wait_document.knowledge_compact" : "component.workflow_file.choose_knowledge")}</button>
       </div>
@@ -155,6 +185,15 @@ export default function WorkflowWaitDocumentField({
       event.target.value = "";
       void add(pendingSelected, pending);
     }} />
+    {captureKind && <input ref={captureRef} type="file" hidden aria-hidden="true" tabIndex={-1}
+      accept={captureKind === "audio" ? "audio/*" : "image/*"}
+      // On a phone this opens the camera or recorder; a desktop browser shows its file chooser.
+      capture={capture === "user" ? "user" : "environment"}
+      onChange={(event) => {
+        const pending = uploads.concat(Array.from(event.target.files || []).map((file) => ({ file, uploadKey: crypto.randomUUID() })));
+        event.target.value = "";
+        void add(pendingSelected, pending);
+      }} />}
     {error && <div className="workflow-wait-document-error" role="alert">
       <span>{error}</span>
       <Button size="sm" variant="outline" disabled={disabled || busy} onClick={() => void add(pendingSelected, uploads)}>{t("component.workflow_wait_document.retry")}</Button>

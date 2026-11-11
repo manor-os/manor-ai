@@ -171,6 +171,55 @@ async def test_file_images_remain_available_for_a_later_multiturn_comparison(mon
     assert all("data:image/png;base64" not in str(message.get("content")) for message in result.messages)
 
 
+@pytest.mark.asyncio
+async def test_batch_rereads_of_more_frames_than_fit_end_instead_of_looping(monkeypatch):
+    """Production loop: a review read 7+ frames per round while only 4 are
+    kept, so the first ones were evicted unseen and re-read forever. Only
+    deliverable pixels are sent, re-reads are capped, and the turn stops."""
+    frames = {f"frame-{index}.png": image_bytes("PNG") + bytes([index]) for index in range(7)}
+    requests: list[list[dict]] = []
+
+    async def fake_completion(messages, tools, **kwargs):
+        requests.append(messages)
+        return "", [
+            {"id": f"r{len(requests)}-{name}", "name": "read_file", "arguments": {"path": name}}
+            for name in frames
+        ], {}
+
+    async def final_completion(messages, **kwargs):
+        requests.append(messages)
+        return "review incomplete", {}
+
+    async def execute(_name, args):
+        return _image_read(args["path"], frames[args["path"]])
+
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_tool_completion", fake_completion)
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_final_completion", final_completion)
+    result = await loop_module.agentic_loop(
+        system_prompt="Review the frames.", user_message="review",
+        tools=[_tool("read_file")], tool_executor=execute, max_rounds=50,
+        metadata={"context_window_tokens": 128_000},
+    )
+
+    def images(messages):
+        return [
+            block for message in messages
+            for block in (message.get("content") if isinstance(message.get("content"), list) else [])
+            if block.get("type") == "image_url"
+        ]
+
+    assert all(len(images(request)) <= loop_module.FILE_VISUAL_HISTORY_MAX_IMAGES for request in requests)
+    first_round = [
+        json.loads(message["content"])["image"] for message in requests[1] if message.get("role") == "tool"
+    ]
+    assert [image["delivered"] for image in first_round] == [True] * 4 + [False] * 3
+    assert {image.get("reason") for image in first_round[4:]} == {"round_image_limit"}
+    assert "reread_limit" in str(requests[-1])
+    assert result.rounds < 20
+    assert result.error_detail == {"stop": "no_progress"}
+    assert "tool use has stopped" in str(requests[-1])
+
+
 def test_file_visual_tail_evicts_oldest_images_when_request_budget_is_small():
     observation = {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]}
     history = [

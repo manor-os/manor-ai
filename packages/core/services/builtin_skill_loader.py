@@ -14,6 +14,7 @@ entity sees them without duplicating rows per tenant.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -289,6 +290,7 @@ def _read_builtin_skill_spec(skill_dir: Path) -> dict | None:
         "temperature",
         "model",
         "search",
+        "groups",
     ):
         if key in skill_config:
             if key == "capability_companion":
@@ -511,7 +513,8 @@ async def seed_builtin_skills(db: AsyncSession) -> list[Skill]:
 
     results: list[Skill] = []
     for skill_dir in skill_dirs:
-        spec = _read_builtin_skill_spec(skill_dir)
+        # A cold read hashes thousands of bundle files; other requests keep running.
+        spec = await asyncio.to_thread(_read_builtin_skill_spec, skill_dir)
         if spec is None:
             continue
         slug = spec["slug"]

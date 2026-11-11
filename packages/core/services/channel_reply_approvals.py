@@ -81,14 +81,28 @@ async def maybe_hold_external_reply_for_approval(
             )
 
         if decision.pause_for_hitl:
+            from packages.core.governance.always_allow import (
+                authorization_card_fields,
+                authorization_decision,
+            )
+
+            choices = authorization_card_fields(
+                await authorization_decision(
+                    db, entity_id=entity_id, workspace_id=workspace_id,
+                    action_key=ExternalMessageActionKey.SEND.value,
+                ),
+                action_label="send replies to people outside the Workspace",
+                action_key=ExternalMessageActionKey.SEND.value,
+            )
+            from packages.core.services.integration_service import channel_display_name
+
             preview = reply_text.strip()
             if len(preview) > 1400:
                 preview = preview[:1400].rstrip() + "..."
             body = (
                 "Approval needed before sending an external message.\n\n"
-                f"Channel: `{channel_type}`\n"
-                f"Recipient: `{sender_name or sender_id}`\n"
-                f"Rule: `{decision.matched_rule or ExternalMessageActionKey.SEND.value}`\n\n"
+                f"Channel: {channel_display_name(channel_type)}\n"
+                f"Recipient: `{sender_name or sender_id}`\n\n"
                 f"Draft reply:\n{preview}"
             )
             msg = await chat_service.post_message(
@@ -117,6 +131,7 @@ async def maybe_hold_external_reply_for_approval(
                     "action_key": ExternalMessageActionKey.SEND.value,
                     "matched_rule": decision.matched_rule,
                     "options": approval_options(),
+                    **choices,
                 },
                 refs=[
                     {"type": "conversation", "id": conversation_id},
@@ -141,6 +156,7 @@ async def maybe_hold_external_reply_for_approval(
                     chat_message_id=msg.id,
                     title=hitl_title,
                     body=hitl_body,
+                    pending_action=msg.pending_action,
                 )
             except Exception:
                 logger.warning(

@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Optional
 
@@ -69,10 +70,12 @@ def effective_agent_id(agent_id: str | None) -> str:
     return MASTER_AGENT_ID if not agent_id or agent_id in MANOR_AGENT_IDS else agent_id
 
 
-def _safe_user_dir(entity_id: str, agent_id: str, user_id: str) -> str:
+def agent_user_dir(entity_id: str, agent_id: str, user_id: str) -> str:
     """Return the per-user override directory for an agent."""
     agent_dir = get_agent_dir(entity_id, agent_id)
     safe_user = re.sub(r'[/\\]', '_', str(user_id).strip())
+    if safe_user in {".", ".."}:
+        safe_user = "_"
     return os.path.join(agent_dir, "users", safe_user)
 
 
@@ -111,7 +114,7 @@ def read_agent_file(
     # Try per-user override first
     agent_id = effective_agent_id(agent_id)
     if user_id:
-        user_dir = _safe_user_dir(entity_id, agent_id, user_id)
+        user_dir = agent_user_dir(entity_id, agent_id, user_id)
         content = _read_file(os.path.join(user_dir, filename))
         if content is not None:
             return content
@@ -139,7 +142,7 @@ def write_agent_file(
 
     agent_id = effective_agent_id(agent_id)
     if user_id:
-        target_dir = _safe_user_dir(entity_id, agent_id, user_id)
+        target_dir = agent_user_dir(entity_id, agent_id, user_id)
     else:
         target_dir = get_agent_dir(entity_id, agent_id)
 
@@ -170,14 +173,18 @@ def _read_with_level(
     filename: str,
     user_id: str | None,
     strict: bool = False,
+    *,
+    allow_entity: bool = True,
 ) -> tuple[str | None, str]:
     """Read a file and return (content, level) where level is 'user'|'entity'|'none'."""
     if user_id:
-        user_dir = _safe_user_dir(entity_id, agent_id, user_id)
+        user_dir = agent_user_dir(entity_id, agent_id, user_id)
         content = _read_file(os.path.join(user_dir, filename), strict=strict)
         if content is not None:
             return content, "user"
 
+    if not allow_entity:
+        return None, "none"
     agent_dir = get_agent_dir(entity_id, agent_id)
     content = _read_file(os.path.join(agent_dir, filename), strict=strict)
     if content is not None:
@@ -205,11 +212,12 @@ def load_agent_files_with_levels(
     *,
     user_id: str | None = None,
     strict: bool = False,
+    level_allowed: Callable[[str, str], bool] | None = None,
 ) -> tuple[AgentFileSet, dict[str, str]]:
     """Load all agent definition files and return (files, levels).
 
     levels is a dict of {filename: "user"|"entity"|"none"} showing
-    where each file was loaded from.
+    where each file was loaded from. A denied level is never read.
     """
     agent_id = effective_agent_id(agent_id)
     mapping = [
@@ -226,7 +234,11 @@ def load_agent_files_with_levels(
     levels: dict[str, str] = {}
     values: dict[str, str | None] = {}
     for fname, attr in mapping:
-        content, level = _read_with_level(entity_id, agent_id, fname, user_id, strict=strict)
+        file_user_id = user_id if level_allowed is None or level_allowed(fname, "user") else None
+        content, level = _read_with_level(
+            entity_id, agent_id, fname, file_user_id, strict=strict,
+            allow_entity=level_allowed is None or level_allowed(fname, "entity"),
+        )
         values[attr] = content
         if content is not None:
             levels[fname] = level
@@ -292,7 +304,7 @@ def list_agent_files(
     Shows both entity-level and per-user files when user_id is provided.
     """
     agent_dir = get_agent_dir(entity_id, agent_id)
-    user_dir = _safe_user_dir(entity_id, agent_id, user_id) if user_id else None
+    user_dir = agent_user_dir(entity_id, agent_id, user_id) if user_id else None
 
     result = {}
     for filename, description in AGENT_FILES.items():

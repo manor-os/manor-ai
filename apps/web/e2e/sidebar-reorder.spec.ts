@@ -2,11 +2,20 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
 
 const USER_ID = "sidebar-reorder-user";
 const ENTITY_ID = "sidebar-reorder-entity";
+const CONVERSATION_ROWS = [
+  "agent:agent-a", "workspace:workspace-a", "room:group-a", "room:group-b", "room:human-a", "workspace:workspace-b",
+];
+const [FIRST_ROW, SECOND_ROW, ...OTHER_ROWS] = CONVERSATION_ROWS;
 const sections = [
-  { name: "AI chats", list: ".manor-session-list", ids: ["ai-a", "ai-b"], key: `manor-chat-sidebar-ai:${ENTITY_ID}:${USER_ID}` },
-  { name: "Workspaces", list: ".workspace-sidebar-list", ids: ["workspace-a", "workspace-b"], key: `manor-workspace-sidebar:${ENTITY_ID}:${USER_ID}` },
-  { name: "Group chats", list: "#chat-sidebar-group", ids: ["group-a", "group-b"], key: `manor-chat-sidebar-group:${ENTITY_ID}:${USER_ID}` },
-  { name: "Direct chats", list: "#chat-sidebar-dm", ids: ["room:human-a", "agent:agent-a"], key: `manor-chat-sidebar-dm:${ENTITY_ID}:${USER_ID}` },
+  {
+    name: "AI chats", list: ".manor-session-list", ids: ["ai-a", "ai-b"], key: `manor-chat-sidebar-ai:${ENTITY_ID}:${USER_ID}`,
+    moved: ["ai-b", "ai-a"], stored: ["ai-b", "ai-a"],
+  },
+  {
+    // A row that moves stays put; the rows below it are still free to follow recency.
+    name: "Conversations", list: ".conversation-sidebar-list", ids: CONVERSATION_ROWS, key: `manor-chat-sidebar-conversations:${ENTITY_ID}:${USER_ID}`,
+    moved: [SECOND_ROW, FIRST_ROW, ...OTHER_ROWS], stored: [SECOND_ROW],
+  },
 ];
 
 async function mockSidebar(page: Page) {
@@ -107,7 +116,7 @@ async function openSidebar(page: Page) {
   const toggle = page.locator('button[aria-controls="manor-chat-sessions"]');
   await expect(toggle).toHaveAttribute("aria-expanded", "true");
   for (const section of sections) {
-    await expect(page.locator(section.list).locator("[data-sidebar-id]")).toHaveCount(2);
+    await expect(page.locator(section.list).locator("[data-sidebar-id]")).toHaveCount(section.ids.length);
   }
 }
 
@@ -152,30 +161,30 @@ for (const width of [1280, 390]) {
       await button.focus();
       await expect(button).toBeFocused();
       await button.press("ArrowUp");
-      await expect.poll(() => order(page, section.list)).toEqual([...section.ids].reverse());
+      await expect.poll(() => order(page, section.list)).toEqual(section.moved);
       await expect(button).toBeFocused();
       await expect(button).not.toHaveCSS("box-shadow", "none");
     }
     if (width === 1280) {
       await page.getByRole("button", { name: "Collapse sidebar", exact: true }).click();
       const collapsedButtons = page.locator(".workspace-collapsed-chat-item > button");
-      await expect(collapsedButtons).toHaveCount(7);
+      await expect(collapsedButtons).toHaveCount(CONVERSATION_ROWS.length + 1);
       expect(await collapsedButtons.evaluateAll((buttons) => buttons.map((button) => button.getAttribute("aria-label"))))
         .toEqual([
-          "Open Manor AI", "Open Sidebar workspace b", "Open Sidebar workspace a",
-          "Open Sidebar group b", "Open Sidebar group a", "Open Sidebar Agent", "Open Sidebar human",
+          "Open Manor AI", "Open Sidebar workspace a", "Open Sidebar Agent",
+          "Open Sidebar group a", "Open Sidebar group b", "Open Sidebar human", "Open Sidebar workspace b",
         ]);
       for (const button of await collapsedButtons.all()) await expect(button).toHaveCSS("cursor", "default");
-      await expect(page.locator(".sidebar-mobile")).toHaveCSS("width", "92px");
+      await expect(page.locator(".sidebar-mobile")).toHaveCSS("width", "76px");
       await page.screenshot({ path: testInfo.outputPath("sidebar-collapsed.png") });
       await page.getByRole("button", { name: "Expand sidebar", exact: true }).click();
     }
     await page.reload();
     await openSidebar(page);
     for (const section of sections) {
-      expect(await order(page, section.list)).toEqual([...section.ids].reverse());
+      expect(await order(page, section.list)).toEqual(section.moved);
       expect(await page.evaluate((key) => JSON.parse(localStorage.getItem(key) || "null"), section.key))
-        .toMatchObject({ mode: "manual", order: [...section.ids].reverse() });
+        .toMatchObject({ mode: "manual", order: section.stored });
     }
     await page.screenshot({ path: testInfo.outputPath(`sidebar-${width}.png`) });
     expect(state.errors).toEqual([]);
@@ -183,7 +192,7 @@ for (const width of [1280, 390]) {
   });
 }
 
-test("drag reorders every chat section without opening the dragged chat", async ({ page }) => {
+test("drag reorders every chat list without opening the dragged chat", async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 1000 });
   const state = await mockSidebar(page);
   await page.goto("/chat?new=chat");
@@ -191,7 +200,7 @@ test("drag reorders every chat section without opening the dragged chat", async 
   const originalUrl = page.url();
   for (const section of sections) {
     await dragBefore(page, section.ids[1], section.ids[0]);
-    await expect.poll(() => order(page, section.list)).toEqual([...section.ids].reverse());
+    await expect.poll(() => order(page, section.list)).toEqual(section.moved);
     await expect(page).toHaveURL(originalUrl);
     await expect(page.locator("[data-sidebar-drop]")).toHaveCount(0);
   }
@@ -202,12 +211,12 @@ test("drag reorders every chat section without opening the dragged chat", async 
   expect(state.mutations).toEqual([]);
 });
 
-test("search and drops across sections preserve each list order", async ({ page }) => {
+test("search and drops across lists preserve each list order", async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 1000 });
   const state = await mockSidebar(page);
   await page.goto("/chat?new=chat");
   await openSidebar(page);
-  await dragBefore(page, "workspace-b", "group-a");
+  await dragBefore(page, "ai-b", "room:group-a");
   for (const section of sections) expect(await order(page, section.list)).toEqual(section.ids);
   await page.locator(".chat-sidebar-global-search").fill("Sidebar");
   for (const section of sections) {

@@ -78,6 +78,12 @@ class ScheduledJob(Base, TimestampMixin):
     goal_step_id: Mapped[Optional[str]] = mapped_column(String(100))
     manor_task_id: Mapped[Optional[str]] = mapped_column(String(26))
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Disabled only because the Workspace was not yet admitting it (still
+    # provisioning, or paused). Workspace activation turns these Jobs on; a
+    # person's or the system's own enable/disable clears the hold.
+    workspace_hold: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
     delete_after_run: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
     last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     next_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))

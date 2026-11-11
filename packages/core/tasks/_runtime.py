@@ -42,6 +42,11 @@ def run_in_worker(coro: Awaitable[Any]) -> Any:
                 from packages.core.tasks.media_tasks import drain_media_background_tasks
 
                 await drain_media_background_tasks()
+                # Usage rows and credit charges of auto-recorded model calls
+                # are written in the background; finish them first.
+                from packages.core.ai.llm_client import drain_fire_and_forget_writes
+
+                await drain_fire_and_forget_writes()
                 # Transaction callbacks schedule committed external delivery.
                 # Drain it before this per-task event loop is torn down.
                 from packages.core.services.event_emitter import (

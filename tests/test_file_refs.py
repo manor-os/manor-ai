@@ -55,6 +55,7 @@ def test_parse_accepts_every_address_the_platform_hands_out(address, expected):
     "/api/v1/fs/ent1/../etc/passwd",
     "https://example.com/report.pdf",
     "Reports/q3.docx",  # relative paths only for tool inputs
+    "https://[draft hook]/x",  # not a URL at all: urlsplit raises on the bracketed host
 ])
 def test_parse_rejects_what_is_not_an_openable_address(address):
     assert parse_file_reference(address, entity_id="ctx") is None

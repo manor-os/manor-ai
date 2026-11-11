@@ -289,3 +289,36 @@ async def test_large_uploaded_png_retains_source_hash_and_converts(db_session, a
     target = await _doc_for(db_session, user.entity_id, "converted.png")
     with Image.open(attachment_fs / args["entity_id"] / target.fs_path) as image:
         assert image.format == "PNG" and image.size == (12, 8)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("fs_enabled")
+@pytest.mark.parametrize("outcome", ["jpeg", "not_image", "http", "document_kind"])
+async def test_public_image_url_is_saved_as_a_real_image(db_session, monkeypatch, outcome):
+    """A post cover is fetched once and stored only if its bytes decode as an image."""
+    from packages.core.services import code_projects
+
+    entity_id, workspace_id = generate_ulid(), generate_ulid()
+    await _seed_workspace(db_session, entity_id, workspace_id)
+    root = Path(file_tools._get_entity_root(entity_id))
+    body = b"<html>login</html>" if outcome == "not_image" else image_bytes("JPEG", mode="RGB")
+    download = AsyncMock(return_value=body)
+    monkeypatch.setattr(code_projects, "download_public_https", download)
+    monkeypatch.setattr(file_actions, "runtime_guard_file_mutation", AsyncMock(return_value=None))
+    url = ("http" if outcome == "http" else "https") + "://cdn.example.com/cover.jpg?sig=1"
+    kind = "document" if outcome == "document_kind" else "image"
+    result = json.loads(await tool._generate_file_handler(
+        entity_id, kind=kind, name="cover.jpg", file_type="jpg", source={"url": url}, workspace_id=workspace_id,
+    ))
+    target = await _doc_for(db_session, entity_id, "cover.jpg")
+    if outcome == "jpeg":
+        assert result["created"] and result["converted"], result
+        assert target.id == result["document"]["document_id"] and target.file_type == "jpg"
+        with Image.open(io.BytesIO((root / target.fs_path).read_bytes())) as image:
+            assert image.format == "JPEG" and image.size == (12, 8)
+        download.assert_awaited_once()
+    else:
+        assert result.get("error"), result
+        assert target is None
+        if outcome in {"http", "document_kind"}:
+            download.assert_not_awaited()

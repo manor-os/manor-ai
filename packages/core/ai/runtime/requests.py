@@ -5,6 +5,9 @@ from typing import Any
 
 from packages.core.ai.runtime.surfaces import ChatSurface
 
+# Set by the Workflow runner for a step whose run works on a WorkflowProject.
+WORKFLOW_PROJECT_FOLDER_METADATA_KEY = "workflow_project_folder"
+
 
 @dataclass(frozen=True)
 class ChannelRuntimeContext:
@@ -64,3 +67,8 @@ class AIRuntimeRequest:
     channel_context: ChannelRuntimeContext | None = None
     editor_context: dict[str, Any] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def workflow_project_folder(self) -> str | None:
+        """The folder of the WorkflowProject this Workflow step's run works on."""
+        return str(self.metadata.get(WORKFLOW_PROJECT_FOLDER_METADATA_KEY) or "").strip().strip("/") or None

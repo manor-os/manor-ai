@@ -128,6 +128,27 @@ async def test_independent_tool_prompts_on_one_message_have_separate_receipts(cl
 
 
 @pytest.mark.asyncio
+async def test_open_decision_names_its_waiting_run_and_the_run_hosting_it(client, db_session):
+    # A sub-flow's review (a music video inside a campaign) is offered on the campaign run's own panel.
+    headers = await _register(client, "attention_host_run")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    wid = await _workspace(client, headers)
+    _, thread = await _seed(db_session, me["entity_id"], wid)
+    review = _card(thread, "human_input", created_at=BASE)
+    review.pending_action = {**review.pending_action, "title": "Review the storyboard and lyrics",
+                             "workflow_run_id": "music-video-run", "workflow_chat_host_run_id": "campaign-run"}
+    plain = _card(thread, "human_input", created_at=BASE + timedelta(minutes=1))
+    db_session.add_all([review, plain])
+    await db_session.commit()
+    response = await client.get(f"/api/v1/workspaces/{wid}/chat/attention", headers=headers, params={"scope": "open"})
+    assert response.status_code == 200, response.text
+    items = {item["message_id"]: item for item in response.json()["items"]}
+    assert (items[review.id]["workflow_run_id"], items[review.id]["workflow_host_run_id"]) == (
+        "music-video-run", "campaign-run")
+    assert (items[plain.id]["workflow_run_id"], items[plain.id]["workflow_host_run_id"]) == (None, None)
+
+
+@pytest.mark.asyncio
 async def test_unread_list_is_read_only_scoped_and_excludes_viewed_cards(client, db_session):
     headers = await _register(client, "attention_list")
     me = (await client.get("/api/v1/auth/me", headers=headers)).json()

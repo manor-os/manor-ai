@@ -1,3 +1,5 @@
+import { startVisiblePolling } from "../lib/visiblePolling";
+import { displayReadInterval } from "../lib/readRefreshPolicy";
 import ApprovalModeTrigger from "./approvals/ApprovalModeTrigger";
 import { getPreferredTimeZone } from "../lib/format";
 import { Fragment, Suspense, lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from "react";
@@ -403,7 +405,7 @@ export function ChatRoomConversation({ roomId, currentUserId, requestedAction }:
   const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
   const [olderMessagesError, setOlderMessagesError] = useState("");
   const historyRequestRef = useRef(0);
-  const { data: room, isLoading, error: roomError } = useQuery({ queryKey: ["chat-room", roomId], queryFn: () => api.chatRooms.get(roomId), refetchInterval: 120_000 });
+  const { data: room, isLoading, error: roomError } = useQuery({ queryKey: ["chat-room", roomId], queryFn: () => api.chatRooms.get(roomId), refetchInterval: (query) => displayReadInterval(query.state, 120_000) });
   const messageQueryKey = ["chat-room-messages", roomId, searchedMessageQuery];
   const { data: latestMessages = [], error: messagesError } = useQuery({
     queryKey: messageQueryKey,
@@ -437,27 +439,29 @@ export function ChatRoomConversation({ roomId, currentUserId, requestedAction }:
       return [...merged.values()].sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id)).slice(-200);
     },
     enabled: !!room && !anchoredLatestMessages,
-    refetchInterval: searchedMessageQuery || anchoredLatestMessages ? false : 120_000,
+    refetchInterval: (query) => searchedMessageQuery || anchoredLatestMessages
+      ? false : displayReadInterval(query.state, 120_000),
   });
   const messages = [...olderMessages, ...(anchoredLatestMessages || latestMessages)];
   const displayedMessageIdsRef = useRef<string[]>([]);
   displayedMessageIdsRef.current = messages.map((message) => message.id).slice(-1000);
-  const refreshRetractions = useCallback(() => {
-    const ids = displayedMessageIdsRef.current;
-    if (!ids.length) return;
-    void api.chatRooms.retractions(roomId, ids).then(({ message_ids }) => {
-      if (!message_ids.length) return;
+  const retractionPollRef = useRef<ReturnType<typeof startVisiblePolling> | null>(null);
+  const refreshRetractions = useCallback(() => { void retractionPollRef.current?.refresh(); }, []);
+  useEffect(() => {
+    const poll = startVisiblePolling(async (signal) => {
+      const ids = displayedMessageIdsRef.current;
+      if (!ids.length) return;
+      const { message_ids } = await api.chatRooms.retractions(roomId, ids, signal);
+      if (signal.aborted || !message_ids.length) return;
       const removed = new Set(message_ids);
       setOlderMessages((items) => redactRoomMessages(items, removed));
       setAnchoredLatestMessages((items) => items ? redactRoomMessages(items, removed) : null);
       queryClient.setQueriesData<ChatRoomMessage[]>({ queryKey: ["chat-room-messages", roomId] },
         (items) => items ? redactRoomMessages(items, removed) : items);
-    }).catch(() => {});
+    }, 120_000, { immediate: false });
+    retractionPollRef.current = poll;
+    return () => { poll.stop(); retractionPollRef.current = null; };
   }, [roomId, queryClient]);
-  useEffect(() => {
-    const timer = window.setInterval(refreshRetractions, 120_000);
-    return () => window.clearInterval(timer);
-  }, [refreshRetractions]);
   const roomRefreshTimerRef = useRef<number | null>(null);
   const roomCatchupTimerRef = useRef<number | null>(null);
   const pendingPreviousIdsRef = useRef(new Set<string>());
@@ -546,7 +550,7 @@ export function ChatRoomConversation({ roomId, currentUserId, requestedAction }:
       }, 150);
     },
   });
-  const { data: presence, error: presenceError } = useQuery({ queryKey: ["chat-room-presence", roomId], queryFn: () => api.chatRooms.presence(roomId), enabled: !!room, refetchInterval: 60_000 });
+  const { data: presence, error: presenceError } = useQuery({ queryKey: ["chat-room-presence", roomId], queryFn: () => api.chatRooms.presence(roomId), enabled: !!room, refetchInterval: (query) => displayReadInterval(query.state, 60_000) });
   const [draft, setDraft] = useState("");
   const [replyingTo, setReplyingTo] = useState<ChatRoomMessage | null>(null);
   const [messageToRetract, setMessageToRetract] = useState<ChatRoomMessage | null>(null);
@@ -778,21 +782,21 @@ export function ChatRoomConversation({ roomId, currentUserId, requestedAction }:
     queryKey: ["chat-room-invites", roomId],
     queryFn: () => api.chatRooms.pendingInvites(roomId),
     enabled: !!room && detailsOpen && !!(canInvite || canReissueDmInvite),
-    refetchInterval: detailsOpen ? 120_000 : false,
+    refetchInterval: (query) => displayReadInterval(query.state, detailsOpen ? 120_000 : false),
   });
   const pendingInviteCount = pendingInvites.filter((invitation) => invitation.status !== "expired").length;
   const { data: toolApprovals = [], isLoading: approvalsLoading, error: approvalsError } = useQuery({
     queryKey: ["chat-room-tool-approvals", roomId],
     queryFn: () => api.chatRooms.toolApprovals(roomId),
     enabled: !!canReviewAiTools && (detailsOpen || approvalOpen),
-    refetchInterval: approvalOpen ? 120_000 : false,
+    refetchInterval: (query) => approvalOpen ? displayReadInterval(query.state, 120_000) : false,
   });
   const pendingToolApprovals = toolApprovals.filter((approval) => approval.status === "pending");
   const { data: pendingReplyApprovals = [], isLoading: repliesLoading, error: repliesError } = useQuery({
     queryKey: ["chat-room-reply-approvals", roomId],
     queryFn: () => api.chatRooms.replyApprovals(roomId),
     enabled: !!canReviewAiTools,
-    refetchInterval: canReviewAiTools ? 120_000 : false,
+    refetchInterval: (query) => displayReadInterval(query.state, canReviewAiTools ? 120_000 : false),
   });
   const { data: agentCandidates = [], isLoading: agentsLoading, error: agentsError } = useQuery({
     queryKey: ["chat-room-agent-candidates", roomId],

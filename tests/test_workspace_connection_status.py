@@ -1,6 +1,7 @@
 """Current connection guidance is independent of Workspace creation origin."""
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
@@ -106,6 +107,161 @@ async def test_connection_recovery_and_expiry_without_creation_flags(db_session,
     await db.flush()
     assert (await _status(db, workspace, user_id))["required_issue_count"] == 0
     assert workspace.settings == original
+
+
+@pytest.mark.parametrize("installed", [False, True])
+async def test_pending_connection_is_asked_once_in_workspace_chat(db_session, installed):
+    """Created and installed Workspaces ask to connect a missing integration
+    with the Reconnect card, connecting recommended, and never ask twice."""
+    from packages.core.models.task import Message
+    from packages.core.services.workspace_connection_status import ask_to_connect_pending_integrations
+
+    db = db_session
+    user_id = generate_ulid()
+    server = await _server(db)
+    settings = {"_blueprint": {"live_setup_requirements": [{
+        "kind": "missing_integration", "payload": {"provider": server.server_key}, "blocking": True,
+    }]}} if installed else {"flagged_integrations": [{
+        "provider": server.server_key, "required": True, "source": "agent_design",
+        "linked_service_keys": ["email"], "blocks_creation": False,
+    }]}
+    workspace = await _workspace(db, settings=settings)
+    # Operation-written services key themselves with ``key``.
+    workspace.operating_model = {"services": [{"key": "email", "name": "客户咨询回复"}]}
+    agent = await _agent(db, workspace)
+    db.add(AgentMCPBinding(agent_id=agent.id, mcp_server_id=server.id))
+    await db.flush()
+
+    asked = await ask_to_connect_pending_integrations(
+        db, workspace=workspace, user_id=user_id, publish_event=False,
+    )
+    assert asked == [server.server_key]
+    assert await ask_to_connect_pending_integrations(
+        db, workspace=workspace, user_id=user_id, publish_event=False,
+    ) == []
+    await db.flush()
+    cards = [
+        row.pending_action for row in (await db.execute(select(Message))).scalars().all()
+        if (row.pending_action or {}).get("provider_key") == server.server_key
+    ]
+    assert len(cards) == 1
+    card = cards[0]
+    assert card["kind"] == "needs_login"
+    assert card["options"][0] == "sign_in"
+    assert card["recommendation"]["option"] == "sign_in"
+    assert card["login_url"] == f"/integrations?provider={server.server_key}"
+    assert card["option_details"]["sign_in"]["label_code"] == "integration.connect"
+    # Viewer-language title and description name the waiting service, never its key.
+    assert card["title_code"] == "integration.connect"
+    assert card["description_code"] == "connect_waiting"
+    assert card["description_params"]["services"] == "客户咨询回复"
+    assert "email" not in card["description_params"]["services"]
+
+    # The App lists this requirement once: its connections row, not the queue too.
+    from types import SimpleNamespace
+    from packages.core.services.workspace_app_sections import _queue_items
+    from packages.core.workspace_chat.attention import list_workspace_attention
+
+    viewer = SimpleNamespace(id=user_id, entity_id=workspace.entity_id, preferences={})
+    attention = await list_workspace_attention(db, user=viewer, workspace_id=workspace.id, unread_only=False)
+    assert [item["connection_provider"] for item in attention["items"]] == [server.server_key]
+    assert await _queue_items(db, workspace, user=viewer) == []
+
+
+async def test_continuing_after_a_connect_card_hands_the_waiting_work_back_to_the_ai(db_session, monkeypatch):
+    """"Continue the waiting work" becomes the person's next message to the AI,
+    but only once the account really is usable."""
+    from types import SimpleNamespace
+
+    from apps.api.routers import workspace_chat
+    from packages.core.models.task import Message
+
+    db = db_session
+    user_id = generate_ulid()
+    server = await _server(db)
+    workspace = await _workspace(db)
+    user = SimpleNamespace(id=user_id, entity_id=workspace.entity_id, locale="zh")
+    card = {"kind": "needs_login", "connection_request": True, "provider_key": server.server_key,
+            "title_params": {"provider": "Gmail"}}
+    scheduled: list[dict] = []
+    monkeypatch.setattr(workspace_chat, "_schedule_workspace_chat_processing", AsyncMock(side_effect=lambda **kwargs: scheduled.append(kwargs)))
+
+    async def follow_ups():
+        return [row for row in (await db.execute(select(Message))).scalars().all()
+                if row.author_kind == "user" and "Gmail" in (row.content or "")]
+
+    await workspace_chat._continue_after_connection(db, user=user, workspace_id=workspace.id, pending_action=card)
+    assert scheduled == [] and await follow_ups() == []
+
+    db.add(OAuthAccount(user_id=user_id, provider=server.server_key, provider_user_id="owner@example.test",
+                        access_token="fixture-token-not-used-for-provider-calls"))
+    await db.flush()
+    await workspace_chat._continue_after_connection(db, user=user, workspace_id=workspace.id, pending_action=card)
+    [message] = await follow_ups()
+    assert message.content == "Gmail 已连接，请继续之前在等它的工作。"
+    assert (message.meta or {}).get("workspace_chat_audience") == "ai"
+    assert [call["message_id"] for call in scheduled] == [message.id]
+
+
+async def test_failed_workflow_step_names_the_integration_its_agent_waited_for(db_session):
+    """A run's retry can offer "connect X, then continue" only for the step whose
+    Agent needs X, and only while X is not connected."""
+    from types import SimpleNamespace
+
+    from packages.core.services.workspace_connection_status import workflow_step_connection_need
+
+    db = db_session
+    user_id = generate_ulid()
+    server = await _server(db)
+    workspace = await _workspace(db)
+    agent = await _agent(db, workspace, service="publishing")
+    db.add(AgentMCPBinding(agent_id=agent.id, mcp_server_id=server.id))
+    await db.flush()
+    from packages.core.services.workflow_run_trace import build_execution_snapshot
+
+    workflow = SimpleNamespace(id="wf-1", version=1, variables={}, steps=[
+        {"id": "draft", "type": "agent", "config": {"service_key": "writing"}},
+        {"id": "publish", "type": "agent", "config": {"service_key": "publishing"}},
+        {"id": "notify", "type": "agent", "config": {"agent_id": agent.id}},
+    ])
+    # The step config lives in the run's frozen execution contract, not in
+    # its display snapshot.
+    run = SimpleNamespace(
+        workspace_id=workspace.id, workflow_id="wf-1",
+        definition_snapshot={"nodes": [{"id": "publish", "type": "agent"}]},
+        execution_snapshot=build_execution_snapshot(workflow),
+    )
+
+    assert await workflow_step_connection_need(db, run=run, step_id="draft", user_id=user_id) is None
+    need = await workflow_step_connection_need(db, run=run, step_id="publish", user_id=user_id)
+    assert need and need["provider"] == server.server_key
+    assert (await workflow_step_connection_need(db, run=run, step_id="notify", user_id=user_id))["provider"] == server.server_key
+    # Staging 2026-11-05: a step that said what else was wrong still waited for this connection.
+    for said, waits in (("The file was not found; please upload it.", False),
+                        ("Reading mail is outside this agent's scope.", False),
+                        ("I have no access to the account.", True),
+                        (f"Connect {server.server_key} first.", True)):
+        need = await workflow_step_connection_need(db, run=run, step_id="publish", user_id=user_id, evidence=said)
+        assert bool(need) is waits, said
+    # Without evidence from the caller, the result the run stored for the step speaks;
+    # a step that stopped for a person needs a connection only when its ask names one.
+    for stored, waits in (({"status": "failed", "error": "The file was not found."}, False),
+                          ({"status": "failed", "error": "I have no access to the account."}, True),
+                          ({"status": "completed", "needs_person": {
+                              "missing": "I have no access to real product photos.",
+                              "ask": "Add product photos to the knowledge."}}, False),
+                          ({"status": "completed", "needs_person": {
+                              "missing": "Nothing can be published yet.",
+                              "ask": f"Connect {server.server_key}."}}, True)):
+        run.step_results = {"publish": stored}
+        need = await workflow_step_connection_need(db, run=run, step_id="publish", user_id=user_id)
+        assert bool(need) is waits, stored
+    run.step_results = {}
+
+    db.add(OAuthAccount(user_id=user_id, provider=server.server_key, provider_user_id="owner@example.test",
+                        access_token="fixture-token-not-used-for-provider-calls"))
+    await db.flush()
+    assert await workflow_step_connection_need(db, run=run, step_id="publish", user_id=user_id) is None
 
 
 async def test_other_users_accounts_and_other_workspaces_do_not_satisfy_requirements(db_session):
@@ -329,6 +485,30 @@ async def test_connection_status_http_projection_and_tenant_boundary(client, db_
     _, other_headers = await _register(client, "noticeoutsider")
     denied = await client.get(f"/api/v1/workspaces/{workspace.id}/connection-status", headers=other_headers)
     assert denied.status_code == 404
+
+
+@pytest.mark.parametrize(("linked", "platform", "asked_again"), [
+    ("instagram_engagement", "instagram", False),
+    ("", "instagram", False),
+    ("", "xiaohongshu", True),
+])
+async def test_a_platform_the_workspace_already_connects_through_an_integration_is_not_asked_again(
+    db_session, linked, platform, asked_again,
+):
+    """Local eval 2026-11-03: Meta was asked for, and App's Needs you still read "instagram (no built-in channel)"."""
+    workspace = await _workspace(db_session)
+    workspace.operating_model = {"channel_config": {"secondary_external_channels": [
+        {"channel_type": "other", "provider": platform, "required": True, "linked_service_key": linked},
+    ]}}
+    workspace.settings = {"flagged_integrations": [
+        {"provider": "facebook", "required": True, "linked_service_keys": ["instagram_engagement"]},
+    ]}
+    await db_session.flush()
+
+    result = await _status(db_session, workspace, generate_ulid())
+
+    labels = [row["label"] for row in result["requirements"] if row["kind"] == "channel"]
+    assert bool(labels) is asked_again, labels
 
 
 async def test_other_platform_channel_is_optional_and_satisfied_by_a_dedicated_integration(db_session):

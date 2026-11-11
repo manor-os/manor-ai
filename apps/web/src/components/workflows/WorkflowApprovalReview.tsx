@@ -67,6 +67,12 @@ function hasReviewValue(value: unknown): boolean {
   return true;
 }
 
+function isConstrainedPreviewTechnicalField(key: string): boolean {
+  return ["review_artifacts", "artifacts", "files", "checklist", "summary", "previews", "pages", "review_title"].includes(key)
+    || /(?:^|_)(?:document|file|artifact)_id$/i.test(key)
+    || /(?:^|_)(?:sha(?:256|512)?|hash|fs_path)$/i.test(key);
+}
+
 /** Labelled fields, lists, links and Knowledge files, as a person reads them. */
 export function StructuredReviewValue({ value }: { value: unknown }) {
   if (Array.isArray(value)) {
@@ -112,6 +118,12 @@ export function workflowReviewIsEditable(review: unknown): review is Record<stri
   return Boolean(review && typeof review === "object" && !Array.isArray(review));
 }
 
+export function workflowReviewIsRevisionChoice(choice: string): boolean {
+  return ["revise", "request_revision", "request_changes", "changes_requested"].includes(
+    choice.trim().toLowerCase().replace(/[-\s]+/g, "_"),
+  );
+}
+
 function cloneReviewRecord(review: unknown): Record<string, unknown> {
   try {
     return JSON.parse(JSON.stringify(review)) as Record<string, unknown>;
@@ -130,9 +142,13 @@ export function EditableWorkflowApprovalReview({
   review,
   disabled,
   onDraftState,
+  editableFields,
+  revisionField,
 }: WorkflowApprovalReviewProps & {
   disabled?: boolean;
   onDraftState: (draft: Record<string, unknown>, valid: boolean) => void;
+  editableFields?: string[];
+  revisionField?: string;
 }) {
   const [draft, setDraft] = useState<Record<string, unknown>>(
     () => cloneReviewRecord(review),
@@ -144,18 +160,17 @@ export function EditableWorkflowApprovalReview({
         .map(([key, value]) => [key, JSON.stringify(value, null, 2)]),
     ),
   );
+  const [rawStringLists, setRawStringLists] = useState<Record<string, string>>(() =>
+    Object.fromEntries(
+      Object.entries(cloneReviewRecord(review))
+        .filter(([, value]) => Array.isArray(value) && value.every((item) => typeof item === "string"))
+        .map(([key, value]) => [key, (value as string[]).join(", ")]),
+    ),
+  );
   const [errors, setErrors] = useState<Record<string, string>>({});
   const editDetailsRef = useRef<HTMLDetailsElement>(null);
   const hasErrors = Object.values(errors).some(Boolean);
   const changed = JSON.stringify(draft) !== JSON.stringify(review);
-
-  useEffect(() => {
-    onDraftState(draft, !hasErrors);
-  }, [draft, hasErrors, onDraftState]);
-
-  useEffect(() => {
-    if (hasErrors && editDetailsRef.current) editDetailsRef.current.open = true;
-  }, [hasErrors]);
 
   const updateValue = (key: string, value: unknown) => {
     setDraft((current) => ({ ...current, [key]: value }));
@@ -177,6 +192,107 @@ export function EditableWorkflowApprovalReview({
       }));
     }
   };
+
+  const constrainedFields = Array.isArray(editableFields) ? editableFields : null;
+  const revisionRequested = Boolean(revisionField)
+    && Boolean(String(draft[revisionField!] ?? "").trim());
+
+  useEffect(() => {
+    onDraftState(draft, !hasErrors);
+  }, [draft, hasErrors, onDraftState]);
+
+  useEffect(() => {
+    if (hasErrors && editDetailsRef.current) editDetailsRef.current.open = true;
+  }, [hasErrors]);
+
+  if (constrainedFields) {
+    const preview = Object.fromEntries(
+      Object.entries(draft).filter(([key]) => (
+        !constrainedFields.includes(key)
+        && key !== revisionField
+        && (["review_artifacts", "artifacts", "files", "previews", "pages"].includes(key)
+          || !isConstrainedPreviewTechnicalField(key))
+      )),
+    );
+    return (
+      <div className="approval-review-editor">
+        <WorkflowApprovalReview review={preview} reviewTitle={reviewTitle} prompt={prompt} />
+        <div className="approval-review-editor__fields">
+          {constrainedFields.filter((key) => key !== revisionField).map((key) => {
+            const value = draft[key];
+            const label = formatUserFacingLabel(key);
+            if (Array.isArray(value) && value.every((item) => typeof item === "string")) {
+              return <Input
+                key={key}
+                className="approval-review-editor__field"
+                label={label}
+                value={rawStringLists[key] ?? value.join(", ")}
+                onChange={(event) => {
+                  const source = event.target.value;
+                  setRawStringLists((current) => ({ ...current, [key]: source }));
+                  updateValue(key, source.split(",").map((item) => item.trim()).filter(Boolean));
+                }}
+                disabled={disabled}
+              />;
+            }
+            if (typeof value === "number") {
+              return <Input
+                key={key}
+                className="approval-review-editor__field"
+                label={label}
+                type="number"
+                value={String(value)}
+                onChange={(event) => updateValue(key, Number(event.target.value))}
+                disabled={disabled}
+              />;
+            }
+            if (typeof value === "boolean") {
+              return <label className="approval-review-editor__field" key={key}>
+                <input
+                  type="checkbox"
+                  checked={value}
+                  onChange={(event) => updateValue(key, event.target.checked)}
+                  disabled={disabled}
+                />
+                {label}
+              </label>;
+            }
+            if (typeof value !== "string") return null;
+            const multiline = /(description|content|text|body)$/i.test(key);
+            return multiline ? <Textarea
+              key={key}
+              className="approval-review-editor__field approval-review-editor__field--wide"
+              label={label}
+              ariaLabel={label}
+              value={value}
+              onChange={(event) => updateValue(key, event.target.value)}
+              rows={4}
+              disabled={disabled}
+            /> : <Input
+              key={key}
+              className="approval-review-editor__field"
+              label={label}
+              value={value}
+              onChange={(event) => updateValue(key, event.target.value)}
+              disabled={disabled}
+            />;
+          })}
+          {revisionField && <Textarea
+            className="approval-review-editor__field approval-review-editor__field--wide"
+            label={formatUserFacingLabel(revisionField)}
+            ariaLabel={formatUserFacingLabel(revisionField)}
+            value={String(draft[revisionField] ?? "")}
+            onChange={(event) => updateValue(revisionField, event.target.value)}
+            rows={3}
+            disabled={disabled}
+          />}
+          {revisionRequested && <p className="approval-review-editor__notice" role="status">
+            Submit the video change request or clear it before approving.
+          </p>}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="approval-review-editor">
@@ -483,7 +599,7 @@ export function ApprovalChangePreview({ argsPreview }: { argsPreview: unknown })
   return request ? <PermissionChanges edits={request.edits} written={request.written} patches={request.patches} /> : null;
 }
 
-function PermissionRequestReview({ request, review }: { request: PermissionRequest; review: unknown }) {
+function PermissionRequestReview({ request }: { request: PermissionRequest }) {
   return (
     <div className="chat-hitl-summary chat-workflow-review">
       <div className="chat-hitl-title">{permissionTitle(request)}</div>
@@ -493,10 +609,6 @@ function PermissionRequestReview({ request, review }: { request: PermissionReque
         ))}
       </div>}
       <PermissionChanges edits={request.edits} written={request.written} patches={request.patches} />
-      <details className="chat-workflow-review-raw">
-        <summary>{t("component.workflow_review.original_data")}</summary>
-        <pre>{previewText(review, true)}</pre>
-      </details>
     </div>
   );
 }
@@ -506,12 +618,18 @@ export interface WorkflowApprovalReviewProps {
   reviewTitle?: string;
   review: unknown;
   full?: boolean;
+  /** The prompt already reads above the card (a chat message's text), so it is not said twice. */
+  promptShown?: boolean;
+  /** Decided: what was reviewed stays, the instructions for deciding go. */
+  resolved?: boolean;
 }
 
 export default function WorkflowApprovalReview({
   prompt,
   reviewTitle,
   review,
+  promptShown = false,
+  resolved = false,
 }: WorkflowApprovalReviewProps) {
   const plan = asRecord(review);
   const scenes = Array.isArray(plan?.scenes)
@@ -528,7 +646,7 @@ export default function WorkflowApprovalReview({
   const hasProductVideoPlan = Boolean(productPromise || narration || scenes.length || outputProfile);
 
   const permission = permissionRequest(plan);
-  if (permission) return <PermissionRequestReview request={permission} review={review} />;
+  if (permission) return <PermissionRequestReview request={permission} />;
 
   if (!hasProductVideoPlan) {
     const pages = workflowReviewArtifacts({ artifacts: plan?.previews ?? plan?.pages });
@@ -544,25 +662,31 @@ export default function WorkflowApprovalReview({
     // A deliverable with its own player needs no second player from its link.
     const playable = artifacts.some((item) => item.documentId && (item.kind === "video" || item.kind === "audio"));
     const media = playable ? [] : workflowFinalMediaRefs(review);
-    const guidance = prompt && prompt.trim() !== summary ? prompt : "";
+    const guidance = prompt && !promptShown && !resolved && prompt.trim() !== summary ? prompt : "";
     const frames = workflowReviewHasFrames(plan);
+    // Something to listen to or look at speaks for itself: its description folds away, and goes
+    // once decided. A review with nothing to show keeps it as its text.
+    const showsWork = artifacts.length > 0 || pages.length > 0 || media.length > 0;
+    const foldedSummary = showsWork && !resolved ? summary : "";
+    const checks = resolved ? [] : checklist;
     return (
       <div className={`chat-hitl-summary chat-workflow-review chat-workflow-review--compact${frames ? " chat-workflow-review--frames" : ""}`}>
         <div className="chat-hitl-title">
           {reviewTitle ? formatUserFacingText(reviewTitle) : t("component.chat_action_card.workflow_review_title")}
         </div>
-        {summary && <div className="workflow-review-summary">{formatUserFacingText(summary)}</div>}
+        {summary && !showsWork && <div className="workflow-review-summary">{formatUserFacingText(summary)}</div>}
         {media.length > 0 && (
           <section className="chat-workflow-review-section chat-workflow-review-media">
             {media.map((item, index) => <MediaPreview key={`${item.url}-${index}`} refItem={item} maxHeight={320} />)}
           </section>
         )}
         <ReviewDeliverables artifacts={artifacts} pages={pages} compact />
-        {(guidance || checklist.length > 0) && (
+        {(foldedSummary || guidance || checks.length > 0) && (
           <details className="workflow-review-guidance">
-            <summary>{t("component.workflow_review.what_to_check")}</summary>
+            <summary>{t(guidance || checks.length > 0 ? "component.workflow_review.what_to_check" : "component.workflow_review.details")}</summary>
+            {foldedSummary && <p>{formatUserFacingText(foldedSummary)}</p>}
             {guidance && <p>{formatUserFacingText(guidance)}</p>}
-            <ReviewChecklist items={checklist} />
+            <ReviewChecklist items={checks} />
           </details>
         )}
         {(facts.length > 0 || sections.length > 0 || !plan) && (
@@ -580,10 +704,6 @@ export default function WorkflowApprovalReview({
             {!plan && <StructuredReviewValue value={review} />}
           </div>
         )}
-        {plan && <details className="chat-workflow-review-raw">
-          <summary>{t("component.workflow_review.original_data")}</summary>
-          <pre>{previewText(review, true)}</pre>
-        </details>}
       </div>
     );
   }
@@ -604,7 +724,7 @@ export default function WorkflowApprovalReview({
       <div className="chat-hitl-title">
         {reviewTitle ? formatUserFacingLabel(reviewTitle) : t("component.chat_action_card.workflow_review_title")}
       </div>
-      {prompt && <div className="chat-hitl-description">{formatUserFacingText(prompt)}</div>}
+      {prompt && !promptShown && !resolved && <div className="chat-hitl-description">{formatUserFacingText(prompt)}</div>}
 
       <div className="chat-workflow-review-scroll">
         {productPromise && (

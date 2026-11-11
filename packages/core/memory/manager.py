@@ -28,6 +28,9 @@ JUDGMENT_CACHE_TTL = 15 * 60
 EXTRACTION_CACHE_TTL = 7 * 24 * 60 * 60
 WORKER_TIMEOUT = 40
 SELECTION_TIMEOUT = 8
+# Consolidation is a background pass over many notes: a longer answer and wait.
+CONSOLIDATION_TIMEOUT = 120
+CONSOLIDATION_MAX_ENTRIES = 40
 MAX_INPUT_CHARS = 100_000
 _LOCAL_DECISIONS: OrderedDict[str, tuple[float, dict]] = OrderedDict()
 _INFLIGHT: set[str] = set()
@@ -66,6 +69,8 @@ def _validate(operation: str, data: object, payload: dict) -> dict:
         if not isinstance(ids, list) or any(not isinstance(i, str) or i not in allowed for i in ids):
             raise ValueError("Memory worker selected an unknown record")
         return {"ids": list(dict.fromkeys(ids))[: payload.get("limit", 100)]}
+    if operation == "consolidate":
+        return _validate_consolidation(data, payload)
     key = "entries" if operation == "extract" else "memories"
     entries = data.get(key)
     if not isinstance(entries, list) or len(entries) > 20:
@@ -102,8 +107,16 @@ def _validate(operation: str, data: object, payload: dict) -> dict:
                 or any(not isinstance(t, str) or len(t) > 100 for t in tags)
             ):
                 raise ValueError("Invalid memory tags")
+            layers = payload.get("layers")
+            layer = item.get("layer")
+            if layer is None:
+                layer = "private"
+            if layers is not None and layer not in layers:
+                raise ValueError("Invalid memory layer")
             entry = {k: item[k] for k in ("scope", "title", "body", "source_message_id", "confidence")}
             entry["tags"] = tags
+            if layers is not None:
+                entry["layer"] = layer
         else:
             importance = item.get("importance", 5)
             if type(importance) is not int or not 1 <= importance <= 10:
@@ -114,6 +127,31 @@ def _validate(operation: str, data: object, payload: dict) -> dict:
             seen.add(fingerprint)
             valid.append(entry)
     return {key: valid}
+
+
+def _validate_consolidation(data: dict, payload: dict) -> dict:
+    entries = data.get("entries")
+    if not isinstance(entries, list) or len(entries) > CONSOLIDATION_MAX_ENTRIES:
+        raise ValueError("Invalid memory consolidation collection")
+    items = {item["id"] for item in payload["items"]}
+    existing = {item["id"] for item in payload.get("existing", [])}
+    valid = []
+    for item in entries:
+        if not isinstance(item, dict):
+            raise ValueError("Invalid memory consolidation item")
+        body, sources, replaces = item.get("body"), item.get("sources"), item.get("replaces")
+        if (
+            item.get("scope") not in {"fact", "preference", "decision", "guidance", "learning"}
+            or item.get("layer") not in payload["layers"]
+            or not isinstance(body, str) or not body.strip() or len(body) > 600
+            or not isinstance(sources, list) or not sources
+            or any(not isinstance(s, str) or s not in items for s in sources)
+            or (replaces is not None and replaces not in existing)
+        ):
+            raise ValueError("Invalid memory consolidation entry")
+        valid.append({"scope": item["scope"], "layer": item["layer"], "body": body,
+                      "sources": list(dict.fromkeys(sources)), "replaces": replaces})
+    return {"entries": valid}
 
 
 async def run_memory_skill(
@@ -131,7 +169,7 @@ async def run_memory_skill(
     )
     from packages.core.ai.runtime.sources import RUNTIME_INTERNAL_WORKER_SOURCE
 
-    if operation not in {"extract", "extract_legacy", "select"}:
+    if operation not in {"extract", "extract_legacy", "select", "consolidate"}:
         raise ValueError("Unknown memory operation")
     serialized = json.dumps({**payload, "operation": operation}, ensure_ascii=False)
     if len(serialized) > MAX_INPUT_CHARS:
@@ -185,7 +223,7 @@ async def run_memory_skill(
         raise RuntimeError("Memory decision is already running")
     _INFLIGHT.add(key)
     token = uuid4().hex
-    timeout = SELECTION_TIMEOUT if operation == "select" else WORKER_TIMEOUT
+    timeout = {"select": SELECTION_TIMEOUT, "consolidate": CONSOLIDATION_TIMEOUT}.get(operation, WORKER_TIMEOUT)
     lease = None
     try:
         lease = await cache.acquire_lease(key + ":lease", token, ttl=timeout + 10)
@@ -216,7 +254,7 @@ async def run_memory_skill(
                     model=model,
                     metadata=metadata,
                     temperature=0,
-                    max_tokens=2500,
+                    max_tokens=5000 if operation == "consolidate" else 2500,
                     # Keep the bounded JSON budget available for the result.
                     # Reasoning-enabled defaults can consume it before the
                     # worker finishes even a small extraction batch.

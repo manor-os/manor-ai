@@ -39,8 +39,45 @@ def is_external_response_audience(*, profile=None, surface=None) -> bool:
     }
 
 
-def response_language_guidance(locale: str | None) -> str | None:
+# Surfaces where a person talks something through: replies follow the language
+# they write in, and what gets saved keeps their language setting.
+_MESSAGE_LANGUAGE_REPLY_SURFACES = frozenset({"workspace_draft_architect"})
+
+
+def replies_in_message_language(*, surface=None) -> bool:
+    return getattr(surface, "value", surface) in _MESSAGE_LANGUAGE_REPLY_SURFACES
+
+
+def _message_language_reply_guidance(language: str | None) -> str:
+    saved_content = (
+        "- Content you save for later use, such as names, descriptions, instructions, "
+        "Workflow steps, and documents, is written in "
+        f"{_LANGUAGE_NAMES[language]} ({language}), the user's saved language setting, "
+        "unless the person asks for another language.\n"
+        if language else ""
+    )
+    return (
+        f"{RESPONSE_LANGUAGE_BLOCK_START}\n"
+        "## Response Language\n"
+        "- Reply in the language the person writes in. Answers, explanations, progress "
+        "updates, questions, and the options you offer follow the language of their latest "
+        "message, even when earlier replies in this conversation used another language. "
+        "A message that is only a chosen option, a name, or a number keeps the language "
+        "of their earlier messages.\n"
+        f"{saved_content}"
+        "- Preserve the required output format. Do not translate JSON keys, schema fields, "
+        "enum values, tool commands, filenames, API names, code identifiers, or original "
+        "verbatim quotations.\n"
+        f"{RESPONSE_LANGUAGE_BLOCK_END}"
+    )
+
+
+def response_language_guidance(
+    locale: str | None, *, reply_in_message_language: bool = False,
+) -> str | None:
     language = normalize_response_locale(locale)
+    if reply_in_message_language:
+        return _message_language_reply_guidance(language)
     if language is None:
         return None
     return (

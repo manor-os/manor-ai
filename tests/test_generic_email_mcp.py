@@ -365,6 +365,31 @@ async def test_save_attachment_projects_to_current_workspace(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_message_pages_a_long_body_as_text(monkeypatch):
+    msg = EmailMessage()
+    msg["From"] = "Gary <gary@example.com>"
+    msg["Subject"] = "Product feedback"
+    body = "Feedback sentence. " * 900 + "FINAL LINE"
+    msg.set_content(body)
+    msg.add_alternative(f"<p>{body}</p>", subtype="html")
+    monkeypatch.setattr(email_mcp, "_imap_connect", lambda cfg: _FakeImap(msg.as_bytes()))
+
+    pages = []
+    offset = 0
+    while offset is not None:
+        result = await email_mcp.call_tool(
+            "get_message", {"uid": "7", "offset": offset}, json.dumps(_credentials()),
+        )
+        page = json.loads(result["content"][0]["text"])
+        assert "html" not in page
+        pages.append(page["content"])
+        offset = page["next_offset"]
+
+    assert len(pages) == 2
+    assert "".join(pages) == body
+
+
+@pytest.mark.asyncio
 async def test_get_thread_scans_inbox_and_sent(monkeypatch):
     root = _thread_message_bytes(
         sender="Alice <alice@example.com>",
@@ -445,10 +470,11 @@ def test_reply_actions_use_email_send_approval(tool_name):
     assert action.risk_level == "high"
 
 
-def test_save_attachment_uses_workspace_knowledge_approval():
+@pytest.mark.parametrize("server", ["email", "gmail", "outlook"])
+def test_save_attachment_uses_workspace_knowledge_approval(server):
     action = classify_runtime_tool_action(
-        "mcp__email__save_attachment_to_workspace",
-        {"uid": "7", "attachment_id": "3"},
+        f"mcp__{server}__save_attachment_to_workspace",
+        {"uid": "7", "message_id": "m", "attachment_id": "3"},
     )
     assert action is not None
     assert action.action_key == "workspace.knowledge.update"

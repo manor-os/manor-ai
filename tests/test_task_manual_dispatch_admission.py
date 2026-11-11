@@ -321,7 +321,7 @@ async def test_drafted_workspace_task_starts_its_own_run_from_chat(db_session, m
     )}
     drafted = json.loads(await runtime_workspace_create_task_action(
         entity_id=scenario.entity_id, workspace_id=scenario.workspace.id, user_id=scenario.user.id,
-        params={"title": "Drafted report", "owner_service_key": "reader", **chat_context},
+        params={"title": "Drafted report", "owner_service_key": "reader", "start": False, **chat_context},
     ))
     task_id = drafted["task"]["id"]
     assert drafted["dispatched"] is False
@@ -350,6 +350,95 @@ async def test_drafted_workspace_task_starts_its_own_run_from_chat(db_session, m
         params={"task_id": task_id, "start": True, **chat_context},
     ))
     assert again["error"] == "task_not_startable" and again["status"] == "in_progress"
+
+
+@pytest.mark.parametrize(
+    ("profile", "extra", "started"),
+    [
+        # Prod: "Create a task: update the deck" stayed pending and nothing ever ran it.
+        ("workspace_operator", {}, True),
+        ("workspace_operator", {"start": False}, False),
+        ("workspace_operator", {"run_now": False}, False),
+        ("workspace_operator", {"assignee_id": "scenario-user"}, False),
+        # An automatic run keeps asking to start: it must not fan out on its own.
+        ("background_worker", {}, False),
+    ],
+    ids=["chat-starts", "user-said-later", "legacy-run-now-false", "for-a-person", "background-run"],
+)
+@pytest.mark.asyncio
+async def test_workspace_chat_task_starts_unless_for_later_or_for_a_person(
+    db_session, monkeypatch, profile, extra, started,
+):
+    from sqlalchemy import select
+
+    from packages.core.ai.runtime.workspace_task_actions import runtime_workspace_create_task_action
+    from packages.core.models.runtime_run import RuntimeOutboxEvent
+    from packages.core.models.task import Task
+    from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
+    from tests.task_manual_helpers import task_manual_scenario
+
+    scenario = await task_manual_scenario(db_session)
+    await db_session.commit()
+    monkeypatch.setattr(
+        "packages.core.database.async_session",
+        async_sessionmaker(db_session.bind, expire_on_commit=False),
+    )
+    if extra.get("assignee_id"):
+        extra = {**extra, "assignee_id": scenario.user.id}
+    created = json.loads(await runtime_workspace_create_task_action(
+        entity_id=scenario.entity_id, workspace_id=scenario.workspace.id, user_id=scenario.user.id,
+        params={"title": "Update the deck", **extra, "_runtime_envelope_from_context": SimpleNamespace(
+            profile=profile, user_id=scenario.user.id, task_id=None, workspace_id=scenario.workspace.id,
+        )},
+    ))
+
+    assert created["dispatched"] is started, created
+    task = await db_session.get(Task, created["task"]["id"])
+    await db_session.refresh(task)
+    assert task.status == ("in_progress" if started else "pending")
+    intents = (await db_session.execute(select(RuntimeOutboxEvent).where(
+        RuntimeOutboxEvent.aggregate_id == task.id,
+        RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
+    ))).scalars().all()
+    assert len(intents) == (1 if started else 0)
+
+
+@pytest.mark.asyncio
+async def test_workspace_chat_task_is_kept_when_no_agent_can_run_it(db_session, monkeypatch):
+    """Starting by default must not lose the request; asking to start still says why it cannot."""
+    from packages.core.ai.runtime.workspace_task_actions import runtime_workspace_create_task_action
+    from packages.core.models.task import Task
+    from packages.core.models.workspace import AgentSubscription
+    from tests.task_manual_helpers import task_manual_scenario
+
+    scenario = await task_manual_scenario(db_session)
+    await db_session.execute(
+        update(AgentSubscription)
+        .where(AgentSubscription.workspace_id == scenario.workspace.id)
+        .values(status="inactive")
+    )
+    await db_session.commit()
+    monkeypatch.setattr(
+        "packages.core.database.async_session",
+        async_sessionmaker(db_session.bind, expire_on_commit=False),
+    )
+    chat_context = {"_runtime_envelope_from_context": SimpleNamespace(
+        profile="workspace_operator", user_id=scenario.user.id, task_id=None,
+        workspace_id=scenario.workspace.id,
+    )}
+    kept = json.loads(await runtime_workspace_create_task_action(
+        entity_id=scenario.entity_id, workspace_id=scenario.workspace.id, user_id=scenario.user.id,
+        params={"title": "Update the deck", **chat_context},
+    ))
+    assert kept["created"] is True and kept["dispatched"] is False, kept
+    task = await db_session.get(Task, kept["task"]["id"])
+    assert task.status == "pending"
+
+    refused = json.loads(await runtime_workspace_create_task_action(
+        entity_id=scenario.entity_id, workspace_id=scenario.workspace.id, user_id=scenario.user.id,
+        params={"title": "Another deck", "start": True, **chat_context},
+    ))
+    assert refused["error"] == "task_executor_unavailable"
 
 
 @pytest.mark.asyncio
@@ -388,7 +477,7 @@ async def test_the_turn_that_starts_a_task_reports_it_with_server_status(db_sess
     drafted = json.loads(await runtime_workspace_create_task_action(
         entity_id=scenario.entity_id, workspace_id=scenario.workspace.id, user_id=scenario.user.id,
         conversation_id="chat-9",
-        params={"title": "Drafted report", "owner_service_key": "reader", **turn("m1")},
+        params={"title": "Drafted report", "owner_service_key": "reader", "start": False, **turn("m1")},
     ))
     assert "start_task" in drafted["next"]
     task_id = drafted["task"]["id"]
@@ -433,11 +522,11 @@ async def test_starting_a_drafted_task_by_recreating_it_points_back_to_the_draft
             params={"title": "Drafted report", "owner_service_key": "reader", **params, **chat_context},
         ))
 
-    drafted = await create("chat-1")
+    drafted = await create("chat-1", start=False)
     draft = await db_session.get(Task, drafted["task"]["id"])
 
-    again = await create("chat-1", start=True)
-    assert again["error"] == "task_already_drafted" and again["task_id"] == draft.id
+    for again in (await create("chat-1", start=True), await create("chat-1")):
+        assert again["error"] == "task_already_drafted" and again["task_id"] == draft.id
     count = (await db_session.execute(select(func.count()).select_from(Task).where(
         Task.workspace_id == scenario.workspace.id, Task.title == "Drafted report",
     ))).scalar_one()
@@ -647,3 +736,132 @@ def test_every_chat_reachable_task_creation_records_its_conversation():
     assert found, "no Task creation sites found: the scan is broken"
     assert not missing, f"Task creation without the drafting conversation: {missing}"
     assert _CREATE_TASK_WITHOUT_CONVERSATION <= found, "an exemption names a site that no longer exists"
+
+
+@pytest.mark.asyncio
+async def test_a_stage_created_without_predecessors_can_be_linked_to_them(db_session, monkeypatch):
+    """Live: stages 2 and 3 were created unlinked and unstarted, and sat pending after stage 1 finished."""
+    from packages.core.ai.runtime.workspace_task_actions import (
+        runtime_workspace_create_task_action,
+        runtime_workspace_update_task_runtime_action,
+    )
+    from packages.core.models.task import Task
+    from tests.task_manual_helpers import task_manual_scenario
+
+    scenario = await task_manual_scenario(db_session)
+    await db_session.commit()
+    monkeypatch.setattr(
+        "packages.core.database.async_session",
+        async_sessionmaker(db_session.bind, expire_on_commit=False),
+    )
+    chat = {"_runtime_envelope_from_context": SimpleNamespace(
+        profile="workspace_operator", user_id=scenario.user.id, task_id=None,
+        workspace_id=scenario.workspace.id,
+    )}
+
+    async def stage(title):
+        created = json.loads(await runtime_workspace_create_task_action(
+            entity_id=scenario.entity_id, workspace_id=scenario.workspace.id, user_id=scenario.user.id,
+            params={"title": title, "owner_service_key": "reader", "start": False, **chat},
+        ))
+        return created["task"]["id"]
+
+    async def link(task_id, predecessor):
+        return json.loads(await runtime_workspace_update_task_runtime_action(
+            entity_id=scenario.entity_id, workspace_id=scenario.workspace.id, user_id=scenario.user.id,
+            params={"task_id": task_id, "depends_on_task_ids": [predecessor], **chat},
+        ))
+
+    # The predecessor is still running: the stage waits for it.
+    waiting_id = await stage("Stage 2")
+    waiting = await link(waiting_id, scenario.task.id)
+    assert waiting["started"] is False and "starts when they complete" in waiting["next"]
+    row = await db_session.get(Task, waiting_id)
+    await db_session.refresh(row)
+    assert row.status == "pending" and row.details["depends_on_task_ids"] == [scenario.task.id]
+
+    # The predecessor already finished: nothing would release the stage later, so it starts now.
+    scenario.task.status = "completed"
+    await db_session.commit()
+    started = await link(await stage("Stage 3"), scenario.task.id)
+    assert started["started"] is True, started
+
+    # A correction to the waiting stage names the finished predecessor it will not reach.
+    corrected = json.loads(await runtime_workspace_update_task_runtime_action(
+        entity_id=scenario.entity_id, workspace_id=scenario.workspace.id, user_id=scenario.user.id,
+        params={"task_id": waiting_id, "runtime_instructions": "预算改为740元。", **chat},
+    ))
+    assert corrected["finished_predecessors"] == [{"id": scenario.task.id, "title": scenario.task.title}]
+
+    unknown = await link(await stage("Stage 4"), "01NOTATASK0000000000000000")
+    assert unknown["error"] == "unknown_predecessor_tasks"
+
+
+@pytest.mark.asyncio
+async def test_a_change_to_a_running_task_is_recorded_and_says_it_may_not_reach_the_run(db_session, monkeypatch):
+    from packages.core.ai.runtime.workspace_task_actions import runtime_workspace_update_task_runtime_action
+    from packages.core.models.task import Task
+    from tests.task_manual_helpers import task_manual_scenario
+
+    scenario = await task_manual_scenario(db_session)  # its Task is already in_progress
+    await db_session.commit()
+    monkeypatch.setattr(
+        "packages.core.database.async_session",
+        async_sessionmaker(db_session.bind, expire_on_commit=False),
+    )
+    result = json.loads(await runtime_workspace_update_task_runtime_action(
+        entity_id=scenario.entity_id, workspace_id=scenario.workspace.id, user_id=scenario.user.id,
+        params={"task_id": scenario.task.id, "runtime_instructions": "预算改为740元。",
+                "_runtime_envelope_from_context": SimpleNamespace(
+                    profile="workspace_operator", user_id=scenario.user.id, task_id=None,
+                    workspace_id=scenario.workspace.id)},
+    ))
+    assert "receives this change at its next step" in result["next"]
+    row = await db_session.get(Task, scenario.task.id)
+    await db_session.refresh(row)
+    assert row.details["changes"][-1]["text"] == "预算改为740元。"
+
+    # Live: the correction landed 21 s after stage 1 completed; "updated" left its 900 deliverable.
+    row.status = "completed"
+    await db_session.commit()
+    finished = json.loads(await runtime_workspace_update_task_runtime_action(
+        entity_id=scenario.entity_id, workspace_id=scenario.workspace.id, user_id=scenario.user.id,
+        params={"task_id": scenario.task.id, "runtime_instructions": "目标改为20位。",
+                "_runtime_envelope_from_context": SimpleNamespace(
+                    profile="workspace_operator", user_id=scenario.user.id, task_id=None,
+                    workspace_id=scenario.workspace.id)},
+    ))
+    assert finished["error"] == "task_already_finished" and "follow-up Task" in finished["message"]
+    await db_session.refresh(row)
+    assert row.details["changes"][-1]["text"] == "预算改为740元。"
+
+
+@pytest.mark.asyncio
+async def test_a_correction_sent_as_instructions_reaches_the_task(db_session, monkeypatch):
+    """Live: the Agent sent "预算改为740元" as `instructions`; update_task_runtime dropped it and said "updated"."""
+    from packages.core.ai.runtime.workspace_task_actions import runtime_workspace_update_task_runtime_action
+    from packages.core.models.task import Task
+    from tests.task_manual_helpers import task_manual_scenario
+
+    scenario = await task_manual_scenario(db_session)
+    await db_session.commit()
+    monkeypatch.setattr(
+        "packages.core.database.async_session",
+        async_sessionmaker(db_session.bind, expire_on_commit=False),
+    )
+
+    async def update(**params):
+        return json.loads(await runtime_workspace_update_task_runtime_action(
+            entity_id=scenario.entity_id, workspace_id=scenario.workspace.id, user_id=scenario.user.id,
+            params={"task_id": scenario.task.id, **params, "_runtime_envelope_from_context": SimpleNamespace(
+                profile="workspace_operator", user_id=scenario.user.id, task_id=None,
+                workspace_id=scenario.workspace.id)},
+        ))
+
+    assert (await update(instructions="预算改为740元。"))["updated"] is True
+    row = await db_session.get(Task, scenario.task.id)
+    await db_session.refresh(row)
+    assert row.details["changes"][-1]["text"] == "预算改为740元。"
+
+    nothing = await update(notes="预算改为740元。")
+    assert nothing["error"] == "nothing_to_update" and nothing["unknown_fields"] == ["notes"]

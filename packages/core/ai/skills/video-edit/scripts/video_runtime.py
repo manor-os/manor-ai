@@ -16,7 +16,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -908,10 +910,49 @@ def _resource_snapshot() -> dict[str, int | None]:
         "pids_denied": denied_pids,
         "memory_limit": number("memory.max"),
         "memory_current": number("memory.current"),
+        "memory_peak": number("memory.peak"),
         "memory_reclaimable": _reclaimable_page_cache(),
         "memory_oom_kills": oom_kills,
         "cpu_limit": cpus,
     }
+
+
+@contextmanager
+def _memory_peak_sampler(interval: float = 2.0):
+    """Where the memory went at the render's highest point.
+
+    ``memory.peak`` gives only the total; sizing a render machine needs the
+    split: ``anon`` (browsers, encoder), ``shmem`` (the tmpfs work area:
+    project, extracted and captured frames) and ``file`` (page cache).
+    """
+
+    peak: dict[str, int] = {}
+    stop = threading.Event()
+
+    def sample() -> None:
+        while True:
+            try:
+                current = int((CGROUP / "memory.current").read_text().strip())
+                stat = dict(line.split() for line in (CGROUP / "memory.stat").read_text().splitlines())
+            except (OSError, ValueError):
+                current = -1
+            if current > peak.get("memory_bytes", -1):
+                peak.update(
+                    memory_bytes=current,
+                    anon_bytes=int(stat.get("anon", 0)),
+                    shmem_bytes=int(stat.get("shmem", 0)),
+                    file_bytes=int(stat.get("file", 0)),
+                )
+            if stop.wait(interval):
+                return
+
+    thread = threading.Thread(target=sample, daemon=True)
+    thread.start()
+    try:
+        yield peak
+    finally:
+        stop.set()
+        thread.join(timeout=interval + 1)
 
 
 def _reclaimable_page_cache() -> int:
@@ -1794,6 +1835,7 @@ def _render(output: str, quality: str, workers: int, reviewed: bool = False) -> 
     media_elements = _media_element_count()
     attempts: list[dict] = []
     timeout_attempts: list[dict] = []
+    render_memory_peak: dict[str, int] = {}
     global _media_plan, _browser_plan
     while True:
         workers = int(resources["workers"])
@@ -1807,23 +1849,27 @@ def _render(output: str, quality: str, workers: int, reviewed: bool = False) -> 
             _activity("retrying", "Retrying the render with more time or fewer workers", kind="warning")
         else:
             _activity("preparing")
-        rendered = _run(
-            [
-                "hyperframes",
-                "render",
-                ".",
-                "--quality",
-                quality,
-                "--output",
-                output,
-                "--strict-all",
-                "--no-best-effort",
-                "--no-browser-gpu",
-                "--workers",
-                str(max(1, min(workers, 4))),
-            ],
-            timeout=max(1, int(deadline - time.monotonic() - 60)),
-        )
+        with _memory_peak_sampler() as memory_peak:
+            rendered = _run(
+                [
+                    "hyperframes",
+                    "render",
+                    ".",
+                    "--quality",
+                    quality,
+                    "--output",
+                    output,
+                    "--strict-all",
+                    "--no-best-effort",
+                    "--no-browser-gpu",
+                    "--workers",
+                    str(max(1, min(workers, 4))),
+                ],
+                timeout=max(1, int(deadline - time.monotonic() - 60)),
+            )
+        if memory_peak.get("memory_bytes", -1) > render_memory_peak.get("memory_bytes", -1):
+            render_memory_peak = dict(memory_peak)
+        resources["memory_peak_breakdown"] = dict(render_memory_peak)
         if rendered.returncode == 0 and output_path.is_file() and output_path.stat().st_size > 0:
             break
         after = _resource_snapshot()

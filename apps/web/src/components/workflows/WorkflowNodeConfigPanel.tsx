@@ -1,3 +1,4 @@
+import { t } from "../../lib/i18n";
 import { agentListQueryOptions, skillListQueryOptions, useCatalogScope } from "../../lib/catalogQueries";
 import { useEffect, useId, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
@@ -65,178 +66,178 @@ type Field = {
 // the AI generator's prompt (packages/core/services/workflow_generator.py).
 const SCHEMA: Record<string, Field[]> = {
   llm: [
-    { key: "model", label: "Model", kind: "model", modelRole: "primary,worker", hint: "Pick from your model catalog. Blank = the account default." },
-    { key: "system_prompt", label: "System prompt", kind: "textarea" },
-    { key: "prompt", label: "Prompt", kind: "textarea", hint: "Click an Input parameter, or type { and press Tab to insert it." },
-    { key: "temperature", label: "Temperature", kind: "number" },
-    { key: "max_rounds", label: "Max rounds", kind: "number" },
+    { key: "model", label: t("ui.model"), kind: "model", modelRole: "primary,worker", hint: "Pick from your model catalog. Blank = the account default." },
+    { key: "system_prompt", label: t("ui.system_prompt"), kind: "textarea" },
+    { key: "prompt", label: t("ui.prompt"), kind: "textarea", hint: "Click an Input parameter, or type { and press Tab to insert it." },
+    { key: "temperature", label: t("ui.temperature"), kind: "number" },
+    { key: "max_rounds", label: t("ui.max_rounds"), kind: "number" },
   ],
   classifier: [
-    { key: "model", label: "Model", kind: "model", modelRole: "primary,worker", hint: "Pick from your model catalog. Blank = the account default." },
-    { key: "prompt", label: "Prompt", kind: "textarea", hint: "Runs as a tool-less agent — list the categories in the prompt." },
+    { key: "model", label: t("ui.model"), kind: "model", modelRole: "primary,worker", hint: "Pick from your model catalog. Blank = the account default." },
+    { key: "prompt", label: t("ui.prompt"), kind: "textarea", hint: "Runs as a tool-less agent — list the categories in the prompt." },
   ],
-  condition: [{ key: "expression", label: "Expression", kind: "text", hint: "Compared with == != > < >= <=. The node's true / false branches set the routes." }],
+  condition: [{ key: "expression", label: t("ui.expression"), kind: "text", hint: "Compared with == != > < >= <=. The node's true / false branches set the routes." }],
   http: [
-    { key: "method", label: "Method", kind: "select", options: ["GET", "POST", "PUT", "PATCH", "DELETE"] },
+    { key: "method", label: t("ui.method"), kind: "select", options: ["GET", "POST", "PUT", "PATCH", "DELETE"] },
     { key: "url", label: "URL", kind: "text" },
-    { key: "headers", label: "Headers", kind: "json" },
-    { key: "body", label: "Body", kind: "textarea" },
+    { key: "headers", label: t("ui.headers"), kind: "json" },
+    { key: "body", label: t("ui.body"), kind: "textarea" },
   ],
   rag: [
-    { key: "query", label: "Query", kind: "text", hint: "The natural-language question to retrieve relevant docs for." },
-    { key: "limit", label: "Max results", kind: "number" },
-    { key: "workspace_id", label: "Workspace", kind: "workspace", hint: "Empty = all knowledge; or scope to one workspace." },
-    { key: "collection", label: "Collection", kind: "collection", hint: "Optional — restrict to one knowledge collection (document group)." },
+    { key: "query", label: t("ui.query"), kind: "text", hint: "The natural-language question to retrieve relevant docs for." },
+    { key: "limit", label: t("ui.max_results"), kind: "number" },
+    { key: "workspace_id", label: t("ui.workspace"), kind: "workspace", hint: "Empty = all knowledge; or scope to one workspace." },
+    { key: "collection", label: t("ui.collection"), kind: "collection", hint: "Optional — restrict to one knowledge collection (document group)." },
   ],
   tool: [
-    { key: "tool", label: "Tool name", kind: "text" },
-    { key: "args", label: "Arguments", kind: "json" },
+    { key: "tool", label: t("ui.tool_name"), kind: "text" },
+    { key: "args", label: t("ui.arguments"), kind: "json" },
   ],
   connector: [
-    { key: "tool", label: "Tool / MCP operation", kind: "text", hint: "Resolved tool name (e.g. mcp__slack__post_message)." },
-    { key: "args", label: "Arguments", kind: "json" },
+    { key: "tool", label: t("ui.tool_mcp_operation"), kind: "text", hint: "Resolved tool name (e.g. mcp__slack__post_message)." },
+    { key: "args", label: t("ui.arguments"), kind: "json" },
   ],
   publication_receipt: [
     {
       key: "receipt",
-      label: "Publication receipt",
+      label: t("ui.publication_receipt"),
       kind: "json",
       hint: "Map the publisher output to platform, verification_status, external_id or published_url, published_at, evidence, attempts, and optional fallback_used.",
     },
     {
       key: "payload",
-      label: "Published payload",
+      label: t("ui.published_payload"),
       kind: "json",
       hint: "Optional exact payload used for publishing. Manor stores only its SHA-256 fingerprint in the receipt.",
     },
     {
       key: "require_verified",
-      label: "Require verified publication",
+      label: t("ui.require_verified_publication"),
       kind: "boolean",
       hint: "On by default. The Workflow fails unless the publisher has observed the external postcondition.",
     },
   ],
   workflow_effect_deadline: [
-    { key: "deadline_at", label: "Deadline", kind: "text", hint: "Timezone-aware ISO timestamp or a Workflow binding." },
-    { key: "action_keys", label: "Restricted action keys", kind: "json", hint: "Trusted Runtime action keys that may no longer begin after the deadline." },
+    { key: "deadline_at", label: t("ui.deadline"), kind: "text", hint: "Timezone-aware ISO timestamp or a Workflow binding." },
+    { key: "action_keys", label: t("ui.restricted_action_keys"), kind: "json", hint: "Trusted Runtime action keys that may no longer begin after the deadline." },
   ],
   image: [
-    { key: "model", label: "Model", kind: "model", modelRole: "image", hint: "Image model from your catalog. Blank = the account default." },
-    { key: "prompt", label: "Prompt", kind: "textarea", hint: "What to generate. Insert a parameter below to use upstream data, e.g. {{scene}}." },
-    { key: "size", label: "Size", kind: "select", options: ["1024x1024", "1536x1024", "1024x1536"], hint: "Square · Landscape · Portrait. Default 1024x1024." },
-    { key: "quality", label: "Quality", kind: "select", options: ["low", "medium", "high"], hint: "Higher quality takes longer. Default medium." },
-    { key: "reference_url", label: "Reference image", kind: "text", hint: "Optional — Knowledge path or URL to edit or use as a style reference. Supports {{var}}." },
+    { key: "model", label: t("ui.model"), kind: "model", modelRole: "image", hint: "Image model from your catalog. Blank = the account default." },
+    { key: "prompt", label: t("ui.prompt"), kind: "textarea", hint: "What to generate. Insert a parameter below to use upstream data, e.g. {{scene}}." },
+    { key: "size", label: t("ui.size"), kind: "select", options: ["1024x1024", "1536x1024", "1024x1536"], hint: "Square · Landscape · Portrait. Default 1024x1024." },
+    { key: "quality", label: t("ui.quality"), kind: "select", options: ["low", "medium", "high"], hint: "Higher quality takes longer. Default medium." },
+    { key: "reference_url", label: t("ui.reference_image"), kind: "text", hint: "Optional — Knowledge path or URL to edit or use as a style reference. Supports {{var}}." },
   ],
   audio: [
-    { key: "model", label: "Model", kind: "model", modelRole: "audio,voice,sfx", hint: "Audio / voice model from your catalog. Blank = the account default." },
-    { key: "prompt", label: "Prompt", kind: "textarea" },
+    { key: "model", label: t("ui.model"), kind: "model", modelRole: "audio,voice,sfx", hint: "Audio / voice model from your catalog. Blank = the account default." },
+    { key: "prompt", label: t("ui.prompt"), kind: "textarea" },
   ],
   video: [
-    { key: "model", label: "Model", kind: "model", modelRole: "video", hint: "Video model from your catalog. Blank = the account default." },
-    { key: "prompt", label: "Prompt", kind: "textarea" },
-    { key: "duration", label: "Duration (s)", kind: "select", options: ["4", "5", "6", "8", "10", "12", "15"] },
-    { key: "resolution", label: "Resolution", kind: "select", options: ["480p", "720p", "1080p"] },
-    { key: "aspect_ratio", label: "Aspect ratio", kind: "select", options: ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"] },
+    { key: "model", label: t("ui.model"), kind: "model", modelRole: "video", hint: "Video model from your catalog. Blank = the account default." },
+    { key: "prompt", label: t("ui.prompt"), kind: "textarea" },
+    { key: "duration", label: t("ui.duration_s"), kind: "select", options: ["4", "5", "6", "8", "10", "12", "15"] },
+    { key: "resolution", label: t("ui.resolution"), kind: "select", options: ["480p", "720p", "1080p"] },
+    { key: "aspect_ratio", label: t("ui.aspect_ratio"), kind: "select", options: ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"] },
   ],
   media: [
-    { key: "kind", label: "Kind", kind: "select", options: ["image", "video", "audio", "document", "presentation"] },
-    { key: "prompt", label: "Prompt", kind: "textarea" },
+    { key: "kind", label: t("ui.kind"), kind: "select", options: ["image", "video", "audio", "document", "presentation"] },
+    { key: "prompt", label: t("ui.prompt"), kind: "textarea" },
   ],
   code: [
-    { key: "language", label: "Language", kind: "select", options: ["python", "javascript", "bash"], hint: "Runs in a new restricted sandbox for every execution." },
-    { key: "code", label: "Code", kind: "textarea", hint: "Use the input picker below to insert language-correct access code. Print one JSON value to return structured output." },
-    { key: "requirements", label: "Python requirements", kind: "textarea", hint: "Optional pip requirements, one per line. Enable Network access below so the sandbox can install them." },
-    { key: "code_timeout", label: "Timeout (s)", kind: "number", hint: "1–300 seconds. Default 60." },
-    { key: "output_format", label: "Output format", kind: "select", options: ["auto", "json", "text"], hint: "Auto parses stdout as JSON when possible." },
-    { key: "allow_network", label: "Network access", kind: "boolean", hint: "Off by default. Enable only when this code must reach an external service." },
+    { key: "language", label: t("ui.language"), kind: "select", options: ["python", "javascript", "bash"], hint: "Runs in a new restricted sandbox for every execution." },
+    { key: "code", label: t("ui.code"), kind: "textarea", hint: "Use the input picker below to insert language-correct access code. Print one JSON value to return structured output." },
+    { key: "requirements", label: t("ui.python_requirements"), kind: "textarea", hint: "Optional pip requirements, one per line. Enable Network access below so the sandbox can install them." },
+    { key: "code_timeout", label: t("ui.timeout_s"), kind: "number", hint: "1–300 seconds. Default 60." },
+    { key: "output_format", label: t("ui.output_format"), kind: "select", options: ["auto", "json", "text"], hint: "Auto parses stdout as JSON when possible." },
+    { key: "allow_network", label: t("ui.network_access"), kind: "boolean", hint: "Off by default. Enable only when this code must reach an external service." },
   ],
   loop: [
-    { key: "items", label: "Items", kind: "text", hint: "Expression / variable to iterate, e.g. {{panels}}." },
-    { key: "item_var", label: "Item variable", kind: "text", hint: "Name each item is bound to (default: item)." },
-    { key: "max_iterations", label: "Max iterations", kind: "number" },
-    { key: "steps", label: "Sub-steps", kind: "json" },
+    { key: "items", label: t("ui.items"), kind: "text", hint: "Expression / variable to iterate, e.g. {{panels}}." },
+    { key: "item_var", label: t("ui.item_variable"), kind: "text", hint: "Name each item is bound to (default: item)." },
+    { key: "max_iterations", label: t("ui.max_iterations"), kind: "number" },
+    { key: "steps", label: t("ui.sub_steps"), kind: "json" },
   ],
-  parallel: [{ key: "steps", label: "Branches (sub-steps)", kind: "json" }],
-  subworkflow: [{ key: "workflow_id", label: "Workflow", kind: "workflow_ref", hint: "The workflow to run. Its inputs come from the Inputs below; its result (the child's variables) is this step's output — reach a value with {{this_step.var}}." }],
+  parallel: [{ key: "steps", label: t("ui.branches_sub_steps"), kind: "json" }],
+  subworkflow: [{ key: "workflow_id", label: t("ui.workflow"), kind: "workflow_ref", hint: "The workflow to run. Its inputs come from the Inputs below; its result (the child's variables) is this step's output — reach a value with {{this_step.var}}." }],
   extract: [
-    { key: "input", label: "Source text", kind: "textarea", hint: "Text to extract from. Use {{name}} to pull in an upstream value." },
-    { key: "schema", label: "Fields", kind: "textarea", hint: "What to extract — e.g. 'name, email, amount' or a JSON shape. Output is a JSON object." },
-    { key: "model", label: "Model", kind: "text" },
+    { key: "input", label: t("ui.source_text"), kind: "textarea", hint: "Text to extract from. Use {{name}} to pull in an upstream value." },
+    { key: "schema", label: t("ui.fields"), kind: "textarea", hint: "What to extract — e.g. 'name, email, amount' or a JSON shape. Output is a JSON object." },
+    { key: "model", label: t("ui.model"), kind: "text" },
   ],
   filter: [
-    { key: "items", label: "Items", kind: "text", hint: "A list to filter, e.g. {{leads}}." },
-    { key: "item_var", label: "Item variable", kind: "text", hint: "Name each item is bound to in the condition (default: item)." },
-    { key: "condition", label: "Condition", kind: "text", hint: "Keep items where this is true, e.g. item.score >= 70. Same operators as IF." },
+    { key: "items", label: t("ui.items"), kind: "text", hint: "A list to filter, e.g. {{leads}}." },
+    { key: "item_var", label: t("ui.item_variable"), kind: "text", hint: "Name each item is bound to in the condition (default: item)." },
+    { key: "condition", label: t("ui.condition"), kind: "text", hint: "Keep items where this is true, e.g. item.score >= 70. Same operators as IF." },
   ],
   aggregate: [
-    { key: "items", label: "Items", kind: "text", hint: "A list to reduce, e.g. {{rows}}." },
-    { key: "operation", label: "Operation", kind: "select", options: ["count", "sum", "avg", "min", "max", "join", "first", "last", "collect"] },
-    { key: "field", label: "Field", kind: "text", hint: "For a list of objects — which field to aggregate (dotted ok). Blank = the item itself." },
-    { key: "separator", label: "Separator", kind: "text", hint: "For join — text between values (default ', ')." },
+    { key: "items", label: t("ui.items"), kind: "text", hint: "A list to reduce, e.g. {{rows}}." },
+    { key: "operation", label: t("ui.operation"), kind: "select", options: ["count", "sum", "avg", "min", "max", "join", "first", "last", "collect"] },
+    { key: "field", label: t("ui.field"), kind: "text", hint: "For a list of objects — which field to aggregate (dotted ok). Blank = the item itself." },
+    { key: "separator", label: t("ui.separator"), kind: "text", hint: "For join — text between values (default ', ')." },
   ],
   datetime: [
-    { key: "operation", label: "Operation", kind: "select", options: ["now", "format", "add", "subtract"] },
-    { key: "value", label: "Value", kind: "text", hint: "Base date (ISO). Blank / 'now' = current time. Supports {{var}}." },
-    { key: "amount", label: "Amount", kind: "number", hint: "For add / subtract." },
-    { key: "unit", label: "Unit", kind: "select", options: ["seconds", "minutes", "hours", "days", "weeks"] },
-    { key: "format", label: "Format", kind: "text", hint: "strftime pattern, e.g. %Y-%m-%d. Blank = ISO 8601." },
+    { key: "operation", label: t("ui.operation"), kind: "select", options: ["now", "format", "add", "subtract"] },
+    { key: "value", label: t("ui.value"), kind: "text", hint: "Base date (ISO). Blank / 'now' = current time. Supports {{var}}." },
+    { key: "amount", label: t("ui.amount"), kind: "number", hint: "For add / subtract." },
+    { key: "unit", label: t("ui.unit"), kind: "select", options: ["seconds", "minutes", "hours", "days", "weeks"] },
+    { key: "format", label: t("ui.format"), kind: "text", hint: "strftime pattern, e.g. %Y-%m-%d. Blank = ISO 8601." },
   ],
   split: [
-    { key: "items", label: "Items", kind: "text", hint: "A list (e.g. {{tags}}) or a delimited string to split into separate values." },
-    { key: "field", label: "Field", kind: "text", hint: "For a list of objects — pluck (and flatten) this field from each." },
-    { key: "separator", label: "Separator", kind: "text", hint: "For a string — split on this, e.g. ','." },
+    { key: "items", label: t("ui.items"), kind: "text", hint: "A list (e.g. {{tags}}) or a delimited string to split into separate values." },
+    { key: "field", label: t("ui.field"), kind: "text", hint: "For a list of objects — pluck (and flatten) this field from each." },
+    { key: "separator", label: t("ui.separator"), kind: "text", hint: "For a string — split on this, e.g. ','." },
   ],
   limit: [
-    { key: "items", label: "Items", kind: "text", hint: "A list to cap, e.g. {{rows}}." },
-    { key: "max", label: "Max items", kind: "number", hint: "How many to keep." },
-    { key: "keep", label: "Keep", kind: "select", options: ["first", "last"] },
+    { key: "items", label: t("ui.items"), kind: "text", hint: "A list to cap, e.g. {{rows}}." },
+    { key: "max", label: t("ui.max_items"), kind: "number", hint: "How many to keep." },
+    { key: "keep", label: t("ui.keep"), kind: "select", options: ["first", "last"] },
   ],
   respond: [
-    { key: "body", label: "Response body", kind: "textarea", hint: "Returned to the webhook caller. JSON ({...}) is sent as JSON; supports {{var}}." },
-    { key: "status_code", label: "Status code", kind: "number", hint: "HTTP status (default 200)." },
+    { key: "body", label: t("ui.response_body"), kind: "textarea", hint: "Returned to the webhook caller. JSON ({...}) is sent as JSON; supports {{var}}." },
+    { key: "status_code", label: t("ui.status_code"), kind: "number", hint: "HTTP status (default 200)." },
   ],
   sort: [
-    { key: "items", label: "Items", kind: "text", hint: "A list to sort, e.g. {{rows}}." },
-    { key: "field", label: "Field", kind: "text", hint: "For a list of objects — sort by this field (dotted ok). Blank = the item itself." },
-    { key: "order", label: "Order", kind: "select", options: ["asc", "desc"] },
+    { key: "items", label: t("ui.items"), kind: "text", hint: "A list to sort, e.g. {{rows}}." },
+    { key: "field", label: t("ui.field"), kind: "text", hint: "For a list of objects — sort by this field (dotted ok). Blank = the item itself." },
+    { key: "order", label: t("ui.order"), kind: "select", options: ["asc", "desc"] },
   ],
   dedupe: [
-    { key: "items", label: "Items", kind: "text", hint: "A list to de-duplicate, e.g. {{rows}}." },
-    { key: "field", label: "Field", kind: "text", hint: "Identity field (dotted ok). Blank = the whole item." },
+    { key: "items", label: t("ui.items"), kind: "text", hint: "A list to de-duplicate, e.g. {{rows}}." },
+    { key: "field", label: t("ui.field"), kind: "text", hint: "Identity field (dotted ok). Blank = the whole item." },
   ],
   stop: [
-    { key: "message", label: "Error message", kind: "text", hint: "Why the workflow stops. Supports {{var}}." },
+    { key: "message", label: t("ui.error_message"), kind: "text", hint: "Why the workflow stops. Supports {{var}}." },
   ],
   extractfromfile: [
-    { key: "input", label: "Content", kind: "textarea", hint: "Text to parse, e.g. {{http.body}} from a download." },
-    { key: "format", label: "Format", kind: "select", options: ["auto", "json", "csv"] },
+    { key: "input", label: t("ui.content"), kind: "textarea", hint: "Text to parse, e.g. {{http.body}} from a download." },
+    { key: "format", label: t("ui.format"), kind: "select", options: ["auto", "json", "csv"] },
   ],
-  transform: [{ key: "set", label: "Set variables", kind: "json", hint: '{ "var": "value or {{expr}}" }' }],
+  transform: [{ key: "set", label: t("ui.set_variables"), kind: "json", hint: '{ "var": "value or {{expr}}" }' }],
   switch: [
-    { key: "cases", label: "Cases", kind: "json", hint: '[{ "expression": "status == \\"vip\\"", "next": ["stepId"] }]' },
-    { key: "default_next", label: "Default → (step ids)", kind: "json" },
+    { key: "cases", label: t("ui.cases"), kind: "json", hint: '[{ "expression": "status == \\"vip\\"", "next": ["stepId"] }]' },
+    { key: "default_next", label: t("ui.default_step_ids"), kind: "json" },
   ],
   merge: [
-    { key: "sources", label: "Sources (step ids)", kind: "json" },
-    { key: "mode", label: "Mode", kind: "select", options: ["list", "object"] },
+    { key: "sources", label: t("ui.sources_step_ids"), kind: "json" },
+    { key: "mode", label: t("ui.mode"), kind: "select", options: ["list", "object"] },
   ],
   wait: [
-    { key: "wait_type", label: "Wait type", kind: "select", options: ["approval", "input", "timer", "event"] },
-    { key: "duration_seconds", label: "Duration (s)", kind: "number", hint: "For timer waits — ≤90s runs inline; longer waits pause and resume automatically." },
-    { key: "message", label: "Message", kind: "text", hint: "Shown while approval / event waits are paused." },
-    { key: "response_variable", label: "Response variable", kind: "text", hint: "Stores the user's decision or response for downstream nodes." },
-    { key: "collection_fields", label: "Information to collect", kind: "json", hint: '[{"key":"artist_name","label":"Artist name","required":true,"default":"{{analysis.artist}}"}]. Input waits ask again for any missing fields. A default binding prefills the answer for confirmation; suggestions offer alternative one-click answers. Unresolved bindings are dropped.' },
-    { key: "fields_per_round", label: "Questions per round", kind: "number", hint: "How many missing fields to ask for at a time. Default: 3." },
-    { key: "output_var", label: "Collected information variable", kind: "text", hint: "The complete answers become available to later nodes under this name." },
-    { key: "options", label: "Choices", kind: "json", hint: "Approval choices shown in the originating Chat, for example [\"approve\", \"revise\", \"cancel\"]." },
-    { key: "approval_values", label: "Approved choices", kind: "json", hint: "Choices that count as approval. Other choices can route to revision or cancellation branches." },
-    { key: "allow_always", label: "Allow permanent approval", kind: "boolean", hint: "Adds Always approve. Future matching operations skip this gate until the user revokes the saved approval." },
-    { key: "approval_action_key", label: "Approval action scope", kind: "text", hint: "Stable operation key shared with runtime approval, for example social_post.publish. Required for permanent approval." },
+    { key: "wait_type", label: t("ui.wait_type"), kind: "select", options: ["approval", "input", "timer", "event"] },
+    { key: "duration_seconds", label: t("ui.duration_s"), kind: "number", hint: "For timer waits — ≤90s runs inline; longer waits pause and resume automatically." },
+    { key: "message", label: t("ui.message"), kind: "text", hint: "Shown while approval / event waits are paused." },
+    { key: "response_variable", label: t("ui.response_variable"), kind: "text", hint: "Stores the user's decision or response for downstream nodes." },
+    { key: "collection_fields", label: t("ui.information_to_collect"), kind: "json", hint: '[{"key":"artist_name","label":"Artist name","required":true,"default":"{{analysis.artist}}"}]. Input waits ask again for any missing fields. A default binding prefills the answer for confirmation; suggestions offer alternative one-click answers. Unresolved bindings are dropped.' },
+    { key: "fields_per_round", label: t("ui.questions_per_round"), kind: "number", hint: "How many missing fields to ask for at a time. Default: 3." },
+    { key: "output_var", label: t("ui.collected_information_variable"), kind: "text", hint: "The complete answers become available to later nodes under this name." },
+    { key: "options", label: t("ui.choices"), kind: "json", hint: "Approval choices shown in the originating Chat, for example [\"approve\", \"revise\", \"cancel\"]." },
+    { key: "approval_values", label: t("ui.approved_choices"), kind: "json", hint: "Choices that count as approval. Other choices can route to revision or cancellation branches." },
+    { key: "allow_always", label: t("ui.allow_permanent_approval"), kind: "boolean", hint: "Adds Always approve. Future matching operations skip this gate until the user revokes the saved approval." },
+    { key: "approval_action_key", label: t("ui.approval_action_scope"), kind: "text", hint: "Stable operation key shared with runtime approval, for example social_post.publish. Required for permanent approval." },
   ],
   notify: [
-    { key: "channel", label: "Channel", kind: "text" },
-    { key: "person_id", label: "Notify person", kind: "person", hint: "Optional — a team member to notify." },
-    { key: "message", label: "Message", kind: "textarea" },
+    { key: "channel", label: t("ui.channel"), kind: "text" },
+    { key: "person_id", label: t("ui.notify_person"), kind: "person", hint: "Optional — a team member to notify." },
+    { key: "message", label: t("ui.message"), kind: "textarea" },
   ],
 };
 
@@ -287,24 +288,24 @@ function StageOperationsSummary({ config }: { config: Record<string, any> }) {
     <section aria-labelledby="workflow-stage-operations-title" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
       <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: 16, alignItems: "end" }}>
         <div style={{ minWidth: 0 }}>
-          <span style={{ display: "block", fontSize: 11, color: "var(--text-faint)", marginBottom: 4 }}>Entry operation</span>
+          <span style={{ display: "block", fontSize: 11, color: "var(--text-faint)", marginBottom: 4 }}>{t("ui.entry_operation")}</span>
           <code className="mono" style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12, color: "var(--text-strong)" }}>
             {String(config.entry_operation_id || "-")}
           </code>
         </div>
         <div style={{ textAlign: "right" }}>
-          <span style={{ display: "block", fontSize: 11, color: "var(--text-faint)", marginBottom: 4 }}>Operations</span>
+          <span style={{ display: "block", fontSize: 11, color: "var(--text-faint)", marginBottom: 4 }}>{t("ui.operations")}</span>
           <span className="mono" style={{ fontSize: 13, fontWeight: 700, color: "var(--text-strong)" }}>{operations.length}</span>
         </div>
       </div>
 
       <div>
-        <h3 id="workflow-stage-operations-title" style={{ margin: "0 0 8px", fontSize: 12, fontWeight: 700, color: "var(--text-strong)" }}>Operations</h3>
+        <h3 id="workflow-stage-operations-title" style={{ margin: "0 0 8px", fontSize: 12, fontWeight: 700, color: "var(--text-strong)" }}>{t("ui.operations")}</h3>
         <ol style={{ listStyle: "none", margin: 0, padding: 0, maxHeight: 340, overflowY: "auto", background: "var(--surface-muted)", borderRadius: "var(--radius-control)" }}>
           {operations.map((operation: Record<string, any>, index: number) => {
             const operationType = String(operation.type || "node");
             return (
-              <li key={String(operation.id || index)} style={{ display: "grid", gridTemplateColumns: "24px 28px minmax(0, 1fr) auto", alignItems: "center", gap: 8, minHeight: 44, padding: "5px 10px", borderBottom: index + 1 < operations.length ? "1px solid rgba(28,25,23,0.06)" : "none" }}>
+              <li key={String(operation.id || index)} style={{ display: "grid", gridTemplateColumns: "24px 28px minmax(0, 1fr) auto", alignItems: "center", gap: 8, minHeight: 44, padding: "5px 10px", borderBottom: index + 1 < operations.length ? "0.5px solid rgba(29, 29, 31,0.06)" : "none" }}>
                 <span className="mono" style={{ fontSize: 10.5, color: "var(--text-faint)", textAlign: "right" }}>{index + 1}</span>
                 <span style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)" }}><NodeIcon type={operationType} size={15} /></span>
                 <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12, fontWeight: 600, color: "var(--text-default)" }}>{String(operation.name || operation.id || "Operation")}</span>
@@ -316,7 +317,7 @@ function StageOperationsSummary({ config }: { config: Record<string, any> }) {
       </div>
 
       <div>
-        <h3 style={{ margin: "0 0 8px", fontSize: 12, fontWeight: 700, color: "var(--text-strong)" }}>Routes</h3>
+        <h3 style={{ margin: "0 0 8px", fontSize: 12, fontWeight: 700, color: "var(--text-strong)" }}>{t("ui.routes")}</h3>
         <dl style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)", gap: "6px 14px", margin: 0 }}>
           {routes.map(([route, target]) => (
             <div key={route} style={{ display: "contents" }}>
@@ -452,8 +453,8 @@ export default function WorkflowNodeConfigPanel({
     staleTime: 0,
   });
   const { data: allWorkflows = [] } = useQuery({
-    queryKey: ["workflows"],
-    queryFn: () => api.workflows.list(),
+    queryKey: ["workflows", "summary"],
+    queryFn: () => api.workflows.listSummaries(),
     enabled: step?.type === "subworkflow",
     staleTime: 0,
   });
@@ -693,8 +694,8 @@ export default function WorkflowNodeConfigPanel({
             {running ? "Testing…" : "Test node"}
           </Button>
           <div className="workflow-node-dialog-primary-actions">
-            <Button variant="ghost" onClick={close} disabled={saving}>Cancel</Button>
-            <Button onClick={save} loading={saving} disabled={saving || running || !!rawErr || hasBindingValueErrors || connectorAccountInvalid || connectorOperationInvalid || Object.keys(jsonErrs).length > 0}>Save</Button>
+            <Button variant="ghost" onClick={close} disabled={saving}>{t("ui.cancel")}</Button>
+            <Button onClick={save} loading={saving} disabled={saving || running || !!rawErr || hasBindingValueErrors || connectorAccountInvalid || connectorOperationInvalid || Object.keys(jsonErrs).length > 0}>{t("ui.save")}</Button>
           </div>
         </div>
       }
@@ -702,7 +703,7 @@ export default function WorkflowNodeConfigPanel({
       {saveError && <p role="alert">{saveError}</p>}
       <fieldset disabled={saving} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
       <div className="workflow-node-dialog-shell">
-        <div className="workflow-node-dialog-meta" aria-label="Node identity">
+        <div className="workflow-node-dialog-meta" aria-label={t("ui.node_identity")}>
           <span className="workflow-node-type-chip">{m.label}</span>
           <code>{step.id}</code>
         </div>
@@ -710,11 +711,11 @@ export default function WorkflowNodeConfigPanel({
           <div className="workflow-node-config-fields">
             <section className="workflow-node-section workflow-node-configuration-section">
               <div className="workflow-node-section-heading">
-                <strong>Configuration</strong>
-                <span>What this node does when the Workflow reaches it.</span>
+                <strong>{t("ui.configuration")}</strong>
+                <span>{t("ui.what_this_node_does_when_the_workflow_reaches_it")}</span>
               </div>
-              <Field label="Node name">
-                <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Node name" />
+              <Field label={t("ui.node_name")}>
+                <Input value={name} onChange={(e) => setName(e.target.value)} placeholder={t("ui.node_name")} />
               </Field>
 
         {step.type === "unsupported" && (
@@ -733,19 +734,19 @@ export default function WorkflowNodeConfigPanel({
         ) : step.type === "agent" ? (
           <>
             {config.service_key && (
-              <div className="workflow-service-binding" aria-label="Workspace agent binding">
+              <div className="workflow-service-binding" aria-label={t("ui.workspace_agent_binding")}>
                 <span className="workflow-service-binding-icon" aria-hidden="true">
                   <NodeIcon type="agent" size={15} />
                 </span>
                 <span className="workflow-service-binding-copy">
-                  <strong>Workspace-bound agent</strong>
-                  <small>Resolved from the Workspace that starts this run.</small>
+                  <strong>{t("ui.workspace_bound_agent")}</strong>
+                  <small>{t("ui.resolved_from_the_workspace_that_starts_this_run")}</small>
                 </span>
                 <code>{String(config.service_key)}</code>
               </div>
             )}
             <Field
-              label="Run as agent"
+              label={t("ui.run_as_agent")}
               hint={(agents as unknown[]).length
                 ? "Pick one of your agents — it brings its own model, tools and system prompt. Leave on “None” to configure inline below."
                 : "No agents of your own yet — pick a ready-made one below (or create your own on the Agents page). Or leave on “None” and configure inline."}
@@ -753,21 +754,21 @@ export default function WorkflowNodeConfigPanel({
               <Select
                 value={String(config.agent_id ?? "")}
                 onChange={(v) => setKey("agent_id", v || undefined)}
-                placeholder="Select an agent…"
+                placeholder={t("ui.select_an_agent")}
                 options={[
                   { value: "", label: "— None (configure inline) —" },
                   ...(agents as { id: string; name: string }[]).map((a) => ({ value: a.id, label: a.name })),
                 ]}
               />
-              {config.agent_id && <OpenLink label="Open agent" onClick={() => goResource(`/agents/${config.agent_id}`)} />}
+              {config.agent_id && <OpenLink label={t("ui.open_agent")} onClick={() => goResource(`/agents/${config.agent_id}`)} />}
             </Field>
             <Field label="…or run a Skill" hint="If set, the skill runs instead of the agent.">
               <Select
                 value={String(config.skill ?? "")}
                 onChange={(v) => setKey("skill", v || undefined)}
-                placeholder="No skill"
+                placeholder={t("ui.no_skill")}
                 options={[
-                  { value: "", label: "No skill" },
+                  { value: "", label: t("ui.no_skill") },
                   ...(skills as { id: string; slug?: string; name: string; display_name?: string }[]).map((s) => ({
                     value: s.slug || s.id,
                     label: s.display_name || s.name,
@@ -775,10 +776,10 @@ export default function WorkflowNodeConfigPanel({
                 ]}
               />
             </Field>
-            <Field label="System message" hint="The agent's role / objective — its standing instructions.">
+            <Field label={t("ui.system_message")} hint="The agent's role / objective — its standing instructions.">
               <Textarea value={String(config.system_prompt ?? "")} onChange={(e) => setKey("system_prompt", e.target.value || undefined)} rows={3} placeholder="e.g. You are a Gmail labelling agent…" />
             </Field>
-            <Field label="Prompt (user message)" hint="Click an Input parameter, or type { and press Tab to insert it.">
+            <Field label={t("ui.prompt_user_message")} hint="Click an Input parameter, or type { and press Tab to insert it.">
               <PromptInputTextarea
                 value={String(config.prompt ?? config.input ?? "")}
                 onChange={(value) => setKey("prompt", value)}
@@ -786,7 +787,7 @@ export default function WorkflowNodeConfigPanel({
                 rows={3}
               />
             </Field>
-            <Field label="Model" hint="LLM the agent runs on, from your model catalog. Blank = the selected agent's default.">
+            <Field label={t("ui.model")} hint="LLM the agent runs on, from your model catalog. Blank = the selected agent's default.">
               {(() => {
                 const opts = modelOptionsForRole("primary,worker");
                 return (
@@ -803,12 +804,12 @@ export default function WorkflowNodeConfigPanel({
                           : []),
                       ]}
                     />
-                    <OpenLink label="Manage models" onClick={() => goResource("/account?tab=models")} />
+                    <OpenLink label={t("ui.manage_models")} onClick={() => goResource("/account?tab=models")} />
                   </>
                 );
               })()}
             </Field>
-            <Field label="Tools" hint="Tools / connectors the agent may call. Imported from its attached tool nodes.">
+            <Field label={t("ui.tools")} hint="Tools / connectors the agent may call. Imported from its attached tool nodes.">
               {Array.isArray(config.tools) && config.tools.length > 0 ? (
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                   {(config.tools as any[]).map((t, i) => (
@@ -828,14 +829,14 @@ export default function WorkflowNodeConfigPanel({
               )}
             </Field>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-              <span style={{ fontSize: 13, color: "var(--text-strong)" }}>Memory</span>
+              <span style={{ fontSize: 13, color: "var(--text-strong)" }}>{t("ui.memory")}</span>
               <Toggle
                 checked={!!config.memory}
                 onChange={() => setConfig({ ...config, memory: config.memory ? undefined : true })}
-                aria-label="Memory"
+                aria-label={t("ui.memory")}
               />
             </div>
-            <Field label="Max iterations" hint="Most tool-call rounds before the agent stops. Default 5.">
+            <Field label={t("ui.max_iterations")} hint="Most tool-call rounds before the agent stops. Default 5.">
               <Input value={String(config.max_rounds ?? config.max_iterations ?? "")} onChange={(e) => setKey("max_rounds", e.target.value === "" ? undefined : Number(e.target.value))} placeholder="5" type="number" />
             </Field>
             {config.agent_id && !config.model && !(Array.isArray(config.tools) && config.tools.length) && (
@@ -1088,7 +1089,7 @@ export default function WorkflowNodeConfigPanel({
             const required = new Set(selectedInputSchema.required || []);
             return (
               <>
-                <Field label="Integration" hint="Resolved against this entity / workspace's connected accounts.">
+                <Field label={t("ui.integration")} hint="Resolved against this entity / workspace's connected accounts.">
                   <Select
                     value={server}
                     onChange={selectServer}
@@ -1100,10 +1101,10 @@ export default function WorkflowNodeConfigPanel({
                     options={serverOptions}
                     disabled={integrationServersLoading}
                     filterable
-                    ariaLabel="Integration"
+                    ariaLabel={t("ui.integration")}
                   />
                   {integrationServersError && (
-                    <span role="alert" className="workflow-connector-error">Connected integrations could not be loaded.</span>
+                    <span role="alert" className="workflow-connector-error">{t("ui.connected_integrations_could_not_be_loaded")}</span>
                   )}
                   <OpenLink label={serverOptions.length ? "Manage integrations" : "Connect an integration"} onClick={() => goResource("/integrations")} />
                 </Field>
@@ -1112,7 +1113,7 @@ export default function WorkflowNodeConfigPanel({
                   || requiresExplicitAccount
                   || Boolean(connectorAccountValidationError)) && (
                   <Field
-                    label="Account"
+                    label={t("ui.account")}
                     hint={requiresExplicitAccount
                       ? "Choose an exact connected account because the provider default is unavailable."
                       : "Use the default, choose one account, or query all connected accounts for compatible read operations."}
@@ -1123,7 +1124,7 @@ export default function WorkflowNodeConfigPanel({
                       placeholder={requiresExplicitAccount ? "Select an account" : "Default account"}
                       options={accountSelectionOptions}
                       filterable
-                      ariaLabel="Integration account"
+                      ariaLabel={t("ui.integration_account")}
                     />
                     {connectorAccountValidationError && (
                       <span role="alert" className="workflow-connector-error">{connectorAccountValidationError}</span>
@@ -1131,21 +1132,21 @@ export default function WorkflowNodeConfigPanel({
                   </Field>
                 )}
                 {server && resources.length > 1 && (
-                  <Field label="Resource" hint="Narrow the operation list to one kind of object.">
+                  <Field label={t("ui.resource")} hint="Narrow the operation list to one kind of object.">
                     <Select
                       value={resourceFilter}
                       onChange={selectResource}
-                      placeholder="All operations"
+                      placeholder={t("ui.all_operations")}
                       options={[
-                        { value: "", label: "All operations" },
+                        { value: "", label: t("ui.all_operations") },
                         ...resources.map((resource) => ({ value: resource, label: resource })),
                       ]}
-                      ariaLabel="Integration resource"
+                      ariaLabel={t("ui.integration_resource")}
                     />
                   </Field>
                 )}
                 <Field
-                  label="Operation"
+                  label={t("ui.operation")}
                   hint={selectedOperation?.description || "Choose the action this node performs."}
                 >
                   {server && (connectorCatalogError || (!connectorCatalogLoading && operations.length === 0)) ? (
@@ -1153,7 +1154,7 @@ export default function WorkflowNodeConfigPanel({
                       value={tool}
                       onChange={(event) => selectOperation(event.target.value)}
                       placeholder="e.g. send_message"
-                      ariaLabel="Integration operation"
+                      ariaLabel={t("ui.integration_operation")}
                     />
                   ) : (
                     <Select
@@ -1167,7 +1168,7 @@ export default function WorkflowNodeConfigPanel({
                       options={operationOptions}
                       disabled={!server || connectorCatalogLoading}
                       filterable
-                      ariaLabel="Integration operation"
+                      ariaLabel={t("ui.integration_operation")}
                     />
                   )}
                   {server && connectorCatalogError && (
@@ -1209,20 +1210,20 @@ export default function WorkflowNodeConfigPanel({
                   />
                 ))}
                 {selectedOperation && Object.keys(properties).length === 0 && (
-                  <span className="workflow-connector-help">This operation does not require parameters.</span>
+                  <span className="workflow-connector-help">{t("ui.this_operation_does_not_require_parameters")}</span>
                 )}
                 <details className="workflow-connector-advanced">
                   <summary>
                     <span>
-                      <strong>Advanced</strong>
-                      <small>View or edit the exact JSON arguments.</small>
+                      <strong>{t("ui.advanced")}</strong>
+                      <small>{t("ui.view_or_edit_the_exact_json_arguments")}</small>
                     </span>
                   </summary>
                   <div className="workflow-connector-advanced-content">
                     {tool && <code className="workflow-connector-tool-name">{tool}</code>}
                     <JsonField
                       fieldKey="args"
-                      label="Arguments (JSON)"
+                      label={t("ui.arguments_json")}
                       hint="Use this for nested values, expressions, or parameters not represented above."
                       config={config}
                       setConfig={setConfig}
@@ -1309,39 +1310,39 @@ export default function WorkflowNodeConfigPanel({
                   <Select
                     value={String(config[f.key] ?? "")}
                     onChange={(v) => setKey(f.key, v || undefined)}
-                    placeholder="All knowledge"
+                    placeholder={t("ui.all_knowledge")}
                     options={[
-                      { value: "", label: "All knowledge" },
+                      { value: "", label: t("ui.all_knowledge") },
                       ...(workspaces as { id: string; name: string }[]).map((w) => ({ value: w.id, label: w.name })),
                     ]}
                   />
-                  {config[f.key] && <OpenLink label="Open workspace" onClick={() => goResource(`/workspaces/${config[f.key]}`)} />}
+                  {config[f.key] && <OpenLink label={t("ui.open_workspace")} onClick={() => goResource(`/workspaces/${config[f.key]}`)} />}
                 </>
               ) : f.kind === "collection" ? (
                 <>
                   <Select
                     value={String((config.group_ids as string[] | undefined)?.[0] ?? "")}
                     onChange={(v) => setKey("group_ids", v ? [v] : undefined)}
-                    placeholder="All collections"
+                    placeholder={t("ui.all_collections")}
                     options={[
-                      { value: "", label: "All collections" },
+                      { value: "", label: t("ui.all_collections") },
                       ...(groups as { id: string; name: string }[]).map((g) => ({ value: g.id, label: g.name })),
                     ]}
                   />
-                  {(config.group_ids as string[] | undefined)?.[0] && <OpenLink label="Open knowledge" onClick={() => goResource("/knowledge")} />}
+                  {(config.group_ids as string[] | undefined)?.[0] && <OpenLink label={t("ui.open_knowledge")} onClick={() => goResource("/knowledge")} />}
                 </>
               ) : f.kind === "person" ? (
                 <>
                   <Select
                     value={String(config[f.key] ?? "")}
                     onChange={(v) => setKey(f.key, v || undefined)}
-                    placeholder="No one"
+                    placeholder={t("ui.no_one")}
                     options={[
-                      { value: "", label: "No one" },
+                      { value: "", label: t("ui.no_one") },
                       ...(people as { id: string; display_name?: string; email: string }[]).map((p) => ({ value: p.id, label: p.display_name || p.email })),
                     ]}
                   />
-                  {config[f.key] && <OpenLink label="Open team" onClick={() => goResource("/team")} />}
+                  {config[f.key] && <OpenLink label={t("ui.open_team")} onClick={() => goResource("/team")} />}
                 </>
               ) : f.kind === "model" ? (
                 (() => {
@@ -1360,7 +1361,7 @@ export default function WorkflowNodeConfigPanel({
                             : []),
                         ]}
                       />
-                      <OpenLink label="Manage models" onClick={() => goResource("/account?tab=models")} />
+                      <OpenLink label={t("ui.manage_models")} onClick={() => goResource("/account?tab=models")} />
                     </>
                   );
                 })()
@@ -1388,7 +1389,7 @@ export default function WorkflowNodeConfigPanel({
                         <NodeIcon type="subworkflow" size={16} />
                       </span>
                       <span className="workflow-reference-card-copy">
-                        <strong>Open publishing workflow</strong>
+                        <strong>{t("ui.open_publishing_workflow")}</strong>
                         <small>{
                           (allWorkflows as { id: string; name: string }[])
                             .find((workflow) => workflow.id === config[f.key])?.name || String(config[f.key])
@@ -1415,7 +1416,7 @@ export default function WorkflowNodeConfigPanel({
             {step.type === "end" ? "Terminal node — map the Workflow result below." : "Entry node — starts the workflow. Triggering is set on the deployment."}
           </p>
         ) : step.type === "unsupported" ? null : (
-          <Field label="Config (JSON)">
+          <Field label={t("ui.config_json")}>
             <Textarea
               value={JSON.stringify(config, null, 2)}
               onChange={(e) => {
@@ -1429,14 +1430,14 @@ export default function WorkflowNodeConfigPanel({
         )}
         {step.type !== "unsupported" && (
           <details>
-            <summary style={{ cursor: "pointer", fontSize: 12.5 }}>Advanced configuration</summary>
-            <pre aria-label="Node connections" style={{ fontSize: 11, whiteSpace: "pre-wrap" }}>
+            <summary style={{ cursor: "pointer", fontSize: 12.5 }}>{t("ui.advanced_configuration")}</summary>
+            <pre aria-label={t("ui.node_connections")} style={{ fontSize: 11, whiteSpace: "pre-wrap" }}>
               {JSON.stringify({
                 next: step.next || [], true_next: step.true_next || [],
                 false_next: step.false_next || [], depends_on: step.depends_on || [],
               }, null, 2)}
             </pre>
-            {(fields || step.type === "agent" || NO_CONFIG_TYPES.has(step.type)) && <Field label="Advanced config (JSON)" hint="Inspect or edit configuration fields that are not shown in the form above.">
+            {(fields || step.type === "agent" || NO_CONFIG_TYPES.has(step.type)) && <Field label={t("ui.advanced_config_json")} hint="Inspect or edit configuration fields that are not shown in the form above.">
               <Textarea
                 value={JSON.stringify(config, null, 2)}
                 onChange={(e) => {
@@ -1523,11 +1524,11 @@ export default function WorkflowNodeConfigPanel({
           return (
             <section className="workflow-node-section">
               <div className="workflow-node-section-heading">
-                <strong>Data mapping</strong>
+                <strong>{t("ui.data_mapping")}</strong>
                 <span>Choose what enters this node and what it exposes downstream.</span>
               </div>
               <FieldGroup
-                label="Inputs"
+                label={t("ui.inputs")}
                 hint={isEntryNode
                   ? undefined
                   : step.type === "end"
@@ -1551,7 +1552,7 @@ export default function WorkflowNodeConfigPanel({
                 )}
               </FieldGroup>
               <FieldGroup
-                label="Outputs"
+                label={t("ui.outputs")}
                 hint={isEntryNode
                   ? undefined
                   : step.type === "end"
@@ -1576,42 +1577,42 @@ export default function WorkflowNodeConfigPanel({
           <details className="workflow-node-settings">
             <summary>
               <span>
-                <strong>Run settings</strong>
+                <strong>{t("ui.run_settings")}</strong>
                 <small>Error handling, cache, retries, and maintainer notes.</small>
               </span>
             </summary>
             <div className="workflow-node-settings-content">
-            <Field label="On error" hint="Stop the whole run, or skip this step and continue.">
+            <Field label={t("ui.on_error")} hint="Stop the whole run, or skip this step and continue.">
               <Select
                 value={String(config.on_error ?? "stop")}
                 onChange={(v) => setKey("on_error", v === "stop" ? undefined : v)}
                 options={[
-                  { value: "stop", label: "Stop workflow" },
-                  { value: "continue", label: "Continue (skip on error)" },
+                  { value: "stop", label: t("ui.stop_workflow") },
+                  { value: "continue", label: t("ui.continue_skip_on_error") },
                 ]}
               />
             </Field>
-            <Field label="Cache" hint="Reuse this step's last result on a re-run when its inputs are unchanged — ComfyUI-style, so iterating on a later node skips re-running this one.">
+            <Field label={t("ui.cache")} hint="Reuse this step's last result on a re-run when its inputs are unchanged — ComfyUI-style, so iterating on a later node skips re-running this one.">
               <Select
                 value={String(config.cache_policy ?? "auto")}
                 onChange={(v) => setKey("cache_policy", v === "auto" ? undefined : v)}
                 options={[
-                  { value: "auto", label: "Auto (pure steps only)" },
-                  { value: "cache", label: "Reuse if inputs unchanged" },
-                  { value: "never", label: "Always re-run" },
+                  { value: "auto", label: t("ui.auto_pure_steps_only") },
+                  { value: "cache", label: t("ui.reuse_if_inputs_unchanged") },
+                  { value: "never", label: t("ui.always_re_run") },
                 ]}
               />
             </Field>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-              <span style={{ fontSize: 13, color: "var(--text-strong)" }}>Retry on fail</span>
+              <span style={{ fontSize: 13, color: "var(--text-strong)" }}>{t("ui.retry_on_fail")}</span>
               <Toggle
                 checked={!!config.retry_on_fail}
                 onChange={() => setConfig({ ...config, retry_on_fail: config.retry_on_fail ? undefined : true })}
-                aria-label="Retry on fail"
+                aria-label={t("ui.retry_on_fail")}
               />
             </div>
             {config.retry_on_fail && (
-              <Field label="Max tries" hint="Including the first attempt (max 5). Default 3.">
+              <Field label={t("ui.max_tries")} hint="Including the first attempt (max 5). Default 3.">
                 <Input
                   value={String(config.max_tries ?? "")}
                   onChange={(e) => setKey("max_tries", e.target.value === "" ? undefined : Number(e.target.value))}
@@ -1620,7 +1621,7 @@ export default function WorkflowNodeConfigPanel({
                 />
               </Field>
             )}
-            <Field label="Notes" hint="A note for whoever maintains this workflow. No effect on the run.">
+            <Field label={t("ui.notes")} hint="A note for whoever maintains this workflow. No effect on the run.">
               <Textarea
                 value={String(config.notes ?? "")}
                 onChange={(e) => setKey("notes", e.target.value || undefined)}
@@ -1711,7 +1712,6 @@ function ExecutionResultPanel({
   const subLabel: React.CSSProperties = {
     fontSize: 10.5,
     color: "var(--text-faint)",
-    letterSpacing: 0.2,
   };
   const contentStyle: React.CSSProperties = {
     background: "var(--surface-panel)",
@@ -1737,12 +1737,12 @@ function ExecutionResultPanel({
     <div
       ref={resultRef}
       role="region"
-      aria-label="Execution result"
+      aria-label={t("ui.execution_result")}
       className="workflow-node-execution-result"
     >
       <div className="workflow-node-result-heading">
         <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 0 }}>
-          <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text-strong)" }}>Test & result</span>
+          <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text-strong)" }}>{t("ui.test_result")}</span>
           <span aria-live="polite" aria-atomic="true" style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 11.5, color: "var(--text-muted)" }}>
             <span
               aria-hidden="true"
@@ -1784,7 +1784,7 @@ function ExecutionResultPanel({
             aria-expanded={testInputsOpen}
             onClick={onToggleTestInputs}
           >
-            <span id="workflow-node-test-inputs-title">Test inputs</span>
+            <span id="workflow-node-test-inputs-title">{t("ui.test_inputs")}</span>
             <span>{testInputs.length} {testInputs.length === 1 ? "field" : "fields"} · not saved</span>
           </button>
           {testInputsOpen && (
@@ -1814,7 +1814,7 @@ function ExecutionResultPanel({
                           type={input.type === "number" ? "number" : "text"}
                           error={input.error}
                           ariaLabel={`Test value for ${input.key}`}
-                          placeholder="Enter a test value"
+                          placeholder={t("ui.enter_a_test_value")}
                         />
                       )}
                       {input.source && (
@@ -1835,13 +1835,13 @@ function ExecutionResultPanel({
         <div className="workflow-node-result-empty">
           <span aria-hidden="true" style={{ fontFamily: "var(--font-mono, monospace)", fontSize: 18, color: "var(--text-faint)" }}>{"{ }"}</span>
           <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-            <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text-strong)" }}>Test this node to see its result</span>
+            <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text-strong)" }}>{t("ui.test_this_node_to_see_its_result")}</span>
             <span style={{ fontSize: 11.5, lineHeight: 1.5, color: "var(--text-muted)" }}>Output, errors, and the complete JSON response will appear here.</span>
           </div>
         </div>
       ) : running ? (
         <div className="workflow-node-result-empty">
-          <span style={{ fontSize: 11.5, lineHeight: 1.5, color: "var(--text-muted)" }}>Waiting for the node to return output…</span>
+          <span style={{ fontSize: 11.5, lineHeight: 1.5, color: "var(--text-muted)" }}>{t("ui.waiting_for_the_node_to_return_output")}</span>
         </div>
       ) : raw && result ? (
         <pre style={preStyle}>{JSON.stringify(result, null, 2)}</pre>
@@ -1859,7 +1859,7 @@ function ExecutionResultPanel({
             </details>
           )}
           <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-            <span style={subLabel}>Result output</span>
+            <span style={subLabel}>{t("ui.result_output")}</span>
             {result.error ? (
               <pre style={{ ...preStyle, color: "var(--editor-danger-text)" }}>{result.error}</pre>
             ) : media.length > 0 ? (
@@ -1923,7 +1923,7 @@ function DataView({ data, depth = 0 }: { data: any; depth?: number }) {
             }
           >
             <span style={{ fontSize: 11, color: "var(--text-muted)", fontWeight: 500, wordBreak: "break-word" }}>{k}</span>
-            <div style={nested ? { marginLeft: 6, paddingLeft: 9, borderLeft: "1px solid rgba(28,25,23,0.08)" } : undefined}>
+            <div style={nested ? { marginLeft: 6, paddingLeft: 9, borderLeft: "0.5px solid rgba(29, 29, 31,0.08)" } : undefined}>
               <DataView data={v} depth={depth + 1} />
             </div>
           </div>
@@ -1944,7 +1944,7 @@ function DataTable({ rows, cols, depth }: { rows: any[]; cols: string[]; depth: 
       </thead>
       <tbody>
         {rows.map((row, i) => (
-          <tr key={i} style={{ borderTop: i ? "1px solid rgba(28,25,23,0.06)" : "none" }}>
+          <tr key={i} style={{ borderTop: i ? "0.5px solid rgba(29, 29, 31,0.06)" : "none" }}>
             {cols.map((c) => (
               <td key={c} style={cell}>
                 {row[c] === undefined ? (
@@ -1973,7 +1973,7 @@ function ExpressionHelp() {
   );
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 5, padding: "10px 12px", borderRadius: 10, background: "var(--surface-muted)" }}>
-      <div style={{ fontSize: 11, fontWeight: 500, letterSpacing: 0.2, color: "var(--text-faint)" }}>Expression format</div>
+      <div style={{ fontSize: 11, fontWeight: 500, color: "var(--text-faint)" }}>{t("ui.expression_format")}</div>
       <Row k={<>{"=="} {"!="} {">"} {"<"} {">="} {"<="}</>} v="compare two values" />
       <Row k="and · or" v="combine clauses (or binds loosest)" />
       <Row k={'status == "vip"'} v="variable vs quoted text" />
@@ -1981,7 +1981,7 @@ function ExpressionHelp() {
       <Row k="len(items) > 0" v="length of a list/text" />
       <Row k="result.ok == true" v="field of an object variable" />
       <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 2, lineHeight: 1.5 }}>
-        Variables come from upstream steps (set an <b>Output var</b>, or a <b>Set</b> node) — reference them by bare name, no <code style={mono}>{"{{ }}"}</code>.
+        {t("ui.expression_variables_help")}
       </div>
     </div>
   );
@@ -2163,13 +2163,13 @@ function PromptInputTextarea({
             }
           }}
           rows={rows}
-          ariaLabel="Prompt"
+          ariaLabel={t("ui.prompt")}
           ariaControls={open ? menuId : undefined}
           ariaExpanded={open}
           ariaAutocomplete="list"
         />
         {open && (
-          <div id={menuId} className="workflow-prompt-input-menu" role="listbox" aria-label="Input parameters">
+          <div id={menuId} className="workflow-prompt-input-menu" role="listbox" aria-label={t("ui.input_parameters")}>
             {filteredNames.length ? filteredNames.map((name, index) => (
               <button
                 key={name}
@@ -2184,14 +2184,14 @@ function PromptInputTextarea({
                 <code>{`{{${name}}}`}</code>
               </button>
             )) : (
-              <span className="workflow-prompt-input-empty">No matching Inputs</span>
+              <span className="workflow-prompt-input-empty">{t("ui.no_matching_inputs")}</span>
             )}
           </div>
         )}
       </div>
       {inputNames.length ? (
-        <div className="workflow-prompt-input-bar" aria-label="Quick insert Input parameters">
-          <span className="workflow-prompt-input-label">Insert input</span>
+        <div className="workflow-prompt-input-bar" aria-label={t("ui.quick_insert_input_parameters")}>
+          <span className="workflow-prompt-input-label">{t("ui.insert_input")}</span>
           {inputNames.map((name) => (
             <button
               key={name}
@@ -2209,7 +2209,7 @@ function PromptInputTextarea({
           </span>
         </div>
       ) : (
-        <span className="workflow-prompt-input-empty-hint">Add an Input below to enable quick insert.</span>
+        <span className="workflow-prompt-input-empty-hint">{t("ui.add_an_input_below_to_enable_quick_insert")}</span>
       )}
     </div>
   );
@@ -2309,13 +2309,13 @@ function CodeInputTextarea({
             }
           }}
           rows={rows}
-          ariaLabel="Code"
+          ariaLabel={t("ui.code")}
           ariaControls={open ? menuId : undefined}
           ariaExpanded={open}
           ariaAutocomplete="list"
         />
         {open && (
-          <div id={menuId} className="workflow-prompt-input-menu" role="listbox" aria-label="Code input parameters">
+          <div id={menuId} className="workflow-prompt-input-menu" role="listbox" aria-label={t("ui.code_input_parameters")}>
             {filteredNames.length ? filteredNames.map((name, index) => (
               <button
                 key={name}
@@ -2330,14 +2330,14 @@ function CodeInputTextarea({
                 <code>{codeInputToken(normalizedLanguage, name)}</code>
               </button>
             )) : (
-              <span className="workflow-prompt-input-empty">No matching Inputs</span>
+              <span className="workflow-prompt-input-empty">{t("ui.no_matching_inputs")}</span>
             )}
           </div>
         )}
       </div>
       {inputNames.length ? (
-        <div className="workflow-prompt-input-bar" aria-label="Quick insert code input parameters">
-          <span className="workflow-prompt-input-label">Insert input</span>
+        <div className="workflow-prompt-input-bar" aria-label={t("ui.quick_insert_code_input_parameters")}>
+          <span className="workflow-prompt-input-label">{t("ui.insert_input")}</span>
           {inputNames.map((name) => {
             const token = codeInputToken(normalizedLanguage, name);
             return (
@@ -2358,7 +2358,7 @@ function CodeInputTextarea({
           </span>
         </div>
       ) : (
-        <span className="workflow-prompt-input-empty-hint">Add an Input below to enable code insert.</span>
+        <span className="workflow-prompt-input-empty-hint">{t("ui.add_an_input_below_to_enable_code_insert")}</span>
       )}
     </div>
   );
@@ -2427,28 +2427,28 @@ function WorkflowRunInputRows({
               {row.required !== false && <span>required</span>}
             </summary>
             <div className="workflow-run-input-fields">
-              <Field label="Key">
+              <Field label={t("ui.key")}>
                 <Input
                   value={row.key ?? ""}
                   onChange={(event) => update(index, { key: event.target.value })}
                   placeholder="input_name"
                 />
               </Field>
-              <Field label="Label">
+              <Field label={t("ui.label")}>
                 <Input
                   value={row.label ?? ""}
                   onChange={(event) => update(index, { label: event.target.value })}
                   placeholder={key || "Input label"}
                 />
               </Field>
-              <Field label="Type">
+              <Field label={t("ui.type")}>
                 <Select
                   value={type}
                   onChange={(value) => update(index, { type: value })}
                   options={["string", "number", "boolean", "json"]}
                 />
               </Field>
-              <Field label="Default">
+              <Field label={t("ui.default")}>
                 {type === "json" ? (
                   <Textarea
                     value={formatTestInputValue(defaultValue)}
@@ -2465,7 +2465,7 @@ function WorkflowRunInputRows({
                 )}
               </Field>
               {type === "json" && (
-                <Field label="Input control" hint="Files can be uploaded or selected from Knowledge when starting the workflow.">
+                <Field label={t("ui.input_control")} hint="Files can be uploaded or selected from Knowledge when starting the workflow.">
                   <Select
                     value={row.schema?.["x-ui"]?.control === "documents" ? "Files / Knowledge" : "JSON"}
                     options={["JSON", "Files / Knowledge"]}
@@ -2485,7 +2485,7 @@ function WorkflowRunInputRows({
                   />
                 </Field>
               )}
-              <Field label="Placeholder">
+              <Field label={t("ui.placeholder")}>
                 <Input
                   value={row.placeholder ?? ""}
                   onChange={(event) => update(index, { placeholder: event.target.value })}
@@ -2493,7 +2493,7 @@ function WorkflowRunInputRows({
               </Field>
               {type === "json" && (
                 <Field
-                  label="Schema (JSON)"
+                  label={t("ui.schema_json")}
                   hint="Optional JSON Schema used to render and validate structured Workflow inputs."
                 >
                   <Textarea
@@ -2526,7 +2526,7 @@ function WorkflowRunInputRows({
               )}
               <div className="workflow-run-input-options">
                 <label>
-                  <span>Required</span>
+                  <span>{t("ui.required")}</span>
                   <Toggle
                     checked={row.required !== false}
                     onChange={() => update(index, { required: row.required === false })}
@@ -2534,7 +2534,7 @@ function WorkflowRunInputRows({
                   />
                 </label>
                 <label>
-                  <span>Hidden</span>
+                  <span>{t("ui.hidden")}</span>
                   <Toggle
                     checked={!!row.hidden}
                     onChange={() => update(index, { hidden: !row.hidden })}
@@ -2546,7 +2546,7 @@ function WorkflowRunInputRows({
                   size="sm"
                   onClick={() => onChange(rows.filter((_, rowIndex) => rowIndex !== index))}
                 >
-                  Remove
+                  {t("ui.remove")}
                 </Button>
               </div>
             </div>
@@ -2636,10 +2636,10 @@ function BindingRows({
                           __valueRaw: undefined,
                           __valueError: undefined,
                         })}
-                        title="Choose an upstream output"
-                        ariaLabel="Choose an upstream output"
+                        title={t("ui.choose_an_upstream_output")}
+                        ariaLabel={t("ui.choose_an_upstream_output")}
                       >
-                        Outputs
+                        {t("ui.outputs")}
                       </Button>
                     )}
                   </div>
@@ -2651,17 +2651,17 @@ function BindingRows({
                       className="workflow-binding-custom-input"
                       value={r.value ?? ""}
                       onChange={(e) => update(i, { value: e.target.value, __custom: true })}
-                      placeholder="Enter a literal or {{reference}}"
+                      placeholder={t("ui.enter_a_literal_or_reference")}
                     />
                     <Button
                       variant="ghost"
                       size="sm"
                       onClick={() => update(i, { value: "", __custom: false })}
-                      title="Choose an upstream output"
-                      ariaLabel="Choose an upstream output"
+                      title={t("ui.choose_an_upstream_output")}
+                      ariaLabel={t("ui.choose_an_upstream_output")}
                       style={{ flexShrink: 0, padding: "0 8px" }}
                     >
-                      Outputs
+                      {t("ui.outputs")}
                     </Button>
                   </div>
                 ) : (
@@ -2682,7 +2682,7 @@ function BindingRows({
                     placeholder={valueOptions.length ? "Select an upstream output…" : "Connect an upstream node…"}
                     options={[
                       ...valueOptions,
-                      { value: CUSTOM_BINDING_VALUE, label: "Custom value…" },
+                      { value: CUSTOM_BINDING_VALUE, label: t("ui.custom_value") },
                     ]}
                     filterable={valueOptions.length > 6}
                     dropdownMinWidth={300}
@@ -2698,7 +2698,7 @@ function BindingRows({
               </div>
               <button
                 type="button"
-                title="Remove"
+                title={t("ui.remove")}
                 onClick={() => onChange(rows.filter((_, j) => j !== i))}
                 className="workflow-binding-remove"
                 style={{ width: 28, height: 28, borderRadius: 8, border: "none", cursor: "pointer", background: "transparent", color: "var(--text-faint)", fontSize: 16, lineHeight: 1 }}
@@ -2748,7 +2748,7 @@ function OpenLink({ onClick, label = "Open" }: { onClick: () => void; label?: st
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return (
     <label style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-      <span style={{ fontSize: 11, fontWeight: 500, letterSpacing: 0.2, color: "var(--text-faint)" }}>{label}</span>
+      <span style={{ fontSize: 11, fontWeight: 500, color: "var(--text-faint)" }}>{label}</span>
       {children}
       {hint && <span style={{ fontSize: 11, color: "var(--text-faint)", fontWeight: 400, lineHeight: 1.4 }}>{hint}</span>}
     </label>
@@ -2758,7 +2758,7 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
 function FieldGroup({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-      <span style={{ fontSize: 11, fontWeight: 500, letterSpacing: 0.2, color: "var(--text-faint)" }}>{label}</span>
+      <span style={{ fontSize: 11, fontWeight: 500, color: "var(--text-faint)" }}>{label}</span>
       {children}
       {hint && <span style={{ fontSize: 11, color: "var(--text-faint)", fontWeight: 400, lineHeight: 1.4 }}>{hint}</span>}
     </div>
@@ -2834,8 +2834,8 @@ function ConnectorArgumentField({
             ...(!required || schema.default !== undefined
               ? [{ value: "__unset__", label: schema.default !== undefined ? `Provider default (${String(schema.default)})` : "Not set" }]
               : []),
-            { value: "true", label: "True" },
-            { value: "false", label: "False" },
+            { value: "true", label: t("ui.true") },
+            { value: "false", label: t("ui.false") },
           ]}
           ariaLabel={label}
         />

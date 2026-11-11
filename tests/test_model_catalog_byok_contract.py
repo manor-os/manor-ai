@@ -53,6 +53,7 @@ def test_media_catalog_ids_match_provider_wire_ids():
         "openai/gpt-5-image-mini",
         "google/gemini-3.1-flash-image-preview",
         "openai/gpt-image-2",
+        "openai/gpt-image-2.6-sunburst",
     }.issubset(image_ids)
     for catalog_id in image_ids:
         assert native_catalog_model_id(catalog_id)

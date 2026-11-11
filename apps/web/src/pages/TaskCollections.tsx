@@ -43,15 +43,15 @@ function CollectionModalContent({
       <Textarea label={t("page.task_collections.description")} value={description} onChange={(e) => setDescription(e.target.value)} rows={3} placeholder={t("page.task_collections.optional_description")} />
 
       <div>
-        <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: "#44403c", marginBottom: 4 }}>{t("page.task_collections.color")}</label>
+        <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: "var(--text-default)", marginBottom: 4 }}>{t("page.task_collections.color")}</label>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <input
             type="color"
             value={color}
             onChange={(e) => setColor(e.target.value)}
-            style={{ height: 36, width: 36, borderRadius: 10, border: "1px solid rgba(28,25,23,0.06)", cursor: "pointer" }}
+            style={{ height: 36, width: 36, borderRadius: 10, border: "0.5px solid rgba(29, 29, 31,0.06)", cursor: "pointer" }}
           />
-          <span style={{ fontSize: 12, color: "#a8a29e" }}>{color}</span>
+          <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{color}</span>
         </div>
       </div>
     </form>
@@ -165,11 +165,6 @@ export default function TaskCollections() {
             <IconFolder size={32} className="text-stone-300" />
           }
           title={t("page.task_collections.no_collections")}
-          action={
-            <button onClick={openCreate} style={{ fontSize: 13, fontWeight: 600, color: "#436b65", background: "transparent", border: "none", cursor: "pointer" }}>
-              {t("page.task_collections.create_first")}
-            </button>
-          }
         />
       ) : (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 180px), 1fr))", gap: 16 }}>
@@ -186,12 +181,12 @@ export default function TaskCollections() {
                 onMouseEnter={() => setHoveredId(cat.id)}
                 onMouseLeave={() => setHoveredId(null)}
                 style={{
-                  border: "1px solid rgba(28,25,23,0.06)",
+                  border: "0.5px solid rgba(29, 29, 31,0.06)",
                   borderRadius: 32,
                   padding: 0,
                   cursor: "pointer",
                   transition: "all 0.25s ease",
-                  borderColor: hoveredId === cat.id ? "var(--card-hover-border)" : "rgba(28,25,23,0.06)",
+                  borderColor: hoveredId === cat.id ? "var(--card-hover-border)" : "rgba(29, 29, 31,0.06)",
                   background: hoveredId === cat.id ? "var(--card-hover-bg)" : "rgba(255,255,255,0.65)",
                   transform: hoveredId === cat.id ? "var(--card-hover-transform)" : "none",
                   boxShadow: hoveredId === cat.id ? "var(--card-hover-shadow)" : "none",
@@ -218,11 +213,11 @@ export default function TaskCollections() {
                       </span>
                     </div>
                     <div style={{ minWidth: 0, flex: 1 }}>
-                      <h3 style={{ fontSize: 14, fontWeight: 700, color: "#292524", margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{cat.name}</h3>
+                      <h3 style={{ fontSize: 14, fontWeight: 700, color: "var(--text-strong)", margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{cat.name}</h3>
                       {cat.description && (
-                        <p style={{ fontSize: 12, color: "#78716c", marginTop: 2, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{cat.description}</p>
+                        <p style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{cat.description}</p>
                       )}
-                      <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 8, fontSize: 12, color: "#a8a29e" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 8, fontSize: 12, color: "var(--text-muted)" }}>
                         <span>{catTasks.length} {catTasks.length !== 1 ? t("page.task_collections.tasks_plural") : t("page.task_collections.task_singular")}</span>
                         <span>{formatDate(cat.created_at)}</span>
                       </div>
@@ -231,7 +226,7 @@ export default function TaskCollections() {
                 </div>
 
                 {/* Card footer */}
-                <div style={{ padding: "12px 20px", borderTop: "1px solid rgba(28,25,23,0.06)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <div style={{ padding: "12px 20px", borderTop: "0.5px solid rgba(29, 29, 31,0.06)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
                     {tasksForCollectionsLoading ? (
                       <>
@@ -258,13 +253,13 @@ export default function TaskCollections() {
                       </span>
                     )}
                     {!tasksForCollectionsLoading && catTasks.length === 0 && (
-                      <span style={{ fontSize: 12, color: "#a8a29e" }}>{t("page.task_collections.no_tasks")}</span>
+                      <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{t("page.task_collections.no_tasks")}</span>
                     )}
                   </div>
                   <div style={{ display: "flex", alignItems: "center", gap: 4 }} onClick={(e) => e.stopPropagation()}>
                     <button
                       onClick={() => openEdit(cat)}
-                      style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "#a8a29e", transition: "all 0.2s" }}
+                      style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "var(--text-muted)", transition: "all 0.2s" }}
                       title={t("action.edit")}
                     >
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
@@ -273,7 +268,7 @@ export default function TaskCollections() {
                     </button>
                     <button
                       onClick={() => setConfirmDelete(cat.id)}
-                      style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "#a8a29e", transition: "all 0.2s" }}
+                      style={{ padding: 6, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", color: "var(--text-muted)", transition: "all 0.2s" }}
                       title={t("action.delete")}
                     >
                       <IconTrash size={14} />

@@ -96,7 +96,13 @@ async function captureAiEditAdapter(page: Page) {
       window.__aiEditFormatAdapter = event.detail.adapter;
     }) as EventListener, { once: true });
   });
-  await page.getByRole("button", { name: "AI edit", exact: true }).click();
+  // Audio keeps AI edit as its main action; PDF and image keep it in the menu beside Edit.
+  const aiEdit = page.getByRole("button", { name: "AI edit", exact: true });
+  if (await aiEdit.count()) await aiEdit.click();
+  else {
+    await page.getByRole("button", { name: "More", exact: true }).click();
+    await page.getByRole("menuitem", { name: "AI edit", exact: true }).click();
+  }
   await expect.poll(() => page.evaluate(() => typeof window.__aiEditFormatAdapter)).toBe("object");
 }
 

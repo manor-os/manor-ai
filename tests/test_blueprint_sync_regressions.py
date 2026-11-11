@@ -14,6 +14,7 @@ from test_blueprint_upgrade_and_revert import _workspace
 from packages.core.blueprints.installer import install_blueprint, InstallMode
 from packages.core.blueprints.upgrade import BlueprintUpgradePlanChangedError, apply, revert
 from packages.core.models.base import generate_ulid
+from packages.core.models.blueprint_upgrade import WorkspaceBlueprintUpgradeState
 from packages.core.models.channel import ChannelConfig, MessageLog
 from packages.core.models.document import Channel, Document, DocumentGroup, DocumentGroupMember
 from packages.core.models.workspace import Agent, Workspace
@@ -111,11 +112,12 @@ async def test_revert_removes_only_unshared_upgrade_document(db_session, multipl
 
 async def test_legacy_knowledge_receipt_without_membership_identity_fails_closed(db_session):
     workspace, document_id, _group, user_id = await _created_knowledge(db_session)
-    settings = copy.deepcopy(workspace.settings)
-    for entry in settings["_blueprint"]["restore_point"]["items"]:
+    state = await db_session.get(WorkspaceBlueprintUpgradeState, workspace.id)
+    point = copy.deepcopy(state.restore_point)
+    for entry in point["items"]:
         entry.pop("remove_group_membership_on_revert", None)
         entry.pop("created_group_ids", None)
-    workspace.settings = settings
+    state.restore_point = point
     await db_session.flush()
     with pytest.raises(BlueprintUpgradePlanChangedError):
         await revert(db_session, workspace=workspace, by_user_id=user_id)

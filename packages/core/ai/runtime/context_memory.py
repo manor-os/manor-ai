@@ -8,6 +8,7 @@ import logging
 from packages.core.ai.runtime.context_window import context_section, manage_prompt_sections
 from packages.core.ai.runtime.memory import (
     runtime_allows_agent_memory_reader, runtime_allows_workspace_memory_reader,
+    runtime_identity_file_filter,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,10 +49,9 @@ class RuntimeContextMemory:
     async def refresh(self, messages):
         from packages.core.database import async_session
         from packages.core.memory.compaction import authorize_memory_scope
-        from packages.core.services.memory_service import get_context_memories
         from packages.core.memory.manager import select_prompt_memories
         from packages.core.ai.runtime.prompt_context import (
-            runtime_agent_identity_prompt, runtime_workspace_operating_memory_prompt,
+            runtime_agent_identity_prompt, runtime_read_agent_memories, runtime_workspace_operating_memory_prompt,
         )
 
         self.pending = None
@@ -67,12 +67,12 @@ class RuntimeContextMemory:
                 identity = runtime_agent_identity_prompt(
                     entity_id=self.ctx.entity_id, agent_id=self.ctx.agent_id,
                     user_id=self.ctx.user_id, strict=True,
+                    file_allowed=runtime_identity_file_filter(self.ctx.runtime_envelope, self.ctx.user_id),
                 )
                 fresh.extend(s for s in identity.sections if s["category"] == "memory_files")
-                # Exact personal scope: never make None mean "all users" or
-                # mix workspace records into a personal-memory section.
-                content = await get_context_memories(
-                    db, self.ctx.entity_id, agent_id=self.ctx.agent_id, user_id=self.ctx.user_id,
+                content = await runtime_read_agent_memories(
+                    db, envelope=self.ctx.runtime_envelope, entity_id=self.ctx.entity_id,
+                    agent_id=self.ctx.agent_id, user_id=self.ctx.user_id,
                     query=self.ctx.active_user_message, sync_files=False,
                 )
                 if content:
@@ -83,12 +83,17 @@ class RuntimeContextMemory:
                     workspace_id=self.ctx.workspace_id, workspace=workspace,
                     agent_id=self.ctx.agent_id, sections_out=fresh, strict=True,
                 )
+            from packages.core.memory.layer_prompt import memory_layer_file_sections
+            # Stable layers only: speaker_memory re-renders the speaker's layers
+            # every turn, and here they could land in the shared system prompt.
+            fresh.extend(await memory_layer_file_sections(self.ctx, per_speaker=False, db=db))
 
         def reloadable(s):
             source = s.get("source", "")
             return (source.startswith(("workspace:", "workspace_agent:"))
                     or source == "prompt_sections:agent_memories"
-                    or (source.startswith("agent_files:") and s["category"] == "memory_files"))
+                    or (source.startswith("agent_files:") and s["category"] == "memory_files")
+                    or (source.startswith("memory_layer:") and s["category"] == "memory_files"))
 
         # Keep non-memory sections byte-for-byte and replace each source once.
         # Missing/deleted sources disappear; genuinely failed reads raise above.

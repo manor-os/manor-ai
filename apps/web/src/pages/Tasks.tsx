@@ -1,3 +1,5 @@
+import { displayReadInterval, pagedReadInterval } from "../lib/readRefreshPolicy";
+import { usePageVisible } from "../lib/usePageVisible";
 import { agentListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
 import { preserveSelectedOption, taskBoardQueryEnabled, taskListQueryEnabled, taskRowsForActiveView } from "../lib/taskViewQueries";
 import { useState, useEffect, useCallback, useRef, useMemo, type DragEvent, type KeyboardEvent, type ReactNode } from "react";
@@ -21,7 +23,8 @@ import Input from "../components/ui/Input";
 import Textarea from "../components/ui/Textarea";
 import Calendar from "../components/ui/Calendar";
 import type { CalendarEvent } from "../components/ui/Calendar";
-import { IconClose, IconClock, IconFlag, IconUser, IconUsers, IconComment, IconCircleDot, IconCalendar, IconCategory, IconEdit, IconSend, IconUpload, IconDocument, IconDownload, IconExternalLink, IconManorLogo, IconAgent, IconPlay, IconHeadphones, IconCheckCircle, IconTrash, IconPaperclip, IconWorkspace, IconBuilding, IconLayers, IconWarning, IconChevronRight, IconChevronDown, IconGrid, IconList } from "../components/icons";
+import { IconClose, IconClock, IconFlag, IconUser, IconUsers, IconComment, IconCircleDot, IconCalendar, IconCategory, IconEdit, IconSend, IconUpload, IconDocument, IconDownload, IconExternalLink, IconManorLogo, IconAgent, IconPlay, IconHeadphones, IconCheckCircle, IconTrash, IconPaperclip, IconWorkspace, IconBuilding, IconLayers, IconWarning, IconChevronRight, IconChevronDown, IconGrid, IconList, IconPlus } from "../components/icons";
+import Dropdown from "../components/ui/Dropdown";
 import Select from "../components/ui/Select";
 import DateTimePicker from "../components/ui/DateTimePicker";
 import TabSwitcher from "../components/ui/TabSwitcher";
@@ -54,34 +57,22 @@ import {
   SELECTED_TEXT_TASK_DRAFT_KEY,
   type SelectedTextTaskDraft,
 } from "../lib/selectionActions";
+import "./Tasks.css";
 
 /* ── constants ──────────────────────────────────────────── */
 
-const VIEW_TABS: { key: string; label: string; icon: React.ReactNode }[] = [
-  {
-    key: "board",
-    label: "Tickets",
-    icon: (
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-        <rect x="3" y="3" width="7" height="7" /><rect x="14" y="3" width="7" height="7" /><rect x="3" y="14" width="7" height="7" /><rect x="14" y="14" width="7" height="7" />
-      </svg>
-    ),
-  },
-  {
-    key: "calendar",
-    label: t("page.tasks.calendar"),
-    icon: (
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-        <rect x="3" y="4" width="18" height="18" rx="2" /><path d="M16 2v4M8 2v4M3 10h18" />
-      </svg>
-    ),
-  },
+type TaskScope = "mine" | "delegated" | "all";
+
+const TASK_SCOPE_TABS: { key: TaskScope; label: string }[] = [
+  { key: "mine", label: t("page.tasks.scope_mine") },
+  { key: "delegated", label: t("page.tasks.scope_delegated") },
+  { key: "all", label: t("page.tasks.scope_all") },
 ];
 
 /* ── Task constants (mirrors packages/core/constants/task.py) ── */
 
 const TASK_STATUSES: Record<string, { label: string; color: string; order: number }> = {
-  created:              { label: t("page.dashboard.created"),              color: "#a8a29e", order: 0 },
+  created:              { label: t("page.dashboard.created"),              color: "var(--text-faint)", order: 0 },
   proposed:             { label: t("page.tasks.proposed"),             color: "#a78bfa", order: 1 },
   pending:              { label: t("status.pending"),              color: "#cf9b44", order: 2 },
   scheduled:            { label: t("status.scheduled"),            color: "#9079c2", order: 3 },
@@ -90,7 +81,7 @@ const TASK_STATUSES: Record<string, { label: string; color: string; order: numbe
   on_hold:              { label: t("page.tasks.on_hold"),              color: "#a07fc0", order: 6 },
   blocked:              { label: t("page.tasks.blocked"),              color: "#d65f59", order: 7 },
   completed:            { label: t("status.completed"),            color: "#4f9c84", order: 8 },
-  cancelled:            { label: t("status.cancelled"),            color: "#78716c", order: 9 },
+  cancelled:            { label: t("status.cancelled"),            color: "var(--text-muted)", order: 9 },
   failed:               { label: t("page.dashboard.failed"),               color: "#c14a44", order: 10 },
 };
 
@@ -202,7 +193,7 @@ function DependencyStatusPill({ info, compact }: { info: TaskDependencyInfo; com
   const palette = info.status === "blocked"
     ? { fg: "#a23e38", bg: "#f8f0ef", border: "#ecc8c5", label: t("page.tasks.dependency_blocked") }
     : info.status === "completed"
-      ? { fg: "#436b65", bg: "#f5f5f4", border: "#ccded9", label: t("page.tasks.dependency_ready") }
+      ? { fg: "#436b65", bg: "#f5f5f7", border: "#ccded9", label: t("page.tasks.dependency_ready") }
       : { fg: "#76502c", bg: "#faf7ef", border: "#ecdca4", label: t("page.tasks.dependency_waiting") };
   return (
     <span style={{
@@ -232,7 +223,7 @@ const PRIORITY_CONFIG: Record<number, { label: string; color: string; badge: "da
   4: { label: t("page.tasks.high"),     color: "#d3873f", badge: "warning" },
   3: { label: t("page.tasks.medium"),   color: "#c3a63f", badge: "info" },
   2: { label: t("page.tasks.low"),      color: "#8aa9d1", badge: "teal" },
-  1: { label: t("page.tasks.minimal"),  color: "#a8a29e", badge: "inactive" },
+  1: { label: t("page.tasks.minimal"),  color: "var(--text-faint)", badge: "inactive" },
 };
 
 type TaskStatusFilter = "all" | "overdue" | "done" | typeof BOARD_COLUMNS[number];
@@ -246,7 +237,7 @@ type TaskFilterOption<T extends string = string> = {
 };
 
 const STATUS_FILTER_OPTIONS: TaskFilterOption<TaskStatusFilter>[] = [
-  { key: "all", label: t("page.workspaces.filter_all"), icon: <IconCircleDot size={14} style={{ color: "#a8a29e" }} /> },
+  { key: "all", label: t("page.workspaces.filter_all"), icon: <IconCircleDot size={14} style={{ color: "var(--text-muted)" }} /> },
   { key: "overdue", label: t("page.task_detail.overdue"), icon: <IconWarning size={14} style={{ color: "#d65f59" }} /> },
   ...BOARD_COLUMNS.map((key) => {
     const Icon = COLUMN_META[key].Icon;
@@ -255,11 +246,11 @@ const STATUS_FILTER_OPTIONS: TaskFilterOption<TaskStatusFilter>[] = [
 ];
 
 const DUE_FILTER_OPTIONS: TaskFilterOption<TaskDueFilter>[] = [
-  { key: "all", label: t("page.workspaces.filter_all"), icon: <IconCalendar size={14} style={{ color: "#a8a29e" }} /> },
+  { key: "all", label: t("page.workspaces.filter_all"), icon: <IconCalendar size={14} style={{ color: "var(--text-muted)" }} /> },
   { key: "overdue", label: t("page.task_detail.overdue"), icon: <IconWarning size={14} style={{ color: "#d65f59" }} /> },
-  { key: "today", label: "Today", icon: <IconCalendar size={14} style={{ color: "#57534e" }} /> },
-  { key: "upcoming", label: "Upcoming", icon: <IconClock size={14} style={{ color: "#4869ac" }} /> },
-  { key: "no_due", label: "No due", icon: <IconClose size={14} style={{ color: "#a8a29e" }} /> },
+  { key: "today", label: t("page.tasks.due_today"), icon: <IconCalendar size={14} style={{ color: "var(--text-muted)" }} /> },
+  { key: "upcoming", label: t("page.tasks.due_upcoming"), icon: <IconClock size={14} style={{ color: "#4869ac" }} /> },
+  { key: "no_due", label: t("page.tasks.due_none"), icon: <IconClose size={14} style={{ color: "var(--text-muted)" }} /> },
 ];
 
 function isBoardColumnKey(value: string): value is BoardColumnKey {
@@ -389,6 +380,14 @@ function taskOwnerFilterKey(task: Task): TaskOwnerFilter {
   if (task.agent_id || isMaster) return `agent:${task.agent_id || MANOR_AGENT_ID}`;
   if (task.assignee_id) return `person:${task.assignee_id}`;
   return "unassigned";
+}
+
+// Mine: it is on my plate. Handed off: I asked for it and someone or some AI has it.
+function taskIsInScope(task: Task, scope: TaskScope, userId?: string): boolean {
+  if (scope === "all") return true;
+  const owner = taskOwnerFilterKey(task);
+  const mine = owner === `person:${userId}` || (owner === "unassigned" && task.creator_id === userId);
+  return scope === "mine" ? mine : !mine && task.creator_id === userId;
 }
 
 function matchesOwnerFilter(task: Task, filter: TaskOwnerFilter): boolean {
@@ -566,15 +565,15 @@ function ColumnVisibilityMenu({
         aria-haspopup="menu"
         aria-expanded={open}
         aria-label={`Customize Kanban columns. ${visibleCount} visible.`}
-        title="Customize Kanban columns"
+        title={t("ui.customize_kanban_columns")}
       >
         <IconLayers size={14} />
       </button>
       {open && (
         <div className="task-column-menu-popover" role="menu">
           <div className="task-column-menu-header">
-            <span>Columns</span>
-            <button type="button" onClick={onShowAll}>Show all</button>
+            <span>{t("ui.columns")}</span>
+            <button type="button" onClick={onShowAll}>{t("ui.show_all")}</button>
           </div>
           {columnOrder.map((key, index) => {
             const meta = COLUMN_META[key];
@@ -632,7 +631,7 @@ function ColumnVisibilityMenu({
                     className="task-column-menu-move"
                     onClick={() => onMoveColumn(key, -1)}
                     disabled={index === 0}
-                    title="Move up"
+                    title={t("ui.move_up")}
                     aria-label={`Move ${meta.label} up`}
                   >
                     <IconChevronDown className="task-column-menu-move-icon is-up" size={12} />
@@ -642,7 +641,7 @@ function ColumnVisibilityMenu({
                     className="task-column-menu-move"
                     onClick={() => onMoveColumn(key, 1)}
                     disabled={index === columnOrder.length - 1}
-                    title="Move down"
+                    title={t("ui.move_down")}
                     aria-label={`Move ${meta.label} down`}
                   >
                     <IconChevronDown className="task-column-menu-move-icon" size={12} />
@@ -657,40 +656,46 @@ function ColumnVisibilityMenu({
   );
 }
 
-function TaskBoardModeSwitch({
+type TaskViewMode = "kanban" | "list" | "calendar";
+
+function TaskViewModeSwitch({
   value,
   onChange,
+  showCalendar,
 }: {
-  value: "kanban" | "list";
-  onChange: (value: "kanban" | "list") => void;
+  value: TaskViewMode;
+  onChange: (value: TaskViewMode) => void;
+  showCalendar: boolean;
 }) {
+  const modes: { key: TaskViewMode; label: string; icon: ReactNode }[] = [
+    { key: "kanban", label: t("page.tasks.board"), icon: <IconGrid size={15} /> },
+    { key: "list", label: t("page.tasks.list"), icon: <IconList size={15} /> },
+    ...(showCalendar ? [{ key: "calendar" as const, label: t("page.tasks.calendar"), icon: <IconCalendar size={15} /> }] : []),
+  ];
   return (
-    <div className="task-board-mode-switch" aria-label="Ticket view mode">
-      <button
-        type="button"
-        className={value === "kanban" ? "is-active" : ""}
-        onClick={() => onChange("kanban")}
-        title="Kanban"
-        aria-label="Show Kanban view"
-        aria-pressed={value === "kanban"}
-      >
-        <IconGrid size={15} />
-      </button>
-      <button
-        type="button"
-        className={value === "list" ? "is-active" : ""}
-        onClick={() => onChange("list")}
-        title="List"
-        aria-label="Show List view"
-        aria-pressed={value === "list"}
-      >
-        <IconList size={15} />
-      </button>
+    <div className="task-board-mode-switch" role="group" aria-label={t("page.tasks.view_mode")}>
+      {modes.map((mode) => (
+        <button
+          key={mode.key}
+          type="button"
+          className={value === mode.key ? "is-active" : ""}
+          onClick={() => onChange(mode.key)}
+          title={mode.label}
+          aria-label={mode.label}
+          aria-pressed={value === mode.key}
+        >
+          {mode.icon}
+        </button>
+      ))}
     </div>
   );
 }
 
+// The board column already says these.
+const ROUTINE_BOARD_STATUSES = new Set(["created", "pending", "scheduled", "in_progress", "completed"]);
+
 function BoardTaskCard({ task, onClick, onOpenFull, agents, dimmed, compact, wsName, workspaceScoped, grouped }: { task: Task; onClick: () => void; onOpenFull: () => void; agents?: any[]; dimmed?: boolean; compact?: boolean; wsName?: string; workspaceScoped?: boolean; grouped?: boolean }) {
+  const currentUserId = useAuthStore((s) => s.user?.id);
   const handleDragStart = useCallback((e: DragEvent<HTMLDivElement>) => {
     e.dataTransfer.setData("taskId", task.id);
     e.dataTransfer.effectAllowed = "move";
@@ -720,10 +725,11 @@ function BoardTaskCard({ task, onClick, onOpenFull, agents, dimmed, compact, wsN
   const checkTotal = (task.details as any)?.checklist_total || 0;
   const dependencyInfo = _taskDependencyInfo(task);
   const isProcessingGlow = task.execution_active === true && !dimmed;
-  const scopeName = wsName || task.workspace_name || (!task.workspace_id ? "Entity-level" : "");
-  const scopeIsEntityLevel = !task.workspace_id;
+  const scopeName = wsName || task.workspace_name || "";
+  const ownerIsSomeoneElse = isAI || (!!task.assignee_id && task.assignee_id !== currentUserId);
   const statusConfig = TASK_STATUSES[task.status];
   const blocker = currentTaskBlocker(task);
+  const statusIsException = !!blocker || !ROUTINE_BOARD_STATUSES.has(task.status);
   const statusLabel = blocker ? taskBlockerView(blocker).label : statusConfig?.label || formatUserFacingLabel(task.status);
 
   return (
@@ -756,11 +762,6 @@ function BoardTaskCard({ task, onClick, onOpenFull, agents, dimmed, compact, wsN
             <p className="task-board-card-title">
               {formatUserFacingText(task.title)}
             </p>
-            {assigneeName && (
-              <p className={`task-board-card-assignee${isAI ? " is-agent" : ""}`}>
-                {assigneeName}
-              </p>
-            )}
           </div>
           <button
             type="button"
@@ -777,60 +778,25 @@ function BoardTaskCard({ task, onClick, onOpenFull, agents, dimmed, compact, wsN
         </div>
 
         <div className="task-board-card-context">
-          {scopeName && !grouped && (
-            <span className={`task-board-card-scope${scopeIsEntityLevel ? " is-entity" : ""}`}>
-              <IconWorkspace size={10} />
-              <span>{scopeName}</span>
+          {ownerIsSomeoneElse && assigneeName && <span>{assigneeName}</span>}
+          {task.workspace_id && scopeName && !grouped && <span>{scopeName}</span>}
+          {overdue && <span className="task-board-card-overdue">{t("page.task_detail.overdue")}</span>}
+          {!overdue && task.deadline && <span>{formatDate(task.deadline)}</span>}
+          {(task.priority || 0) >= 4 && <span>{pcfg.label}</span>}
+          {!compact && hasChecklist && <span>{checkDone}/{checkTotal}</span>}
+          {isProcessingGlow ? (
+            <span className="task-board-card-status">
+              {t("page.dashboard.running_now")}
+              <span className="task-board-running-dots" aria-hidden="true">
+                <span />
+                <span />
+                <span />
+              </span>
             </span>
+          ) : statusIsException && (
+            <span className="task-board-card-status">{statusLabel}</span>
           )}
-          <span className="task-board-card-status">
-            {isProcessingGlow ? (
-              <>
-                <span style={{ background: "#4f9c84" }} />
-                {t("page.dashboard.running_now")}
-                <span className="task-board-running-dots" aria-hidden="true">
-                  <span />
-                  <span />
-                  <span />
-                </span>
-              </>
-            ) : (
-              <>
-                <span style={{ background: statusConfig?.color || "#a8a29e" }} />
-                {statusLabel}
-              </>
-            )}
-          </span>
-        </div>
-
-        {!compact && hasChecklist && (
-          <div className="task-board-card-progress">
-            <IconCheckCircle size={10} />
-            <span>{checkDone}/{checkTotal}</span>
-          </div>
-        )}
-
-        <div className="task-board-card-footer">
-          <div className="task-board-card-footer-meta">
-            <span className="task-board-card-priority-label">
-              <IconFlag size={10} />
-              {pcfg.label}
-            </span>
-            {overdue && (
-              <span className="task-board-card-overdue">
-                <IconWarning size={10} />
-                {t("page.task_detail.overdue")}
-              </span>
-            )}
-            {!overdue && task.deadline && (
-              <span className="task-board-card-due">
-                <IconClock size={10} />
-                {formatDate(task.deadline)}
-              </span>
-            )}
-            {dependencyInfo && <DependencyStatusPill info={dependencyInfo} compact />}
-          </div>
-          <span className="task-board-card-id">#{task.id.slice(-4)}</span>
+          {dependencyInfo && <DependencyStatusPill info={dependencyInfo} compact />}
         </div>
       </div>
     </div>
@@ -881,13 +847,13 @@ type TaskListSortState = { key: TaskListSortKey; direction: TaskListSortDirectio
 
 const DEFAULT_TASK_LIST_SORT: TaskListSortState = { key: "created", direction: "desc" };
 const TASK_LIST_SORT_LABELS: Record<TaskListSortKey, string> = {
-  ticket: "Ticket",
-  workspace: "Workspace",
-  owner: "Owner",
-  status: "Status",
-  priority: "Priority",
-  due: "Due",
-  created: "Created",
+  ticket: t("page.tasks.column_task"),
+  workspace: t("page.tasks.column_workspace"),
+  owner: t("page.tasks.column_owner"),
+  status: t("page.tasks.column_status"),
+  priority: t("page.tasks.column_priority"),
+  due: t("page.tasks.column_due"),
+  created: t("page.tasks.column_created"),
 };
 
 function defaultTaskListSortDirection(key: TaskListSortKey): TaskListSortDirection {
@@ -938,13 +904,13 @@ function taskListOwnerName(task: Task, currentUser?: any, agentById?: Map<string
     ? task.agent_name || agent?.name || (isMaster ? MANOR_AGENT_NAME : t("page.tasks.ai_agent"))
     : task.assignee_name
       || (task.assignee_id === currentUser?.id ? currentUser?.display_name || currentUser?.email : "")
-      || "Unassigned";
+      || t("page.tasks.unassigned");
 }
 
 function taskListWorkspaceName(task: Task, wsMap?: Record<string, string>): string {
   return (task.workspace_id && wsMap?.[task.workspace_id])
     || task.workspace_name
-    || "Entity-level";
+    || t("page.tasks.no_workspace");
 }
 
 function compareTaskListItems(
@@ -988,7 +954,7 @@ function taskStatusBadgeType(task: Task): string {
 
 function taskDueText(task: Task): { label: string; overdue: boolean } {
   const raw = task.deadline || task.scheduled_at || "";
-  if (!raw) return { label: "No due", overdue: false };
+  if (!raw) return { label: "—", overdue: false };
   return {
     label: formatDate(raw),
     overdue: isDeadlineOverdue(task.deadline, task.status),
@@ -996,7 +962,7 @@ function taskDueText(task: Task): { label: string; overdue: boolean } {
 }
 
 function taskCreatedText(task: Task): string {
-  return task.created_at ? formatDate(task.created_at) : "Unknown";
+  return task.created_at ? formatDate(task.created_at) : "—";
 }
 
 type WorkspaceTaskGroup = {
@@ -1073,7 +1039,7 @@ function TaskDependencySummary({ task }: { task: Task }) {
     <div style={{ borderRadius: 12, border: "1px solid rgba(207,155,68,0.18)", background: "rgba(250,247,239,0.58)", padding: 12 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
         <IconCircleDot size={13} style={{ color: info.status === "completed" ? "#436b65" : info.status === "blocked" ? "#a23e38" : "#76502c" }} />
-        <span style={{ fontSize: 11, fontWeight: 800, color: "#76502c", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+        <span style={{ fontSize: 11, fontWeight: 800, color: "#76502c", }}>
           {t("page.tasks.dependency_inputs")}
         </span>
         <span style={{ marginLeft: "auto" }}>
@@ -1085,20 +1051,20 @@ function TaskDependencySummary({ task }: { task: Task }) {
           {info.outputs.slice(0, 4).map((dep: any, i: number) => {
             const files = Array.isArray(dep.files) ? dep.files : [];
             return (
-              <div key={`${dep.task_id || i}`} style={{ borderRadius: 10, background: "rgba(255,255,255,0.72)", border: "1px solid rgba(28,25,23,0.06)", padding: "7px 9px" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 750, color: "#44403c" }}>
-                  <IconCheckCircle size={12} style={{ color: "#57534e" }} />
+              <div key={`${dep.task_id || i}`} style={{ borderRadius: 10, background: "rgba(255,255,255,0.72)", border: "0.5px solid rgba(29, 29, 31,0.06)", padding: "7px 9px" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 750, color: "var(--text-default)" }}>
+                  <IconCheckCircle size={12} style={{ color: "var(--text-muted)" }} />
                   <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     {formatUserFacingText(dep.task_title || `${t("page.tasks.predecessor_outputs")} ${i + 1}`)}
                   </span>
                 </div>
                 {dep.result_summary && (
-                  <p style={{ fontSize: 11, color: "#78716c", lineHeight: 1.45, margin: "4px 0 0" }}>
+                  <p style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.45, margin: "4px 0 0" }}>
                     {formatUserFacingStructuredText(dep.result_summary).slice(0, 180)}
                   </p>
                 )}
                 {files.length > 0 && (
-                  <p style={{ fontSize: 10, color: "#57534e", fontWeight: 700, margin: "4px 0 0" }}>
+                  <p style={{ fontSize: 10, color: "var(--text-muted)", fontWeight: 700, margin: "4px 0 0" }}>
                     {files.length} {t("page.tasks.files")}
                   </p>
                 )}
@@ -1107,7 +1073,7 @@ function TaskDependencySummary({ task }: { task: Task }) {
           })}
         </div>
       ) : (
-        <p style={{ fontSize: 12, color: "#78716c", lineHeight: 1.55, margin: 0 }}>
+        <p style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.55, margin: 0 }}>
           {t("page.tasks.waiting_to_start_when_ready")}
         </p>
       )}
@@ -1135,30 +1101,30 @@ function TaskOutputSummary({ task, returnTo }: { task: Task; returnTo?: string }
     <div className="task-output-summary-card" style={{ borderRadius: 12, border: "1px solid rgba(95,146,138,0.16)", background: "rgba(242,246,245,0.52)", padding: 12 }}>
       <div className="task-output-summary-header" style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
         <IconDocument className="task-output-summary-icon" size={13} style={{ color: "#436b65" }} />
-        <span className="task-output-summary-label" style={{ fontSize: 11, fontWeight: 800, color: "#436b65", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-          Result
+        <span className="task-output-summary-label" style={{ fontSize: 11, fontWeight: 800, color: "#436b65", }}>
+          {t("ui.result")}
         </span>
         {outputStatus && (
           <span
             className={`task-output-summary-status task-output-summary-status--${outputStatus.replace(/[^a-z0-9_-]/gi, "_").toLowerCase()}`}
-            style={{ marginLeft: "auto", fontSize: 10, fontWeight: 700, color: "#78716c", background: "rgba(255,255,255,0.8)", border: "1px solid rgba(226,232,240,0.8)", borderRadius: 999, padding: "2px 7px" }}
+            style={{ marginLeft: "auto", fontSize: 10, fontWeight: 700, color: "var(--text-muted)", background: "rgba(255,255,255,0.8)", border: "1px solid rgba(226,232,240,0.8)", borderRadius: 999, padding: "2px 7px" }}
           >
             {formatUserFacingLabel(outputStatus)}
           </span>
         )}
       </div>
       {summary ? (
-        <div className="task-output-summary-markdown" style={{ fontSize: 12, color: "#44403c", lineHeight: 1.55, marginBottom: files.length || steps.length ? 8 : 0 }}>
+        <div className="task-output-summary-markdown" style={{ fontSize: 12, color: "var(--text-default)", lineHeight: 1.55, marginBottom: files.length || steps.length ? 8 : 0 }}>
           <ChatMarkdown content={formatUserFacingStructuredText(summary)} />
         </div>
       ) : files.length === 0 && steps.length === 0 ? (
-        <p className="task-output-summary-empty" style={{ fontSize: 12, color: "#78716c", lineHeight: 1.55, margin: files.length || steps.length ? "0 0 8px" : 0 }}>
+        <p className="task-output-summary-empty" style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.55, margin: files.length || steps.length ? "0 0 8px" : 0 }}>
           {batchId
             ? "This task is part of a grouped run. Results will appear here after the agent finishes."
             : "The run recorded activity, but no final summary was saved."}
         </p>
       ) : !summary && steps.length > 0 ? (
-        <p className="task-output-summary-empty" style={{ fontSize: 12, color: "#78716c", lineHeight: 1.55, margin: files.length ? "0 0 8px" : 0 }}>
+        <p className="task-output-summary-empty" style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.55, margin: files.length ? "0 0 8px" : 0 }}>
           The run recorded {steps.length} {steps.length === 1 ? "step" : "steps"}.
         </p>
       ) : null}
@@ -1181,22 +1147,22 @@ function TaskOutputSummary({ task, returnTo }: { task: Task; returnTo?: string }
                 trustedReference
               />
             ) : (
-              <span key={generatedFileIdentity(file) || i} className="task-output-summary-file" style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 700, color: "#57534e" }}>
+              <span key={generatedFileIdentity(file) || i} className="task-output-summary-file" style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 700, color: "var(--text-muted)" }}>
                 <IconDocument size={11} />
                 <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</span>
               </span>
             );
           })}
-          {files.length > 4 && <span className="task-output-summary-more" style={{ fontSize: 11, color: "#a8a29e" }}>+ {files.length - 4} more files</span>}
+          {files.length > 4 && <span className="task-output-summary-more" style={{ fontSize: 11, color: "var(--text-muted)" }}>+ {files.length - 4} more files</span>}
         </div>
       )}
       {steps.length > 0 && (
         <div className="task-output-summary-steps" style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
-          <span className="task-output-summary-section-title" style={{ flexBasis: "100%", fontSize: 11, fontWeight: 800, color: "#57534e", marginBottom: 2 }}>
-            Steps
+          <span className="task-output-summary-section-title" style={{ flexBasis: "100%", fontSize: 11, fontWeight: 800, color: "var(--text-muted)", marginBottom: 2 }}>
+            {t("ui.steps")}
           </span>
           {steps.slice(0, 6).map((step: any, i: number) => (
-            <span key={i} className="task-output-summary-step-chip" style={{ fontSize: 10, color: "#78716c", background: "rgba(255,255,255,0.75)", border: "1px solid rgba(226,232,240,0.8)", borderRadius: 999, padding: "2px 7px" }}>
+            <span key={i} className="task-output-summary-step-chip" style={{ fontSize: 10, color: "var(--text-muted)", background: "rgba(255,255,255,0.75)", border: "1px solid rgba(226,232,240,0.8)", borderRadius: 999, padding: "2px 7px" }}>
               {taskOutputStepLabel(step, i)}
             </span>
           ))}
@@ -1277,7 +1243,7 @@ function CalendarOpsRail({
 }) {
   return (
     <div style={{
-      border: "1px solid rgba(28,25,23,0.06)",
+      border: "0.5px solid rgba(29, 29, 31,0.06)",
       background: "rgba(255,255,255,0.78)",
       borderRadius: 18,
       padding: "12px 14px",
@@ -1293,9 +1259,9 @@ function CalendarOpsRail({
           <IconCalendar size={14} />
         </span>
         <div style={{ minWidth: 0 }}>
-          <div style={{ fontSize: 12, fontWeight: 800, color: "#1c1917", marginBottom: 5 }}>Today</div>
+          <div style={{ fontSize: 12, fontWeight: 800, color: "var(--text-strong)", marginBottom: 5 }}>{t("ui.today")}</div>
           {items.length === 0 ? (
-            <div style={{ fontSize: 11, fontWeight: 650, color: "#a8a29e" }}>No scheduled items</div>
+            <div style={{ fontSize: 11, fontWeight: 650, color: "var(--text-muted)" }}>{t("ui.no_scheduled_items")}</div>
           ) : (
             <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, overflow: "hidden" }}>
               {items.slice(0, 3).map((item) => {
@@ -1314,23 +1280,23 @@ function CalendarOpsRail({
                       alignItems: "center",
                       gap: 6,
                       borderRadius: 9,
-                      border: `1px solid ${isBooking ? "rgba(79,125,117,0.18)" : "rgba(28,25,23,0.06)"}`,
+                      border: `1px solid ${isBooking ? "rgba(79,125,117,0.18)" : "rgba(29, 29, 31,0.06)"}`,
                       background: isBooking ? "rgba(247,250,249,0.96)" : "#fff",
                       padding: "0 9px",
                       cursor: item.task_id ? "pointer" : "default",
-                      color: "#44403c",
+                      color: "var(--text-muted)",
                       fontSize: 11,
                       fontWeight: 750,
                     }}
                   >
-                    <IconClock size={11} style={{ color: isBooking ? "#4f7d75" : "#a8a29e", flexShrink: 0 }} />
-                    <span style={{ color: "#78716c", flexShrink: 0 }}>{formatAgendaTime(item.starts_at, timezone)}</span>
+                    <IconClock size={11} style={{ color: isBooking ? "#4f7d75" : "#aeaeb2", flexShrink: 0 }} />
+                    <span style={{ color: "var(--text-muted)", flexShrink: 0 }}>{formatAgendaTime(item.starts_at, timezone)}</span>
                     <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.title}</span>
                   </button>
                 );
               })}
               {items.length > 3 && (
-                <span style={{ fontSize: 11, fontWeight: 800, color: "#78716c", flexShrink: 0 }}>+{items.length - 3}</span>
+                <span style={{ fontSize: 11, fontWeight: 800, color: "var(--text-muted)", flexShrink: 0 }}>+{items.length - 3}</span>
               )}
             </div>
           )}
@@ -1343,7 +1309,7 @@ function CalendarOpsRail({
           height: 32,
           borderRadius: 10,
           border: "1px solid rgba(79,125,117,0.16)",
-          background: "#fff",
+          background: "var(--surface-panel)",
           color: "#436b65",
           fontSize: 11,
           fontWeight: 800,
@@ -1356,7 +1322,7 @@ function CalendarOpsRail({
         }}
       >
         <IconExternalLink size={12} />
-        Booking links
+        {t("ui.booking_links")}
       </button>
     </div>
   );
@@ -1515,29 +1481,29 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
   const comments = (logs as any[]).filter((l: any) => !l.log_type.startsWith("ai_"));
 
   return (
-    <div className="task-detail-drawer-panel" style={{ width: "min(100%, 380px)", maxWidth: "100%", borderLeft: "1px solid rgba(28,25,23,0.06)", background: "rgba(255,255,255,0.85)", backdropFilter: "blur(16px)", display: "flex", flexDirection: "column", overflowY: "auto", height: "100%" }}>
+    <div className="task-detail-drawer-panel" style={{ width: "min(100%, 380px)", maxWidth: "100%", borderLeft: "0.5px solid rgba(29, 29, 31,0.06)", background: "rgba(255,255,255,0.85)", backdropFilter: "blur(16px)", display: "flex", flexDirection: "column", overflowY: "auto", height: "100%" }}>
       {/* Header — Open full view + Delete + close. Surfaced directly
           so the actions are reachable without hunting in a "..." menu. */}
-      <div style={{ padding: "12px 16px", borderBottom: "1px solid rgba(28,25,23,0.06)", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexShrink: 0 }}>
+      <div style={{ padding: "12px 16px", borderBottom: "0.5px solid rgba(29, 29, 31,0.06)", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <button
             onClick={onOpenFull}
             title={t("page.tasks.open_full_view")}
             style={{
               display: "inline-flex", alignItems: "center", gap: 5,
-              padding: "5px 10px", borderRadius: 8, border: "1px solid rgba(28,25,23,0.9)",
-              background: "#1c1917", cursor: "pointer", fontSize: 12, fontWeight: 650, color: "#fff",
-              boxShadow: "0 8px 18px rgba(28,25,23,0.12)",
+              padding: "5px 10px", borderRadius: 8, border: "1px solid rgba(29, 29, 31,0.9)",
+              background: "#1d1d1f", cursor: "pointer", fontSize: 12, fontWeight: 650, color: "#fff",
+              boxShadow: "0 8px 18px rgba(29, 29, 31,0.12)",
               transition: "background 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease",
             }}
             onMouseEnter={(e) => {
-              e.currentTarget.style.background = "#0c0a09";
-              e.currentTarget.style.boxShadow = "0 10px 22px rgba(28,25,23,0.18)";
+              e.currentTarget.style.background = "#000000";
+              e.currentTarget.style.boxShadow = "0 10px 22px rgba(29, 29, 31,0.18)";
               e.currentTarget.style.transform = "translateY(-1px)";
             }}
             onMouseLeave={(e) => {
-              e.currentTarget.style.background = "#1c1917";
-              e.currentTarget.style.boxShadow = "0 8px 18px rgba(28,25,23,0.12)";
+              e.currentTarget.style.background = "#1d1d1f";
+              e.currentTarget.style.boxShadow = "0 8px 18px rgba(29, 29, 31,0.12)";
               e.currentTarget.style.transform = "none";
             }}
           >
@@ -1550,7 +1516,7 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
             style={{
               display: "inline-flex", alignItems: "center", gap: 5,
               padding: "5px 10px", borderRadius: 8, border: "1px solid rgba(236,200,197,0.8)",
-              background: "#fff", cursor: "pointer", fontSize: 12, fontWeight: 500, color: "#c14a44",
+              background: "var(--surface-panel)", cursor: "pointer", fontSize: 12, fontWeight: 500, color: "#c14a44",
               transition: "background 0.15s",
             }}
             onMouseEnter={(e) => { e.currentTarget.style.background = "#f8f0ef"; }}
@@ -1560,8 +1526,8 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
             {t("action.delete")}
           </button>
         </div>
-        <button onClick={onClose} style={{ width: 28, height: 28, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: "#a8a29e" }}
-          onMouseEnter={(e) => { e.currentTarget.style.background = "#f5f5f4"; }}
+        <button onClick={onClose} style={{ width: 28, height: 28, borderRadius: 8, border: "none", background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)" }}
+          onMouseEnter={(e) => { e.currentTarget.style.background = "#f5f5f7"; }}
           onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}>
           <IconClose size={14} />
         </button>
@@ -1569,9 +1535,9 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
 
       <div style={{ flex: 1, overflowY: "auto", padding: 16, display: "flex", flexDirection: "column", gap: 14 }}>
         {/* Title */}
-        <h3 style={{ fontSize: 17, fontWeight: 700, color: "#1c1917", margin: 0, lineHeight: 1.3 }}>
+        <h3 style={{ fontSize: 17, fontWeight: 700, color: "var(--text-strong)", margin: 0, lineHeight: 1.3 }}>
           {formatUserFacingText(task.title)}
-          <span style={{ fontSize: 10, color: "#a8a29e", fontWeight: 500, marginLeft: 6, fontFamily: "monospace" }}>#{task.id.slice(-6)}</span>
+          <span style={{ fontSize: 10, color: "var(--text-muted)", fontWeight: 500, marginLeft: 6, fontFamily: "var(--font-mono)" }}>#{task.id.slice(-6)}</span>
         </h3>
 
         {/* Properties — shared component (compact variant). Priority +
@@ -1598,7 +1564,7 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
           onClick={() => setShowMore((v) => !v)}
           style={{
             alignSelf: "flex-start",
-            fontSize: 11, fontWeight: 600, color: "#78716c",
+            fontSize: 11, fontWeight: 600, color: "var(--text-muted)",
             background: "transparent", border: "none", cursor: "pointer",
             padding: "0 0 0 4px",
           }}
@@ -1629,10 +1595,11 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
         {/* Description */}
         {task.description && (
           <div id={`task-description-${task.id}`}>
-            <span style={{ fontSize: 11, fontWeight: 700, color: "#57534e", textTransform: "uppercase", letterSpacing: "0.04em" }}>{t("page.task_collections.description")}</span>
-            <div style={{ fontSize: 13, color: "#44403c", margin: "4px 0 0", lineHeight: 1.6 }}>
+            <span style={{ fontSize: 11, fontWeight: 700, color: "var(--text-muted)", }}>{t("page.task_collections.description")}</span>
+            <div style={{ fontSize: 13, color: "var(--text-default)", margin: "4px 0 0", lineHeight: 1.6 }}>
               <ChatMarkdown
                 content={formatTaskDescriptionForDisplay(task.description)}
+                preserveReferences
                 returnTo={`${returnTo.split("#")[0]}#task-description-${task.id}`}
               />
             </div>
@@ -1641,7 +1608,7 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
 
         {/* Dates — only when "More details" is open */}
         {showMore && (
-          <div style={{ display: "flex", gap: 16, fontSize: 11, color: "#a8a29e" }}>
+          <div style={{ display: "flex", gap: 16, fontSize: 11, color: "var(--text-muted)" }}>
             {task.created_at && <span>{t("page.dashboard.created")} {formatDate(task.created_at)}</span>}
             {task.started_at && <span>{t("page.tasks.started")} {formatDate(task.started_at)}</span>}
             {task.completed_at && <span>{t("page.team_people.done")} {formatDate(task.completed_at)}</span>}
@@ -1652,10 +1619,10 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
             primary scroll area free of destructive actions. */}
 
         {/* Comments */}
-        <div style={{ borderTop: "1px solid rgba(28,25,23,0.06)", paddingTop: 14 }}>
+        <div style={{ borderTop: "0.5px solid rgba(29, 29, 31,0.06)", paddingTop: 14 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
-            <IconComment size={12} style={{ color: "#78716c" }} />
-            <span style={{ fontSize: 11, fontWeight: 700, color: "#57534e", textTransform: "uppercase", letterSpacing: "0.04em" }}>{t("page.tasks.comments")} ({comments.length})</span>
+            <IconComment size={12} style={{ color: "var(--text-muted)" }} />
+            <span style={{ fontSize: 11, fontWeight: 700, color: "var(--text-muted)", }}>{t("page.tasks.comments")} ({comments.length})</span>
           </div>
 
           {/* Comment input */}
@@ -1663,8 +1630,8 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
           <div style={{
             marginBottom: 10,
             display: "flex", flexDirection: "column",
-            background: "#fff",
-            border: "1px solid rgba(28,25,23,0.06)", borderRadius: 10,
+            background: "var(--surface-panel)",
+            border: "0.5px solid rgba(29, 29, 31,0.06)", borderRadius: 10,
             transition: "border-color 0.15s, box-shadow 0.15s",
           }}>
             <textarea
@@ -1675,16 +1642,16 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
               style={{
                 width: "100%", resize: "vertical", fontSize: 12, lineHeight: 1.5,
                 padding: "8px 10px", border: "none", outline: "none",
-                background: "transparent", color: "#292524",
+                background: "transparent", color: "var(--text-strong)",
                 fontFamily: "inherit", boxSizing: "border-box", minHeight: 56,
               }}
               onFocus={(e) => {
                 const shell = e.currentTarget.parentElement;
-                if (shell) { shell.style.borderColor = "#436b65"; shell.style.boxShadow = "0 0 0 3px rgba(28,25,23,0.10)"; }
+                if (shell) { shell.style.borderColor = "#436b65"; shell.style.boxShadow = "0 0 0 3px rgba(29, 29, 31,0.10)"; }
               }}
               onBlur={(e) => {
                 const shell = e.currentTarget.parentElement;
-                if (shell) { shell.style.borderColor = "#e7e5e4"; shell.style.boxShadow = "none"; }
+                if (shell) { shell.style.borderColor = "#e5e5ea"; shell.style.boxShadow = "none"; }
               }}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && (comment.trim() || pendingFiles.length > 0)) {
@@ -1696,10 +1663,10 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
             {pendingFiles.length > 0 && (
               <div style={{ display: "flex", flexWrap: "wrap", gap: 4, padding: "0 10px 6px" }}>
                 {pendingFiles.map((f, i) => (
-                  <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 6px", borderRadius: 6, background: "#f5f5f4", border: "1px solid rgba(28,25,23,0.06)", fontSize: 10, color: "#57534e" }}>
-                    <IconDocument size={9} style={{ color: "#a8a29e" }} />{f.name}
+                  <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 6px", borderRadius: 6, background: "var(--surface-muted)", border: "0.5px solid rgba(29, 29, 31,0.06)", fontSize: 10, color: "var(--text-muted)" }}>
+                    <IconDocument size={9} style={{ color: "var(--text-muted)" }} />{f.name}
                     <button type="button" onClick={() => setPendingFiles((p) => p.filter((_, j) => j !== i))}
-                      style={{ width: 12, height: 12, padding: 0, border: "none", background: "none", cursor: "pointer", color: "#a8a29e", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                      style={{ width: 12, height: 12, padding: 0, border: "none", background: "none", cursor: "pointer", color: "var(--text-muted)", display: "flex", alignItems: "center", justifyContent: "center" }}>
                       <IconClose size={8} />
                     </button>
                   </span>
@@ -1709,7 +1676,7 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
             <div style={{
               display: "flex", alignItems: "center", gap: 4,
               padding: "4px 6px",
-              borderTop: "1px solid rgba(28,25,23,0.06)",
+              borderTop: "0.5px solid rgba(29, 29, 31,0.06)",
             }}>
               <input ref={fileRef} type="file" multiple hidden onChange={(e) => { if (e.target.files) { setPendingFiles((p) => [...p, ...Array.from(e.target.files!)]); e.target.value = ""; } }} />
               <button
@@ -1720,10 +1687,10 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
                   width: 26, height: 26, borderRadius: 6, border: "none",
                   background: "transparent", cursor: "pointer",
                   display: "flex", alignItems: "center", justifyContent: "center",
-                  color: "#78716c", transition: "background 0.15s, color 0.15s",
+                  color: "var(--text-muted)", transition: "background 0.15s, color 0.15s",
                 }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = "#f5f5f4"; e.currentTarget.style.color = "#436b65"; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "#78716c"; }}
+                onMouseEnter={(e) => { e.currentTarget.style.background = "#f5f5f7"; e.currentTarget.style.color = "#436b65"; }}
+                onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "#8e8e93"; }}
               >
                 <IconPaperclip size={13} />
               </button>
@@ -1736,11 +1703,11 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
                 style={{
                   display: "inline-flex", alignItems: "center", gap: 4,
                   padding: "5px 10px", borderRadius: 6, border: "none",
-                  background: (comment.trim() || pendingFiles.length > 0) ? "linear-gradient(135deg, #436b65, #5f928a)" : "#e7e5e4",
-                  color: (comment.trim() || pendingFiles.length > 0) ? "#fff" : "#a8a29e",
+                  background: (comment.trim() || pendingFiles.length > 0) ? "linear-gradient(135deg, #436b65, #5f928a)" : "#e5e5ea",
+                  color: (comment.trim() || pendingFiles.length > 0) ? "#fff" : "#aeaeb2",
                   cursor: (comment.trim() || pendingFiles.length > 0) ? "pointer" : "not-allowed",
                   fontSize: 11, fontWeight: 600,
-                  boxShadow: (comment.trim() || pendingFiles.length > 0) ? "0 1px 2px rgba(28,25,23,0.25)" : "none",
+                  boxShadow: (comment.trim() || pendingFiles.length > 0) ? "0 1px 2px rgba(29, 29, 31,0.25)" : "none",
                   transition: "all 0.15s",
                 }}
               >
@@ -1765,7 +1732,7 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
               staff={(staffList as any[]) || []}
             />
           ))}
-          {comments.length === 0 && <p style={{ fontSize: 12, color: "#a8a29e", margin: 0, textAlign: "center" }}>{t("page.tasks.no_comments_yet")}</p>}
+          {comments.length === 0 && <p style={{ fontSize: 12, color: "var(--text-muted)", margin: 0, textAlign: "center" }}>{t("page.tasks.no_comments_yet")}</p>}
         </div>
       </div>
     </div>
@@ -1823,7 +1790,7 @@ function KanbanColumn({
   onLoadMore?: () => void;
   countIsPartial?: boolean;
 }) {
-  const meta = COLUMN_META[status] ?? { label: status, dot: "#a8a29e", headerBg: "rgba(168,162,158,0.08)", statuses: [], Icon: IconCircleDot };
+  const meta = COLUMN_META[status] ?? { label: status, dot: "#aeaeb2", headerBg: "rgba(168,162,158,0.08)", statuses: [], Icon: IconCircleDot };
   const canCollapse = _COLLAPSIBLE.has(status);
   const isDone = status === "done";
   const isSecondary = status === "scheduled" || status === "done";
@@ -1995,9 +1962,6 @@ function KanbanColumn({
         tabIndex={canCollapse ? 0 : undefined}
       >
         <div className="task-board-column-heading">
-          <span className="task-board-column-icon">
-            <meta.Icon size={13} />
-          </span>
           {!collapsed && <h3 className="task-board-column-title">{meta.label}</h3>}
         </div>
         <div className="task-board-column-header-meta">
@@ -2020,7 +1984,7 @@ function KanbanColumn({
       {/* Cards */}
       {!collapsed && (
         <div className={`task-board-column-body${visibleTasks.length > 5 || largeColumnMode ? " is-dense" : ""}${largeColumnMode ? " is-large-mode" : ""}`}>
-          {doneBoardManaged && (
+          {doneBoardManaged && (tasks.length > 0 || hiddenDoneCount > 0) && (
             <div className="task-board-done-summary">
               <div className="task-board-done-summary-copy">
                 <div className="task-board-done-summary-title">
@@ -2043,14 +2007,9 @@ function KanbanColumn({
               </button>
             </div>
           )}
-          {displayTasks.length === 0 && (
+          {displayTasks.length === 0 && doneBoardManaged && tasks.length > 0 && (
             <div className="task-board-empty">
-              <meta.Icon size={16} />
-              <span>
-                {doneBoardManaged && tasks.length > 0
-                  ? t("page.tasks.no_recent_done")
-                  : t("page.tasks.drop_tasks_here")}
-              </span>
+              <span>{t("page.tasks.no_recent_done")}</span>
             </div>
           )}
           {largeColumnMode && displayTasks.length > 0 && (
@@ -2071,7 +2030,7 @@ function KanbanColumn({
           )}
           {largeColumnMode && focusTasks.length > 0 && (
             <div className="task-board-focus-stack">
-              <div className="task-board-focus-label">Focus first</div>
+              <div className="task-board-focus-label">{t("ui.focus_first")}</div>
               {focusTasks.map((task) => (
                 <BoardTaskCard
                   key={task.id}
@@ -2206,31 +2165,38 @@ function KanbanColumn({
   );
 }
 
+// One row per person or AI employee, with what they own; unassigned work goes last.
+function groupTasksByOwner(tasks: Task[], currentUser: any, agentById: Map<string, any>) {
+  const groups = new Map<string, { key: string; name: string; tasks: Task[] }>();
+  for (const task of tasks) {
+    const key = taskOwnerFilterKey(task);
+    const group = groups.get(key) ?? { key, name: taskListOwnerName(task, currentUser, agentById), tasks: [] };
+    group.tasks.push(task);
+    groups.set(key, group);
+  }
+  return [...groups.values()].sort((a, b) =>
+    Number(a.key === "unassigned") - Number(b.key === "unassigned") || a.name.localeCompare(b.name));
+}
+
 function TaskListView({
   tasks,
-  totalCount,
   sort,
   onSortChange,
   currentUser,
   agentById,
   wsMap,
+  groupByOwner,
   onOpenTask,
 }: {
   tasks: Task[];
-  totalCount: number;
   sort: TaskListSortState;
   onSortChange: (key: TaskListSortKey) => void;
   currentUser?: any;
   agentById: Map<string, any>;
   wsMap: Record<string, string>;
+  groupByOwner: boolean;
   onOpenTask: (task: Task) => void;
 }) {
-  const shownText = totalCount > tasks.length
-    ? `${tasks.length} shown of ${totalCount}`
-    : `${tasks.length} tickets`;
-  const sortDescription = sort.key === "created" && sort.direction === "desc"
-    ? "Newest tickets first"
-    : `Sorted by ${TASK_LIST_SORT_LABELS[sort.key].toLowerCase()} ${sort.direction === "asc" ? "ascending" : "descending"}`;
   const renderSortHeader = (key: TaskListSortKey) => {
     const active = sort.key === key;
     return (
@@ -2239,7 +2205,6 @@ function TaskListView({
         className={`task-list-sort-header${active ? " is-active" : ""}`}
         onClick={() => onSortChange(key)}
         aria-sort={active ? (sort.direction === "asc" ? "ascending" : "descending") : "none"}
-        title={`Sort by ${TASK_LIST_SORT_LABELS[key]}`}
       >
         <span>{TASK_LIST_SORT_LABELS[key]}</span>
         <IconChevronDown
@@ -2250,33 +2215,7 @@ function TaskListView({
     );
   };
 
-  if (tasks.length === 0) {
-    return (
-      <div className="task-list-view">
-        <EmptyState title={t("page.tasks.no_tasks_found")} description={t("page.tasks.create_to_get_started")} />
-      </div>
-    );
-  }
-
-  return (
-    <div className="task-list-view">
-      <div className="task-list-toolbar">
-        <div>
-          <strong>{shownText}</strong>
-          <span>{sortDescription}</span>
-        </div>
-      </div>
-      <div className="task-list-table" role="table" aria-label="Tasks list">
-        <div className="task-list-row task-list-row--header" role="row">
-          {renderSortHeader("ticket")}
-          {renderSortHeader("workspace")}
-          {renderSortHeader("owner")}
-          {renderSortHeader("status")}
-          {renderSortHeader("priority")}
-          {renderSortHeader("due")}
-          {renderSortHeader("created")}
-        </div>
-        {tasks.map((task) => {
+  const renderRow = (task: Task) => {
           const isMaster = isMasterAgent(task.agent_id, task.agent_type);
           const agentId = task.agent_id || (isMaster ? MANOR_AGENT_ID : "");
           const agent = agentId ? agentById.get(agentId) : null;
@@ -2285,7 +2224,7 @@ function TaskListView({
             ? task.agent_name || agent?.name || (isMaster ? MANOR_AGENT_NAME : t("page.tasks.ai_agent"))
             : task.assignee_name
               || (task.assignee_id === currentUser?.id ? currentUser?.display_name || currentUser?.email : "")
-              || "Unassigned");
+              || t("page.tasks.unassigned"));
           const ownerAvatar = task.owner_agent_avatar || (isAI
             ? task.agent_avatar || agent?.avatar_url || null
             : task.assignee_avatar || (task.assignee_id === currentUser?.id ? currentUser?.avatar_url : null) || null);
@@ -2317,13 +2256,14 @@ function TaskListView({
                 />
                 <div>
                   <strong>{formatUserFacingText(task.title)}</strong>
-                  <span>#{task.id.slice(-4)} · Created {taskCreatedText(task)}</span>
                 </div>
               </div>
-              <div className="task-list-muted-cell">{workspaceName}</div>
-              <div className="task-list-owner-cell">
-                <span>{ownerName}</span>
-              </div>
+              <div className="task-list-muted-cell">{task.workspace_id ? workspaceName : ""}</div>
+              {!groupByOwner && (
+                <div className="task-list-owner-cell">
+                  <span>{ownerName}</span>
+                </div>
+              )}
               <div>
                 <StatusBadge type={taskStatusBadgeType(task)} dot>
                   {statusLabel}
@@ -2334,7 +2274,38 @@ function TaskListView({
               <div className="task-list-muted-cell">{taskCreatedText(task)}</div>
             </div>
           );
-        })}
+  };
+
+  if (tasks.length === 0) {
+    return (
+      <div className="task-list-view">
+        <EmptyState title={t("page.tasks.no_tasks_found")} description={t("page.tasks.create_to_get_started")} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="task-list-view">
+      <div className={`task-list-table${groupByOwner ? " task-list-table--by-owner" : ""}`} role="table" aria-label={t("nav.tasks")}>
+        <div className="task-list-row task-list-row--header" role="row">
+          {renderSortHeader("ticket")}
+          {renderSortHeader("workspace")}
+          {!groupByOwner && renderSortHeader("owner")}
+          {renderSortHeader("status")}
+          {renderSortHeader("priority")}
+          {renderSortHeader("due")}
+          {renderSortHeader("created")}
+        </div>
+        {!groupByOwner && tasks.map(renderRow)}
+        {groupByOwner && groupTasksByOwner(tasks, currentUser, agentById).map((group) => (
+          <section key={group.key} className="task-list-owner-group" aria-label={group.name}>
+            <div className="task-list-owner-group-label">
+              <span>{group.name}</span>
+              <span className="task-list-owner-group-count">{group.tasks.length}</span>
+            </div>
+            {group.tasks.map(renderRow)}
+          </section>
+        ))}
       </div>
     </div>
   );
@@ -2350,6 +2321,7 @@ export interface EmbeddedTaskCreate {
 }
 
 export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTaskCreate } = {}) {
+  const pageVisible = usePageVisible();
   const catalogScope = useCatalogScope();
   // In the customer-trial frame the company directory and staff are refused;
   // tasks are assigned from the Workspace's own agents and staff.
@@ -2366,9 +2338,14 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
     loadLocalTaskBoardPreferences(currentUser?.id),
   );
   const [view, setView] = useState("board");
-  const [boardMode, setBoardMode] = useState<"kanban" | "list">(
+  const [taskScope, setTaskScope] = useState<TaskScope>(() =>
+    searchParams.get("status") || searchParams.get("workspaceId") || searchParams.get("workspace_id") ? "all" : "mine");
+  const [savedBoardMode, setSavedBoardMode] = useState<"kanban" | "list">(
     initialTaskBoardPreferences.mode,
   );
+  // "All" reads as who-does-what by default; the saved mode is for the personal views.
+  const [allScopeBoardMode, setAllScopeBoardMode] = useState<"kanban" | "list">("list");
+  const boardMode = taskScope === "all" && !collaborator ? allScopeBoardMode : savedBoardMode;
   const [taskListSort, setTaskListSort] = useState<TaskListSortState>(DEFAULT_TASK_LIST_SORT);
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -2384,6 +2361,7 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
     initialTaskBoardPreferences.columnOrder,
   );
   const [taskBoardPreferencesHydrated, setTaskBoardPreferencesHydrated] = useState(false);
+  const syncedBoardPreferencesRef = useRef<string | null>(null);
   const { data: storedTaskBoardPreferences } = useQuery({
     queryKey: ["task-board-preferences", currentUser?.id],
     queryFn: () => api.tasks.getBoardPreferences(),
@@ -2392,7 +2370,7 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
   useEffect(() => {
     setTaskBoardPreferencesHydrated(false);
     const localPreferences = loadLocalTaskBoardPreferences(currentUser?.id);
-    setBoardMode(localPreferences.mode);
+    setSavedBoardMode(localPreferences.mode);
     setVisibleBoardColumns(localPreferences.visibleColumns);
     setBoardColumnOrder(localPreferences.columnOrder);
   }, [currentUser?.id]);
@@ -2402,11 +2380,18 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
       const remoteVisibleColumns = storedTaskBoardPreferences.visible_columns.filter(
         (key): key is BoardColumnKey => isBoardColumnKey(key),
       );
-      setBoardMode(storedTaskBoardPreferences.mode);
+      setSavedBoardMode(storedTaskBoardPreferences.mode);
       setVisibleBoardColumns(new Set(
         remoteVisibleColumns.length > 0 ? remoteVisibleColumns : BOARD_COLUMNS,
       ));
       setBoardColumnOrder(normalizeBoardColumnOrder(storedTaskBoardPreferences.column_order));
+      syncedBoardPreferencesRef.current = JSON.stringify({
+        mode: storedTaskBoardPreferences.mode,
+        visible_columns: remoteVisibleColumns.length > 0
+          ? BOARD_COLUMNS.filter((key) => remoteVisibleColumns.includes(key))
+          : BOARD_COLUMNS,
+        column_order: normalizeBoardColumnOrder(storedTaskBoardPreferences.column_order),
+      });
     }
     setTaskBoardPreferencesHydrated(true);
   }, [currentUser?.id, storedTaskBoardPreferences]);
@@ -2417,15 +2402,22 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
     if (!embeddedCreate) persistBoardColumnOrder(currentUser?.id, boardColumnOrder);
   }, [boardColumnOrder, currentUser?.id]);
   useEffect(() => {
-    if (!embeddedCreate) persistTaskBoardMode(currentUser?.id, boardMode);
-  }, [boardMode, currentUser?.id]);
+    if (!embeddedCreate) persistTaskBoardMode(currentUser?.id, savedBoardMode);
+  }, [savedBoardMode, currentUser?.id]);
   useEffect(() => {
     if (embeddedCreate || !currentUser?.id || !taskBoardPreferencesHydrated) return;
+    const preferences = {
+      mode: savedBoardMode,
+      visible_columns: BOARD_COLUMNS.filter((key) => visibleBoardColumns.has(key)),
+      column_order: normalizeBoardColumnOrder(boardColumnOrder),
+    };
+    const serialized = JSON.stringify(preferences);
+    if (serialized === syncedBoardPreferencesRef.current) return;
     const timeout = window.setTimeout(() => {
-      void api.tasks.updateBoardPreferences({
-        mode: boardMode,
-        visible_columns: BOARD_COLUMNS.filter((key) => visibleBoardColumns.has(key)),
-        column_order: normalizeBoardColumnOrder(boardColumnOrder),
+      void api.tasks.updateBoardPreferences(preferences).then((saved) => {
+        syncedBoardPreferencesRef.current = serialized;
+        // Coming back within the cache window must not restore the older layout.
+        queryClient.setQueryData(["task-board-preferences", currentUser?.id], saved);
       }).catch(() => {
         // Keep the user-scoped browser copy as an offline fallback.
       });
@@ -2433,7 +2425,7 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
     return () => window.clearTimeout(timeout);
   }, [
     boardColumnOrder,
-    boardMode,
+    savedBoardMode,
     currentUser?.id,
     taskBoardPreferencesHydrated,
     visibleBoardColumns,
@@ -2484,7 +2476,6 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
   const [formDesc, setFormDesc] = useState("");
   const [formPriority, setFormPriority] = useState(3);
   const [formDeadline, setFormDeadline] = useState("");
-  const [formStep, setFormStep] = useState(1);
   const [formCategory, setFormCategory] = useState("");
   const [formWorkspace, setFormWorkspace] = useState<string | null>(null);
   const [formAssigneeTab, setFormAssigneeTab] = useState<"self" | "ai" | "agent" | "staff">("self");
@@ -2619,8 +2610,10 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
     initialPageParam: 0,
     queryFn: ({ pageParam, signal }) => api.tasks.board(apiWorkspaceFilter, pageParam, TASK_BOARD_PAGE_SIZE, signal),
     getNextPageParam: (lastPage: TaskBoardPage, _pages: TaskBoardPage[], lastOffset: number) => nextTaskBoardOffset(lastPage, lastOffset),
-    refetchInterval: (query) => query.state.data?.pages.some(hasLiveTasks) ? TASK_POLL_INTERVAL_MS : false,
-    enabled: !embeddedCreate && taskBoardQueryEnabled(view, boardMode),
+    refetchInterval: (query) => displayReadInterval(query.state, pagedReadInterval(query.state.data?.pages.length,
+      query.state.data?.pages.some(hasLiveTasks) ? TASK_POLL_INTERVAL_MS : 120_000)),
+    enabled: pageVisible && !embeddedCreate && taskBoardQueryEnabled(view, boardMode),
+    refetchOnWindowFocus: "always",
   });
   const boardLoading = boardQuery.isLoading;
   const board = useMemo(() => mergeTaskBoardPages(boardQuery.data?.pages), [boardQuery.data]);
@@ -2633,8 +2626,9 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
   const { data: taskList, isLoading: taskListLoading } = useQuery({
     queryKey: ["tasks", "all", wsFilter],
     queryFn: () => api.tasks.list({ limit: 200, workspace_id: apiWorkspaceFilter }),
-    refetchInterval: (query) => hasLiveTasks(query.state.data) ? TASK_POLL_INTERVAL_MS : false,
-    enabled: !embeddedCreate && taskListQueryEnabled(view, boardMode),
+    refetchInterval: (query) => displayReadInterval(query.state, hasLiveTasks(query.state.data) ? TASK_POLL_INTERVAL_MS : 120_000),
+    enabled: pageVisible && !embeddedCreate && taskListQueryEnabled(view, boardMode),
+    refetchOnWindowFocus: "always",
   });
 
   const { data: workspaces } = useQuery({
@@ -2667,23 +2661,23 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
   } = useQuery({
     queryKey: ["workspace-assignable-agents", formWorkspace],
     queryFn: () => api.workspaces.agents.assignable(formWorkspace!),
-    enabled: showCreateModal && (embeddedCreate || formStep === 3) && formAssigneeTab === "agent" && !!formWorkspace,
+    enabled: showCreateModal && formAssigneeTab === "agent" && !!formWorkspace,
   });
   const { data: entityUsersForCreate = [], isLoading: entityUsersLoading } = useQuery({
     queryKey: ["entity-users-for-create-task-assignee", "directory"],
     queryFn: () => api.users.directory(),
-    enabled: !collaborator && showCreateModal && (embeddedCreate || formStep === 3) && (formAssigneeTab === "staff" || formTaskType === TaskType.INTERACTIVE),
+    enabled: !collaborator && showCreateModal && (formAssigneeTab === "staff" || formTaskType === TaskType.INTERACTIVE),
   });
   const { data: workspaceStaff = [], isLoading: workspaceStaffLoading } = useQuery({
     queryKey: ["workspace-staff-for-task-assignee", formWorkspace],
     queryFn: () => api.workspaces.staff.list(formWorkspace!),
-    enabled: !collaborator && showCreateModal && (embeddedCreate || formStep === 3) && (formAssigneeTab === "staff" || formTaskType === TaskType.INTERACTIVE) && !!formWorkspace,
+    enabled: !collaborator && showCreateModal && (formAssigneeTab === "staff" || formTaskType === TaskType.INTERACTIVE) && !!formWorkspace,
   });
 
   const { data: entityStaff, isLoading: entityStaffLoading } = useQuery({
     queryKey: ["entity-staff-for-task-assignee"],
     queryFn: () => api.staff.list(),
-    enabled: !collaborator && showCreateModal && (embeddedCreate || formStep === 3) && (formAssigneeTab === "staff" || formTaskType === TaskType.INTERACTIVE),
+    enabled: !collaborator && showCreateModal && (formAssigneeTab === "staff" || formTaskType === TaskType.INTERACTIVE),
   });
 
   type StaffAssigneeOption = {
@@ -2857,6 +2851,8 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
       queryClient.invalidateQueries({ queryKey: ["taskBoard"] });
       queryClient.invalidateQueries({ queryKey: ["tasks"] });
       embeddedCreate?.onCreated(embeddedCreate.drafts.length - importDrafts.length, task);
+      // A new task stays in view: handing it to someone moves you to where it now lives.
+      if (!taskIsInScope(task, taskScope, currentUser?.id)) setTaskScope(task.creator_id === currentUser?.id ? "delegated" : "all");
       if (importDrafts.length > 1) {
         const remaining = importDrafts.slice(1);
         setImportDrafts(remaining);
@@ -2913,7 +2909,6 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
     setFormDesc("");
     setFormPriority(3);
     setFormDeadline("");
-    setFormStep(1);
     setFormCategory("");
     setFormWorkspace(null);
     setFormAssigneeTab("self");
@@ -2934,7 +2929,6 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
       const source = draft.sourcePath ? `\n\nSource: ${draft.sourcePath}` : "";
       setFormDesc(`${draft.description}${source}`);
     }
-    if (draft?.title || draft?.description) setFormStep(2);
     setShowCreateModal(true);
   };
 
@@ -3095,9 +3089,12 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
       )
     );
 
-  const setTaskBoardMode = useCallback((mode: "kanban" | "list") => {
-    setBoardMode(mode);
-  }, []);
+  const setTaskViewMode = useCallback((mode: TaskViewMode) => {
+    setView(mode === "calendar" ? "calendar" : "board");
+    if (mode === "calendar") return;
+    if (taskScope === "all" && !collaborator) setAllScopeBoardMode(mode);
+    else setSavedBoardMode(mode);
+  }, [collaborator, taskScope]);
 
   const handleTaskListSortChange = useCallback((key: TaskListSortKey) => {
     setTaskListSort((current) => ({
@@ -3242,12 +3239,12 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
           />,
         );
       } else {
-        addOwner("unassigned", "Unassigned", <IconUser size={14} style={{ color: "#a8a29e" }} />);
+        addOwner("unassigned", "Unassigned", <IconUser size={14} style={{ color: "var(--text-muted)" }} />);
       }
     }
 
     const rawOptions: TaskFilterOption<TaskOwnerFilter>[] = [
-      { key: "all", label: t("page.workspaces.filter_all"), icon: <IconUsers size={14} style={{ color: "#a8a29e" }} /> },
+      { key: "all", label: t("page.workspaces.filter_all"), icon: <IconUsers size={14} style={{ color: "var(--text-muted)" }} /> },
       ...Array.from(ownerMap.entries())
         .sort(([, a], [, b]) => b.count - a.count || a.label.localeCompare(b.label))
         .map(([key, value]) => ({
@@ -3269,6 +3266,7 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
       setOwnerFilter("all");
     }
   }, [ownerFilter, ownerFilterOptions]);
+  const scopeActive = taskScope !== "all" && !collaborator;
   const hasTaskFilters = !!searchQuery.trim()
     || !!wsFilter
     || priorityFilter !== null
@@ -3293,6 +3291,7 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
     || !!statusFocus;
   // Status and workspace counts are authoritative; other filters run on loaded rows.
   const boardRowFiltersActive = !!searchQuery.trim()
+    || scopeActive
     || wsFilter === ENTITY_LEVEL_WORKSPACE_FILTER
     || priorityFilter !== null
     || ownerFilter !== "all"
@@ -3300,6 +3299,7 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
     || statusFilter === "overdue"
     || statusFocus === "overdue";
   const taskMatchesFilters = useCallback((task: Task) => {
+    if (scopeActive && !taskIsInScope(task, taskScope, currentUser?.id)) return false;
     if (!matchesWorkspaceFilter(task, wsFilter)) return false;
     if (statusFocus && !matchesStatusFocus(task, statusFocus)) return false;
     if (!taskMatchesSearch(task, searchQuery)) return false;
@@ -3308,7 +3308,7 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
     if (!matchesOwnerFilter(task, ownerFilter)) return false;
     if (!matchesDueFilter(task, dueFilter)) return false;
     return true;
-  }, [dueFilter, ownerFilter, priorityFilter, searchQuery, statusFilter, statusFocus, wsFilter]);
+  }, [currentUser?.id, dueFilter, ownerFilter, priorityFilter, scopeActive, searchQuery, statusFilter, statusFocus, taskScope, wsFilter]);
   const filteredCalendarTasks = useMemo(
     () => allTasks.filter(taskMatchesFilters),
     [allTasks, taskMatchesFilters],
@@ -3355,7 +3355,7 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
     queryFn: () => api.calendarSettings.events(calendarVisibleRange.start, calendarVisibleRange.end),
     enabled: view === "calendar" && externalCalendarSettingsKey !== null,
     staleTime: EXTERNAL_CALENDAR_REFRESH_INTERVAL_MS,
-    refetchInterval: EXTERNAL_CALENDAR_REFRESH_INTERVAL_MS,
+    refetchInterval: (query) => displayReadInterval(query.state, EXTERNAL_CALENDAR_REFRESH_INTERVAL_MS),
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: true,
   });
@@ -3456,19 +3456,19 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
     ? totalBoardTasks
     : taskList?.total;
   const workspaceFilterOptions: TaskFilterOption[] = [
-    { key: "all", label: `${t("page.workspaces.filter_all")}${activeTaskTotal === undefined ? "" : ` (${activeTaskTotal})`}`, icon: <IconLayers size={14} style={{ color: "#a8a29e" }} /> },
+    { key: "all", label: `${t("page.workspaces.filter_all")}${activeTaskTotal === undefined ? "" : ` (${activeTaskTotal})`}`, icon: <IconLayers size={14} style={{ color: "var(--text-muted)" }} /> },
     {
       key: ENTITY_LEVEL_WORKSPACE_FILTER,
       label: taskListQueryEnabled(view, boardMode) && entityLevelTaskCount > 0 ? `Entity-level (${entityLevelTaskCount})` : "Entity-level",
-      icon: <IconBuilding size={14} style={{ color: "#78716c" }} />,
+      icon: <IconBuilding size={14} style={{ color: "var(--text-muted)" }} />,
     },
     ...(workspaces ?? []).map((ws: Workspace) => {
       const count = wsTaskCounts[ws.id] ?? 0;
-      return { key: ws.id, label: taskListQueryEnabled(view, boardMode) && count > 0 ? `${ws.name} (${count})` : ws.name, icon: <IconWorkspace size={14} style={{ color: "#57534e" }} /> };
+      return { key: ws.id, label: taskListQueryEnabled(view, boardMode) && count > 0 ? `${ws.name} (${count})` : ws.name, icon: <IconWorkspace size={14} style={{ color: "var(--text-muted)" }} /> };
     }),
   ];
   const priorityFilterOptions: TaskFilterOption[] = [
-    { key: "all", label: t("page.workspaces.filter_all"), icon: <IconFlag size={14} style={{ color: "#a8a29e" }} /> },
+    { key: "all", label: t("page.workspaces.filter_all"), icon: <IconFlag size={14} style={{ color: "var(--text-muted)" }} /> },
     ...[5, 4, 3, 2, 1].map((p) => ({
       key: String(p),
       label: PRIORITY_CONFIG[p].label,
@@ -3491,15 +3491,22 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
         .filter(taskMatchesFilters)
         .sort(compareDoneTasks)
     : [];
-  const taskSummary = [
-    activeTaskTotal === undefined ? null : `${activeTaskTotal} ${t("page.tasks.tasks")}`,
-    activeTaskCount > 0 ? `${activeTaskCount} ${t("status.in_progress")}` : null,
-    attentionTaskCount > 0 ? `${attentionTaskCount} ${t("page.tasks.needs_attention")}` : null,
-  ].filter(Boolean).join(" · ");
+  const taskSummary = attentionTaskCount > 0 ? `${attentionTaskCount} ${t("page.tasks.needs_attention")}` : undefined;
   // The calendar view reads the person's company calendar; a collaborator has the task board only.
-  const taskViewTabs = collaborator
+  const taskScopeTabs = collaborator
     ? null
-    : <TabSwitcher tabs={VIEW_TABS} value={view} onChange={setView} wrap className="tasks-view-tabs" />;
+    : (
+      <TabSwitcher
+        tabs={TASK_SCOPE_TABS}
+        value={taskScope}
+        onChange={(scope) => {
+          setTaskScope(scope as TaskScope);
+          setOwnerFilter("all");
+        }}
+        wrap
+        className="tasks-view-tabs"
+      />
+    );
 
   // Share the native controls between the wizard and companion layout.
   const taskTitleField = (<>
@@ -3551,17 +3558,17 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
               style={{
                 padding: 12,
                 borderRadius: 12,
-                border: selected ? "2px solid #4f7d75" : "1px solid #e7e5e4",
+                border: selected ? "2px solid #4f7d75" : "0.5px solid #e5e5ea",
                 background: selected ? "rgba(79,125,117,0.04)" : "#fff",
                 textAlign: "left",
                 cursor: disabled ? "not-allowed" : "pointer",
                 opacity: disabled ? 0.55 : 1,
               }}
             >
-              <span style={{ display: "block", fontSize: 13, fontWeight: 650, color: embeddedCreate ? "var(--text-strong)" : selected ? "#315f57" : "#292524" }}>
+              <span style={{ display: "block", fontSize: 13, fontWeight: 650, color: embeddedCreate ? "var(--text-strong)" : selected ? "#315f57" : "#2c2c2e" }}>
                 {option.title}
               </span>
-              <span style={{ display: "block", marginTop: 3, fontSize: 11, lineHeight: 1.45, color: "#a8a29e" }}>
+              <span style={{ display: "block", marginTop: 3, fontSize: 11, lineHeight: 1.45, color: "var(--text-muted)" }}>
                 {option.description}
               </span>
             </button>
@@ -3581,7 +3588,7 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
   const taskPriorityField = (<>
     {/* Priority chips */}
     <div>
-      <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#78716c", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>{t("page.tasks.priority")}</label>
+      <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "var(--text-muted)", marginBottom: 8 }}>{t("page.tasks.priority")}</label>
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
         {[5, 4, 3, 2, 1].map((p) => {
           const cfg = PRIORITY_CONFIG[p];
@@ -3593,10 +3600,10 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
               style={{
                 display: "inline-flex", alignItems: "center", gap: 6,
                 padding: "6px 14px", borderRadius: 20,
-                border: isActive ? `2px solid ${cfg.color}` : "1px solid #e7e5e4",
+                border: isActive ? `2px solid ${cfg.color}` : "0.5px solid #e5e5ea",
                 background: isActive ? `${cfg.color}10` : "#ffffff",
                 cursor: "pointer", fontSize: 13, fontWeight: 500,
-                color: isActive ? "#292524" : "#78716c", transition: "all 0.2s",
+                color: isActive ? "#2c2c2e" : "#8e8e93", transition: "all 0.2s",
               }}
             >
               <span style={{ width: 8, height: 8, borderRadius: "50%", background: cfg.color }} />
@@ -3644,7 +3651,7 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
               flex: 1, padding: "8px 12px", borderRadius: 9, fontSize: 13, fontWeight: 600,
               border: "none", cursor: "pointer", transition: "all 0.2s",
               background: isActive ? "#ffffff" : "transparent",
-              color: isActive ? "#1c1917" : "#78716c",
+              color: isActive ? "#1d1d1f" : "#8e8e93",
               boxShadow: isActive ? "0 1px 4px rgba(0,0,0,0.06)" : "none",
             }}
           >
@@ -3657,12 +3664,12 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
     {/* Tab content */}
     {formAssigneeTab === "self" && (
       <div className="task-assignee-summary" style={{ display: "flex", alignItems: "center", gap: 12, padding: 20, borderRadius: 14, border: "2px solid #4f7d75", background: "rgba(79,125,117,0.04)" }}>
-        <div style={{ width: 44, height: 44, borderRadius: "50%", background: "linear-gradient(135deg, #e8eff4, #ddd6fe)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, fontWeight: 700, color: "#57534e" }}>
+        <div style={{ width: 44, height: 44, borderRadius: "50%", background: "linear-gradient(135deg, #e8eff4, #ddd6fe)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, fontWeight: 700, color: "var(--text-muted)" }}>
           {t("page.tasks.me")}
         </div>
         <div>
-          <p style={{ fontSize: 14, fontWeight: 600, color: "#57534e", margin: 0 }}>{t("page.tasks.assign_to_myself")}</p>
-          <p style={{ fontSize: 12, color: "#a8a29e", margin: "2px 0 0" }}>{t("page.tasks.you_will_be_responsible_for_this_task")}</p>
+          <p style={{ fontSize: 14, fontWeight: 600, color: "var(--text-muted)", margin: 0 }}>{t("page.tasks.assign_to_myself")}</p>
+          <p style={{ fontSize: 12, color: "var(--text-muted)", margin: "2px 0 0" }}>{t("page.tasks.you_will_be_responsible_for_this_task")}</p>
         </div>
       </div>
     )}
@@ -3675,17 +3682,17 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
           </svg>
         </div>
         <div>
-          <p style={{ fontSize: 14, fontWeight: 600, color: "#57534e", margin: 0 }}>{t("page.chat_history.manor_ai")}</p>
-          <p style={{ fontSize: 12, color: "#a8a29e", margin: "2px 0 0" }}>{t("page.tasks.let_ai_handle_and_complete_this_task")}</p>
+          <p style={{ fontSize: 14, fontWeight: 600, color: "var(--text-muted)", margin: 0 }}>{t("page.chat_history.manor_ai")}</p>
+          <p style={{ fontSize: 12, color: "var(--text-muted)", margin: "2px 0 0" }}>{t("page.tasks.let_ai_handle_and_complete_this_task")}</p>
         </div>
       </div>
     )}
 
         {formAssigneeTab === "agent" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            <p style={{ fontSize: 12, color: "#a8a29e", margin: 0 }}>{t("page.tasks.select_an_agent_to_assign_this_task_to")}</p>
+            <p style={{ fontSize: 12, color: "var(--text-muted)", margin: 0 }}>{t("page.tasks.select_an_agent_to_assign_this_task_to")}</p>
             {formWorkspace && formWorkspaceAssignableAgentsLoading ? (
-              <div role="status" style={{ padding: 16, borderRadius: 12, border: "1px solid rgba(28,25,23,0.06)", background: "#fafaf9", textAlign: "center", fontSize: 13, color: "#a8a29e" }}>
+              <div role="status" style={{ padding: 16, borderRadius: 12, border: "0.5px solid rgba(29, 29, 31,0.06)", background: "var(--surface-muted)", textAlign: "center", fontSize: 13, color: "var(--text-muted)" }}>
                 {t("page.tasks.workspace_agents_loading")}
               </div>
             ) : (
@@ -3709,7 +3716,7 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
                       }}
                       style={{
                         display: "flex", alignItems: "center", gap: 10, padding: 12, borderRadius: 12,
-                        border: isActive ? "2px solid #4f7d75" : "1px solid #e7e5e4",
+                        border: isActive ? "2px solid #4f7d75" : "0.5px solid #e5e5ea",
                         background: isActive ? "rgba(79,125,117,0.04)" : "#ffffff",
                         cursor: "pointer", textAlign: "left" as const, transition: "all 0.2s",
                       }}>
@@ -3717,13 +3724,13 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
                         <IconAgent size={16} style={{ color: "#437f6b" }} />
                       </div>
                       <div style={{ minWidth: 0 }}>
-                        <p style={{ fontSize: 13, fontWeight: 600, color: "#292524", margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{agent.name}</p>
-                        {description && <p style={{ fontSize: 11, color: "#a8a29e", margin: "2px 0 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{description}</p>}
+                        <p style={{ fontSize: 13, fontWeight: 600, color: "var(--text-strong)", margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{agent.name}</p>
+                        {description && <p style={{ fontSize: 11, color: "var(--text-muted)", margin: "2px 0 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{description}</p>}
                       </div>
                     </button>
                   );
                 })}
-                {formAssignableHostOptions.length === 0 && <p style={{ fontSize: 12, color: "#a8a29e", margin: 0, gridColumn: "1/-1", textAlign: "center", padding: 12 }}>{t("page.tasks.no_agents_available")}</p>}
+                {formAssignableHostOptions.length === 0 && <p style={{ fontSize: 12, color: "var(--text-muted)", margin: 0, gridColumn: "1/-1", textAlign: "center", padding: 12 }}>{t("page.tasks.no_agents_available")}</p>}
               </div>
             )}
           </div>
@@ -3752,18 +3759,18 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
 
     {formAssigneeTab === "staff" && (
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        <p style={{ fontSize: 12, color: "#a8a29e", margin: 0 }}>{t("page.tasks.select_a_staff_member")}</p>
-        <p style={{ fontSize: 11, color: "#a8a29e", margin: "-2px 0 4px" }}>
+        <p style={{ fontSize: 12, color: "var(--text-muted)", margin: 0 }}>{t("page.tasks.select_a_staff_member")}</p>
+        <p style={{ fontSize: 11, color: "var(--text-muted)", margin: "-2px 0 4px" }}>
           {formWorkspace ? t("page.tasks.workspace_staff_hint") : t("page.tasks.entity_staff_hint")}
         </p>
         {staffAssigneeLoading ? (
-          <div style={{ padding: 16, borderRadius: 12, border: "1px solid rgba(28,25,23,0.06)", background: "#fafaf9", textAlign: "center", fontSize: 13, color: "#a8a29e" }}>
+          <div style={{ padding: 16, borderRadius: 12, border: "0.5px solid rgba(29, 29, 31,0.06)", background: "var(--surface-muted)", textAlign: "center", fontSize: 13, color: "var(--text-muted)" }}>
             {t("page.tasks.workspace_staff_loading")}
           </div>
         ) : staffAssigneeOptions.length === 0 ? (
-          <div style={{ padding: 16, borderRadius: 12, border: "1px solid rgba(28,25,23,0.06)", background: "#fafaf9", textAlign: "center" }}>
-            <p style={{ fontSize: 13, color: "#a8a29e", margin: 0 }}>{t("page.tasks.no_staff_members_available")}</p>
-            <p style={{ fontSize: 11, color: "#d6d3d1", margin: "4px 0 0" }}>
+          <div style={{ padding: 16, borderRadius: 12, border: "0.5px solid rgba(29, 29, 31,0.06)", background: "var(--surface-muted)", textAlign: "center" }}>
+            <p style={{ fontSize: 13, color: "var(--text-muted)", margin: 0 }}>{t("page.tasks.no_staff_members_available")}</p>
+            <p style={{ fontSize: 11, color: "var(--text-faint)", margin: "4px 0 0" }}>
               {formWorkspace ? t("page.tasks.add_staff_to_your_workspace_to_assign_tasks") : t("page.tasks.add_people_to_your_team_to_assign_tasks")}
             </p>
           </div>
@@ -3779,7 +3786,7 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
                   onClick={() => setFormSelectedStaffUserId(option.id)}
                   style={{
                     display: "flex", alignItems: "center", gap: 10, padding: 12, borderRadius: 12,
-                    border: isActive ? "2px solid #4f7d75" : "1px solid #e7e5e4",
+                    border: isActive ? "2px solid #4f7d75" : "0.5px solid #e5e5ea",
                     background: isActive ? "rgba(79,125,117,0.04)" : "#ffffff",
                     cursor: option.disabled ? "not-allowed" : "pointer",
                     textAlign: "left" as const,
@@ -3789,8 +3796,8 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
                 >
                   <UserAvatar name={option.name} avatarUrl={option.avatarUrl} size={32} />
                   <div style={{ minWidth: 0, flex: 1 }}>
-                    <p style={{ fontSize: 13, fontWeight: 700, color: "#292524", margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{option.name}</p>
-                    {option.meta && <p style={{ fontSize: 11, color: "#a8a29e", margin: "2px 0 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{option.meta}</p>}
+                    <p style={{ fontSize: 13, fontWeight: 700, color: "var(--text-strong)", margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{option.name}</p>
+                    {option.meta && <p style={{ fontSize: 11, color: "var(--text-muted)", margin: "2px 0 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{option.meta}</p>}
                     {option.disabled && (
                       <p style={{ fontSize: 11, color: "#936027", margin: "4px 0 0" }}>
                         {option.disabledReason || t("page.tasks.staff_unavailable")}
@@ -3850,10 +3857,10 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
       {!embeddedCreate && <div className="tasks-page-main" style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
         <div className="tasks-page-header" style={{ padding: 0 }}>
             <PageHeader
-              title={t("page.tasks.my_tasks")}
+              title={t("nav.tasks")}
               subtitle={t("page.tasks.subtitle")}
               meta={taskSummary}
-              tabs={taskViewTabs}
+              tabs={taskScopeTabs}
               toolbar={(
                 <div className="tasks-header-tools">
                   <SmartToolbar
@@ -3864,7 +3871,25 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
                   />
                 </div>
               )}
-              actions={<PageHeaderAddButton label={t("page.tasks.add_task")} onClick={() => openCreateModal()} />}
+              actions={collaborator
+                ? <PageHeaderAddButton label={t("page.tasks.add_task")} onClick={() => openCreateModal()} />
+                : (
+                  // CSV import and export cover the whole company's tasks.
+                  <Dropdown
+                    align="right"
+                    trigger={<PageHeaderAddButton label={t("page.tasks.add_task")} caret />}
+                    items={[
+                      { key: "create", label: t("page.tasks.add_task"), icon: <IconPlus size={14} /> },
+                      { key: "import", label: t("action.import"), icon: <IconUpload size={14} /> },
+                      { key: "export", label: t("action.export"), icon: <IconDownload size={14} /> },
+                    ]}
+                    onSelect={(key) => {
+                      if (key === "create") openCreateModal();
+                      if (key === "import") fileInputRef.current?.click();
+                      if (key === "export") handleExportCsv();
+                    }}
+                  />
+                )}
             />
             <input
               ref={fileInputRef}
@@ -3891,7 +3916,7 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
                         borderRadius: 10,
                         border: "1px solid transparent",
                         background: "transparent",
-                        color: "#78716c",
+                        color: "var(--text-muted)",
                         fontSize: 12,
                         fontWeight: 700,
                         cursor: "pointer",
@@ -3902,9 +3927,11 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
                       {t("common.clear")}
                     </button>
                   )}
-                  {view === "board" && (
-                    <TaskBoardModeSwitch value={boardMode} onChange={setTaskBoardMode} />
-                  )}
+                  <TaskViewModeSwitch
+                    value={view === "calendar" ? "calendar" : boardMode}
+                    onChange={setTaskViewMode}
+                    showCalendar={!collaborator}
+                  />
                   {view === "board" && boardMode === "kanban" && (
                     <ColumnVisibilityMenu
                       columnOrder={boardColumnOrder}
@@ -3915,25 +3942,6 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
                       onReorderColumn={reorderBoardColumn}
                     />
                   )}
-                  {/* CSV import and export cover the whole company's tasks. */}
-                  {!collaborator && <button
-                    type="button"
-                    className="btn-manor-outline"
-                    onClick={() => fileInputRef.current?.click()}
-                    title={t("action.import")}
-                    style={{ width: 34, height: 34, padding: 0, borderRadius: 10, background: "rgba(255,255,255,0.78)" }}
-                  >
-                    <IconUpload size={13} />
-                  </button>}
-                  {!collaborator && <button
-                    type="button"
-                    className="btn-manor-outline"
-                    onClick={handleExportCsv}
-                    title={t("action.export")}
-                    style={{ width: 34, height: 34, padding: 0, borderRadius: 10, background: "rgba(255,255,255,0.78)" }}
-                  >
-                    <IconDownload size={13} />
-                  </button>}
                 </>
               )}
             >
@@ -3965,17 +3973,19 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
                 width={140}
                 dropdownMinWidth={128}
               />
-              <FilterSelect
-                label={t("component.embedded_chat.assignee")}
-                Icon={IconUser}
-                value={ownerFilter}
-                onChange={(value) => setOwnerFilter(value as TaskOwnerFilter)}
-                options={ownerFilterOptions}
-                width={168}
-                valueMinWidth={76}
-                dropdownMinWidth={220}
-                showSelectedIcon
-              />
+              {taskScope !== "mine" && (
+                <FilterSelect
+                  label={t("component.embedded_chat.assignee")}
+                  Icon={IconUser}
+                  value={ownerFilter}
+                  onChange={(value) => setOwnerFilter(value as TaskOwnerFilter)}
+                  options={ownerFilterOptions}
+                  width={168}
+                  valueMinWidth={76}
+                  dropdownMinWidth={220}
+                  showSelectedIcon
+                />
+              )}
               <FilterSelect
                 label={t("page.task_process.due")}
                 Icon={IconCalendar}
@@ -3997,8 +4007,8 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
                     padding: "0 10px",
                     borderRadius: 11,
                     border: "1px solid #ccded9",
-                    background: "#f5f5f4",
-                    color: "#57534e",
+                    background: "var(--surface-muted)",
+                    color: "var(--text-muted)",
                     fontSize: 12,
                     fontWeight: 800,
                     cursor: "pointer",
@@ -4013,7 +4023,7 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
         </div>
 
         {/* View content */}
-        {view === "board" && boardMode === "kanban" && board && (
+        {view === "board" && boardMode === "kanban" && board && (boardQuery.hasNextPage || boardQuery.isError) && (
           <div className="task-board-pagination" role="status">
             <span>{t("page.tasks.loaded_task_count", {
               loaded: Object.values(board).reduce((sum, tasks) => sum + (Array.isArray(tasks) ? tasks.length : 0), 0),
@@ -4157,7 +4167,7 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
             ) : (
               <TaskListView
                 tasks={filteredListTasks}
-                totalCount={hasTaskFilters ? filteredListTasks.length : taskList?.total ?? 0}
+                groupByOwner={taskScope === "all" && !collaborator}
                 sort={taskListSort}
                 onSortChange={handleTaskListSortChange}
                 currentUser={currentUser}
@@ -4198,7 +4208,7 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
                   }}
                 >
                   <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
-                    <StatusPill status="failed" label="Calendar sync unavailable" size="sm" />
+                    <StatusPill status="failed" label={t("ui.calendar_sync_unavailable")} size="sm" />
                     <span>
                       {externalCalendarData
                         ? "Showing the last successfully synced external events."
@@ -4251,7 +4261,7 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
         />
       )}
 
-      {/* Native wizard and single-page companion composer share fields and submit. */}
+      {/* One page everywhere: the fields that matter, the rest under More options. */}
       <Modal
         open={showCreateModal}
         onClose={() => {
@@ -4263,61 +4273,19 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
         title={`${t("page.tasks.new_task")}${importDrafts.length > 1 ? ` · ${importDrafts.length} drafts` : ""}`}
         maxWidth="640px"
         footer={
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%" }}>
-            {embeddedCreate ? <Button variant="outline" disabled={createMutation.isPending} onClick={() => {
-              setImportDrafts([]); setShowCreateModal(false); resetForm(); embeddedCreate.onClose();
-            }}>{t("common.cancel")}</Button> : <div style={{ display: "flex", gap: 6 }}>
-              {[1, 2, 3].map((s) => (
-                <span
-                  key={s}
-                  style={{
-                    width: 8, height: 8, borderRadius: "50%",
-                    background: formStep >= s ? "#4f7d75" : "transparent",
-                    border: formStep >= s ? "2px solid #4f7d75" : "2px solid #d6d3d1",
-                    transition: "all 0.2s",
-                  }}
-                />
-              ))}
-            </div>}
-            <div style={{ display: "flex", gap: 8 }}>
-              {!embeddedCreate && formStep > 1 && (
-                <Button variant="outline" onClick={() => setFormStep(formStep - 1)}>
-                  {t("page.onboarding.back")}
-                </Button>
-              )}
-              {!embeddedCreate && formStep < 3 ? (
-                <button
-                  onClick={() => setFormStep(formStep + 1)}
-                  disabled={formStep === 2 && !formTitle.trim()}
-                  style={{
-                    padding: "8px 20px", borderRadius: 10, fontSize: 13, fontWeight: 600,
-                    border: "none", cursor: (formStep === 2 && !formTitle.trim()) ? "not-allowed" : "pointer",
-                    background: "#1c1917", color: "#ffffff",
-                    opacity: (formStep === 2 && !formTitle.trim()) ? 0.5 : 1,
-                    transition: "opacity 0.2s",
-                  }}
-                >
-                  {t("page.onboarding.next")}
-                </button>
-              ) : (
-                <button
-                  className={embeddedCreate ? "companion-task-submit" : undefined}
-                  onClick={handleCreate}
-                  disabled={taskCreateDisabled}
-                  style={{
-                    padding: "8px 20px", borderRadius: 10, fontSize: 13, fontWeight: 600,
-                    border: "none",
-                    cursor: taskCreateDisabled ? "not-allowed" : "pointer",
-                    background: "#1c1917", color: "#ffffff",
-                    opacity: taskCreateDisabled ? 0.5 : 1,
-                    transition: "opacity 0.2s",
-                  }}
-                >
-                  {createMutation.isPending ? t("page.flows.creating") : t("page.tasks.create_task")}
-                </button>
-              )}
-            </div>
-          </div>
+          <>
+            <Button variant="outline" disabled={createMutation.isPending} onClick={() => {
+              setImportDrafts([]); setShowCreateModal(false); resetForm(); embeddedCreate?.onClose();
+            }}>{t("common.cancel")}</Button>
+            <Button
+              variant="primary"
+              className={embeddedCreate ? "companion-task-submit" : undefined}
+              onClick={handleCreate}
+              disabled={taskCreateDisabled}
+            >
+              {createMutation.isPending ? t("page.flows.creating") : t("page.tasks.create_task")}
+            </Button>
+          </>
         }
       >
         {embeddedCreate && <p className="companion-task-account">{[
@@ -4325,13 +4293,13 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
           currentUser?.email,
         ].filter(Boolean).join(" · ")}{embeddedCreate.drafts.length > 1 && <span>{embeddedCreate.drafts.length - importDrafts.length + 1} / {embeddedCreate.drafts.length}</span>}</p>}
         {createMutation.isError && <p role="alert">{createMutation.error instanceof Error ? createMutation.error.message : "Could not create the task. Please check its details."}</p>}
-        {embeddedCreate && <div className="companion-task-fields">
+        <div className="task-create-fields">
           {taskTitleField}
-          <div className="companion-task-row">
+          <div className="task-create-row">
             <div>
-              <label className="manor-label" htmlFor="companion-task-workspace">{t("page.app_layout.workspace")}</label>
+              <label className="manor-label" htmlFor="task-create-workspace">{t("page.app_layout.workspace")}</label>
               <Select
-                id="companion-task-workspace"
+                id="task-create-workspace"
                 ariaLabel={t("page.app_layout.workspace")}
                 value={formWorkspace || ""}
                 onChange={value => setFormWorkspace(value || null)}
@@ -4345,112 +4313,22 @@ export default function Tasks({ embeddedCreate }: { embeddedCreate?: EmbeddedTas
             </div>
             {taskDeadlineField}
           </div>
-          <div className="companion-task-assignee">
+          <div className="task-create-assignee">
             <label className="manor-label">{t("component.embedded_chat.assignee")}</label>
             {taskAssigneeFields}
           </div>
           {formTaskType === TaskType.INTERACTIVE && !formWorkspace && <p role="alert">{t("page.tasks.interactive_session_workspace_required")}</p>}
           {taskDescriptionField}
-          <details className="companion-task-options" key={importDrafts.length}>
+          <details className="task-create-options" key={importDrafts.length}>
             <summary>{t("component.workspace_app_view.data_more_options")}{formTaskType === TaskType.INTERACTIVE ? ` · ${t("page.tasks.interactive_session")}` : ""}</summary>
-            <div className="companion-task-fields">
+            <div className="task-create-fields">
               {taskModeField}
               {taskPriorityField}
               {taskCategoryField}
               {taskRuntimeFields}
             </div>
           </details>
-        </div>}
-        {/* ── Step 1: Scope ── */}
-        {!embeddedCreate && formStep === 1 && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-              <span style={{ width: 24, height: 24, borderRadius: "50%", background: "#1c1917", color: "#fff", fontSize: 12, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center" }}>1</span>
-              <span style={{ fontSize: 14, fontWeight: 600, color: "#292524" }}>{t("page.tasks.where_should_this_task_live")}</span>
-            </div>
-
-            {/* Entity-level option: a collaborator's tasks live in their Workspace. */}
-            {!collaborator && <button
-              onClick={() => setFormWorkspace(null)}
-              style={{
-                display: "flex", alignItems: "center", gap: 12, padding: 16, borderRadius: 14,
-                border: formWorkspace === null ? "2px solid #4f7d75" : "1px solid #e7e5e4",
-                background: formWorkspace === null ? "rgba(79,125,117,0.04)" : "rgba(255,255,255,0.7)",
-                backdropFilter: "blur(8px)", cursor: "pointer", textAlign: "left" as const, transition: "all 0.2s",
-              }}
-            >
-              <div style={{ width: 40, height: 40, borderRadius: 12, background: formWorkspace === null ? "rgba(79,125,117,0.1)" : "#f5f5f4", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={formWorkspace === null ? "#4f7d75" : "#78716c"} strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M3.75 21h16.5M4.5 3h15M5.25 3v18m13.5-18v18M9 6.75h1.5m-1.5 3h1.5m-1.5 3h1.5m3-6H15m-1.5 3H15m-1.5 3H15M9 21v-3.375c0-.621.504-1.125 1.125-1.125h3.75c.621 0 1.125.504 1.125 1.125V21" />
-                </svg>
-              </div>
-              <div>
-                <p style={{ fontSize: 14, fontWeight: 600, color: formWorkspace === null ? "#4f7d75" : "#44403c", margin: 0 }}>{t("page.tasks.entity_level")}</p>
-                <p style={{ fontSize: 12, color: "#a8a29e", margin: "2px 0 0" }}>{t("page.tasks.applies_across_all_workspaces")}</p>
-              </div>
-            </button>}
-
-            {/* Workspace options */}
-            {(workspaces ?? []).map((ws: Workspace) => {
-              const isActive = formWorkspace === ws.id;
-              return (
-                <button
-                  key={ws.id}
-                  onClick={() => setFormWorkspace(ws.id)}
-                  style={{
-                    display: "flex", alignItems: "center", gap: 12, padding: 16, borderRadius: 14,
-                    border: isActive ? "2px solid #4f7d75" : "1px solid #e7e5e4",
-                    background: isActive ? "rgba(79,125,117,0.04)" : "rgba(255,255,255,0.7)",
-                    backdropFilter: "blur(8px)", cursor: "pointer", textAlign: "left" as const, transition: "all 0.2s",
-                  }}
-                >
-                  <div style={{ width: 40, height: 40, borderRadius: 12, background: isActive ? "rgba(79,125,117,0.1)" : "#f5f5f4", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={isActive ? "#4f7d75" : "#78716c"} strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M2.25 21h19.5m-18-18v18m10.5-18v18m6-13.5V21M6.75 6.75h.75m-.75 3h.75m-.75 3h.75m3-6h.75m-.75 3h.75m-.75 3h.75M6.75 21v-3.375c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125V21M3 3h12m-.75 4.5H21m-3.75 3H21m-3.75 3H21" />
-                    </svg>
-                  </div>
-                  <div>
-                    <p style={{ fontSize: 14, fontWeight: 600, color: isActive ? "#4f7d75" : "#44403c", margin: 0 }}>{ws.name}</p>
-                    <p style={{ fontSize: 12, color: "#a8a29e", margin: "2px 0 0" }}>{ws.category || ws.kind || t("page.tasks.operation")}</p>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        )}
-
-        {/* ── Step 2: Details ── */}
-        {!embeddedCreate && formStep === 2 && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-              <span style={{ width: 24, height: 24, borderRadius: "50%", background: "#1c1917", color: "#fff", fontSize: 12, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center" }}>2</span>
-              <span style={{ fontSize: 14, fontWeight: 600, color: "#292524" }}>{t("page.tasks.task_details")}</span>
-            </div>
-
-            {taskTitleField}
-            {taskDescriptionField}
-            {taskModeField}
-            {taskDeadlineField}
-
-            {taskPriorityField}
-
-            {taskCategoryField}
-          </div>
-        )}
-
-        {/* ── Step 3: Assignee ── */}
-        {!embeddedCreate && formStep === 3 && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-              <span style={{ width: 24, height: 24, borderRadius: "50%", background: "#1c1917", color: "#fff", fontSize: 12, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center" }}>3</span>
-              <span style={{ fontSize: 14, fontWeight: 600, color: "#292524" }}>{t("page.tasks.who_should_handle_this")}</span>
-            </div>
-
-            {taskAssigneeFields}
-
-            {taskRuntimeFields}
-          </div>
-        )}
+        </div>
       </Modal>
     </div>
   );

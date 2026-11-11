@@ -48,6 +48,8 @@ test("a restored running message completes even after the cursor passes it", asy
   });
   await openChat(page);
   await expect(page.getByText("Later question", { exact: true })).toBeVisible();
+  // A visitor's own words stay readable on the accent color.
+  await expect(page.getByText("Later question", { exact: true })).toHaveCSS("color", "rgb(255, 255, 255)");
   await expect.poll(() => refreshedCursors).toContain("user-2");
   completed = true;
   await expect(page.getByText("Recovered complete answer", { exact: true })).toHaveCount(1);

@@ -14,6 +14,7 @@ import WorkspaceAppDataSettings from "./WorkspaceAppDataSettings";
 import WorkspaceAppSectionsSettings from "./WorkspaceAppSectionsSettings";
 import WorkspaceAppView from "./WorkspaceAppView";
 import "./WorkspaceAppViewSettings.css";
+import ConfiguredImage from "../ui/ConfiguredImage";
 
 type Visual = WorkspaceAppViewConfig["visual"];
 type Layout = WorkspaceAppViewConfig["layout"];
@@ -232,9 +233,7 @@ export default function WorkspaceAppViewSettings({ workspaceId, canManage }: { w
   return <div className="workspace-app-settings">
     <div className="workspace-app-settings__heading">
       <div>
-        <span className="workspace-app-settings__eyebrow">{t("component.workspace_app_view.title")}</span>
         <h2>{t("component.workspace_app_view.configure_title")}</h2>
-        <p>{t("component.workspace_app_view.configure_description")}</p>
       </div>
       <Link className="workspace-app-settings__open" to={`/chat?workspace=${encodeURIComponent(workspaceId)}`}>
         {t("component.workspace_app_view.open_page")} <IconArrowRight size={15} />
@@ -417,7 +416,7 @@ export default function WorkspaceAppViewSettings({ workspaceId, canManage }: { w
             {!view.cover_image_url && <span>{t("component.workspace_app_view.no_cover_hint")} </span>}
             <Link to={`/workspaces/${encodeURIComponent(workspaceId)}?tab=settings#workspace-cover-image`}>{view.cover_image_url ? t("component.workspace_app_view.change_cover") : t("component.workspace_app_view.add_cover")}</Link>
           </p>}
-          {view.cover_image_url && (config.visual === "image" || config.visual === "auto" || config.visual === "motion") && <div className="workspace-app-settings__cover-preview"><img src={view.cover_image_url} alt="" /><span>{t(view.cover_source === "starter" || view.cover_source === "app" ? "component.workspace_app_view.using_starter_cover" : "component.workspace_app_view.using_workspace_cover")}</span></div>}
+          {view.cover_image_url && (config.visual === "image" || config.visual === "auto" || config.visual === "motion") && <div className="workspace-app-settings__cover-preview"><ConfiguredImage src={view.cover_image_url} alt="" /><span>{t(view.cover_source === "starter" || view.cover_source === "app" ? "component.workspace_app_view.using_starter_cover" : "component.workspace_app_view.using_workspace_cover")}</span></div>}
           {config.visual === "motion" && view.cover_image_url && <label className="workspace-app-settings__motion-source">
             {t("component.workspace_app_view.motion_cover_label")}
             <input className="manor-input" type="text" value={config.motion_cover_url || ""} onChange={(event) => update({ motion_cover_url: event.target.value || null, motion_cover_source_url: event.target.value ? view.cover_image_url : null })} placeholder="https://…/cover.mp4" disabled={!canManage || save.isPending} />

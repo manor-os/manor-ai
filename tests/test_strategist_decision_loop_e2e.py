@@ -973,6 +973,8 @@ async def test_human_request_and_meta_suppression_loop(client, db_session, monke
         "hitl_type": "input",
         "commitment_id": commitment.id,
         "prompt": _HR_QUESTION,
+        # The card carries the deadline itself; the body is the text-only copy.
+        "expected_by": commitment.expected_by.isoformat(),
     }
     assert _HR_QUESTION in chat_messages[0].content
     assert chat_messages[0].author_kind == "agent"

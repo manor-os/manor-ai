@@ -44,7 +44,7 @@ function buildSvgUrl(
     .replace(/>/g, "&gt;");
   const svg = `
 <svg xmlns="http://www.w3.org/2000/svg" width="${tile}" height="${tile}" viewBox="0 0 ${tile} ${tile}">
-  <g transform="rotate(-30 ${tile / 2} ${tile / 2})" fill="#57534e" fill-opacity="${opacity}" font-family="Inter, system-ui, sans-serif" font-size="${fontSize}" font-weight="600">
+  <g transform="rotate(-30 ${tile / 2} ${tile / 2})" fill="#6e6e73" fill-opacity="${opacity}" font-family="Inter, system-ui, sans-serif" font-size="${fontSize}" font-weight="600">
     <text x="20" y="${tile / 2}">${safe}</text>
     <text x="${tile / 4}" y="${(3 * tile) / 4}">${safe}</text>
   </g>

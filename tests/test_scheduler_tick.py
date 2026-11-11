@@ -901,8 +901,10 @@ def test_run_agent_task_does_not_finalize_a_suppressed_duplicate(monkeypatch):
     rechecks = []
 
     def deny_claim(awaitable):
+        name = awaitable.cr_code.co_name
         awaitable.close()
-        return False, None
+        # The Task is still in progress, so it has no terminal result to settle.
+        return None if name == "_terminal_task_result" else (False, None)
 
     monkeypatch.setattr(database, "create_worker_session", lambda: object())
     monkeypatch.setattr(ai_tasks, "_run_async", deny_claim)
@@ -1320,8 +1322,10 @@ def test_agent_task_claim_recheck_does_not_schedule_recursively(monkeypatch):
     import packages.core.database as database
 
     def deny_claim(awaitable):
+        name = awaitable.cr_code.co_name
         awaitable.close()
-        return False, None
+        # The Task is still in progress, so it has no terminal result to settle.
+        return None if name == "_terminal_task_result" else (False, None)
 
     monkeypatch.setattr(database, "create_worker_session", lambda: object())
     monkeypatch.setattr(ai_tasks, "_run_async", deny_claim)
@@ -1985,6 +1989,8 @@ async def test_scheduled_agent_occurrences_create_distinct_tasks(monkeypatch):
     ]
     assert first["args"] == ["task-1", "agent-1"]
     assert second["args"] == ["task-2", "agent-1"]
+    # Told to confirm side effects, an Agent reported its own chat delivery as unconfirmed.
+    assert scheduler_tasks._CHAT_DELIVERY_NOTE in str(created[0][1])
     assert first["kwargs"] == {
         "scheduled_run_id": "run-1",
         "scheduled_job_id": "job-1",
@@ -2114,8 +2120,10 @@ def test_agent_task_claim_recheck_publish_failure_retries_delivery(monkeypatch):
     retry_calls = []
 
     def deny_claim(awaitable):
+        name = awaitable.cr_code.co_name
         awaitable.close()
-        return False, None
+        # The Task is still in progress, so it has no terminal result to settle.
+        return None if name == "_terminal_task_result" else (False, None)
 
     def fail_recheck(**_kwargs):
         raise RuntimeError("broker unavailable")

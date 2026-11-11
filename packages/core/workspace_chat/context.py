@@ -101,14 +101,18 @@ def _query_matches(q: str, *texts: str | None) -> bool:
     haystack = " ".join(text or "" for text in texts).lower()
     if needle in haystack:
         return True
-    tokens = [
+    tokens = _query_tokens(needle)
+    if not tokens:
+        return False
+    return any(token in haystack for token in tokens)
+
+
+def _query_tokens(needle: str) -> list[str]:
+    return [
         token
         for token in needle.replace("/", " ").replace("|", " ").replace(",", " ").split()
         if len(token) >= 3 and token not in _QUERY_STOPWORDS
     ]
-    if not tokens:
-        return False
-    return any(token in haystack for token in tokens)
 
 
 def _clip_text(text: str, limit: int) -> str:
@@ -203,6 +207,50 @@ def _operating_rules_block(rules: list[Any]) -> str:
         lines.append(entry)
         used += len(entry)
     return "\n".join(lines)
+
+
+async def _guardrails_line(db: AsyncSession, workspace_id: str) -> str:
+    """The Workspace's approval guardrails as one prompt line, or ''."""
+    try:
+        from packages.core.governance import get_policy
+
+        # Governance summary is also best-effort prompt context. Keep a failed
+        # read inside its savepoint rather than leaving the caller's session in
+        # PostgreSQL's aborted-transaction state.
+        async with db.begin_nested():
+            policy = await get_policy(db, workspace_id)
+        from packages.core.governance.approval_projection import approval_summary
+        guardrails = approval_summary(policy)
+        if policy.max_risk_level != "high":
+            guardrails.append(f"max risk {policy.max_risk_level}")
+        if guardrails:
+            return "Runtime guardrails: " + "; ".join(guardrails) + ". These are checked before tools run."
+    except Exception:
+        logger.debug("Workspace governance summary failed", exc_info=True)
+    return ""
+
+
+async def rules_text(db: AsyncSession, workspace_id: str, entity_id: str) -> str:
+    """The Workspace's current operating rules and guardrails, uncached.
+
+    The same lines the Workspace Context carries, for a run that started
+    under older rules and must follow the ones in force now.
+    """
+    from packages.core.models.workspace import Workspace
+
+    operating_model = (await db.execute(
+        select(Workspace.operating_model).where(
+            Workspace.id == workspace_id,
+            Workspace.entity_id == entity_id,
+            Workspace.deleted_at.is_(None),
+        )
+    )).scalar_one_or_none() or {}
+    op_rules = operating_model.get("rules") or []
+    parts = [_operating_rules_block(op_rules) if op_rules else "Operating rules: none."]
+    guardrails = await _guardrails_line(db, workspace_id)
+    if guardrails:
+        parts.append(guardrails)
+    return "\n".join(parts)
 
 
 async def _build_summary(db: AsyncSession, workspace_id: str, entity_id: str) -> str:
@@ -420,22 +468,9 @@ async def _build_summary(db: AsyncSession, workspace_id: str, entity_id: str) ->
             "asks to enable one again; shared accounts and Agent definitions remain unchanged."
         )
 
-    try:
-        from packages.core.governance import get_policy
-
-        # Governance summary is also best-effort prompt context. Keep a failed
-        # read inside its savepoint rather than leaving the caller's session in
-        # PostgreSQL's aborted-transaction state.
-        async with db.begin_nested():
-            policy = await get_policy(db, workspace_id)
-        from packages.core.governance.approval_projection import approval_summary
-        guardrails = approval_summary(policy)
-        if policy.max_risk_level != "high":
-            guardrails.append(f"max risk {policy.max_risk_level}")
-        if guardrails:
-            parts.append("Runtime guardrails: " + "; ".join(guardrails) + ". These are checked before tools run.")
-    except Exception:
-        logger.debug("Workspace governance summary failed", exc_info=True)
+    guardrails = await _guardrails_line(db, workspace_id)
+    if guardrails:
+        parts.append(guardrails)
 
     parts.append(
         "\nUse manor(action='workspace') with its search action to look up goals, tasks, agents, "
@@ -549,6 +584,9 @@ async def workspace_search(
 
     if cat in ("humans", "all"):
         results.append(await _search_humans(db, workspace_id, entity_id, q, limit))
+
+    if cat in ("records", "all"):
+        results.append(await _search_records(db, workspace_id, entity_id, q, limit))
 
     text = "\n\n".join(r for r in results if r)
     return text or "No results found."
@@ -1139,6 +1177,40 @@ async def _format_human_queue(
         if len(lines) >= limit:
             break
     return "\n".join(lines)
+
+
+async def _search_records(
+    db: AsyncSession, ws_id: str, entity_id: str, q: str, limit: int,
+) -> str:
+    """Records the Workspace's Workflows keep (a menu item, a campaign, a weekly batch)."""
+    from packages.core.models.workflow import WorkflowProject
+
+    stmt = select(WorkflowProject).where(
+        WorkflowProject.entity_id == entity_id,
+        WorkflowProject.workspace_id == ws_id,
+    )
+    if q:
+        fields = (
+            WorkflowProject.project_type, WorkflowProject.project_key,
+            WorkflowProject.current_stage, WorkflowProject.state.cast(String),
+        )
+        stmt = stmt.where(or_(*(
+            field.ilike(f"%{term}%") for term in dict.fromkeys([q, *_query_tokens(q)]) for field in fields
+        )))
+    rows = (await db.execute(
+        stmt.order_by(func.coalesce(WorkflowProject.updated_at, WorkflowProject.created_at).desc(),
+                      WorkflowProject.id.desc())
+        .limit(limit)
+    )).scalars().all()
+    lines = ["## Workflow records"]
+    for row in rows:
+        state = json.dumps(row.state or {}, ensure_ascii=False, default=str, sort_keys=True)
+        lines.append(
+            f"- record_id={row.id} type={row.project_type} stage={row.current_stage}"
+            + (f" key={row.project_key}" if row.project_key else "")
+            + f" revision={row.revision}\n  {_clip_text(state, 600)}"
+        )
+    return "\n".join(lines) if len(lines) > 1 else ""
 
 
 async def _search_humans(

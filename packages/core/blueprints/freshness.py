@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
 
@@ -105,6 +106,22 @@ def blueprint_section_fingerprints(payload: dict[str, Any] | None) -> dict[str, 
         encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
         out[section] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
     return out
+
+
+@dataclass(frozen=True)
+class BlueprintDigest:
+    """All an update badge reads from a payload: its fingerprints.
+
+    The workspace list compares every install against its blueprint. Carrying
+    these instead of the payload spares reading and hashing each payload again.
+    """
+
+    fingerprint: str
+    sections: dict[str, str]
+
+    @classmethod
+    def of(cls, payload: dict[str, Any] | None) -> "BlueprintDigest":
+        return cls(blueprint_content_fingerprint(payload), blueprint_section_fingerprints(payload))
 
 
 def blueprint_upgrade_unsupported_fingerprint(
@@ -388,7 +405,7 @@ def blueprint_freshness(
 
 def blueprint_update_summary(
     workspace_settings: Any,
-    current_payload: dict[str, Any] | None,
+    current_payload: dict[str, Any] | BlueprintDigest | None,
     *,
     current_version: str | None = None,
     current_fingerprint: str | None = None,
@@ -399,8 +416,14 @@ def blueprint_update_summary(
     changed" is something an operator can judge. A bare "update available" is
     not, and this is the difference between a badge people act on and one
     they learn to dismiss.
+
+    ``current_payload`` may be the payload's ``BlueprintDigest`` instead.
     """
     record = installed_blueprint_record(workspace_settings)
+    digest = current_payload if isinstance(current_payload, BlueprintDigest) else None
+    if digest is not None:
+        current_payload = None
+        current_fingerprint = digest.fingerprint
     if current_fingerprint is None:
         current_fingerprint = blueprint_content_fingerprint(current_payload)
     status = blueprint_freshness(
@@ -421,14 +444,15 @@ def blueprint_update_summary(
     }
     if status is BlueprintFreshness.UPDATE_AVAILABLE:
         summary["changed"] = _changed_sections(
-            record.get(SECTION_FINGERPRINTS_KEY), current_payload,
+            record.get(SECTION_FINGERPRINTS_KEY),
+            digest.sections if digest is not None else blueprint_section_fingerprints(current_payload),
         )
     return summary
 
 
 def _changed_sections(
     installed_sections: Optional[dict[str, Any]],
-    current_payload: dict[str, Any] | None,
+    current: dict[str, str],
 ) -> list[str]:
     """Name the sections that differ, when the install recorded enough to tell.
 
@@ -439,7 +463,6 @@ def _changed_sections(
     """
     if not isinstance(installed_sections, dict) or not installed_sections:
         return []
-    current = blueprint_section_fingerprints(current_payload)
     if not current:
         return []
     return [

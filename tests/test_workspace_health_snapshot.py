@@ -51,6 +51,9 @@ async def test_snapshot_rolls_today_before_deriving(db_session):
     snap = await db_session.get(WorkspaceHealthSnapshot, ws.id)
     assert snap.surfaces["task"]["success_rate_24h"] == 1.0
     assert snap.status == STATUS_HEALTHY
+    # The same Tasks also fill the work surface, which health never adds in.
+    assert "work" not in snap.surfaces
+    assert sum(surface["judged_7d"] for surface in snap.surfaces.values()) == 5
 
 
 @pytest.mark.asyncio

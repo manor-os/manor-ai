@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy import event
 
 import packages.core.database as db_module
@@ -38,6 +39,7 @@ from packages.core.models.workspace import Workspace, WorkspaceStaff
 from packages.core.models.user import Entity, User, UserMembership
 from packages.core.services.document_access import (
     DocumentAccessContext,
+    _folder_ancestor_ids,
     document_is_client_visible,
     document_is_public_agent_visible,
     effective_document_capabilities_for_user,
@@ -85,6 +87,34 @@ def _grant(entity_id: str, resource_type: str, resource_id: str, subject_id: str
         granted_at=datetime.now(timezone.utc),
         status=GrantStatus.ACTIVE,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("root_parent", [None, "folder-1", "other-tenant-root"])
+async def test_folder_policy_ancestors_keep_the_full_same_tenant_chain(root_parent):
+    folder_ids = [f"folder-{index}" for index in range(1002)]
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(DocumentFolder.__table__.create)
+            await conn.execute(DocumentFolder.__table__.insert(), [
+                {
+                    "id": folder_id,
+                    "entity_id": "tenant",
+                    "name": folder_id,
+                    "parent_id": folder_ids[index - 1] if index else root_parent,
+                }
+                for index, folder_id in enumerate(folder_ids)
+            ])
+            await conn.execute(DocumentFolder.__table__.insert(), {
+                "id": "other-tenant-root", "entity_id": "other-tenant", "name": "Root",
+            })
+        async with AsyncSession(engine) as db:
+            assert await _folder_ancestor_ids(
+                db, entity_id="tenant", folder_id=folder_ids[-1],
+            ) == folder_ids[::-1]
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

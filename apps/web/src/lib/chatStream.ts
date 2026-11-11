@@ -3,6 +3,8 @@
  *
  * Used by: EmbeddedChat, FloatingChat
  */
+import { recommendationOf, type Recommendation, type RecommendedQuestion } from "./recommendedOptions";
+import { requestInputFieldFrom, type RequestInputField } from "./requestInputForm";
 import { useState, useEffect } from "react";
 import { useUpgradeStore } from "../stores/upgrade";
 import {
@@ -15,6 +17,7 @@ import {
 import { t } from "./i18n";
 import { planLimitOffersUpgrade } from "./planLimit";
 import { normalizeFileRef } from "./fileReferences";
+import { isSiteAttachment } from "./publishedSites";
 import type { ManualSkillReference } from "./manualSkillRefs";
 import { TYPEWRITER_TICK_MS, nextTypewriterSlice } from "./chatTypewriter";
 import { isWebsiteAccessDenied, PUBLIC_WEBSITE_ACCESS_DENIED_MESSAGE } from "./websiteAccessDenied";
@@ -23,6 +26,8 @@ import { isWebsiteAccessDenied, PUBLIC_WEBSITE_ACCESS_DENIED_MESSAGE } from "./w
 
 export interface ToolCall {
   name: string;
+  /** Already written for people: shown as is instead of a label made from `name`. */
+  displayLabel?: string;
   args?: unknown;
   arguments?: string;
   result?: string;
@@ -132,7 +137,18 @@ export interface AssistantTemplateSurfaceRender {
     | "learning.code_lab"
     | "response.choice"
     | "workspace.ledger.overview"
-    | "workspace.ledger.query";
+    | "workspace.ledger.query"
+    | "card.chart"
+    | "card.delivery"
+    | "card.email"
+    | "card.post"
+    | "card.comment"
+    | "card.person"
+    | "card.event"
+    | "card.stock"
+    | "card.product"
+    | "card.map"
+    | "card.search_results";
   template_version: 1;
   props: Record<string, unknown>;
 }
@@ -272,6 +288,9 @@ export interface HITLRequest {
   workflow_run_id?: string;
   workflow_step_id?: string;
   options?: string[];
+  /** Set when a durable run is parked on this approval: it is decided
+   * against that run (`/chat/runs/{id}/approval`), not by a chat message. */
+  runtime_run_id?: string;
   resolved?: boolean;
   resolution?: string;
 }
@@ -365,6 +384,10 @@ export interface ChatMessage {
     previewUrl?: string;
     openUrl?: string;
     fsPath?: string;
+    /** type "site": a published website (lib/publishedSites), not a file. */
+    url?: string;
+    site_id?: string;
+    revision?: number;
   }[];
   mentions?: {
     id: string;
@@ -502,12 +525,10 @@ export interface RuntimeQueueState {
   deadlineAt?: string;
 }
 
-export interface RuntimeHumanInputField {
-  name: string;
+export interface RuntimeHumanInputField extends RequestInputField {
   label: string;
   type: string;
   required: boolean;
-  options?: string[];
 }
 
 /** The `request_input` question a durable run is parked on. */
@@ -516,6 +537,8 @@ export interface RuntimeHumanInputState {
   status: string;
   question: string;
   options?: string[];
+  /** The asker's recommended answer (one of `options`) and why. */
+  recommendation?: Recommendation;
   fields?: RuntimeHumanInputField[];
   context?: string;
   /** Files the agent asks the person to judge (`request_input` file_review), resolved to Documents. */
@@ -530,6 +553,8 @@ export interface RuntimeHumanInputState {
 export interface RuntimeStreamState {
   runId: string;
   status: string;
+  /** Why the run waits, e.g. `capability_approval` (parked on an approval). */
+  statusReason?: string;
   queue?: RuntimeQueueState;
   humanInput?: RuntimeHumanInputState;
   pollAfterSeconds: number;
@@ -545,25 +570,18 @@ export function runtimeHumanInputFromPayload(raw: unknown): RuntimeHumanInputSta
   const options = Array.isArray(value.options)
     ? value.options.map((item) => String(item)).filter(Boolean)
     : undefined;
+  // Each field carries the schema its control is drawn from (the same set as a Workflow form).
   const fields = Array.isArray(value.fields)
     ? value.fields
-        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
-        .map((item) => ({
-          name: String(item.name || ""),
-          label: String(item.label || item.name || ""),
-          type: String(item.type || "text"),
-          required: item.required !== false,
-          options: Array.isArray(item.options)
-            ? item.options.map((option) => String(option)).filter(Boolean)
-            : undefined,
-        }))
-        .filter((item) => item.name)
+        .map(requestInputFieldFrom)
+        .filter((item): item is RuntimeHumanInputField => item !== null)
     : undefined;
   return {
     requestId,
     status: String(value.status || "pending"),
     question,
     options: options && options.length > 0 ? options : undefined,
+    recommendation: recommendationOf(value as RecommendedQuestion) || undefined,
     fields: fields && fields.length > 0 ? fields : undefined,
     context: value.context ? String(value.context) : undefined,
     reviewFiles: Array.isArray(value.review_files)
@@ -991,6 +1009,15 @@ function normalizeMessageAttachments(value: unknown): ChatMessage["attachments"]
   const attachments = value
     .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
     .map((item) => {
+      if (isSiteAttachment(item)) {
+        return {
+          name: String(item.name || ""),
+          type: "site",
+          url: typeof item.url === "string" ? item.url : undefined,
+          site_id: typeof item.site_id === "string" ? item.site_id : undefined,
+          revision: typeof item.revision === "number" ? item.revision : undefined,
+        };
+      }
       // Persisted rows carry the snake_case FileRef; older rows camelCase.
       const ref = normalizeFileRef(item);
       return {
@@ -1261,6 +1288,8 @@ export function parseToolCalls(raw: any): ToolCall[] | undefined {
     "assistant_reply",
     "title",
     "next_step",
+    // The architect's question: answer buttons under the chat reply.
+    "question",
   ] as const;
   const workspaceDraftPublicResult = (tc: any): string | undefined => {
     const toolName = String(tc?.name || "").toLowerCase();
@@ -1807,7 +1836,8 @@ export async function processSSEStream(
     // This body is the host's facts-only failure projection, not a rejected
     // model candidate or a provider diagnostic. History uses the same body.
     const validationFailure = errorCode === "final_response_validation_failed";
-    const content = validationFailure ? redactSensitiveText(String(message)) : persisted || INTERNAL_TOOL_CONTRACT_ERROR_RE.test(String(message))
+    const resourceFailure = typeof errorCode === "string" && ["sandbox_allocation_failed", "sandbox_queue_timeout", "sandbox_capacity_timeout", "sandbox_runner_unavailable", "sandbox_allocation_rejected"].includes(errorCode);
+    const content = validationFailure || resourceFailure ? redactSensitiveText(String(message)) : persisted || INTERNAL_TOOL_CONTRACT_ERROR_RE.test(String(message))
       ? formatPersistedStreamErrorMessage(message)
       : (formatByokProviderErrorMessage(message) ?? String(message));
     setMessages((prev) => {
@@ -1882,10 +1912,11 @@ export async function processSSEStream(
             messageId: parsed.message_id,
           };
           tagLastAssistantMessage(parsed.message_id);
-          // A run ended outside its loop names why; its localized text is
-          // already public, so it skips the persisted-detail projection.
-          const runtimeFailure = runtimeTerminalFailureText(parsed.error_code);
-          applyStreamErrorMessage(runtimeFailure ?? message, runtimeFailure ? false : persisted);
+          // A model-authored explanation is authoritative. Localized reason
+          // text is only a fallback when the server has no reply to show.
+          const runtimeFailure = !parsed.message && !parsed.error
+            ? runtimeTerminalFailureText(parsed.error_code) : undefined;
+          applyStreamErrorMessage(runtimeFailure ?? message, runtimeFailure ? false : persisted, parsed.error_code);
           continue;
         }
 
@@ -1952,6 +1983,7 @@ export async function processSSEStream(
           onRuntimeState?.({
             runId,
             status,
+            statusReason: runtimeStatusReason,
             queue: result.runtimeQueue,
             humanInput,
             pollAfterSeconds,

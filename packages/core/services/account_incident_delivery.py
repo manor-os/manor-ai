@@ -10,6 +10,9 @@ An Integration incident's recipients are:
 Delivery follows each person's notification settings (``notify()``). The
 incident is stamped only after its notices were handed off. A retry reuses
 the same idempotency key, so a crash between the two cannot double-send.
+
+With the ``attention_delivery`` flag on, attention delivery tells about the
+incident (``account_broken``) instead; it stamps ``notified_at`` the same way.
 """
 from __future__ import annotations
 
@@ -18,6 +21,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import func, or_, select
 
+from packages.core.attention.delivery import delivery_enabled
 from packages.core.database import async_session
 from packages.core.models.document import Integration
 from packages.core.models.user import OAuthAccount, User
@@ -60,7 +64,7 @@ async def _workspace_providers(db, workspace: Workspace, user_id: str) -> set[st
     }
 
 
-WorkspaceScan = list[tuple[str, list[str], set[str]]]  # (name, owner ids, provider keys)
+WorkspaceScan = list[tuple[str, str, list[str], set[str]]]  # (id, name, owner ids, provider keys)
 
 
 async def scan_entity_workspaces(db, entity_id: str, now: datetime) -> WorkspaceScan:
@@ -85,7 +89,7 @@ async def scan_entity_workspaces(db, entity_id: str, now: datetime) -> Workspace
         except Exception:
             logger.warning("account incident: provider scan failed for workspace %s", workspace.id, exc_info=True)
             continue
-        scan.append((workspace.name, owners, providers))
+        scan.append((workspace.id, workspace.name, owners, providers))
     return scan
 
 
@@ -98,7 +102,7 @@ async def _recipients(
     affected: list[str] = []
     if integration.entity_id not in scans:
         scans[integration.entity_id] = await scan_entity_workspaces(db, integration.entity_id, now)
-    for name, owners, providers in scans[integration.entity_id]:
+    for _workspace_id, name, owners, providers in scans[integration.entity_id]:
         if provider in providers:
             affected.append(name)
             users.extend(owners)
@@ -163,10 +167,15 @@ async def deliver_account_incidents(*, now: datetime | None = None, limit: int =
         )).scalars().all()
         pending: list[tuple[Integration, list[str], list[str]]] = []
         scans: dict[str, WorkspaceScan] = {}
+        told_by_attention: dict[str, bool] = {}
         for row in rows:
             if _recovered_since_opened(row.config or {}):
                 # Recovered before anyone was told: close it silently.
                 row.config = close_incident(dict(row.config or {}))
+                continue
+            if row.entity_id not in told_by_attention:
+                told_by_attention[row.entity_id] = await delivery_enabled(db, row.entity_id)
+            if told_by_attention[row.entity_id]:
                 continue
             users, affected = await _recipients(db, row, now, scans)
             pending.append((row, users, affected))
@@ -214,6 +223,8 @@ async def deliver_oauth_account_incidents(*, now: datetime | None = None, limit:
                     **profile[INCIDENT_KEY], "notified_at": now.isoformat(), "delivery_failed": True,
                 }}
                 continue
+            if await delivery_enabled(db, owner.entity_id):
+                continue
             pending.append((account.id, account.provider, owner.id, owner.entity_id,
                             profile[INCIDENT_KEY]["opened_at"]))
         await db.commit()
@@ -252,6 +263,16 @@ async def _notify_each(
             failed = True
             logger.warning("account incident notify failed for %s", user_id, exc_info=True)
     return sent, failed
+
+
+async def stamp_incident_notified(db, subject_type: str, row_id: str, *, now: datetime) -> None:
+    """Mark an open incident told, in the caller's transaction (attention delivery)."""
+    model, column = (Integration, "config") if subject_type == "integration" else (OAuthAccount, "profile")
+    row = (await db.execute(select(model).where(model.id == row_id).with_for_update())).scalar_one_or_none()
+    state = dict(getattr(row, column) or {}) if row is not None else {}
+    incident = state.get(INCIDENT_KEY)
+    if isinstance(incident, dict) and not incident.get("notified_at"):
+        setattr(row, column, {**state, INCIDENT_KEY: {**incident, "notified_at": now.isoformat()}})
 
 
 async def _stamp_delivery(model, column: str, row_id: str, opened_at: str, *, failed: bool, now: datetime) -> None:

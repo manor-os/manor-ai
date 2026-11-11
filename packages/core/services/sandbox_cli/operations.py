@@ -129,8 +129,10 @@ async def cli_ls(claims: SandboxCliClaims, body: dict[str, Any]) -> dict[str, An
     from packages.core.ai.tools.file_tools import (
         _blocked_doc_paths_batched,
         _next_scan_batch,
+        _paths_outside_workspace,
         _safe_path,
         _scan_list_files,
+        _workspace_scope_fields,
     )
     from packages.core.services.knowledge_visibility import normalize_rel_path
 
@@ -150,16 +152,27 @@ async def cli_ls(claims: SandboxCliClaims, body: dict[str, Any]) -> dict[str, An
     scanner = _scan_list_files(root, abs_path, recursive)
     entries: list[dict[str, Any]] = []
     visible = 0
+    excluded = 0
     has_more = False
     while batch := await asyncio.to_thread(_next_scan_batch, scanner):
+        files = [entry["path"] for entry in batch if entry.get("type") == "file"]
+        directories = [entry["path"] for entry in batch if entry.get("type") == "dir"]
         blocked = await _blocked_doc_paths_batched(
             claims.entity_id,
-            [entry["path"] for entry in batch if entry.get("type") == "file"],
+            files,
             kwargs,
-            directory_paths=[entry["path"] for entry in batch if entry.get("type") == "dir"],
+            directory_paths=directories,
         )
+        # Listing the entity root names no location, so it stops at the Workspace.
+        outside = await _paths_outside_workspace(
+            claims.entity_id, files, kwargs, directory_paths=directories,
+        ) if not rel_path else set()
         for entry in batch:
-            if normalize_rel_path(entry["path"]) in blocked:
+            entry_path = normalize_rel_path(entry["path"])
+            if entry_path in blocked:
+                continue
+            if entry_path in outside:
+                excluded += 1
                 continue
             visible += 1
             if visible <= offset:
@@ -178,6 +191,7 @@ async def cli_ls(claims: SandboxCliClaims, body: dict[str, Any]) -> dict[str, An
         "offset": offset,
         "has_more": has_more,
         "next_offset": offset + len(entries) if has_more else None,
+        **_workspace_scope_fields(excluded, kwargs),
     }
 
 

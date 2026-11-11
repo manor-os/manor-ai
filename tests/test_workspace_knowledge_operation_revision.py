@@ -50,9 +50,11 @@ async def _apply(client, headers, workspace_id, draft_id):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mutation", ["initialize", "purpose", "remove"])
-async def test_knowledge_write_invalidates_older_integration_draft(
+async def test_knowledge_write_survives_an_older_integration_draft(
     client, db_session, mutation,
 ):
+    """A Knowledge write bumps the operation revision; a draft made before it
+    still applies (#1572 rebases it) and keeps the Knowledge change."""
     headers, workspace_id = await _workspace(client)
     group_id = None
     if mutation != "initialize":
@@ -88,9 +90,9 @@ async def test_knowledge_write_invalidates_older_integration_draft(
         assert changed.status_code == 204, changed.text
 
     applied = await _apply(client, headers, workspace_id, draft["id"])
-    assert applied.status_code == 409, applied.text
+    assert applied.status_code == 200, applied.text
     workspace = await db_session.get(Workspace, workspace_id, populate_existing=True)
-    assert workspace.operation_revision == draft["base_revision"] + 1
+    assert workspace.operation_revision == draft["base_revision"] + 2
     knowledge = workspace.operating_model["knowledge"]
     if mutation == "initialize":
         assert knowledge["default_group_ids"] == [group_id]
@@ -99,7 +101,8 @@ async def test_knowledge_write_invalidates_older_integration_draft(
     else:
         assert group_id not in knowledge.get("group_purposes", {})
         assert await db_session.get(DocumentGroup, group_id) is None
-    assert "slack" not in workspace.operating_model.get("integration_scope", {}).get("disabled_providers", [])
+    # The draft's own change lands beside it.
+    assert "slack" in workspace.operating_model.get("integration_scope", {}).get("disabled_providers", [])
 
 
 @pytest.mark.asyncio

@@ -54,7 +54,7 @@ export default function QRCode() {
       <div className="glass-panel" style={{ padding: 24 }}>
         {/* URL / Text input */}
         <div style={{ marginBottom: 20 }}>
-          <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: "#57534e", marginBottom: 6 }}>
+          <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: "var(--text-muted)", marginBottom: 6 }}>
             {t("page.qr.url_or_text")}
           </label>
           <input
@@ -69,7 +69,7 @@ export default function QRCode() {
 
         {/* Size selector */}
         <div style={{ marginBottom: 20 }}>
-          <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: "#57534e", marginBottom: 6 }}>
+          <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: "var(--text-muted)", marginBottom: 6 }}>
             {t("page.qr.size")}
           </label>
           <div style={{ display: "flex", gap: 8 }}>
@@ -84,7 +84,7 @@ export default function QRCode() {
                   borderRadius: 10,
                   border: size === s ? "1px solid #4f7d75" : "1px solid rgba(231,229,228,0.6)",
                   background: size === s ? "rgba(79,125,117,0.1)" : "rgba(255,255,255,0.6)",
-                  color: size === s ? "#436b65" : "#57534e",
+                  color: size === s ? "#436b65" : "#6e6e73",
                   cursor: "pointer",
                   transition: "all 0.15s",
                 }}
@@ -139,7 +139,7 @@ export default function QRCode() {
           <div style={{
             borderRadius: 16,
             background: "rgba(255,255,255,0.6)",
-            border: "1px solid rgba(28,25,23,0.06)",
+            border: "0.5px solid rgba(29, 29, 31,0.06)",
             padding: 16,
           }}>
             <img
@@ -150,7 +150,7 @@ export default function QRCode() {
               style={{ borderRadius: 8 }}
             />
           </div>
-          <p style={{ fontSize: 12, color: "#a8a29e", maxWidth: 380, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textAlign: "center" }}>
+          <p style={{ fontSize: 12, color: "var(--text-muted)", maxWidth: 380, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textAlign: "center" }}>
             {generated.text}
           </p>
           <div style={{ display: "flex", gap: 12 }}>

@@ -51,12 +51,12 @@ export interface CalendarProps {
 /* ── helpers ────────────────────────────────────────────── */
 
 const PRIORITY_COLORS: Record<number, string> = {
-  5: "#d65f59", 4: "#d3873f", 3: "#c3a63f", 2: "#8aa9d1", 1: "#a8a29e",
+  5: "#d65f59", 4: "#d3873f", 3: "#c3a63f", 2: "#8aa9d1", 1: "#aeaeb2",
 };
 const STATUS_COLORS: Record<string, string> = {
   completed: "#4f9c84", in_progress: "#4869ac", pending: "#cf9b44",
-  created: "#a8a29e", scheduled: "#5f84bd", waiting_on_customer: "#d3873f",
-  on_hold: "#a07fc0", blocked: "#d65f59", cancelled: "#78716c", failed: "#c14a44",
+  created: "#aeaeb2", scheduled: "#5f84bd", waiting_on_customer: "#d3873f",
+  on_hold: "#a07fc0", blocked: "#d65f59", cancelled: "#8e8e93", failed: "#c14a44",
 };
 
 function monthLabel(month: number): string {
@@ -264,27 +264,27 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
       {/* ── Calendar grid ── */}
       <div style={{
         flex: 1, minWidth: 0, background: "rgba(255,255,255,0.85)", backdropFilter: "blur(16px)",
-        borderRadius: 24, border: "1px solid rgba(28,25,23,0.06)",
+        borderRadius: 24, border: "0.5px solid rgba(29, 29, 31,0.06)",
         boxShadow: "0 8px 24px rgba(0,0,0,0.04)", padding: "20px 24px",
       }}>
         {/* Header */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <button onClick={() => onMonthChange?.(new Date(year, mo - 1, 1))}
-              style={{ width: 32, height: 32, borderRadius: 10, border: "1px solid rgba(28,25,23,0.06)", background: "#fff", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: "#78716c" }}>
+              style={{ width: 32, height: 32, borderRadius: 10, border: "0.5px solid rgba(29, 29, 31,0.06)", background: "var(--surface-panel)", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)" }}>
               <IconChevronLeft size={14} />
             </button>
-            <h2 style={{ fontSize: 18, fontWeight: 800, color: "#1c1917", margin: 0, minWidth: 180, textAlign: "center" }}>
+            <h2 style={{ fontSize: 18, fontWeight: 800, color: "var(--text-strong)", margin: 0, minWidth: 180, textAlign: "center" }}>
               {monthLabel(mo)} {year}
             </h2>
             <button onClick={() => onMonthChange?.(new Date(year, mo + 1, 1))}
-              style={{ width: 32, height: 32, borderRadius: 10, border: "1px solid rgba(28,25,23,0.06)", background: "#fff", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: "#78716c" }}>
+              style={{ width: 32, height: 32, borderRadius: 10, border: "0.5px solid rgba(29, 29, 31,0.06)", background: "var(--surface-panel)", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)" }}>
               <IconChevronRight size={14} />
             </button>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             {/* Stats pills */}
-            <span style={{ fontSize: 11, fontWeight: 600, color: "#57534e", padding: "4px 10px", borderRadius: 20, background: "#f5f5f4" }}>
+            <span style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", padding: "4px 10px", borderRadius: 20, background: "var(--surface-muted)" }}>
               {taskCount} task{taskCount !== 1 ? "s" : ""}
               {bookingCount ? ` · ${bookingCount} booking${bookingCount !== 1 ? "s" : ""}` : ""}
               {externalCount ? ` · ${externalCount} calendar` : ""}
@@ -295,7 +295,7 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
               </span>
             )}
             <button onClick={goToday}
-              style={{ fontSize: 12, fontWeight: 600, color: "#436b65", padding: "5px 14px", borderRadius: 10, border: "1px solid rgba(28,25,23,0.06)", background: "#fff", cursor: "pointer" }}>
+              style={{ fontSize: 12, fontWeight: 600, color: "#436b65", padding: "5px 14px", borderRadius: 10, border: "0.5px solid rgba(29, 29, 31,0.06)", background: "var(--surface-panel)", cursor: "pointer" }}>
               Today
             </button>
           </div>
@@ -304,7 +304,7 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
         {/* Day headers */}
         <div style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 0, marginBottom: 2 }}>
           {dayHeaders.map((d) => (
-            <div key={d} style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", color: "#a8a29e", textAlign: "center", padding: "6px 0" }}>
+            <div key={d} style={{ fontSize: 10, fontWeight: 700, color: "var(--text-muted)", textAlign: "center", padding: "6px 0" }}>
               {d}
             </div>
           ))}
@@ -319,7 +319,7 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
           overflow: "hidden",
           border: "1px solid rgba(231,229,228,0.9)",
           borderRadius: 14,
-          background: "#fff",
+          background: "var(--surface-panel)",
         }}>
           {cells.map((cell, idx) => {
             const dateKey = `${cell.date.getFullYear()}-${String(cell.date.getMonth() + 1).padStart(2, "0")}-${String(cell.date.getDate()).padStart(2, "0")}`;
@@ -352,13 +352,13 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
                   <span style={{
                     width: 22, height: 22, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center",
                     fontSize: 12, fontWeight: isToday ? 800 : 600,
-                    color: !cell.inMonth ? "#d6d3d1" : isToday ? "#fff" : "#44403c",
+                    color: !cell.inMonth ? "#d1d1d6" : isToday ? "#fff" : "#48484a",
                     background: isToday ? "#436b65" : "transparent",
                   }}>
                     {cell.day}
                   </span>
                   {dayEvents.length > 0 && (
-                    <span style={{ fontSize: 9, fontWeight: 700, color: hasOverdue ? "#d65f59" : "#a8a29e", minWidth: 14, textAlign: "right" }}>
+                    <span style={{ fontSize: 9, fontWeight: 700, color: hasOverdue ? "#d65f59" : "#aeaeb2", minWidth: 14, textAlign: "right" }}>
                       {dayEvents.length}
                     </span>
                   )}
@@ -383,7 +383,7 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
                     );
                   })}
                   {dayEvents.length > 3 && (
-                    <span style={{ fontSize: 9, fontWeight: 600, color: "#78716c", paddingLeft: 4 }}>+{dayEvents.length - 3}</span>
+                    <span style={{ fontSize: 9, fontWeight: 600, color: "var(--text-muted)", paddingLeft: 4 }}>+{dayEvents.length - 3}</span>
                   )}
                 </div>
               </div>
@@ -396,21 +396,21 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
       <div style={{
         width: 300, flexShrink: 0,
         background: "rgba(255,255,255,0.85)", backdropFilter: "blur(16px)",
-        borderRadius: 20, border: "1px solid rgba(28,25,23,0.06)",
+        borderRadius: 20, border: "0.5px solid rgba(29, 29, 31,0.06)",
         boxShadow: "0 4px 16px rgba(0,0,0,0.03)", padding: "16px 18px",
         position: "sticky", top: 20,
       }}>
-        <h3 style={{ fontSize: 14, fontWeight: 700, color: "#1c1917", margin: "0 0 12px" }}>
+        <h3 style={{ fontSize: 14, fontWeight: 700, color: "var(--text-strong)", margin: "0 0 12px" }}>
           {selectedDate ? formatDayLabel(selectedDate) : t("component.calendar.select_a_day")}
         </h3>
 
         {!selectedDate && (
-          <p style={{ fontSize: 12, color: "#a8a29e", margin: 0 }}>{t("component.calendar.click_on_day")}</p>
+          <p style={{ fontSize: 12, color: "var(--text-muted)", margin: 0 }}>{t("component.calendar.click_on_day")}</p>
         )}
 
         {selectedDate && selEvents.length === 0 && (
           <div style={{ textAlign: "center", padding: "24px 0" }}>
-            <p style={{ fontSize: 12, color: "#a8a29e", margin: "0 0 8px" }}>{t("component.calendar.no_tasks_due")}</p>
+            <p style={{ fontSize: 12, color: "var(--text-muted)", margin: "0 0 8px" }}>{t("component.calendar.no_tasks_due")}</p>
             <button onClick={() => onDateClick?.(selectedDate)}
               style={{ fontSize: 12, fontWeight: 600, color: "#436b65", background: "none", border: "none", cursor: "pointer", textDecoration: "underline" }}>
               + {t("component.calendar.create_task")}
@@ -424,8 +424,8 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
               const isBooking = ev.source === "booking";
               const isExternal = ev.source === "external";
               const isActiveEvent = (isBooking || isExternal) && selectedEventDetail?.id === ev.id;
-              const pColor = PRIORITY_COLORS[ev.priority ?? 3] || "#a8a29e";
-              const sColor = STATUS_COLORS[ev.status ?? "pending"] || "#a8a29e";
+              const pColor = PRIORITY_COLORS[ev.priority ?? 3] || "#aeaeb2";
+              const sColor = STATUS_COLORS[ev.status ?? "pending"] || "#aeaeb2";
               const sLabel = statusLabel(ev.status);
               const isMaster = ev.agent_type === "manor_agent" || ev.agent_id === "manor-master";
               const avatar = ev.agent_name ? ev.agent_avatar : ev.assignee_avatar;
@@ -439,7 +439,7 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
                 <div key={ev.id} onClick={() => { if (canOpen) handleEventClick(ev); }}
                   style={{
                     padding: "10px 12px", borderRadius: 12, cursor: canOpen ? "pointer" : "default",
-                    border: isActiveEvent ? `1px solid ${isExternal ? "rgba(72,105,172,0.28)" : "rgba(79,125,117,0.28)"}` : "1px solid rgba(28,25,23,0.06)",
+                    border: isActiveEvent ? `1px solid ${isExternal ? "rgba(72,105,172,0.28)" : "rgba(79,125,117,0.28)"}` : "0.5px solid rgba(29, 29, 31,0.06)",
                     background: isActiveEvent ? (isExternal ? "rgba(247,249,253,0.98)" : "rgba(247,250,249,0.98)") : "#fff",
                     transition: "all 0.15s", borderLeft: `3px solid ${accentColor}`,
                   }}
@@ -449,13 +449,13 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
                   {/* Time + Title */}
                   {startStr && (
                     <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 4 }}>
-                      <IconClock size={10} style={{ color: "#78716c" }} />
-                      <span style={{ fontSize: 11, fontWeight: 600, color: "#57534e" }}>
+                      <IconClock size={10} style={{ color: "var(--text-muted)" }} />
+                      <span style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)" }}>
                         {startStr}{endStr ? ` – ${endStr}` : ""}{ev.duration_minutes ? ` (${ev.duration_minutes}min)` : ""}
                       </span>
                     </div>
                   )}
-                  <p style={{ fontSize: 13, fontWeight: 600, color: "#1c1917", margin: "0 0 6px", lineHeight: 1.3 }}>{ev.title}</p>
+                  <p style={{ fontSize: 13, fontWeight: 600, color: "var(--text-strong)", margin: "0 0 6px", lineHeight: 1.3 }}>{ev.title}</p>
 
                   {/* Tags */}
                   <div style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap", marginBottom: 6 }}>
@@ -465,7 +465,7 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
                           Booking
                         </span>
                         {ev.guest_email && (
-                          <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 10, color: "#78716c", fontWeight: 600 }}>
+                          <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 10, color: "var(--text-muted)", fontWeight: 600 }}>
                             {ev.guest_email}
                           </span>
                         )}
@@ -476,7 +476,7 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
                           Calendar
                         </span>
                         {(ev.calendar_name || ev.location_label) && (
-                          <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 10, color: "#78716c", fontWeight: 600 }}>
+                          <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 10, color: "var(--text-muted)", fontWeight: 600 }}>
                             {ev.calendar_name || ev.location_label}
                           </span>
                         )}
@@ -512,10 +512,10 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
                         <img src={avatar} alt="" style={{ width: 16, height: 16, borderRadius: "50%", objectFit: "cover" }} />
                       ) : (
                         <span style={{ width: 16, height: 16, borderRadius: "50%", background: ev.agent_name ? "linear-gradient(135deg,#dceae3,#c4dfd2)" : "linear-gradient(135deg,#e8eff4,#ddd6fe)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                          <IconUser size={8} style={{ color: "#57534e" }} />
+                          <IconUser size={8} style={{ color: "var(--text-muted)" }} />
                         </span>
                       )}
-                      <span style={{ fontSize: 10, color: "#78716c", fontWeight: 500 }}>{isMaster ? "Manor AI" : name}</span>
+                      <span style={{ fontSize: 10, color: "var(--text-muted)", fontWeight: 500 }}>{isMaster ? "Manor AI" : name}</span>
                     </div>
                   )}
                 </div>
@@ -544,17 +544,17 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
             >
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start", marginBottom: 10 }}>
                 <div style={{ minWidth: 0 }}>
-                  <div style={{ fontSize: 10, fontWeight: 800, color: detailAccent, textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 4 }}>
+                  <div style={{ fontSize: 10, fontWeight: 800, color: detailAccent, marginBottom: 4 }}>
                     {isExternal ? "Calendar event" : "Booking details"}
                   </div>
-                  <div style={{ fontSize: 13, fontWeight: 800, color: "#1c1917", lineHeight: 1.25, overflowWrap: "anywhere" }}>
+                  <div style={{ fontSize: 13, fontWeight: 800, color: "var(--text-strong)", lineHeight: 1.25, overflowWrap: "anywhere" }}>
                     {selectedEventDetail.title}
                   </div>
                 </div>
                 <button
                   type="button"
                   onClick={() => setSelectedEventDetail(null)}
-                  style={{ border: "none", background: "transparent", color: "#a8a29e", cursor: "pointer", fontSize: 16, lineHeight: 1, padding: 0 }}
+                  style={{ border: "none", background: "transparent", color: "var(--text-muted)", cursor: "pointer", fontSize: 16, lineHeight: 1, padding: 0 }}
                   aria-label="Close event details"
                 >
                   x
@@ -564,14 +564,14 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                 <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
                   <IconClock size={13} style={{ color: detailAccent, marginTop: 1 }} />
-                  <span style={{ fontSize: 12, fontWeight: 700, color: "#57534e", lineHeight: 1.35 }}>
+                  <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-muted)", lineHeight: 1.35 }}>
                     {formatEventDateTime(selectedEventDetail)}
                   </span>
                 </div>
                 {isBooking && selectedEventDetail.guest_email && (
                   <div style={{ display: "flex", gap: 8, alignItems: "flex-start", minWidth: 0 }}>
                     <IconMail size={13} style={{ color: detailAccent, marginTop: 1, flexShrink: 0 }} />
-                    <span style={{ fontSize: 12, fontWeight: 700, color: "#57534e", lineHeight: 1.35, overflowWrap: "anywhere" }}>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-muted)", lineHeight: 1.35, overflowWrap: "anywhere" }}>
                       {selectedEventDetail.guest_name ? `${selectedEventDetail.guest_name} · ` : ""}{selectedEventDetail.guest_email}
                     </span>
                   </div>
@@ -579,7 +579,7 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
                 {isExternal && (selectedEventDetail.calendar_name || selectedEventDetail.external_provider) && (
                   <div style={{ display: "flex", gap: 8, alignItems: "flex-start", minWidth: 0 }}>
                     <IconLink size={13} style={{ color: detailAccent, marginTop: 1, flexShrink: 0 }} />
-                    <span style={{ fontSize: 12, fontWeight: 700, color: "#57534e", lineHeight: 1.35, overflowWrap: "anywhere" }}>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-muted)", lineHeight: 1.35, overflowWrap: "anywhere" }}>
                       {selectedEventDetail.calendar_name || externalProviderLabel(selectedEventDetail.external_provider)}
                     </span>
                   </div>
@@ -587,7 +587,7 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
                 {isExternal && selectedEventDetail.organizer_email && (
                   <div style={{ display: "flex", gap: 8, alignItems: "flex-start", minWidth: 0 }}>
                     <IconMail size={13} style={{ color: detailAccent, marginTop: 1, flexShrink: 0 }} />
-                    <span style={{ fontSize: 12, fontWeight: 700, color: "#57534e", lineHeight: 1.35, overflowWrap: "anywhere" }}>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-muted)", lineHeight: 1.35, overflowWrap: "anywhere" }}>
                       {selectedEventDetail.organizer_email}
                     </span>
                   </div>
@@ -595,18 +595,18 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
                 {selectedEventDetail.location_label && !selectedEventDetail.meeting_url && (
                   <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
                     <IconLink size={13} style={{ color: detailAccent, marginTop: 1 }} />
-                    <span style={{ fontSize: 12, fontWeight: 700, color: "#57534e", lineHeight: 1.35, overflowWrap: "anywhere" }}>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-muted)", lineHeight: 1.35, overflowWrap: "anywhere" }}>
                       {selectedEventDetail.location_label}
                     </span>
                   </div>
                 )}
                 {isBooking && selectedEventDetail.note && (
-                  <div style={{ fontSize: 12, color: "#57534e", lineHeight: 1.45, padding: "8px 9px", borderRadius: 10, background: "#fff", border: "1px solid rgba(231,229,228,0.9)" }}>
+                  <div style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.45, padding: "8px 9px", borderRadius: 10, background: "var(--surface-panel)", border: "1px solid rgba(231,229,228,0.9)" }}>
                     {selectedEventDetail.note}
                   </div>
                 )}
                 {isExternal && description && (
-                  <div style={{ fontSize: 12, color: "#57534e", lineHeight: 1.45, padding: "8px 9px", borderRadius: 10, background: "#fff", border: "1px solid rgba(231,229,228,0.9)", maxHeight: 96, overflow: "auto" }}>
+                  <div style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.45, padding: "8px 9px", borderRadius: 10, background: "var(--surface-panel)", border: "1px solid rgba(231,229,228,0.9)", maxHeight: 96, overflow: "auto" }}>
                     {description}
                   </div>
                 )}
@@ -635,7 +635,7 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
                     <IconExternalLink size={13} /> Open meeting
                   </a>
                 ) : (
-                  <div style={{ display: "flex", alignItems: "center", gap: 7, padding: "8px 9px", borderRadius: 10, background: "#fff", border: "1px solid rgba(231,229,228,0.9)", color: "#78716c", fontSize: 12, fontWeight: 700 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 7, padding: "8px 9px", borderRadius: 10, background: "var(--surface-panel)", border: "1px solid rgba(231,229,228,0.9)", color: "var(--text-muted)", fontSize: 12, fontWeight: 700 }}>
                     <IconLink size={13} /> No meeting link saved
                   </div>
                 )}
@@ -653,7 +653,7 @@ export default function Calendar({ month, events, onDateClick, onEventClick, onM
                       borderRadius: 10,
                       border: `1px solid ${isExternal ? "rgba(72,105,172,0.22)" : "rgba(79,125,117,0.22)"}`,
                       color: isExternal ? "#4869ac" : "#436b65",
-                      background: "#fff",
+                      background: "var(--surface-panel)",
                       fontSize: 12,
                       fontWeight: 800,
                       textDecoration: "none",

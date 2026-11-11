@@ -11,6 +11,7 @@ import ConfirmDialog from "../ui/ConfirmDialog";
 import RadioCard from "../ui/RadioCard";
 import ApprovalRuleEditor from "./ApprovalRuleEditor";
 import "./approvals.css";
+import { PageLoading } from "../ui/Skeleton";
 
 const modes: ApprovalMode[] = ["confirm_changes", "risk_based", "automatic"];
 const drafts = new Map<string, { baseline: ApprovalSnapshot; draft: ApprovalDraft }>();
@@ -126,7 +127,7 @@ function ApprovalSettingsBody({ scope, presentation = "page", detailKey, showOve
     finally { if (mounted.current) setBusy(null); }
   };
 
-  if (query.isPending || (current && (!baseline || !draft))) return <p role="status" className="approval-note">{t("approval_settings.loading")}</p>;
+  if (query.isPending || (current && (!baseline || !draft))) return <PageLoading label={t("approval_settings.loading")} minHeight={96} />;
   if (!current || !baseline || !draft || (query.error instanceof ApiError && [403, 404].includes(query.error.status))) return <div role="alert" className="approval-status"><p>{t(query.error instanceof ApiError && [403, 404].includes(query.error.status) ? "approval_settings.unavailable" : "approval_settings.error")}</p><Button variant="outline" size="sm" onClick={() => void query.refetch()}>{t("approval_settings.retry")}</Button></div>;
   const local = scope.kind !== "account";
   const inheritedMode = current.inherited_mode;
@@ -180,7 +181,7 @@ function ApprovalExceptions({ entityId }: { entityId: string }) {
   const query = useQuery({ queryKey: approvalKeys.overrides(entityId, user?.id || "", offset), queryFn: () => api.approvalSettings.overrides(entityId, offset), enabled: !!user, refetchOnWindowFocus: "always" });
   return <section className="approval-exceptions"><h3 className="manor-section-title">{t("approval_settings.exceptions")}</h3><p className="manor-section-subtitle">{t("approval_settings.exceptions_description")}</p>
     {query.data && <p className="approval-note">{t("approval_settings.scope_counts", { following: query.data.following_count, custom: query.data.custom_count })}</p>}
-    {query.isPending ? <p role="status" className="approval-note">{t("approval_settings.loading")}</p> : query.isError ? <div role="alert"><p className="approval-note">{t("approval_settings.error")}</p><Button size="sm" variant="outline" onClick={() => void query.refetch()}>{t("approval_settings.retry")}</Button></div> : <>
+    {query.isPending ? <PageLoading label={t("approval_settings.loading")} minHeight={96} /> : query.isError ? <div role="alert"><p className="approval-note">{t("approval_settings.error")}</p><Button size="sm" variant="outline" onClick={() => void query.refetch()}>{t("approval_settings.retry")}</Button></div> : <>
       {query.data.items.length === 0 && <p className="approval-note">{t("approval_settings.no_exceptions")}</p>}
       {query.data.items.map(item => <div className="approval-exception" key={`${item.scope.kind}:${item.scope.id}`}><div><strong>{item.label}</strong><span>{approvalInheritanceLabel(item.snapshot)} · {t(`approval_settings.${item.snapshot.effective_policy.mode}`)}</span></div><Button size="sm" variant="ghost" onClick={() => openApprovalSettings(item.scope, item.label)}>{t("approval_settings.edit")}</Button></div>)}
       {query.data.total > query.data.limit && <div className="approval-pagination"><Button variant="ghost" size="sm" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - query.data.limit))}>{t("approval_settings.previous")}</Button><Button variant="ghost" size="sm" disabled={offset + query.data.items.length >= query.data.total} onClick={() => setOffset(offset + query.data.limit)}>{t("approval_settings.next")}</Button></div>}

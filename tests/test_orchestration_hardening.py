@@ -200,6 +200,30 @@ def test_settlement_tasks_use_versioned_recovery_queue():
     assert queue_for_task("run_workflow") is CeleryQueue.HEAVY
 
 
+@pytest.mark.parametrize(
+    "task_name",
+    [
+        "knowledge.sweep_media_analysis",
+        "metrics.http_flush",
+        "maintenance.cleanup_oauth_dynamic_clients",
+    ],
+)
+def test_bounded_database_sweeps_do_not_queue_behind_heavy_work(task_name):
+    """Periodic sweeps with no provider call run on the control pool.
+
+    On HEAVY they waited behind long Workflow runs, and every waiting tick
+    counted toward the heavy queue-depth autoscaler. Sweeps that call Stripe,
+    a provider, a webhook or the filesystem (billing.reconcile_*,
+    apify.reconcile_collections, events.dispatch_external_due, ...) stay on
+    HEAVY because their duration is not bounded by our own batch size.
+    """
+    scheduled = {entry["task"] for entry in celery_app.conf.beat_schedule.values()}
+
+    assert task_name in scheduled
+    assert queue_for_task(task_name) is CeleryQueue.CONTROL
+    assert route_task(task_name) == {"queue": "celery"}
+
+
 def test_every_beat_entry_names_a_declared_task():
     """A beat entry pointing at an unregistered name would never fire."""
     declared = set(TASK_QUEUES) | set(CELERY_BUILTIN_TASK_QUEUES)

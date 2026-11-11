@@ -16,16 +16,16 @@ is not handled here.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Literal, Optional
 
 from celery.exceptions import SoftTimeLimitExceeded
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete as sa_delete, func, select
+from sqlalchemy import and_, delete as sa_delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,6 +35,13 @@ from apps.api.deps import (
     require_workspace_authority,
     require_workspace_writable,
 )
+from packages.core.services.decision_recommendation import (
+    is_internal_key_only_message,
+    project_hitl_entries,
+    project_recommendation,
+    strip_internal_rule_mentions,
+)
+from packages.core.i18n import get_locale
 from packages.core.workspaces import is_sandbox_workspace
 from packages.core.ai.pending_action import LEASE_HITL_CLOSEABLE_KINDS
 from packages.core.constants.approvals import (
@@ -60,6 +67,7 @@ from packages.core.ai.runtime.output_policy import (
 )
 from packages.core.models.task import Conversation, Message, Task
 from packages.core.models.runtime_run import RuntimeRun, RuntimeRunStatus
+from packages.core.services.runtime_run_service import RuntimeRunNotFoundError
 from packages.core.models.user import User
 from packages.core.models.workspace import Workspace
 from packages.core.services.assistant_blocks import project_browser_display_names, project_skill_display_names, project_workspace_draft_retry_recovery, project_process_outcome
@@ -221,6 +229,7 @@ class SimulationRunResponse(BaseModel):
     updated_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     decision_count: int = 0
+    decision_total: int = 0
     runtime_version: str
 
 
@@ -322,6 +331,7 @@ def _to_message(
     recovery_reason: str | None = None,
 ) -> MessageResponse:
     pending_action = m.pending_action if isinstance(m.pending_action, dict) and m.pending_action.get("kind") else None
+    pending_action = project_recommendation(pending_action)
     if recovery_reason and pending_action:
         pending_action = {
             **pending_action,
@@ -329,7 +339,12 @@ def _to_message(
         }
     author_user_id = _message_author_user_id(m)
     raw_meta = m.meta if isinstance(m.meta, dict) else {}
-    projected_meta = dict(raw_meta)
+    # Walk only what the response keeps: runtime can be most of the metadata.
+    projected_meta = {
+        key: value
+        for key, value in raw_meta.items()
+        if key == "assistant_blocks" or key not in _WORKSPACE_CHAT_META_OMIT_KEYS
+    }
     public_calls, projected_blocks = project_web_access_denials(
         m.tool_calls, raw_meta.get("assistant_blocks"), raw_meta,
     )
@@ -372,6 +387,9 @@ def _to_message(
         raw_meta,
         m.tool_calls,
     )
+    if getattr(m, "role", None) != "user" and body:
+        # Cards stored before the fix carried rule ids; never show them.
+        body = strip_internal_rule_mentions(body)
     return MessageResponse(
         id=m.id,
         conversation_id=m.conversation_id,
@@ -391,7 +409,7 @@ def _to_message(
         attachments=m.attachments,
         meta=_workspace_chat_public_meta(public_meta),
         pending_action=pending_action,
-        hitl_requests=_message_hitl_requests(m),
+        hitl_requests=project_hitl_entries(_message_hitl_requests(m)),
         resolved_at=m.resolved_at,
         resolution=m.resolution,
         resolved_by_user_id=m.resolved_by_user_id,
@@ -482,12 +500,24 @@ async def _augment_latest_page_with_workflow_runtime(
     conversation_id: str,
     rows: list[Message],
 ) -> list[Message]:
-    activity_rows = list((await db.execute(
-        select(Message).where(
-            Message.conversation_id == conversation_id,
-            Message.message_kind == "workflow_activity",
+    # Every activity card of the conversation's history is checked, so read only
+    # the fields the check needs; full rows load for the actionable few.
+    activity_rows = [
+        SimpleNamespace(
+            id=message_id, message_kind="workflow_activity", pending_action=pending_action, refs=refs,
+            meta={"workflow_status": status, "workflow_business_outcome": outcome, "workflow_run_id": run_id},
         )
-    )).scalars().all())
+        for message_id, pending_action, refs, status, outcome, run_id in (await db.execute(
+            select(
+                Message.id, Message.pending_action, Message.refs,
+                Message.meta["workflow_status"], Message.meta["workflow_business_outcome"],
+                Message.meta["workflow_run_id"],
+            ).where(
+                Message.conversation_id == conversation_id,
+                Message.message_kind == "workflow_activity",
+            )
+        )).all()
+    ]
     actionable_activity = [
         message for message in activity_rows if _is_actionable_workflow_activity(message)
     ]
@@ -499,23 +529,32 @@ async def _augment_latest_page_with_workflow_runtime(
     if not actionable_run_ids:
         return rows
 
-    unresolved_rows = list((await db.execute(
-        select(Message).where(
-            Message.conversation_id == conversation_id,
-            Message.pending_action.isnot(None),
-            Message.resolved_at.is_(None),
-        )
-    )).scalars().all())
-    associated_actions = [
-        message
-        for message in unresolved_rows
-        if isinstance(message.pending_action, dict)
-        and message.pending_action.get("kind") in WORKSPACE_WORKFLOW_RUN_ACTION_KINDS
-        and _message_workflow_run_id(message) in actionable_run_ids
+    # Open cards are checked by their run fields too; the page usually holds
+    # them already (the pinned open set), so only the rest load in full.
+    associated_ids = [
+        message_id
+        for message_id, action_run_id, meta_run_id, refs in (await db.execute(
+            select(
+                Message.id, Message.pending_action["workflow_run_id"], Message.meta["workflow_run_id"], Message.refs,
+            ).where(
+                Message.conversation_id == conversation_id,
+                Message.pending_action["kind"].astext.in_(sorted(WORKSPACE_WORKFLOW_RUN_ACTION_KINDS)),
+                Message.resolved_at.is_(None),
+            )
+        )).all()
+        if _message_workflow_run_id(SimpleNamespace(
+            pending_action={"workflow_run_id": action_run_id}, meta={"workflow_run_id": meta_run_id}, refs=refs,
+        )) in actionable_run_ids
     ]
     by_id = {message.id: message for message in rows}
-    for message in [*actionable_activity, *associated_actions]:
-        by_id.setdefault(message.id, message)
+    missing_ids = [
+        message_id
+        for message_id in dict.fromkeys([*(message.id for message in actionable_activity), *associated_ids])
+        if message_id not in by_id
+    ]
+    if missing_ids:
+        for message in (await db.execute(select(Message).where(Message.id.in_(missing_ids)))).scalars().all():
+            by_id[message.id] = message
     return sorted(by_id.values(), key=lambda message: (message.created_at, message.id))
 
 
@@ -757,25 +796,64 @@ def _pending_action_activity_event(kind: str, choice: str) -> str:
     return "pending_action.resolved"
 
 
-def _schedule_workspace_chat_processing(
+async def _schedule_workspace_chat_processing(
+    db: AsyncSession,
     *,
     conversation_id: str,
     workspace_id: str,
     entity_id: str,
-    user_id: str | None,
+    user_id: str,
     message: str,
-    message_id: str | None,
-) -> None:
-    from packages.core.services.workspace_runtime import process_workspace_chat_message
+    message_id: str,
+) -> str:
+    """Stage the message's Agent turn as a durable run in the caller's transaction.
 
-    asyncio.get_running_loop().create_task(process_workspace_chat_message(
+    Same run as browser Chat: a worker owns it, a restart of this process does
+    not lose it, and the chat can tell it is running. Returns the run id to
+    publish once the transaction commits.
+    """
+    from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.services.conversation_messages import (
+        assistant_message_origin_meta,
+        create_assistant_stream_placeholder,
+    )
+    from packages.core.services.runtime_human_input import supersede_parked_approval_run
+    from packages.core.services.runtime_run_service import create_runtime_run
+
+    placeholder = await create_assistant_stream_placeholder(
+        db, conversation_id, entity_id=entity_id, workspace_id=workspace_id, agent_id=None,
+        meta=assistant_message_origin_meta(message_id) or None,
+    )
+    await supersede_parked_approval_run(
+        db, conversation_id=conversation_id, entity_id=entity_id, user_id=user_id, message=message,
+    )
+    run = await create_runtime_run(
+        db,
         conversation_id=conversation_id,
-        workspace_id=workspace_id,
+        assistant_message_id=placeholder.id,
         entity_id=entity_id,
         user_id=user_id,
-        message=message,
-        message_id=message_id,
-    ))
+        agent_id=None,
+        workspace_id=workspace_id,
+        execution_payload={
+            "message": message,
+            "surface": ChatSurface.WORKSPACE_CHAT.value,
+            "runtime_metadata": {"origin_user_message_id": message_id},
+        },
+    )
+    return run.id
+
+
+async def _publish_workspace_chat_run(run_id: str | None) -> None:
+    """Hand the committed run to a worker now; the outbox sweep owns it if this fails."""
+    if not run_id:
+        return
+    from packages.core.tasks.runtime_tasks import publish_runtime_run_outbox_now
+
+    try:
+        await publish_runtime_run_outbox_now(run_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("Immediate runtime run publish failed run=%s", run_id, exc_info=True)
 
 
 async def _record_pending_action_activity(
@@ -1070,6 +1148,12 @@ async def _hydrate_messages(
 ) -> list[MessageResponse]:
     from packages.core.models.workflow import WorkflowRun
 
+    # An approval click's saved line is for the model; the card shows the choice.
+    rows = [
+        message for message in rows
+        if not (message.role == "user" and (message.meta or {}).get("approval_receipt"))
+        and not is_internal_key_only_message(message)
+    ]
     workflow_run_ids = list(dict.fromkeys(
         run_id for message in rows if (run_id := _message_workflow_run_id(message))
     ))
@@ -1600,6 +1684,7 @@ async def start_workspace_simulation_run(
             db,
             workspace=workspace,
             user_id=user.id,
+            locale=get_locale(),
         )
     except SimulationRuntimeError as exc:
         raise HTTPException(409, str(exc)) from exc
@@ -1620,6 +1705,7 @@ async def restart_workspace_simulation_run(
             workspace=workspace,
             user_id=user.id,
             restart=True,
+            locale=get_locale(),
         )
     except SimulationRuntimeError as exc:
         raise HTTPException(409, str(exc)) from exc
@@ -1782,6 +1868,12 @@ async def list_chat_messages_page(
             RuntimeRun.conversation_id == conversation.id,
             RuntimeRun.parent_run_id.is_(None),
             RuntimeRun.status.in_(RuntimeRunStatus.active_root()),
+            # A run parked on an approval waits for a person, not for this
+            # chat: it never locks the composer (a new message supersedes it).
+            ~and_(
+                RuntimeRun.status == RuntimeRunStatus.WAITING_RESOURCE.value,
+                func.coalesce(RuntimeRun.status_reason, "") == "capability_approval",
+            ),
         ).exists())
     ))
     settings = get_settings()
@@ -1814,6 +1906,9 @@ class AttentionReminderResponse(BaseModel):
     kind: str
     summary: str
     created_at: datetime
+    # The waiting run and its host run (a sub-flow's parent), when the card is a run's.
+    workflow_run_id: Optional[str] = None
+    workflow_host_run_id: Optional[str] = None
 
 
 class AttentionResponse(BaseModel):
@@ -1877,22 +1972,35 @@ async def post_chat_message(
         thread_ref_id=req.thread_ref_id,
         publish_event=False,
     )
-
-    await db.commit()
+    run_id = None
+    try:
+        if req.audience == "ai" and (req.body or "").strip():
+            run_id = await _schedule_workspace_chat_processing(
+                db=db,
+                conversation_id=msg.conversation_id,
+                workspace_id=workspace_id,
+                entity_id=user.entity_id,
+                user_id=user.id,
+                message=req.body,
+                message_id=msg.id,
+            )
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        if "uq_runtime_runs_active_conversation" not in str(exc):
+            raise
+        raise HTTPException(
+            409, "The previous request is still running. Wait for it to finish before sending another message.",
+        ) from exc
+    except RuntimeRunNotFoundError as exc:
+        await db.rollback()
+        raise HTTPException(409, str(exc)) from exc
     await chat_service.publish_workspace_chat_message_event(
         user.entity_id,
         workspace_id=workspace_id,
         message=msg,
     )
-    if req.audience == "ai" and (req.body or "").strip():
-        _schedule_workspace_chat_processing(
-            conversation_id=msg.conversation_id,
-            workspace_id=workspace_id,
-            entity_id=user.entity_id,
-            user_id=user.id,
-            message=req.body,
-            message_id=msg.id,
-        )
+    await _publish_workspace_chat_run(run_id)
     return _to_message(msg, author_user=user)
 
 
@@ -2039,6 +2147,18 @@ async def resolve_chat_action(
     normalized_choice = (req.choice or "").strip().lower()
     if normalized_choice in {APPROVAL_CHOICE_ALWAYS_APPROVE, "approve_always", "always_allow"}:
         raise HTTPException(410, "Use Execution & approvals settings to save a scoped rule")
+    if kind == PendingActionKind.BLUEPRINT_UPDATE and normalized_choice == "update" and msg.resolved_at is None:
+        from apps.api.routers.workspaces import (
+            BlueprintRecommendedUpgradeRequest,
+            apply_recommended_blueprint_upgrade,
+        )
+
+        # The one-step update; applying it closes this card as updated.
+        await apply_recommended_blueprint_upgrade(
+            workspace_id, BlueprintRecommendedUpgradeRequest(target_version=pa.get("version")), user, db,
+        )
+        await db.refresh(msg)
+        return _to_message(msg, resolved_by_user=user)
     pa_payload = pa.get("payload") if isinstance(pa.get("payload"), dict) else {}
     pa_reconciliation = (
         pa_payload.get("reconciliation")
@@ -2118,6 +2238,7 @@ async def resolve_chat_action(
                 choice=req.choice,
                 note=req.note,
                 payload=req.payload,
+                locale=get_locale(),
             )
         except SimulationRuntimeError as exc:
             raise HTTPException(409, str(exc)) from exc
@@ -2379,6 +2500,26 @@ async def resolve_chat_action(
                     "External reply account scope is missing; reconnect the "
                     "channel before creating a standing grant.",
                 )
+            # "Always allow" saves the Workspace allow rule the outbound
+            # gate reads, then this reply is approved like any other.
+            from packages.core.governance import approval_policy_service as approval_policies
+            from packages.core.constants.channels import ExternalMessageActionKey
+            from packages.core.governance.always_allow import save_always_allow_rule
+
+            try:
+                approval_scope = await approval_policies.resolve_scope(
+                    db, entity_id=user.entity_id, workspace_id=workspace_id,
+                )
+                await save_always_allow_rule(
+                    db, scope=approval_scope, actor=user,
+                    action_key=str(pa.get("action_key") or ExternalMessageActionKey.SEND.value),
+                )
+            except approval_policies.ApprovalPolicyAccessError as exc:
+                await db.rollback()
+                raise HTTPException(403, str(exc)) from exc
+            except approval_policies.ApprovalPolicyConflict as exc:
+                await db.rollback()
+                raise HTTPException(409, "Approval settings changed; try again") from exc
     if (
         kind == PendingActionKind.EXTERNAL_MESSAGE_APPROVAL
         and not external_approval_requested
@@ -3581,10 +3722,84 @@ async def resolve_chat_action(
         workspace_id=workspace_id,
         candidate_ids=queued_learning_ids,
     )
+    if (
+        kind == PendingActionKind.NEEDS_LOGIN
+        and pa.get("connection_request")
+        and (req.choice or "").lower() == "continue_after_login"
+    ):
+        await _continue_after_connection(db, user=user, workspace_id=workspace_id, pending_action=pa)
     return _to_message(
         resolved,
         resolved_by_user=user if resolved.resolved_by_user_id == user.id else None,
     )
+
+
+async def _continue_after_connection(
+    db: AsyncSession, *, user: User, workspace_id: str, pending_action: dict,
+) -> None:
+    """The person connected what a Workspace was waiting for and chose to go on.
+
+    Their choice becomes their next message to the AI, so the work that waited
+    (a drafted email, a paused request) picks up through the normal chat path,
+    approvals included. Nothing is posted unless the account really is usable.
+    """
+    from packages.core.services.integration_resolution import integration_provider_readiness
+    from packages.core.services.provider_keys import canonical_provider_key
+
+    provider = canonical_provider_key(pending_action.get("provider_key"))
+    if not provider:
+        return
+    state = (await integration_provider_readiness(
+        db, entity_id=user.entity_id, user_id=user.id, provider_keys=[provider],
+    )).get(provider)
+    if state is None or not state.ready:
+        return
+    from packages.core.services.workflow_connection_wait import resume_runs_waiting_for_connection
+
+    # Runs that stopped at a step for this connection continue from that step.
+    await resume_runs_waiting_for_connection(
+        db, entity_id=user.entity_id, workspace_id=workspace_id, provider=provider, user_id=user.id,
+    )
+    if pending_action.get("waiting_workflow_run_id"):
+        # A run asked for it; the run itself continues, nothing for the AI to redo.
+        return
+    label = str((pending_action.get("title_params") or {}).get("provider") or provider)
+    body = (
+        f"{label} 已连接，请继续之前在等它的工作。"
+        if str(getattr(user, "locale", "") or "").lower().startswith("zh")
+        else f"{label} is connected now. Please continue the work that was waiting for it."
+    )
+    msg = await chat_service.post_message(
+        db,
+        entity_id=user.entity_id,
+        workspace_id=workspace_id,
+        body=body,
+        message_kind="text",
+        author_kind="user",
+        author_user_id=user.id,
+        meta={"workspace_chat_audience": "ai"},
+        publish_event=False,
+    )
+    try:
+        run_id = await _schedule_workspace_chat_processing(
+            db=db,
+            conversation_id=msg.conversation_id,
+            workspace_id=workspace_id,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            message=body,
+            message_id=msg.id,
+        )
+        await db.commit()
+    except (IntegrityError, RuntimeRunNotFoundError):
+        # A turn is already running, or the Workspace takes no work now: nothing to nudge.
+        await db.rollback()
+        logger.info("Skipped connection follow-up: workspace=%s provider=%s", workspace_id, provider)
+        return
+    await chat_service.publish_workspace_chat_message_event(
+        user.entity_id, workspace_id=workspace_id, message=msg,
+    )
+    await _publish_workspace_chat_run(run_id)
 
 
 @router.post(

@@ -30,6 +30,28 @@
     "mcp__facebook__get_instagram_media",
     "mcp__facebook__reply_instagram_comment"
   ],
+  "groups": {
+    "publish": {
+      "label": "Publish",
+      "description": "Publish posts, photos and video to a Facebook Page and photos, carousels and Reels to a linked Instagram account, and read what was published.",
+      "tools": ["mcp__facebook__list_pages", "mcp__facebook__get_page", "mcp__facebook__create_post", "mcp__facebook__create_multi_photo_post", "mcp__facebook__create_video_post", "mcp__facebook__list_posts", "mcp__facebook__list_instagram_accounts", "mcp__facebook__get_instagram_account", "mcp__facebook__create_instagram_media", "mcp__facebook__get_instagram_container_status", "mcp__facebook__publish_instagram_media", "mcp__facebook__get_instagram_media"]
+    },
+    "engage": {
+      "label": "Comments and messages",
+      "description": "Read and reply to Page and Instagram comments, hide a comment, and read and answer Messenger conversations.",
+      "tools": ["mcp__facebook__list_pages", "mcp__facebook__get_page", "mcp__facebook__list_posts", "mcp__facebook__list_comments", "mcp__facebook__reply_comment", "mcp__facebook__hide_comment", "mcp__facebook__reply_instagram_comment", "mcp__facebook__list_conversations", "mcp__facebook__send_messenger", "mcp__facebook__list_instagram_accounts", "mcp__facebook__get_instagram_media"]
+    },
+    "insights": {
+      "label": "Insights",
+      "description": "Read Page and post insights and the Instagram account's published media to report results.",
+      "tools": ["mcp__facebook__list_pages", "mcp__facebook__get_page", "mcp__facebook__list_posts", "mcp__facebook__get_page_insights", "mcp__facebook__get_post_insights", "mcp__facebook__list_instagram_accounts", "mcp__facebook__get_instagram_account", "mcp__facebook__get_instagram_media"]
+    },
+    "manage": {
+      "label": "Edit and delete posts",
+      "description": "Change or delete posts already on the Page.",
+      "tools": ["mcp__facebook__list_pages", "mcp__facebook__get_page", "mcp__facebook__list_posts", "mcp__facebook__update_post", "mcp__facebook__delete_post"]
+    }
+  },
   "search": {
     "terms": ["fb", "meta page", "instagram", "reels", "messenger", "page post", "social media post"],
     "examples": ["post photo to facebook page", "reply to comments on page post", "read facebook page insights last week", "publish instagram business photo"]

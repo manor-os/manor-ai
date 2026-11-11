@@ -17,7 +17,8 @@ declare module "@novnc/novnc" {
   }
 
   export default class RFB extends EventTarget {
-    constructor(target: HTMLElement, url: string, options?: RFBOptions);
+    /** A URL, or a WebSocket the caller opened (noVNC attaches to it). */
+    constructor(target: HTMLElement, urlOrChannel: string | WebSocket, options?: RFBOptions);
     viewOnly: boolean;
     scaleViewport: boolean;
     resizeSession: boolean;

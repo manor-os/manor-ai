@@ -361,6 +361,43 @@ def runtime_allows_agent_memory_reader(envelope) -> bool:
     )
 
 
+IDENTITY_MEMORY_FILES = frozenset({"MEMORY.md", "LEARNINGS.md"})
+_OUTER_ROLE_FILES = frozenset({"AGENT.md", "GOALS.md"})
+
+
+def runtime_identity_file_filter(envelope, user_id: str | None):
+    """Return which identity files a turn may load; ``None`` means no restriction.
+
+    The check is ``allowed(filename, agent_id, level)``. Master-agent and
+    per-user memory belong to the owner's own chats. A shared surface such as
+    Workspace chat shows replies to other members, so it only gets a service
+    agent's entity-level memory. Inside a Workspace the master agent works for
+    that Workspace: its company-wide role (AGENT.md, GOALS.md) gives way to
+    the Workspace charter.
+    """
+    if envelope is None:
+        return None
+    from packages.core.constants.agents import MANOR_AGENT_FS_ID
+
+    mounts = [mount for mount in memory_mounts_from_envelope(envelope) if mount.readable]
+    owner = bool(user_id) and any(
+        mount.scope == "owner" and mount.key == f"user:{user_id}" for mount in mounts
+    )
+    keys = {str(mount.key) for mount in mounts}
+    workspace = any(key.startswith("workspace:") for key in keys)
+
+    def allowed(filename: str, agent_id: str, level: str | None) -> bool:
+        if filename in IDENTITY_MEMORY_FILES:
+            if level == "user" or agent_id == MANOR_AGENT_FS_ID:
+                return owner
+            return owner or f"agent:{agent_id}" in keys
+        if filename in _OUTER_ROLE_FILES and agent_id == MANOR_AGENT_FS_ID:
+            return owner or not workspace
+        return True
+
+    return allowed
+
+
 def runtime_allows_workspace_memory_reader(
     envelope,
     workspace_id: str | None = None,

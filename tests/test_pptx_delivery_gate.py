@@ -213,6 +213,140 @@ async def test_save_result_blocks_failed_pptx_before_filesystem_mutation(monkeyp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "skill_view"),
+    [("docx", "docx"), ("docx", None), ("pptx", "pptx")],
+)
+async def test_save_result_accepts_its_own_gate_report_written_through_the_runner_view(
+    monkeypatch, kind: str, skill_view: str | None,
+) -> None:
+    """The runner maps /skill onto /skills/<slot> in every command
+    (``rewrite_skill_paths``), so the gate records the real path in its
+    report. That is still the file the server gated, not "a different path"."""
+    from tests import sandbox_runner_fakes  # noqa: F401  (puts sandbox-service on sys.path)
+    from sandbox.docker_backend import rewrite_skill_paths, skill_slot
+
+    slot = skill_slot(kind)
+    path = f"/skill/projects/northstar/exports/northstar.{kind}"
+    report_path = f"/skill/projects/northstar/qa/{kind}-quality.json"
+    content = f"final-{kind}-bytes".encode()
+    files: dict[str, bytes] = {rewrite_skill_paths(path, slot): content}
+
+    class RunnerViewClient:
+        async def exec(self, *, sandbox_id, command, timeout, execution_id=None, **_queue_and_view):
+            argv = rewrite_skill_paths(command, slot).split()
+            gated = argv[2]
+            assert gated.startswith(f"/skills/{slot}/")
+            # Like the real gates, the report names the path the gate was given.
+            report = _passing_report if kind == "pptx" else _passing_docx_report
+            files[argv[argv.index("--report") + 1]] = report(files[gated], path=gated)
+            return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+        async def read_file_base64(self, *, sandbox_id, path, **_view):
+            payload = files[rewrite_skill_paths(path, slot)]
+            return SimpleNamespace(content_base64=base64.b64encode(payload).decode("ascii"))
+
+        async def close(self):
+            return None
+
+    async def get_sandbox_client(_sandbox_id: str):
+        return RunnerViewClient()
+
+    async def file_view(_scope, _agent_id, _sandbox_id):
+        return skill_view, "/skill"
+
+    async def stop_at_file_mutation(**kwargs):
+        assert kwargs["content_preview"]["source"] == path
+        return "gate-passed"
+
+    monkeypatch.setattr(sandbox_tools, "_get_client_for_sandbox", get_sandbox_client)
+    monkeypatch.setattr(sandbox_tools, "_agent_file_view", file_view)
+    monkeypatch.setattr(sandbox_tools, "runtime_entity_file_root", lambda _entity_id: "/tmp/ent_1")
+    monkeypatch.setattr(sandbox_tools, "runtime_guard_file_mutation", stop_at_file_mutation)
+
+    result = await sandbox_tools._sandbox_save_result(
+        entity_id="ent_1",
+        sandbox_id="sb_1",
+        file_path=path,
+        filename=f"northstar.{kind}",
+        artifact_role="final",
+    )
+
+    assert result == "gate-passed"
+    assert report_path.replace("/skill/", f"/skills/{slot}/") in files
+
+
+@pytest.mark.asyncio
+async def test_save_result_reports_its_own_gate_disagreeing_as_a_retryable_platform_fault(
+    monkeypatch,
+) -> None:
+    """The server chose the gated file and report path, so a report naming
+    another file is Manor's fault: the ledger records a platform fault and
+    proves nothing was saved, which lets step resilience re-run the step."""
+    from packages.core.ai.runtime.tool_evidence import (
+        RuntimeToolEvidence,
+        runtime_unresolved_platform_error,
+    )
+
+    path = "/skill/projects/northstar/exports/northstar.docx"
+    report_path = "/skill/projects/northstar/qa/docx-quality.json"
+    content = b"final-docx-bytes"
+    report = _passing_docx_report(content, path="/skill/projects/other/exports/northstar.docx")
+
+    class Client:
+        async def exec(self, **_kwargs):
+            return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+        async def read_file_base64(self, *, sandbox_id, path, **_view):
+            payload = report if path == report_path else content
+            return SimpleNamespace(content_base64=base64.b64encode(payload).decode("ascii"))
+
+        async def close(self):
+            return None
+
+    async def get_sandbox_client(_sandbox_id: str):
+        return Client()
+
+    async def forbidden_mutation(**_kwargs):
+        raise AssertionError("a blocked DOCX must not reach filesystem mutation")
+
+    monkeypatch.setattr(sandbox_tools, "_get_client_for_sandbox", get_sandbox_client)
+    monkeypatch.setattr(sandbox_tools, "runtime_guard_file_mutation", forbidden_mutation)
+
+    result = await sandbox_tools._sandbox_save_result(
+        entity_id="ent_1",
+        sandbox_id="sb_1",
+        file_path=path,
+        filename="northstar.docx",
+        artifact_role="final",
+    )
+
+    assert "platform fault" in result and "Fix the source" not in result
+    evidence = RuntimeToolEvidence()
+    evidence.observe_tool_result("sandbox", "call-1", result, {"action": "save_result"})
+    state = evidence.checkpoint_state()
+    assert runtime_unresolved_platform_error(state)["code"] == "sandbox_quality_gate_blocked"
+    assert state["effect_state"] == "none"
+
+
+def test_gate_report_for_another_file_is_still_rejected() -> None:
+    path = "/skill/projects/northstar/exports/northstar.docx"
+    content = b"final-docx-bytes"
+    for elsewhere in (
+        "/skills/docx/projects/other/exports/northstar.docx",
+        "/skills/pptx/projects/northstar/exports/northstar.docx",
+    ):
+        error, _payload = sandbox_tools._docx_quality_evidence_error(
+            file_path=path,
+            content_bytes=content,
+            gate_exit_code=0,
+            report_bytes=_passing_docx_report(content, path=elsewhere),
+            skill_view="docx",
+        )
+        assert error == "the report points to a different DOCX path"
+
+
+@pytest.mark.asyncio
 async def test_save_result_rejects_final_pptx_outside_canonical_project_export(monkeypatch) -> None:
     monkeypatch.setattr(
         sandbox_tools,

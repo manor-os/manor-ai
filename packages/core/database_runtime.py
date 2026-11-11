@@ -365,30 +365,54 @@ class DatabaseSession(Session):
         _release_admission(self, None)
 
 
-@event.listens_for(DatabaseSession, "do_orm_execute")
-def _track_statement(state):
-    statement = state.statement
+def _select_may_write(statement) -> bool:
     # Only the catalog-qualified text functions used by Skill slug lookup are
     # audited reads. Unqualified/custom functions may mutate state or lock.
     # Inspect every descendant: an outer read can wrap a locking subquery,
     # a write CTE, raw SQL or an unknown function.
-    if (
-        not state.is_select
-        or any(
-            isinstance(node, (TextClause, UpdateBase))
-            or (isinstance(node, ColumnClause) and node.is_literal)
-            or getattr(node, "_for_update_arg", None) is not None
-            or (
-                isinstance(node, FunctionElement)
-                and not (
-                    getattr(node, "packagenames", ()) == ("pg_catalog",)
-                    and getattr(node, "name", None) in {"lower", "replace"}
-                )
+    return any(
+        isinstance(node, (TextClause, UpdateBase))
+        or (isinstance(node, ColumnClause) and node.is_literal)
+        or getattr(node, "_for_update_arg", None) is not None
+        or (
+            isinstance(node, FunctionElement)
+            and not (
+                getattr(node, "packagenames", ()) == ("pg_catalog",)
+                and getattr(node, "name", None) in {"lower", "replace"}
             )
-            for node in visitors.iterate(statement)
         )
-    ):
-        state.session.info["database_non_read_transaction"] = True
+        for node in visitors.iterate(statement)
+    )
+
+
+# The answer depends only on a statement's structure, which its cache key
+# holds (bound values are not part of it). SQLAlchemy memoizes the key on the
+# statement and compiles from it, so one walk per statement shape suffices.
+_SELECT_MAY_WRITE: dict[tuple, bool] = {}
+_SELECT_MAY_WRITE_LIMIT = 4096
+
+
+@event.listens_for(DatabaseSession, "do_orm_execute")
+def _track_statement(state):
+    info = state.session.info
+    if info.get("database_non_read_transaction"):
+        return
+    if not state.is_select:
+        info["database_non_read_transaction"] = True
+        return
+    statement = state.statement
+    cache_key = statement._generate_cache_key()
+    if cache_key is None:
+        may_write = _select_may_write(statement)
+    else:
+        may_write = _SELECT_MAY_WRITE.get(cache_key.key)
+        if may_write is None:
+            may_write = _select_may_write(statement)
+            if len(_SELECT_MAY_WRITE) >= _SELECT_MAY_WRITE_LIMIT:
+                _SELECT_MAY_WRITE.pop(next(iter(_SELECT_MAY_WRITE)))
+            _SELECT_MAY_WRITE[cache_key.key] = may_write
+    if may_write:
+        info["database_non_read_transaction"] = True
 
 
 @event.listens_for(DatabaseSession, "before_flush")

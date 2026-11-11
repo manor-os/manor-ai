@@ -529,24 +529,13 @@ async def _resolve_workspace_flagged_integrations(
     )
 
 
-_WEEKDAY_CRON: dict[str, str] = {
-    "sunday": "0",
-    "sun": "0",
-    "monday": "1",
-    "mon": "1",
-    "tuesday": "2",
-    "tue": "2",
-    "tues": "2",
-    "wednesday": "3",
-    "wed": "3",
-    "thursday": "4",
-    "thu": "4",
-    "thurs": "4",
-    "friday": "5",
-    "fri": "5",
-    "saturday": "6",
-    "sat": "6",
-}
+async def _user_timezone(db: AsyncSession, user_id: str | None) -> str:
+    """The creator's timezone for cadences that do not name one."""
+    if not user_id:
+        return "UTC"
+    from packages.core.models.user import User
+
+    return str(await db.scalar(select(User.timezone).where(User.id == user_id)) or "UTC")
 
 
 def _automation_slug(value: Any, fallback: str = "automation") -> str:
@@ -567,101 +556,6 @@ def _automation_display_name(automation: dict[str, Any], index: int) -> str:
     return str(raw).replace("_", " ").replace("-", " ").strip().title()
 
 
-def _automation_time(text: str) -> tuple[int, int]:
-    match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", text, flags=re.I)
-    if match:
-        hour = int(match.group(1))
-        minute = int(match.group(2) or 0)
-        meridiem = match.group(3).lower()
-        if meridiem == "pm" and hour < 12:
-            hour += 12
-        if meridiem == "am" and hour == 12:
-            hour = 0
-        return hour % 24, max(0, min(minute, 59))
-
-    match = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", text)
-    if match:
-        return int(match.group(1)), int(match.group(2))
-
-    if "afternoon" in text:
-        return 13, 0
-    if "evening" in text:
-        return 17, 0
-    return 9, 0
-
-
-def _looks_like_cron_expr(value: Any) -> bool:
-    if not isinstance(value, str):
-        return False
-    parts = value.strip().split()
-    if len(parts) != 5:
-        return False
-    field_re = re.compile(r"^(\*|\*/\d+|\d{1,2}(?:-\d{1,2})?(?:,\d{1,2}(?:-\d{1,2})?)*)$")
-    return all(field_re.match(part) for part in parts)
-
-
-def _find_cron_expr(text: str) -> str | None:
-    if _looks_like_cron_expr(text):
-        return text.strip()
-    tokens = text.split()
-    for i in range(0, max(0, len(tokens) - 4)):
-        candidate = " ".join(tokens[i:i + 5])
-        if _looks_like_cron_expr(candidate):
-            return candidate
-    return None
-
-
-def _automation_schedule(automation: dict[str, Any]) -> tuple[str, str, str | None, float | None]:
-    """Translate loose workspace-draft automation cadence into ScheduledJob fields."""
-    direct_cron = automation.get("cron_expr") or automation.get("cron")
-    if _looks_like_cron_expr(direct_cron):
-        return "cron", "cron", direct_cron.strip(), None
-
-    text = " ".join(
-        str(automation.get(key) or "")
-        for key in ("schedule", "cadence", "trigger", "description")
-    ).strip()
-    lowered = text.lower()
-
-    cron_expr = _find_cron_expr(text)
-    if cron_expr:
-        return "cron", "cron", cron_expr, None
-
-    every_match = re.search(
-        r"\bevery\s+(\d+)\s*(minute|minutes|min|mins|m|hour|hours|hr|hrs|h|day|days|d)\b",
-        lowered,
-    )
-    if every_match:
-        amount = int(every_match.group(1))
-        unit = every_match.group(2)
-        if unit.startswith(("minute", "min")) or unit == "m":
-            return "interval", "every", None, float(amount * 60)
-        if unit.startswith(("hour", "hr")) or unit == "h":
-            return "interval", "every", None, float(amount * 3600)
-        return "interval", "every", None, float(amount * 86400)
-
-    if "hourly" in lowered or "every hour" in lowered:
-        return "interval", "every", None, 3600.0
-
-    hour, minute = _automation_time(lowered)
-    weekday_hits = [
-        cron
-        for name, cron in _WEEKDAY_CRON.items()
-        if re.search(rf"\b{name}\b", lowered)
-    ]
-    if "weekday" in lowered or "business day" in lowered:
-        return "cron", "cron", f"{minute} {hour} * * 1-5", None
-    if weekday_hits:
-        days = ",".join(sorted(set(weekday_hits), key=int))
-        return "cron", "cron", f"{minute} {hour} * * {days}", None
-    if "weekly" in lowered or "each week" in lowered:
-        return "cron", "cron", f"{minute} {hour} * * 1", None
-    if "monthly" in lowered or "each month" in lowered:
-        return "cron", "cron", f"{minute} {hour} 1 * *", None
-
-    return "cron", "cron", f"{minute} {hour} * * *", None
-
-
 async def _install_workspace_draft_automations(
     db: AsyncSession,
     *,
@@ -671,12 +565,20 @@ async def _install_workspace_draft_automations(
     sub_by_service: dict[str, dict[str, str]],
     created_subs: list[dict[str, str]],
     user_id: str | None,
+    default_timezone: str = "UTC",
 ) -> int:
-    """Turn setup-draft automations into real workspace-scoped scheduled jobs."""
+    """Turn setup-draft automations into real workspace-scoped scheduled jobs.
+
+    The schedule comes from the automation's structured cron/interval or its
+    trigger words, in its own timezone or the creator's. An automation whose
+    cadence cannot be read is not scheduled: guessing a daily run would
+    silently change what the user asked for. Draft lint reports it first.
+    """
     if not automations:
         return 0
 
     from packages.core.models.scheduler import ScheduledJob
+    from packages.core.schedule_cadence import automation_cadence, automation_timezone
     from packages.core.services.scheduler_service import create_scheduled_job
 
     created = 0
@@ -732,7 +634,17 @@ async def _install_workspace_draft_automations(
             created += 1
             continue
 
-        job_type, schedule_kind, cron_expr, every_seconds = _automation_schedule(raw)
+        try:
+            cadence = automation_cadence(raw)
+            timezone_name = automation_timezone(raw, default=default_timezone)
+        except (TypeError, ValueError):
+            cadence = None
+        if cadence is None:
+            logger.warning(
+                "Workspace %s automation %r has no readable schedule; not scheduled",
+                workspace_id, key,
+            )
+            continue
         name = _automation_display_name(raw, idx)
         trigger = str(raw.get("trigger") or raw.get("schedule") or "").strip()
         description = str(raw.get("description") or "").strip()
@@ -756,11 +668,11 @@ async def _install_workspace_draft_automations(
             entity_id,
             job_id,
             name,
-            job_type=job_type,
-            schedule_kind=schedule_kind,
-            cron_expr=cron_expr,
-            every_seconds=every_seconds,
-            timezone_str="UTC",
+            job_type=cadence.job_type,
+            schedule_kind=cadence.schedule_kind,
+            cron_expr=cadence.cron_expr,
+            every_seconds=cadence.every_seconds,
+            timezone_str=timezone_name,
             payload_message="\n".join(prompt_parts),
             agent_id=agent_id,
             execution_type="agent",
@@ -799,9 +711,10 @@ async def _attach_draft_sources_to_group(
     source_ids: list[str],
 ) -> None:
     """Add draft sources to a knowledge net: documents as members, links as markdown docs."""
-    from packages.core.models.document import Document, DocumentGroupMember
+    from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
     from packages.core.services.document_metadata import merge_document_metadata
     from packages.core.services import knowledge_starter
+    from packages.core.services.entity_fs import EntityFilesystemError
     from packages.core.services.workspace_draft_sources import find_source
 
     wanted = list(dict.fromkeys(str(s).strip() for s in source_ids if str(s or "").strip()))
@@ -810,6 +723,7 @@ async def _attach_draft_sources_to_group(
     existing_members = set((await db.execute(
         select(DocumentGroupMember.document_id).where(DocumentGroupMember.group_id == group_id)
     )).scalars().all())
+    unstored_source_ids: list[str] = []
     for source_id in wanted:
         source = find_source(session.fields, source_id)
         if not source or source.get("status") != "ready":
@@ -833,19 +747,31 @@ async def _attach_draft_sources_to_group(
                 f"# {source.get('name') or url}\n\nSource: {url}\n\n"
                 f"{str(source.get('text') or '').strip()}"
             )
-            doc = await knowledge_starter.write_markdown_document(
-                db,
-                entity_id=session.entity_id,
-                name=_link_document_name(url),
-                content=body,
-                source="workspace_draft_link",
-                metadata=merge_document_metadata(
-                    origin={"workspace_id": workspace_id, "url": url, "tool_name": "workspace_draft_source"},
-                    extra={"draft_source_id": source_id},
-                ),
-            )
+            try:
+                doc = await knowledge_starter.write_markdown_document(
+                    db,
+                    entity_id=session.entity_id,
+                    name=_link_document_name(url),
+                    content=body,
+                    source="workspace_draft_link",
+                    metadata=merge_document_metadata(
+                        origin={"workspace_id": workspace_id, "url": url, "tool_name": "workspace_draft_source"},
+                        extra={"draft_source_id": source_id},
+                    ),
+                )
+            except (EntityFilesystemError, OSError):
+                # Storage is the platform's fault: the Workspace is still created,
+                # and post-commit dispatch reports what was left out to ops.
+                logger.warning("Could not store draft link source %s", source_id, exc_info=True)
+                unstored_source_ids.append(source_id)
+                continue
             db.add(DocumentGroupMember(document_id=doc.id, group_id=group_id))
             existing_members.add(doc.id)
+    if unstored_source_ids:
+        group = (await db.execute(
+            select(DocumentGroup).where(DocumentGroup.id == group_id)
+        )).scalar_one()
+        group.settings = {**(group.settings or {}), "unstored_source_ids": unstored_source_ids}
 
 
 def _should_generate_starter_doc(attachment: dict[str, Any], mode: str) -> bool:
@@ -1490,6 +1416,17 @@ async def finalize_setup(
 
     _report("agents_done", count=len(created_subs))
 
+    # The operating model records the deployment, not the draft's design: a
+    # create_custom row left here is read back by whole-model saves (the Rules
+    # page) as a request for another Agent. Fresh dict, as for knowledge below.
+    from packages.core.services.workspace_service import get_workspace_agent_mappings
+
+    operating_model = {
+        **operating_model,
+        "agent_mappings": await get_workspace_agent_mappings(db, workspace_id, session.entity_id),
+    }
+    workspace.operating_model = operating_model
+
     _report("provisioning_team_and_knowledge")
 
     # ── Staff assignments ──
@@ -1548,6 +1485,7 @@ async def finalize_setup(
                         existing.settings,
                         group_name=existing.name,
                         status="scheduled",
+                        outline=ka.get("starter_outline"),
                     )
                     excerpt = _draft_source_excerpt(fields, ka.get("source_ids") or [])
                     if excerpt:
@@ -1593,6 +1531,7 @@ async def finalize_setup(
                         settings,
                         group_name=name,
                         status="scheduled",
+                        outline=ka.get("starter_outline"),
                     )
                     excerpt = _draft_source_excerpt(fields, ka.get("source_ids") or [])
                     if excerpt:
@@ -1671,6 +1610,7 @@ async def finalize_setup(
                 group_settings,
                 group_name=kname,
                 status="scheduled",
+                outline=ka.get("starter_outline"),
             )
             excerpt = _draft_source_excerpt(fields, ka.get("source_ids") or [])
             if excerpt:
@@ -1794,8 +1734,12 @@ async def finalize_setup(
     # Built-in channel types that don't need external integrations
     from packages.core.services.workspace_readiness import BUILT_IN_CHANNEL_TYPES
 
-    created_channel_configs: list[tuple[str, str, str, str]] = []
-    # (channel_config_id, ch_type, linked_service_key, public_token_or_empty)
+    from packages.core.services.workspace_channel_routes import (
+        new_workspace_channel_binding,
+        new_workspace_channel_config,
+    )
+
+    created_channel_configs: list[ChannelConfig] = []
 
     def _mk_channel(role: str, block: Dict[str, Any]) -> None:
         ch_type = str((block or {}).get("channel_type") or "").strip()
@@ -1839,34 +1783,16 @@ async def finalize_setup(
                 flagged_providers.add(resolved_provider.provider)
             return  # Don't create — just flag
 
-        cc_id = generate_ulid()
-        linked_service_key = block.get("linked_service_key") or ""
-
-        # Webchat channels get a public access token for QR/link sharing
-        import secrets
-        public_token = secrets.token_urlsafe(24) if ch_type == "webchat" else ""
-
-        channel_config = {
-            "role": role,
-            "purpose": block.get("purpose", ""),
-            "login_required": bool(block.get("login_required", False)),
-            "linked_service_key": linked_service_key,
-            "notes": block.get("notes", ""),
-        }
-        if public_token:
-            channel_config["public_token"] = public_token
-
-        db.add(ChannelConfig(
-            id=cc_id,
+        channel_config = new_workspace_channel_config(
             entity_id=session.entity_id,
-            owner_user_id=session.user_id if ch_type == "webchat" else None,
+            user_id=session.user_id,
             workspace_id=workspace_id,
-            channel_type=ch_type,
-            provider=provider,
-            name=block.get("name") or f"{role}: {ch_type}",
-            config=channel_config,
-        ))
-        created_channel_configs.append((cc_id, ch_type, linked_service_key, public_token))
+            role=role,
+            block=block,
+        )
+        db.add(channel_config)
+        created_channel_configs.append(channel_config)
+        linked_service_key = block.get("linked_service_key") or ""
 
         # If the architect didn't already flag this provider AND it's
         # not the always-internal chat, surface it as needs-setup so
@@ -1928,31 +1854,19 @@ async def finalize_setup(
     # ChannelConfig to an AgentSubscription so inbound messages route
     # to the right agent. Without these, the channel_gateway has no
     # binding and drops inbound messages.
-    from packages.core.models.document import Channel
-    for cc_id, ch_type, linked_sk, public_token in created_channel_configs:
+    for channel_config in created_channel_configs:
         # Find the subscription that handles this channel's linked service
+        linked_sk = (channel_config.config or {}).get("linked_service_key")
         matched_sub = sub_by_service.get(linked_sk) if linked_sk else None
         # Fallback: use the first subscription (primary agent)
         if not matched_sub and created_subs:
             matched_sub = created_subs[0]
 
-        channel_config_data: Dict[str, Any] = {
-            "channel_config_id": cc_id,
-        }
-        if public_token:
-            channel_config_data["public_token"] = public_token
-
-        db.add(Channel(
-            id=generate_ulid(),
-            entity_id=session.entity_id,
-            user_id=session.user_id if ch_type == "webchat" else None,
-            workspace_id=workspace_id,
-            type=ch_type,
-            name=ch_type,
+        db.add(new_workspace_channel_binding(
+            channel_config,
+            user_id=session.user_id,
             agent_id=matched_sub["agent_id"] if matched_sub else None,
             agent_subscription_id=matched_sub["subscription_id"] if matched_sub else None,
-            config=channel_config_data,
-            status="active",
         ))
 
     await db.flush()
@@ -1967,6 +1881,7 @@ async def finalize_setup(
             sub_by_service=sub_by_service,
             created_subs=created_subs,
             user_id=session.user_id,
+            default_timezone=await _user_timezone(db, session.user_id),
         )
     except Exception as exc:
         logger.exception("Failed to install workspace draft automations for %s", workspace_id)
@@ -2135,6 +2050,20 @@ async def finalize_setup(
         ws_settings = dict(workspace.settings or {})
         ws_settings["flagged_integrations"] = flagged
         workspace.settings = ws_settings
+    # A requested integration that is not connected stays a pending
+    # requirement; ask the owner to connect it right where they land.
+    await db.flush()
+    try:
+        from packages.core.services.workspace_connection_status import ask_to_connect_pending_integrations
+
+        async with db.begin_nested():
+            asked = await ask_to_connect_pending_integrations(
+                db, workspace=workspace, user_id=session.user_id, publish_event=False,
+            )
+        if asked:
+            _report("connection_questions_posted", providers=asked)
+    except Exception:
+        logger.exception("Failed to ask to connect pending integrations for %s", workspace_id)
 
     # Seed generated workspace state/file caches after goals, agents, knowledge,
     # and integration hints exist so the first Strategist run has a useful map.
@@ -2216,6 +2145,14 @@ async def finalize_setup(
         if not declared_service_keys or not created_subs:
             missing_runtime_parts.append("executable_services")
         _report("runtime_needs_setup", missing=missing_runtime_parts)
+
+    # Automations were created while the Workspace was still provisioning, so
+    # the scheduler held them. The shared lifecycle contract releases them
+    # now that the Workspace has its final state (a paused Workspace keeps
+    # its autonomy Jobs held until it is started).
+    from packages.core.services.scheduler_service import release_workspace_held_jobs
+
+    await release_workspace_held_jobs(db, workspace)
 
     # NOTE: previously this seeded a "Review and configure {workspace}"
     # starter task to nudge the user. Removed — the wizard already walks
@@ -2518,6 +2455,16 @@ async def dispatch_workspace_post_commit(
         )
     )).scalars().all())
     for group in groups:
+        unstored_source_ids = (group.settings or {}).get("unstored_source_ids")
+        if unstored_source_ids:
+            from packages.core.services.platform_faults import report_platform_fault
+
+            await report_platform_fault(
+                target=f"workspace:{workspace.id}",
+                code="knowledge_draft_source_not_stored",
+                summary="Draft link sources could not be stored when this Workspace was created.",
+                context={"group_id": group.id, "source_ids": unstored_source_ids},
+            )
         starter = dict((group.settings or {}).get("starter_document") or {})
         if str(starter.get("status") or "").lower() != "scheduled":
             continue
@@ -2533,6 +2480,7 @@ async def dispatch_workspace_post_commit(
                 workspace.primary_work or "",
                 starter.get("task_key"),
                 starter.get("source_excerpt"),
+                starter.get("outline"),
             )
             starter_documents_dispatched += 1
         except Exception as exc:

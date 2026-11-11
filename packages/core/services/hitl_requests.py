@@ -115,6 +115,16 @@ async def mark_hitl_request_resolved(
 
     if not hitl_id:
         return 0
+    if normalize_approval_choice(choice) == APPROVAL_CHOICE_APPROVE:
+        # "Always allow" saved its rule from this card, then approved: the
+        # card says what the person chose, not the approve that followed.
+        from packages.core.models.hitl_request import HitlRequest
+
+        context = (await db.execute(
+            select(HitlRequest.context).where(HitlRequest.id == str(hitl_id))
+        )).scalar_one_or_none()
+        if isinstance(context, dict) and context.get("rule_command"):
+            choice = "approve_and_save_rule"
     rows = list((await db.execute(
         select(Message)
         .where(

@@ -150,6 +150,40 @@ async def test_upgrade_and_undo_preserve_identity_history_and_new_local_assets(d
         await reconfigure.revert(db_session, workspace=workspace, by_user_id=None, actor=None)
 
 
+@pytest.mark.parametrize("legacy_receipt", [False, True])
+async def test_reviewed_upgrade_refreshes_guide_and_undo_tracks_only_owned_metadata(db_session, legacy_receipt):
+    workspace, source = await installed(db_session)
+    old_guide = workspace.settings["_blueprint"].get("usage_guide")
+    source["manifest"]["usage_guide"] = "Review the product announcement before publishing."
+    reviewed = await preview(db_session, workspace, source)
+    original_guide = source["manifest"]["usage_guide"]
+    source["manifest"]["usage_guide"] = "Changed after preview."
+    with pytest.raises(BlueprintUpgradePlanChangedError):
+        await apply_reviewed(db_session, workspace, source, reviewed)
+    source["manifest"]["usage_guide"] = original_guide
+    await apply_reviewed(db_session, workspace, source, reviewed)
+    assert workspace.settings["_blueprint"]["usage_guide"] == source["manifest"]["usage_guide"]
+    upgraded = copy.deepcopy(workspace.settings)
+    changed = copy.deepcopy(upgraded)
+    changed["_blueprint"]["usage_guide"] = "Later operator guide."
+    workspace.settings = changed
+    await db_session.flush()
+    if legacy_receipt:
+        state = await db_session.get(WorkspaceBlueprintUpgradeState, workspace.id)
+        receipt = copy.deepcopy(state.restore_point)
+        for side in ("metadata_before", "metadata_after"):
+            receipt[side].pop("usage_guide", None)
+        state.restore_point = receipt
+        await db_session.flush()
+    else:
+        with pytest.raises(BlueprintUpgradePlanChangedError):
+            await reconfigure.revert(db_session, workspace=workspace, by_user_id=None, actor=None)
+        workspace.settings = upgraded
+        await db_session.flush()
+    await reconfigure.revert(db_session, workspace=workspace, by_user_id=None, actor=None)
+    assert workspace.settings["_blueprint"].get("usage_guide") == ("Later operator guide." if legacy_receipt else old_guide)
+
+
 async def test_active_task_blocks_apply_without_cancelling_it(db_session):
     workspace, source = await installed(db_session)
     task = Task(entity_id=workspace.entity_id, workspace_id=workspace.id, title="Rendering now", status="in_progress")
@@ -370,7 +404,13 @@ async def test_legacy_full_upgrade_and_revert_preserve_mcp_policy_after_v3_inval
         "config_fields_to_set": [], "required": False, "install_blocking": False,
     }]
 
-    await revert_legacy(db_session, workspace=workspace)
+    # The legacy undo shares the state row with v3 receipts: invalidating the
+    # v3 receipt keeps it, and only the legacy revert may spend it.
+    with pytest.raises(BlueprintUpgradePlanChangedError, match="no applied upgrade"):
+        await reconfigure.revert(db_session, workspace=workspace, by_user_id=None, actor=None)
+    undo = await revert_legacy(db_session, workspace=workspace)
+    assert undo["reverted"]
+    assert (await db_session.get(WorkspaceBlueprintUpgradeState, workspace.id)).restore_point is None
     assert await _export_mcp_requirement(db_session, workspace) == [{
         "slug": "optional-reconfigure-mcp", "purpose": None,
         "config_fields_to_set": [], "required": False, "install_blocking": False,
@@ -489,6 +529,8 @@ async def test_api_keep_runtime_preflights_retained_contract(monkeypatch):
     monkeypatch.setattr(reconfigure, "apply", apply)
     preflight = AsyncMock(return_value={"ready": True, "requirements": []})
     monkeypatch.setattr(routes, "_blueprint_upgrade_setup_preflight", preflight)
+    from packages.core.services import workspace_update_offer
+    monkeypatch.setattr(workspace_update_offer, "close_update_cards", AsyncMock(return_value=0))
     request = routes.BlueprintReconfigurationApplyRequest(
         expected_blueprint_fingerprint="source", expected_plan_fingerprint="plan",
         configuration_resolutions=[{"key": reconfigure.RUNTIME_KEY, "resolution": "keep_yours"}],

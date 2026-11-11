@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 from sqlalchemy import select, update
 from sqlalchemy.orm.attributes import set_committed_value
-from sqlalchemy.orm import load_only
 
 from packages.core.models.task import Conversation, Message
 from packages.core.workspace_chat.pending_actions import _sources
@@ -67,13 +67,22 @@ async def list_workspace_attention(db, *, user: User, workspace_id: str, unread_
     ids = {mid for d in visible for mid in d['messages']}
     if not ids:
         return {'items': []}
-    messages = (await db.execute(select(Message).options(load_only(
-        Message.id, Message.pending_action, Message.meta, Message.content, Message.created_at,
-        Message.resolved_at,
-    )).join(Conversation, Conversation.id == Message.conversation_id).where(
-        Message.id.in_(ids), Conversation.workspace_id == workspace_id,
-        Conversation.entity_id == user.entity_id,
-    ).order_by(Message.created_at.desc(), Message.id.desc()))).scalars().all()
+    # Only the card fields: a Workflow card's metadata carries its whole step list.
+    messages = [
+        SimpleNamespace(
+            id=message_id, pending_action=pending_action, meta={"hitl_requests": hitl_requests},
+            content=content, created_at=created_at, resolved_at=resolved_at,
+        )
+        for message_id, pending_action, hitl_requests, content, created_at, resolved_at in (await db.execute(
+            select(
+                Message.id, Message.pending_action, Message.meta["hitl_requests"], Message.content,
+                Message.created_at, Message.resolved_at,
+            ).join(Conversation, Conversation.id == Message.conversation_id).where(
+                Message.id.in_(ids), Conversation.workspace_id == workspace_id,
+                Conversation.entity_id == user.entity_id,
+            ).order_by(Message.created_at.desc(), Message.id.desc())
+        )).all()
+    ]
     items = []
     for decision in visible:
         message = next((m for m in messages if m.id in decision['messages']), None)
@@ -101,6 +110,15 @@ async def list_workspace_attention(db, *, user: User, workspace_id: str, unread_
             'key': decision['key'], 'message_id': message.id, 'source_id': source_id,
             'kind': str(action.get('kind') or action.get('type') or 'input'),
             'summary': ' '.join(summary.split())[:240], 'created_at': message.created_at,
+            # A connect request duplicates a connection requirement surfaces list.
+            'connection_provider': (
+                str(action.get('provider_key') or '') or None
+                if action.get('connection_request') else None
+            ),
+            # The run that waits on this card, and the run that hosts it (a sub-flow's
+            # parent), so a run's own page can offer the decision it is waiting on.
+            'workflow_run_id': str(action.get('workflow_run_id') or '') or None,
+            'workflow_host_run_id': str(action.get('workflow_chat_host_run_id') or '') or None,
         })
     items.sort(key=lambda item: (item['created_at'], item['message_id']), reverse=True)
     return {'items': items}

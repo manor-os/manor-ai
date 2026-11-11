@@ -31,7 +31,7 @@ def steps(skill):
                 "tool": "manor", "args": {"skill_id": skill}}}],
         }, "chat_projection": "support", "next": ["dynamic"]},
         {"id": "dynamic", "type": "tool", "config": {
-            "tool": "manor", "args": {"skill_id": "{{inputs.skill_id}}"}}, "next": []},
+            "tool": "manor", "args": {"skill_id": "{{skill_id}}"}}, "next": []},
     ]
 
 
@@ -74,7 +74,7 @@ async def test_workflow_only_skill_installs_with_new_identity_and_roundtrips(db_
     portable = payload["recipe"]["workflows"][0]["steps"]
     args = portable[1]["config"]["args"]
     assert args == {"skill_refs": [{"field": "skill", "target": {"skill_component_key": skill.slug}}]}
-    assert portable[2]["config"]["args"]["skill_id"] == "{{inputs.skill_id}}"
+    assert portable[2]["config"]["args"]["skill_id"] == "{{skill_id}}"
     customer = await account(db_session)
     installed = await install_blueprint(db_session, entity_id=customer, payload=payload, mode=mode)
     target_skill = await db_session.scalar(select(Skill).where(Skill.workspace_id == installed.workspace_id))

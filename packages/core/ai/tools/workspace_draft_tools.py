@@ -91,17 +91,22 @@ async def _start_workspace_draft_handler(
         user_id=runtime_context.user_id or user_id,
         initial_brief=kwargs.get("initial_brief"),
         runtime_envelope=runtime_context.runtime_envelope,
+        active_user_message=runtime_context.active_user_message,
     )
 
 
 async def _continue_workspace_draft_handler(
     entity_id: str = "", user_id: str = "", **kwargs: Any,
 ) -> str:
+    runtime_context = runtime_tool_call_context_from_kwargs(
+        kwargs, entity_id=entity_id, user_id=user_id,
+    )
     return await runtime_continue_workspace_draft_action(
         entity_id=entity_id,
         user_id=user_id,
         draft_id=str(kwargs.get("draft_id") or ""),
         message=str(kwargs.get("message") or ""),
+        active_user_message=runtime_context.active_user_message,
     )
 
 

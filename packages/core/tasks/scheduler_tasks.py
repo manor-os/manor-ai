@@ -46,6 +46,12 @@ from packages.core.tasks._runtime import run_in_worker as _run_async
 
 logger = logging.getLogger(__name__)
 
+_CHAT_DELIVERY_NOTE = (
+    "The platform posts your final reply to this Workspace's chat, which is how this "
+    "result reaches its people. Write the reply for them; do not send it another way "
+    "or mention its delivery."
+)
+
 
 INTERVAL_SCHEDULE_KINDS = ("every", "interval")
 
@@ -527,6 +533,22 @@ async def _async_tick():
             )
 
 
+async def _owner_project_ended(db, job) -> bool:
+    """Whether the project that owns this job has ended or been cancelled."""
+    owner_project_id = str(getattr(job, "owner_project_id", "") or "").strip()
+    if not owner_project_id:
+        return False
+    from sqlalchemy import select
+
+    from packages.core.models.workflow import WorkflowProject
+    from packages.core.services.workflow_project_service import PROJECT_END_STAGES
+
+    stage = await db.scalar(select(WorkflowProject.current_stage).where(
+        WorkflowProject.id == owner_project_id, WorkflowProject.entity_id == job.entity_id,
+    ))
+    return stage in PROJECT_END_STAGES
+
+
 async def _prepare_scheduler_parent_dispatch(
     job_db_id: str,
     now: datetime,
@@ -562,6 +584,12 @@ async def _prepare_scheduler_parent_dispatch(
             await db.rollback()
             return None
         if job.stop_after is not None and _as_aware_utc(job.stop_after) <= _as_aware_utc(now):
+            job.enabled, job.next_run_at = False, None
+            await db.commit()
+            return None
+        if await _owner_project_ended(db, job):
+            # Ending the project retires its jobs; this catches one that was
+            # ended some other way, before it runs again.
             job.enabled, job.next_run_at = False, None
             await db.commit()
             return None
@@ -660,6 +688,7 @@ async def dispatch_job_occurrence(
     trigger_detail: str | None = None,
     allow_disabled_agent_initiative: bool = False,
     requesting_user_id: str | None = None,
+    preapproved: dict[str, str] | None = None,
 ) -> ScheduledOccurrenceDispatch | None:
     """Commit and publish one explicit idempotent scheduler occurrence."""
 
@@ -743,6 +772,8 @@ async def dispatch_job_occurrence(
                     "manual": True,
                     "occurrence_key": clean_key,
                     "allow_disabled_agent_initiative": disabled_initiative_allowed,
+                    **({"preapproved": {"responses": dict(preapproved), "user_id": requesting_user_id}}
+                       if preapproved and manual_request else {}),
                 },
             )
             run.result = {
@@ -1764,6 +1795,7 @@ def _dispatch_job_task(
     manual: bool = False,
     occurrence_key: str | None = None,
     allow_disabled_agent_initiative: bool = False,
+    preapproved: dict | None = None,
     _terminal_failure_error: str | None = None,
     _terminal_persistence_retry_limit: int | None = None,
 ):
@@ -1789,6 +1821,7 @@ def _dispatch_job_task(
                     manual=manual,
                     occurrence_key=occurrence_key,
                     allow_disabled_agent_initiative=allow_disabled_agent_initiative,
+                    preapproved=preapproved,
                 )
             )
             return
@@ -1813,6 +1846,7 @@ def _dispatch_job_task(
                         manual=manual,
                         occurrence_key=occurrence_key,
                         allow_disabled_agent_initiative=allow_disabled_agent_initiative,
+                        preapproved=preapproved,
                         allow_legacy_uncommitted_clock=True,
                     )
                 )
@@ -2433,6 +2467,7 @@ async def _async_dispatch_single(
     occurrence_key: str | None = None,
     allow_disabled_agent_initiative: bool = False,
     allow_legacy_uncommitted_clock: bool = False,
+    preapproved: dict | None = None,
 ):
     from packages.core.database import create_worker_session
     from sqlalchemy import select
@@ -2546,6 +2581,7 @@ async def _async_dispatch_single(
             now,
             manual=manual,
             occurrence_key=occurrence_key,
+            preapproved=preapproved,
         )
         if prepared is not None:
             dispatch, run_id = prepared
@@ -2859,6 +2895,7 @@ async def _dispatch_job(
     *,
     manual: bool = False,
     occurrence_key: str | None = None,
+    preapproved: dict | None = None,
 ):
     """Dispatch the appropriate execution for a job."""
     from packages.core.ai.runtime import (
@@ -3090,6 +3127,11 @@ async def _dispatch_job(
         await _mark_run_skipped("manual_requester_unavailable")
         return
 
+    if await _owner_project_ended(db, job):
+        # Run now included: no execution type may restart an ended project's work.
+        await _mark_run_error("The project this automation belongs to has ended.")
+        return
+
     entity_id = str(getattr(job, "entity_id", None) or "").strip()
     if not entity_id and _scheduled_job_requires_credit_gate(job):
         await _mark_run_error("scheduled job missing entity_id")
@@ -3231,11 +3273,32 @@ async def _dispatch_job(
             payload_message = experiment_patch["payload_message"]
         if "execution_script" in experiment_patch:
             execution_script = experiment_patch["execution_script"]
+    if initiative_admission is not None:
+        # The Initiative owns its prompt: render it from the admitted revision
+        # and the current contract, never from a copy stored on the driver.
+        from packages.core.services.agent_initiative_service import (
+            initiative_execution_script,
+        )
+
+        execution_script = initiative_execution_script(initiative_admission.initiative)
+        payload_message = None
     prompt = runtime_scheduled_job_prompt(
         execution_script=execution_script,
         payload_message=payload_message,
         name=job.name,
     ).prompt
+
+    from packages.core.services.scheduler_service import scheduled_job_delivery_mode
+
+    if (
+        prompt
+        and initiative_admission is None
+        and exec_type in {"agent", "orchestrator_prompt"}
+        and scheduled_job_delivery_mode(job) == "workspace_chat"
+    ):
+        # Asked to report and to confirm side effects, an Agent told the chat
+        # that its own delivery "could not be confirmed".
+        prompt = f"{prompt}\n\n{_CHAT_DELIVERY_NOTE}"
 
     # ── Dispatch based on execution_type ──
     prepared_dispatch: PreparedScheduledDispatch | None = None
@@ -3251,6 +3314,9 @@ async def _dispatch_job(
             )
             return
         trigger_data = dict(target)
+        if preapproved:
+            # A person's confirmed answer for this run's own waits, read once by the matching wait.
+            trigger_data["__preapproved"] = dict(preapproved)
         trigger_data.update({
             "payload_message": prompt,
             "scheduled_job_id": job.job_id,
@@ -3279,6 +3345,11 @@ async def _dispatch_job(
             )
         if conversation_id:
             trigger_data.setdefault("conversation_id", conversation_id)
+        if (conversation_id or workspace_id) and not human_requested and "_workflow_chat_origin" not in trigger_data:
+            # A decision the run stops for becomes a card in this chat.
+            from packages.core.services.workflow_chat_projection import scheduled_workflow_chat_origin
+
+            trigger_data["_workflow_chat_origin"] = scheduled_workflow_chat_origin(conversation_id, workspace_id)
         if job.manor_task_id:
             trigger_data.setdefault("task_id", job.manor_task_id)
         trusted_runtime_context = {
@@ -3692,6 +3763,10 @@ async def _dispatch_agent_task(
             "attempted through an available tool and the final answer must "
             "state whether it succeeded."
         )
+        from packages.core.services.scheduler_service import scheduled_job_delivery_mode
+
+        if scheduled_job_delivery_mode(job) == "workspace_chat":
+            done_when += " " + _CHAT_DELIVERY_NOTE
     deliverable = str(target.get("deliverable") or "").strip()
     if initiative_admission is not None:
         deliverable = (
@@ -3737,8 +3812,14 @@ async def _dispatch_agent_task(
             INITIATIVE_DECISION_RESULT_SCHEMA,
         )
 
+        from packages.core.services.agent_initiative_service import (
+            initiative_execution_script,
+        )
+
         marker = initiative_marker_for_admission(initiative_admission)
         details_base.update({
+            "execution_script": initiative_execution_script(initiative_admission.initiative),
+            "payload_message": None,
             "agent_initiative": marker.as_dict(),
             "blocked_tool_names": list(target.get("blocked_tool_names") or []),
             # The run submits its decision as the Task's structured result;

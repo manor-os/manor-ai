@@ -185,7 +185,7 @@ async function selectMode(page: Page, label: "Simple" | "Professional") {
 }
 
 async function openDisplaySettings(page: Page) {
-  await page.locator(".app-shell-sidebar").getByRole("button", { name: "More", exact: true }).click();
+  await page.locator(".app-shell-sidebar").getByRole("button", { name: "Interface Mode User", exact: true }).click();
   await page.getByRole("link", { name: "Settings", exact: true }).click();
   await page.getByRole("complementary", { name: "Settings navigation" })
     .getByRole("button", { name: "Appearance", exact: true }).click();
@@ -195,7 +195,7 @@ async function openMoreMenu(page: Page) {
   if ((page.viewportSize()?.width || 1280) < 1280 && !await page.locator(".sidebar-mobile.open").count()) {
     await page.locator(".mobile-hamburger").click();
   }
-  await page.locator(".app-shell-sidebar").getByRole("button", { name: "More", exact: true }).click();
+  await page.locator(".app-shell-sidebar").getByRole("button", { name: "Interface Mode User", exact: true }).click();
 }
 
 async function startUserGuide(page: Page) {
@@ -220,9 +220,9 @@ for (const width of [1280, 390]) {
       await expect(page.getByRole("dialog", { name: FIRST_RUN_TITLE, exact: true })).not.toBeVisible();
       if (mode === "simple") {
         await expect(page.getByText("Tell Manor what you need.", { exact: true })).toBeVisible();
-        await expect(page.getByRole("heading", { name: "Chat & Workspace", exact: true })).not.toBeVisible();
+        await expect(page.getByRole("heading", { name: "Where things live", exact: true })).not.toBeVisible();
       } else {
-        await expect(page.getByRole("heading", { name: "Chat & Workspace", exact: true })).toBeVisible();
+        await expect(page.getByRole("heading", { name: "Where things live", exact: true })).toBeVisible();
       }
       expect(await page.evaluate(() => localStorage.getItem("manor-interface-mode"))).toBe(mode);
       await page.getByRole("button", { name: "Skip", exact: true }).click();
@@ -240,11 +240,9 @@ for (const width of [1280, 390]) {
     await startUserGuide(page);
     const steps = [
       { title: "Chat", target: "[data-tour='chat-input'], .chat-composer" },
-      { title: "AI chats", target: "[data-tour='chat-sidebar-ai-chats']" },
+      { title: "Conversations", target: "[data-tour='chat-sidebar-ai-chats']" },
       { title: "Workspaces", target: "[data-tour='chat-sidebar-workspaces']" },
       { title: "Create Workspace", target: "[data-tour='create-workspace']" },
-      { title: "Group chats", target: "[data-tour='chat-sidebar-group']" },
-      { title: "Direct chats", target: "[data-tour='chat-sidebar-dm']" },
       { title: "More", target: "[data-tour='sidebar-more']" },
     ];
     for (const [index, step] of steps.entries()) {
@@ -292,24 +290,31 @@ for (const width of [1280, 390]) {
   });
 }
 
-test("the first interface choice preselects Simple and only persists after Save", async ({ page }) => {
+test("a new account starts in Professional without asking for an interface choice", async ({ page }) => {
   const state = await mockInterfaceApp(page);
-  await page.goto(`/chat?workspace=${WORKSPACE_ID}`);
-  const chooser = page.getByRole("dialog", { name: FIRST_RUN_TITLE, exact: true });
-  await expect(chooser).toBeVisible();
-  await expect(chooser.getByRole("radio", { name: "Simple", exact: true })).toBeChecked();
-  await expect(chooser.getByRole("radio", { name: "Professional", exact: true })).not.toBeChecked();
+  await page.goto("/chat");
+  await expect(page.locator('[role="textbox"][contenteditable="true"]')).toBeVisible();
+  await expect(page.getByRole("dialog", { name: FIRST_RUN_TITLE, exact: true })).not.toBeVisible();
+  await page.goto("/settings?tab=appearance");
+  const modes = page.getByRole("radiogroup", { name: "Interface mode", exact: true });
+  await expect(modes.getByRole("radio", { name: /^Professional/ })).toBeChecked();
+  // The default is not a saved browser choice; Settings is where people change it.
   expect(await page.evaluate(() => localStorage.getItem("manor-interface-mode"))).toBeNull();
-  await chooser.getByRole("button", { name: "Save", exact: true }).click();
-  await expect(chooser).not.toBeVisible();
-  await expect(page).toHaveURL(new RegExp(`/chat\\?workspace=${WORKSPACE_ID}$`));
-  await expect(page.getByText(RESPONSE, { exact: true })).toBeVisible();
-  expect(await page.evaluate(() => localStorage.getItem("manor-interface-mode"))).toBe("simple");
-  await page.reload();
-  await expect(page.getByText(RESPONSE, { exact: true })).toBeVisible();
-  await expect(chooser).not.toBeVisible();
-  await expect(page.locator('[role="textbox"][contenteditable="true"]'))
-    .toHaveAttribute("data-placeholder", "What would you like to do?");
+  expect(state.mutations).toEqual([]);
+  expect(state.errors).toEqual([]);
+});
+
+test("a first-time account is greeted with one question that fills the composer", async ({ page }) => {
+  const state = await mockInterfaceApp(page);
+  // No Workspaces yet: the account is brand new.
+  await page.route("**/api/v1/workspaces?*", (route) => route.fulfill({ json: [] }));
+  await page.goto("/chat");
+  // A new account cycles through example Workspaces in "Hand it to ___."
+  await expect(page.getByRole("heading", { name: /^Hand it to .+\.$/ })).toBeVisible();
+  const composer = page.locator('[role="textbox"][contenteditable="true"]');
+  await expect(composer).toHaveAttribute("data-placeholder", "Message Manor");
+  await page.getByRole("button", { name: "Café or restaurant", exact: true }).click();
+  await expect(composer).toHaveText("I run a café and want regulars to come back more often,");
   expect(state.mutations).toEqual([]);
   expect(state.errors).toEqual([]);
 });
@@ -328,53 +333,6 @@ test("an existing account defaults to Professional in a new browser without open
   expect(state.mutations).toEqual([]);
   expect(state.errors).toEqual([]);
 });
-
-test("the first interface choice can confirm Professional without changing the current route", async ({ page }) => {
-  const state = await mockInterfaceApp(page);
-  await page.goto("/settings?tab=appearance");
-  const chooser = page.getByRole("dialog", { name: FIRST_RUN_TITLE, exact: true });
-  await expect(chooser).toBeVisible();
-  await chooser.getByRole("radio", { name: "Professional", exact: true }).click();
-  await expect(chooser.getByRole("radio", { name: "Professional", exact: true })).toBeChecked();
-  await expect(chooser).toBeVisible();
-  expect(await page.evaluate(() => localStorage.getItem("manor-interface-mode"))).toBeNull();
-  await chooser.getByRole("button", { name: "Save", exact: true }).click();
-  await expect(chooser).not.toBeVisible();
-  await expect(page).toHaveURL(/\/settings\?tab=appearance$/);
-  const selector = page.getByRole("button", { name: "Interface mode", exact: true });
-  await expect(selector).toHaveText("Professional");
-  expect(await page.evaluate(() => localStorage.getItem("manor-interface-mode"))).toBe("professional");
-  await page.reload();
-  await expect(selector).toHaveText("Professional");
-  await expect(chooser).not.toBeVisible();
-  expect(state.mutations).toEqual([]);
-  expect(state.errors).toEqual([]);
-});
-
-for (const dismiss of ["Close", "Escape"] as const) {
-  test(`dismissing the first interface choice with ${dismiss} saves Simple`, async ({ page }) => {
-    const state = await mockInterfaceApp(page);
-    await page.goto("/settings?tab=appearance");
-    const chooser = page.getByRole("dialog", { name: FIRST_RUN_TITLE, exact: true });
-    await expect(chooser).toBeVisible();
-    await chooser.getByRole("radio", { name: "Professional", exact: true }).click();
-    await expect(chooser.getByRole("radio", { name: "Professional", exact: true })).toBeChecked();
-    if (dismiss === "Close") {
-      await chooser.getByRole("button", { name: "Close", exact: true }).click();
-    } else {
-      await page.keyboard.press("Escape");
-    }
-    await expect(chooser).not.toBeVisible();
-    const selector = page.getByRole("button", { name: "Interface mode", exact: true });
-    await expect(selector).toHaveText("Simple");
-    expect(await page.evaluate(() => localStorage.getItem("manor-interface-mode"))).toBe("simple");
-    await page.reload();
-    await expect(selector).toHaveText("Simple");
-    await expect(chooser).not.toBeVisible();
-    expect(state.mutations).toEqual([]);
-    expect(state.errors).toEqual([]);
-  });
-}
 
 for (const mode of ["simple", "professional"] as const) {
   test(`a saved ${mode} preference skips the first interface choice`, async ({ page }) => {
@@ -477,4 +435,44 @@ test("simple chat retains blocking setup information and the exact repair destin
   );
   expect(state.mutations).toEqual([]);
   expect(state.errors).toEqual([]);
+});
+
+test("settings chat history preserves a channel link and customer chat actions", async ({ page }) => {
+  await mockInterfaceApp(page);
+  const chatPath = `/api/v1/chat/conversations/${CONVERSATION_ID}`;
+  const conversation = { id: CONVERSATION_ID, channel: "webchat", title: "webchat: Taylor" };
+  let deleted = false;
+  await page.route("**/api/v1/chat/conversations?**", (route) => {
+    const params = new URL(route.request().url()).searchParams;
+    const scoped = params.get("workspace_id") === WORKSPACE_ID && params.get("channel") === "webchat";
+    return route.fulfill({ json: scoped && !deleted ? [conversation] : [] });
+  });
+  await page.route(`**${chatPath}/messages?**`, (route) => route.fulfill({ json: [{
+    id: "visitor-message", role: "user", content: "Order arrived today.",
+  }] }));
+  await page.route(`**${chatPath}`, (route) => {
+    if (route.request().method() === "DELETE") {
+      deleted = true;
+      return route.fulfill({ status: 204 });
+    }
+    conversation.title = route.request().postDataJSON().title;
+    return route.fulfill({ json: conversation });
+  });
+  await page.goto(`/chat/history?workspace=${WORKSPACE_ID}&channel=webchat`, { waitUntil: "domcontentloaded" });
+  await expect(page).toHaveURL(/\/settings\?.*tab=history/);
+  await page.getByRole("button", { name: /Taylor/ }).click();
+  await expect(page.getByText("Order arrived today.")).toBeVisible();
+  await page.getByRole("button", { name: "Rename chat", exact: true }).click();
+  const titleInput = page.getByRole("textbox", { name: "Rename chat", exact: true });
+  await titleInput.fill("Order: delivery confirmed");
+  await titleInput.press("Enter");
+  await expect(page.getByRole("heading", { name: "Order: delivery confirmed" })).toBeVisible();
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.getByText("Order arrived today.")).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  await page.getByRole("button", { name: "Delete", exact: true }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Delete", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Chat History", exact: true })).toBeVisible();
+  await expect(page.getByText("Order: delivery confirmed")).toHaveCount(0);
 });

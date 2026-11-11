@@ -93,6 +93,17 @@ async def resolve_workspace_input_message(
         raise WorkspaceInputResolutionError(422, "This card is not an ordinary input request. Use its decision controls.")
     if pending.get("approval_token") or pending.get("hitl_type") not in {None, "", HitlType.INPUT.value}:
         raise WorkspaceInputResolutionError(422, "This card requires a decision, not an ordinary reply.")
+    if isinstance(data.get("fields"), dict) and data["fields"]:
+        # The asker's fields carry their schema (request_input): the answer is
+        # held to it here, as a run's own answer endpoint does.
+        from packages.core.ai.runtime.human_input import input_field_answer_errors
+
+        asked = pending.get("payload") if isinstance(pending.get("payload"), dict) else {}
+        refused = input_field_answer_errors(asked.get("fields"), data["fields"])
+        if refused:
+            raise WorkspaceInputResolutionError(
+                422, "; ".join(f"{key}: {message}" for key, message in refused.items()),
+            )
     authority = await authorize_hitl_action(
         db, entity_id=user.entity_id, workspace_id=workspace_id, by_user_id=user.id,
         action_key=pending.get("action"), capability_id=pending.get("capability_id"),

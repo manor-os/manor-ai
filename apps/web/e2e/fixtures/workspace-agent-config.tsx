@@ -10,14 +10,17 @@ import { useAuthStore } from "../../src/stores/auth";
 import type { User } from "../../src/lib/types";
 import "../../src/index.css";
 
+// The catalog reads its scope from the token's claims, so the synthetic token carries them.
+const fixtureToken = `e30.${btoa(JSON.stringify({ sub: "fixture-user", entity_id: "fixture-entity", role: "owner", exp: 4102444800 }))}.sig`;
+localStorage.setItem("manor_token", fixtureToken);
 useAuthStore.setState({
-  token: "synthetic-fixture-token", isLoading: false,
+  token: fixtureToken, isLoading: false,
   user: { id: "fixture-user", entity_id: "fixture-entity", display_name: "Operator", role: "owner" } as User,
 });
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } } });
 
 createRoot(document.getElementById("root")!).render(
-  <MemoryRouter initialEntries={["/workspaces/agent-fixture?tab=agents"]}>
+  <MemoryRouter initialEntries={["/workspaces/agent-fixture?tab=staff"]}>
     <QueryClientProvider client={queryClient}>
       <main style={{ padding: 16 }}><Routes><Route path="/workspaces/:workspaceId" element={<WorkspaceDetail />} /></Routes></main>
       <AgentEditModal />

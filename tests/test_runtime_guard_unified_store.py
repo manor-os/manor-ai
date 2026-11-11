@@ -406,7 +406,7 @@ async def test_workspace_exact_setting_is_honored_by_both_execution_planes(db_se
     from packages.core.governance.approvals import ApprovalOrigin, ApprovalSubject
     ids = await _fixture(db_session, hitl_capability="external.social")
     blocked = json.loads(await _guard(ids, {"text": "hello"}) or "{}")
-    assert blocked["hitl"]["options"] == ["approve", "reject"]
+    assert blocked["hitl"]["options"] == ["approve", "approve_and_save_rule", "reject"]
     with pytest.raises(ValueError, match="[Aa]lways|approval.settings"):
         await resolve_runtime_approval_message(db_session,
             conversation_id=ids["conversation_id"], entity_id=ids["entity_id"],
@@ -1156,6 +1156,7 @@ async def test_retry_while_still_pending_re_surfaces_the_same_card(
 
     blocked = json.loads(await _guard(ids, dict(args)) or "{}")
     token = blocked["approval_token"]
+    assert blocked["hitl"]["options"] == ["approve", "approve_and_save_rule", "reject"]
     assert (await db_session.get(HitlRequest, token)).status == "pending"
 
     # The model jumps the gun and retries with the token, still unanswered.
@@ -1167,7 +1168,7 @@ async def test_retry_while_still_pending_re_surfaces_the_same_card(
     # The SAME request — resolving it unblocks the call that is actually stuck.
     assert retried["approval_token"] == token
     assert retried["hitl"]["id"] == token
-    assert retried["hitl"]["options"] == ["approve", "reject"]
+    assert retried["hitl"]["options"] == blocked["hitl"]["options"]
     # And the card is rendered from the context stored at mint time.
     assert retried["hitl"]["action"] == "social_post.publish"
     assert retried["hitl"]["tool"] == "mcp__twitter_x__create_tweet"

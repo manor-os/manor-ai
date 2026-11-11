@@ -114,3 +114,104 @@ async def test_recovery_does_not_bypass_output_validation_or_business_branch(mon
             "expression": "work.success == true"}, "true_next": ["persist"],
             "false_next": ["unresolved"]}, run.variables, run)
         assert branch["next_override"] == ["unresolved"]
+
+
+def _retried_production_step(unit_count: int = 19) -> dict:
+    """A retried clip-making step: a long attempt history and finished clips."""
+    from packages.core.services.workflow_agent_recovery import agent_retry_context
+
+    recovery = None
+    for attempt in range(4):
+        recovery = agent_retry_context(
+            {**({"agent_recovery": recovery} if recovery else {}), "status": "completed",
+             "runtime": {"events": [f"event-{attempt}-{index}-" + "x" * 300 for index in range(30)]},
+             "output": {"ready": False, "blocker": "The master could not be saved."}},
+            run_id=f"attempt-{attempt}", step_id="produce", error="The master could not be saved.",
+        )
+    made = [{"unit_id": f"{index:02d}", "title": f"Shot {index}", "clip": {
+        "document_id": f"clip-document-{index:02d}", "output_name": f"shot-{index:02d}.mp4",
+        "duration_seconds": 6, "job_id": f"job-{index:02d}",
+        "result_url": f"/api/v1/fs/entity/Workspaces/_by_id/ws/workflow/run/videos/shot-{index:02d}.mp4",
+    }} for index in range(1, unit_count + 1)]
+    return {
+        "status": "failed", "resume_strategy": "reexecute", "agent_retry_recovery": True,
+        "output": {"ready": False, "blocker": "The master could not be saved."},
+        "agent_recovery": recovery,
+        "production_progress": {"units_made": made, "units_to_make": [{"unit_id": "20", "title": "End card"}]},
+    }
+
+
+def test_small_siblings_leave_their_budget_to_larger_evidence():
+    from packages.core.services.workflow_agent_recovery import recovery_prompt_evidence
+
+    value = {"flag": False, "step": "produce", "receipts": [f"clip-document-{i:03d}" for i in range(150)],
+             "history": "h" * 60_000}
+    compact = recovery_prompt_evidence(value, max_chars=8000)
+
+    # An equal split gave each of the four fields 2,000 characters and cut the
+    # receipts although the two small fields used almost none of theirs.
+    assert compact["receipts"] == value["receipts"]
+    assert compact["history"]["truncated"] is True
+    assert len(json.dumps(compact)) <= 8000
+
+
+def test_retry_prompt_keeps_every_finished_clip_identity():
+    from packages.core.ai.workflow_runner import _workflow_agent_resume_prompt
+
+    prompt = _workflow_agent_resume_prompt(
+        _retried_production_step(), runtime_context={"workflow_run_id": "retry"}, step_id="produce",
+    )
+
+    for index in range(1, 20):
+        assert f"clip-document-{index:02d}" in prompt
+    assert '"units_to_make": ["20"]' in prompt
+    assert "read_step_recovery" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_retried_agent_step_reads_its_complete_evidence(monkeypatch):
+    from types import SimpleNamespace
+
+    from packages.core.ai import workflow_runner as module
+
+    async def appendix(*args, **kwargs):
+        schema = {"type": "function", "function": {"name": "read_file"}}
+        return SimpleNamespace(prompt_appendix="", tool_schemas=[schema],
+                               allowed_tool_names={"read_file"}, envelope=None)
+
+    calls = []
+
+    async def loop(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(content='{"ready": true}', usage={}, tool_calls_made=[], rounds=1,
+                               stop_reason="completed", error=None, error_detail=None)
+
+    monkeypatch.setattr(module, "runtime_prepare_prompt_appendix_for_turn", appendix)
+    monkeypatch.setattr(module, "runtime_execute_workflow_agent_loop", loop)
+    step = {"id": "produce", "type": "agent", "config": {"prompt": "Make the clips", "output_format": "json"}}
+    runner = WorkflowRunner()
+
+    fresh = WorkflowRun(id="fresh", entity_id="entity", variables={}, step_results={})
+    await runner._execute_step_safe(step, fresh, None)
+    assert "read_step_recovery" not in calls[-1]["dynamic_tool_handlers"]
+    assert "read_step_recovery" not in calls[-1]["allowed_tool_names"]
+
+    retry = WorkflowRun(id="retry", entity_id="entity", variables={},
+                        step_results={"produce": _retried_production_step()})
+    await runner._execute_step_safe(step, retry, None)
+    kwargs = calls[-1]
+    assert "read_step_recovery" in kwargs["allowed_tool_names"]
+    assert "read_step_recovery" in {tool["function"]["name"] for tool in kwargs["tools"]}
+    assert "Call read_step_recovery" in kwargs["user_message"]
+
+    read = kwargs["dynamic_tool_handlers"]["read_step_recovery"]
+    content, offset = "", 0
+    while offset is not None:
+        page = json.loads(await read({"section": "production_progress", "offset": offset}))
+        content += page["content"]
+        offset = page["next_offset"]
+    progress = json.loads(content)
+    assert progress["units_made"][18]["clip"]["result_url"].endswith("shot-19.mp4")
+    history = json.loads(await read({"section": "agent_recovery"}))
+    assert history["total_chars"] > 32_000
+    assert "error" in json.loads(await read({"section": "unknown"}))

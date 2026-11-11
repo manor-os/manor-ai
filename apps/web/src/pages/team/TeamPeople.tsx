@@ -406,10 +406,9 @@ export default function TeamPeople() {
                   display: "flex",
                   alignItems: "center",
                   gap: 6,
-                  color: "#1c1917",
+                  color: "var(--text-strong)",
                   fontSize: 11,
                   fontWeight: 800,
-                  textTransform: "uppercase",
                 }}
               >
                 <IconTag size={13} />
@@ -417,7 +416,7 @@ export default function TeamPeople() {
                   ? t("page.team_people.service_categories")
                   : t("page.team_people.skills")}
               </div>
-              <div style={{ color: "#1c1917", fontSize: 12, lineHeight: 1.45 }}>
+              <div style={{ color: "var(--text-strong)", fontSize: 12, lineHeight: 1.45 }}>
                 {view.cats.join(", ")}
               </div>
             </div>
@@ -478,13 +477,14 @@ export default function TeamPeople() {
   useEffect(() => {
     if (!setTeamControls) return;
     setTeamControls({
-      toolbar: (
+      // Nothing to narrow until there are enough people to lose track of.
+      toolbar: staff.length > 5 ? (
         <FilterPills
           options={KIND_FILTERS.map((k) => ({ key: k.key, label: k.label }))}
           value={kindFilter}
           onChange={(k) => setKindFilter(k as KindFilter)}
         />
-      ),
+      ) : undefined,
       actions: addMenuItems.length > 0 ? (
         <Dropdown
           align="right"
@@ -497,7 +497,7 @@ export default function TeamPeople() {
       ) : null,
     });
     return () => setTeamControls({});
-  }, [addMenuItems, handleAddSelect, kindFilter, setTeamControls]);
+  }, [addMenuItems, handleAddSelect, kindFilter, setTeamControls, staff.length]);
 
   if (isLoading) {
     return (
@@ -567,8 +567,8 @@ export default function TeamPeople() {
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 260px), 1fr))",
-              gap: 24,
+              gridTemplateColumns: "minmax(0, 1fr)",
+              gap: 8,
               alignItems: "start",
             }}
           >
@@ -588,7 +588,7 @@ export default function TeamPeople() {
                   }
                   title={view.displayName}
                   subtitle={
-                    <span style={{ color: "#1c1917" }}>
+                    <span style={{ color: "var(--text-strong)" }}>
                       {view.cardSubtitle || view.subtitle || s.email || s.phone || t("page.team_people.na_dash")}
                     </span>
                   }
@@ -778,7 +778,7 @@ function InviteEmployeeModal({
             </div>
           </div>
           <div>
-            <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-1.5">
+            <label className="block text-xs font-semibold text-stone-500 mb-1.5">
               {t("page.team_people.invite_link")}
             </label>
             <div className="flex gap-2">
@@ -845,7 +845,7 @@ function InviteEmployeeModal({
 
           {selectedRole && (
             <div className="bg-manor-50/60 border border-manor-700/15 rounded-xl p-3">
-              <div className="text-[11px] font-bold uppercase tracking-widest text-manor-700 mb-1.5">
+              <div className="text-[11px] font-bold text-manor-700 mb-1.5">
                 <span className="capitalize">{selectedRole.name}</span> {t("page.team_people.can")}
               </div>
               <div className="text-xs text-stone-600 leading-relaxed">
@@ -920,7 +920,7 @@ function InviteDeliveryModal({
         </div>
 
         <div>
-          <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-1.5">
+          <label className="block text-xs font-semibold text-stone-500 mb-1.5">
             {t("page.team_people.invite_link")}
           </label>
           <div className="flex gap-2">
@@ -1275,7 +1275,7 @@ function StaffAccountCreatedModal({
 
         <div className="space-y-2">
           <div>
-            <label className="block text-xs font-semibold text-stone-500 mb-1 uppercase tracking-wide">
+            <label className="block text-xs font-semibold text-stone-500 mb-1">
               {t("page.team_people.email")}
             </label>
             <div className="manor-input bg-stone-50 select-all">
@@ -1284,7 +1284,7 @@ function StaffAccountCreatedModal({
           </div>
 
           <div>
-            <label className="block text-xs font-semibold text-stone-500 mb-1 uppercase tracking-wide">
+            <label className="block text-xs font-semibold text-stone-500 mb-1">
               {t("page.team_people.password")}
             </label>
             <div className="flex gap-2 items-center">
@@ -1552,8 +1552,8 @@ function StaffAvatar({
           objectFit: "cover",
           display: "block",
           flexShrink: 0,
-          border: "1px solid rgba(28, 25, 23, 0.08)",
-          background: "#fff",
+          border: "0.5px solid rgba(29, 29, 31, 0.08)",
+          background: "var(--surface-panel)",
         }}
       />
     );
@@ -1581,7 +1581,7 @@ function StaffGlyph({
         display: "inline-flex",
         alignItems: "center",
         justifyContent: "center",
-        color: "#1c1917",
+        color: "var(--text-strong)",
         flexShrink: 0,
       }}
     >
@@ -1730,7 +1730,10 @@ function staffViewModel(s: any, roleNameById: Map<string, string>) {
 function normalizedRoleLabel(value: unknown): string {
   const label = String(value || "").trim();
   if (!label || label.toLowerCase() === "staff") return "";
-  return label;
+  // Built-in roles have a name in every language; custom role names stay as written.
+  const key = `page.users.role_${label.toLowerCase()}`;
+  const translated = t(key);
+  return translated === key ? label : translated;
 }
 
 function formatInteger(value: number): string {
@@ -1774,7 +1777,7 @@ function formatShortDate(value?: string | null): string {
 function EmptyUserIcon() {
   return (
     <svg
-      style={{ width: 32, height: 32, color: "#d6d3d1" }}
+      style={{ width: 32, height: 32, color: "var(--text-faint)" }}
       fill="none"
       viewBox="0 0 24 24"
       stroke="currentColor"

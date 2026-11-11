@@ -6,6 +6,7 @@ import type { Document } from "../../lib/types";
 import { IconFolder, IconUpload } from "../icons";
 import Button from "../ui/Button";
 import HitlKnowledgePicker from "../ui/HitlKnowledgePicker";
+import { PageLoading } from "../ui/Skeleton";
 
 export default function WorkspaceAppSetupMaterials({ workspaceId, checkKey, acceptsText, canStart }: {
   workspaceId: string;
@@ -64,6 +65,11 @@ export default function WorkspaceAppSetupMaterials({ workspaceId, checkKey, acce
     },
     onSuccess: (status) => {
       queryClient.setQueryData(["workspace-setup-status", workspaceId], status);
+      // Each Workflow page reads its own copy (whether that Workflow may start); refresh them too.
+      void queryClient.invalidateQueries({
+        queryKey: ["workspace-setup-status", workspaceId],
+        predicate: (query) => query.queryKey.length > 2,
+      });
       void queryClient.invalidateQueries({ queryKey: ["workspace-documents", workspaceId] });
       setSavedIncomplete(!status.ready);
       setDocuments([]);
@@ -76,7 +82,7 @@ export default function WorkspaceAppSetupMaterials({ workspaceId, checkKey, acce
 
   return <div className="workspace-app-setup">
     {existingFiles.length > 0 && <p>{t("component.workspace_app_view.setup_existing_files")}: {existingFiles.slice(0, 3).map((document) => document.name).join(", ")}{existingFiles.length > 3 ? ` +${existingFiles.length - 3}` : ""}</p>}
-    {workspace.isPending ? <p role="status">{t("status.loading")}</p> : workspace.isError ? <div><p role="alert">{t("component.workspace_app_view.setup_check_failed")}</p><Button variant="ghost" onClick={() => void workspace.refetch()}>{t("component.workspace_app_view.check_again")}</Button></div> : !canManage ? <p>{t("component.workspace_app_view.setup_owner_needed")}</p> : <>
+    {workspace.isPending ? <PageLoading label={t("status.loading")} minHeight={96} /> : workspace.isError ? <div><p role="alert">{t("component.workspace_app_view.setup_check_failed")}</p><Button variant="ghost" onClick={() => void workspace.refetch()}>{t("component.workspace_app_view.check_again")}</Button></div> : !canManage ? <p>{t("component.workspace_app_view.setup_owner_needed")}</p> : <>
       <div className="workspace-app-setup__actions">
         <button ref={pickerButton} type="button" onClick={() => setPickerOpen(true)} disabled={!canStart || save.isPending}><IconFolder size={16} />{t("component.workflow_file.choose_knowledge")}</button>
         <button type="button" onClick={() => fileInput.current?.click()} disabled={!canStart || save.isPending}><IconUpload size={16} />{t("component.workflow_file.upload_local")}</button>

@@ -6,11 +6,14 @@ import re
 from html.parser import HTMLParser
 from typing import Any
 
+from packages.core.services.response_cards import RESPONSE_CARD_TEMPLATE_IDS, normalize_response_card
+
 
 RESPONSE_SURFACE_POLICY = "response_surface.v2"
 RESPONSE_SURFACE_TEMPLATE_IDS = frozenset({
     "learning.code_lab",
     "response.choice",
+    *RESPONSE_CARD_TEMPLATE_IDS,
 })
 
 _REGISTERED_TEMPLATE_ACTIONS = {
@@ -619,7 +622,8 @@ def _normalize_code_lab(props: Any, errors: list[dict[str, str]]) -> dict[str, A
     )
     raw_languages = props.get("languages")
     languages: list[dict[str, str]] = []
-    if raw_languages is not None:
+    # Normalized surfaces are normalized again when stored, and carry an empty list.
+    if raw_languages not in (None, []):
         if not isinstance(raw_languages, list) or not 1 <= len(raw_languages) <= 8:
             errors.append(_issue(
                 "template_languages",
@@ -746,11 +750,12 @@ def _normalize_template(render: dict[str, Any], errors: list[dict[str, str]]) ->
         return {"kind": "template", "template_id": template_id, "template_version": 1, "props": {}}
     if render.get("template_version") not in {None, 1}:
         errors.append(_issue("template_version", "Template version must be 1.", "render.template_version"))
-    props = (
-        _normalize_code_lab(render.get("props"), errors)
-        if template_id == "learning.code_lab"
-        else _normalize_choice(render.get("props"), errors)
-    )
+    if template_id in RESPONSE_CARD_TEMPLATE_IDS:
+        props = normalize_response_card(template_id, render.get("props"), errors)
+    elif template_id == "learning.code_lab":
+        props = _normalize_code_lab(render.get("props"), errors)
+    else:
+        props = _normalize_choice(render.get("props"), errors)
     return {
         "kind": "template",
         "template_id": template_id,
@@ -849,6 +854,9 @@ def normalize_response_surface(value: Any) -> dict[str, Any]:
         )
         if registered_action:
             actions = [registered_action]
+        elif normalized_render.get("template_id") in RESPONSE_CARD_TEMPLATE_IDS:
+            # Cards only show. What someone decides about them is an approval or a question.
+            actions = []
     display = _normalize_display(value.get("display"), errors)
     if errors:
         raise ResponseSurfaceValidationError(errors)

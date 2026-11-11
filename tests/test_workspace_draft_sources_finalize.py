@@ -77,6 +77,53 @@ async def test_finalize_adds_document_sources_and_writes_link_sources(db_session
 
 
 @pytest.mark.asyncio
+async def test_unstored_link_source_leaves_no_empty_document_and_reaches_ops(db_session, monkeypatch, tmp_path):
+    from packages.core.config import get_settings
+    from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
+    from packages.core.models.workspace import Workspace
+    from packages.core.services import entity_fs, platform_faults
+    from packages.core.services.workspace_setup_service import dispatch_workspace_post_commit, finalize_setup
+    from packages.core.tasks import ai_tasks
+
+    def unavailable():
+        raise entity_fs.EntityFilesystemError("Entity filesystem root is not mounted: /mnt/manor")
+
+    faults: list[dict] = []
+
+    async def report(**kwargs):
+        faults.append(kwargs)
+        return True
+
+    monkeypatch.setattr(get_settings(), "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(get_settings(), "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(entity_fs, "assert_entity_filesystem_ready", unavailable)
+    monkeypatch.setattr(platform_faults, "report_platform_fault", report)
+    monkeypatch.setattr(ai_tasks.generate_knowledge_content, "delay", lambda *_: None)
+
+    entity_id = generate_ulid()
+    session = _session(entity_id, [
+        {"id": "S1", "kind": "link", "name": "https://example.com/method", "url": "https://example.com/method", "status": "ready", "chars": 4, "text": "page", "turn_index": 0},
+    ], {"name": "Method KB", "purpose": "the method", "mode": "create_new", "generate_starter_doc": True, "source_ids": ["S1"]})
+
+    workspace_id = await finalize_setup(session, db_session)
+    await db_session.commit()
+
+    group = (await db_session.execute(select(DocumentGroup).where(DocumentGroup.workspace_id == workspace_id))).scalar_one()
+    assert group.settings["unstored_source_ids"] == ["S1"]
+    assert group.settings["starter_document"]["source_excerpt"].endswith("page")
+    assert (await db_session.execute(select(DocumentGroupMember).where(DocumentGroupMember.group_id == group.id))).scalars().all() == []
+    assert (await db_session.execute(select(Document).where(Document.entity_id == entity_id))).scalars().all() == []
+
+    workspace = await db_session.get(Workspace, workspace_id)
+    workspace.status = "active"
+    await db_session.commit()
+    await dispatch_workspace_post_commit(db_session, workspace_id=workspace_id, entity_id=entity_id)
+
+    assert [fault["code"] for fault in faults] == ["knowledge_draft_source_not_stored"]
+    assert faults[0]["context"]["source_ids"] == ["S1"]
+
+
+@pytest.mark.asyncio
 async def test_post_commit_dispatch_passes_source_excerpt_positionally(db_session, monkeypatch):
     from packages.core.models.workspace import Workspace
     from packages.core.services.workspace_setup_service import dispatch_workspace_post_commit, finalize_setup

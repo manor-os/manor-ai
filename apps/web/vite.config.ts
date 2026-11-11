@@ -8,6 +8,7 @@ const apiTarget = process.env.VITE_API_TARGET || "http://localhost:8000";
 const buildVersion = process.env.BUILD_VERSION || new Date().toISOString();
 const releaseAssetsDir = `assets/releases/${createHash("sha256").update(buildVersion).digest("hex").slice(0, 20)}`;
 
+
 function firstHeader(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
 }
@@ -19,6 +20,33 @@ function forwardOriginalHost(proxy: any) {
     const proto = firstHeader(req.headers["x-forwarded-proto"]) || "http";
     proxyReq.setHeader("x-forwarded-proto", proto);
   });
+}
+
+// Published sites in local development: production's reverse proxy sends every
+// {slug}.{MANOR_SITES_DOMAIN} request to /api/v1/site-host{uri}. The dev server
+// does the same for hosts under the sites domain, so root-absolute links and
+// /__manor/runtime.js resolve inside the site. The original Host travels as
+// X-Forwarded-Host (forwardOriginalHost), which the API routes by.
+const sitesDomain = (process.env.VITE_SITES_DOMAIN || "sites.localhost").trim().toLowerCase().replace(/^\.+|\.+$/g, "");
+
+function isSitesHost(hostHeader: string | undefined): boolean {
+  const host = (hostHeader || "").replace(/:\d+$/, "").toLowerCase().replace(/\.$/, "");
+  return Boolean(sitesDomain) && host.endsWith(`.${sitesDomain}`);
+}
+
+function publishedSitesDevHost(): Plugin {
+  return {
+    name: "published-sites-dev-host",
+    apply: "serve",
+    configureServer(server) {
+      server.middlewares.use((req, _res, next) => {
+        if (isSitesHost(firstHeader(req.headers.host))) {
+          req.url = `/api/v1/site-host${req.url?.startsWith("/") ? req.url : `/${req.url || ""}`}`;
+        }
+        next();
+      });
+    },
+  };
 }
 
 function emitBuildVersion(): Plugin {
@@ -102,6 +130,18 @@ function pdfjsAssets(): Plugin {
   };
 }
 
+/** Production loads English as its own file; see src/lib/i18n/englishAtStartup.ts. */
+function englishOnDemand(): Plugin {
+  return {
+    name: "manor-english-on-demand",
+    apply: "build",
+    enforce: "pre",
+    resolveId(id) {
+      return id === "./i18n/englishAtStartup" ? resolve(__dirname, "src/lib/i18n/englishOnDemand.ts") : null;
+    },
+  };
+}
+
 // Deployment-specific entries share node_modules but ship separate bundles.
 export default defineConfig({
   define: {
@@ -122,6 +162,9 @@ export default defineConfig({
     },
   },
   plugins: [
+    // First, so a site host never reaches the app's own middlewares.
+    publishedSitesDevHost(),
+    englishOnDemand(),
     react(),
     pdfjsAssets(),
     emitBuildVersion(),
@@ -129,6 +172,8 @@ export default defineConfig({
   server: {
     port: 3000,
     host: true,
+    // Vite refuses unknown Host headers; published sites arrive as {slug}.{sites domain}.
+    allowedHosts: sitesDomain ? [`.${sitesDomain}`] : [],
     proxy: {
       // SSE streaming endpoint — must be listed before the generic /api rule
       // so it matches first and gets the buffering-disabled proxy config

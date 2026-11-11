@@ -76,7 +76,7 @@ async def test_hangup_cancels_preparation_but_commits_submitted_speech(monkeypat
     task = asyncio.create_task(call.run())
     await eventually(lambda: bool(ws.events))
     await utterance(ws)
-    await asyncio.wait_for(entered.wait(), 2)
+    await eventually(entered.is_set)
     await ws.incoming.put({"type": "end"})
     await eventually(lambda: call.closed)
     if phase == "submitted":
@@ -131,7 +131,7 @@ async def test_hangup_prevents_speech_retry_or_endpoint_fallback(monkeypatch, ro
     task = asyncio.create_task(call.run())
     await eventually(lambda: bool(ws.events))
     await utterance(ws)
-    await asyncio.wait_for(entered.wait(), 2)
+    await eventually(entered.is_set)
     await ws.incoming.put({"type": "end"})
     await eventually(lambda: call.closed and ws.closed)
     release.set()

@@ -13,7 +13,7 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
-from packages.core.models.oauth_provider import OAuthAuthorizationCode, OAuthClientApp
+from packages.core.models.oauth_provider import OAuthAuthorizationCode, OAuthClientApp, PersonalAccessToken
 
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
@@ -88,9 +88,13 @@ def test_public_oauth_pkce_and_email_proof_migrations_preserve_legacy_rows_and_c
             # that revision's body: the revisions between carry their own gates.
             public_clients = importlib.import_module(
                 "packages.core.migrations.versions.20261020_10_oauth_public_clients")
+            metadata = importlib.import_module(
+                "packages.core.migrations.versions.20261024_10_oauth_metadata_documents_and_access_tokens")
             with engine.begin() as conn, Operations.context(MigrationContext.configure(conn)):
                 public_clients.upgrade()
                 public_clients.upgrade()
+                metadata.upgrade()
+                metadata.upgrade()
 
             with engine.begin() as conn:
                 assert conn.execute(sa.text("SELECT require_pkce FROM oauth_client_apps WHERE id='legacy'")).scalar_one() is None
@@ -111,6 +115,25 @@ def test_public_oauth_pkce_and_email_proof_migrations_preserve_legacy_rows_and_c
                     session.expire_all()
                     assert session.get(OAuthClientApp, client.id).require_pkce is True
                     assert session.get(OAuthAuthorizationCode, code.id).code_challenge_method == "S256"
+                    url_client = OAuthClientApp(
+                        client_id="https://client.example.test/metadata/" + "x" * 160,
+                        name="Metadata client", redirect_uris=[], require_pkce=True,
+                        metadata_fetched_at=datetime.now(timezone.utc),
+                    )
+                    pat = PersonalAccessToken(
+                        user_id="user", entity_id="entity", name="Read-only automation",
+                        audience="manor-mcp", scope="mcp:read", token_hash="a" * 64,
+                        token_prefix="prefix", token_version=0,
+                    )
+                    session.add_all([url_client, pat])
+                    session.flush()
+                    session.expire_all()
+                    assert len(session.get(OAuthClientApp, url_client.id).client_id) > 64
+                    assert session.get(OAuthClientApp, url_client.id).metadata_fetched_at is not None
+                    assert session.get(PersonalAccessToken, pat.id).token_hash == "a" * 64
+
+            with engine.begin() as conn, Operations.context(MigrationContext.configure(conn)):
+                metadata.downgrade()
 
             command.downgrade(config, pkce.revision)
             command.downgrade(config, "20260917_06")

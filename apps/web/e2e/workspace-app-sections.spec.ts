@@ -1,5 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 
+test.use({ launchOptions: { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH } });
+
 const run = (overrides: Record<string, unknown> = {}) => ({
   run_id: "run-1", workflow_id: "workflow", binding_id: "binding", title: "Weekly report", status: "completed",
   business_outcome: null, trigger_source: "manual", created_at: "2026-10-10T09:00:00Z",
@@ -63,6 +65,50 @@ async function mockApp(page: Page, { sections, outputs, queue, metrics = [], sug
 }
 
 const app = (page: Page) => page.locator('.workspace-chat-output-panes [data-pane-id="app"]');
+
+test("idle outputs discover new results without page activity and pause while hidden", async ({ page }) => {
+  await page.clock.install({ time: new Date("2026-11-04T00:00:00Z") });
+  const outputs: unknown[] = [];
+  let reads = 0;
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname.endsWith("/app-view/sections/outputs")) reads++;
+  });
+  await mockApp(page, {
+    sections: [section("actions", "actions", null), section("outputs", "outputs", "workspace")],
+    outputs, queue: [],
+  });
+  await page.goto("/e2e/fixtures/workspace-app-pane.html");
+  await expect.poll(() => reads).toBe(1);
+  await expect(app(page).getByRole("region", { name: "Functions" })).toBeVisible();
+  await expect(app(page).getByRole("region", { name: "Recent outputs" })).toHaveCount(0);
+
+  // A scheduler or another client creates a result; this page gets no event.
+  outputs.push(run());
+  await page.clock.fastForward(60_000);
+  await expect(app(page).getByRole("link", { name: /Weekly W41\.docx/ })).toBeVisible();
+  expect(reads).toBe(2);
+
+  // A completed list must still discover the next result.
+  outputs.unshift(run({ run_id: "run-2", files: [{ document_id: "doc2", name: "Next report.docx" }] }));
+  await page.clock.fastForward(60_000);
+  await expect(app(page).getByRole("link", { name: /Next report\.docx/ })).toBeVisible();
+  expect(reads).toBe(3);
+
+  await page.evaluate(() => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+    document.dispatchEvent(new Event("visibilitychange", { bubbles: true }));
+  });
+  await page.clock.runFor(1);
+  await page.clock.fastForward(120_000);
+  expect(reads).toBe(3);
+  outputs.unshift(run({ run_id: "run-3", files: [{ document_id: "doc3", name: "While away.docx" }] }));
+  await page.evaluate(() => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+    document.dispatchEvent(new Event("visibilitychange", { bubbles: true }));
+  });
+  await expect(app(page).getByRole("link", { name: /While away\.docx/ })).toBeVisible();
+  expect(reads).toBe(4);
+});
 
 test("default App page shows pending decisions and recent outputs after its actions", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -129,9 +175,10 @@ test("default App page shows pending decisions and recent outputs after its acti
   await expect(app(page).getByRole("region", { name: "Functions" }).locator(".workspace-app-view__hero")).toHaveCount(1);
   await app(page).screenshot({ path: testInfo.outputPath("workspace-app-sections.png"), animations: "disabled" });
 
-  // Deciding happens on the chat card, so a queue item opens the chat there.
+  // Decisions now open the shared review card in a dialog within the App.
   await queue.getByRole("button", { name: /Send Weekly W41/ }).click();
-  await expect(app(page)).toBeHidden();
+  await expect(page.getByRole("dialog", { name: "Send Weekly W41 to 3 recipients" })).toBeVisible();
+  await expect(app(page)).toBeVisible();
   expect(errors).toEqual([]);
 });
 
@@ -260,7 +307,7 @@ test("configured gallery and a removed flow source", async ({ page }, testInfo) 
   // A flow-scoped section is named after its flow.
   const gallery = app(page).getByRole("region", { name: "Article Flow" }).locator(".workspace-app-gallery");
   await expect(gallery.getByRole("link", { name: /Weekly W41\.docx/ })).toBeVisible();
-  await expect(gallery.locator(".workspace-app-gallery__pulse")).toHaveCount(1);
+  await expect(gallery.getByText("Running", { exact: true })).toBeVisible();
   // Previewable files show their thumbnail; audio keeps its icon; video is marked as playable.
   await expect(gallery.locator("img.workspace-app-gallery__thumb")).toHaveCount(3);
   await expect(gallery.getByRole("link", { name: /Theme\.mp3/ }).locator("img")).toHaveCount(0);

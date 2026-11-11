@@ -129,8 +129,8 @@ export default function AgentDashboard() {
                     </svg>
                   </div>
                   <div>
-                    <div style={{ fontSize: 12, fontWeight: 500, textTransform: "uppercase", letterSpacing: "0.03em", color: "#78716c", marginBottom: 2 }}>{stat.label}</div>
-                    <div style={{ fontSize: 28, fontWeight: 800, color: "#292524", lineHeight: 1 }}>{stat.value}</div>
+                    <div style={{ fontSize: 12, fontWeight: 500, color: "var(--text-muted)", marginBottom: 2 }}>{stat.label}</div>
+                    <div style={{ fontSize: 28, fontWeight: 800, color: "var(--text-strong)", lineHeight: 1 }}>{stat.value}</div>
                   </div>
                 </div>
               </div>
@@ -140,7 +140,7 @@ export default function AgentDashboard() {
 
         {/* Agent Grid - same card style as My Agents */}
         <div>
-          <h2 style={{ fontSize: 14, fontWeight: 700, color: "#44403c", marginBottom: 12 }}>{t("nav.agents")}</h2>
+          <h2 style={{ fontSize: 14, fontWeight: 700, color: "var(--text-default)", marginBottom: 12 }}>{t("nav.agents")}</h2>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 180px), 1fr))", gap: 16 }}>
             {agentList.map((agent) => {
               const color = getFallbackColor(agent.name);
@@ -183,14 +183,14 @@ export default function AgentDashboard() {
                           height: 12,
                           borderRadius: "50%",
                           border: "2px solid #fff",
-                          background: isActive ? "#44895f" : "#d6d3d1",
+                          background: isActive ? "#44895f" : "#d1d1d6",
                         }}
                       />
                     </div>
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <h3 style={{ fontSize: 14, fontWeight: 700, color: "#292524", margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{agent.name}</h3>
+                      <h3 style={{ fontSize: 14, fontWeight: 700, color: "var(--text-strong)", margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{agent.name}</h3>
                       {description && (
-                        <p style={{ fontSize: 12, color: "#a8a29e", margin: "2px 0 0 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{description}</p>
+                        <p style={{ fontSize: 12, color: "var(--text-muted)", margin: "2px 0 0 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{description}</p>
                       )}
                     </div>
                   </div>
@@ -205,10 +205,10 @@ export default function AgentDashboard() {
                           {latest.status}
                         </StatusBadge>
                       ) : (
-                        <span style={{ color: "#a8a29e" }}>{t("page.agent_dashboard.no_executions")}</span>
+                        <span style={{ color: "var(--text-muted)" }}>{t("page.agent_dashboard.no_executions")}</span>
                       )}
                     </div>
-                    <span style={{ color: "#a8a29e" }}>{todayCount} {t("page.agent_dashboard.today")}</span>
+                    <span style={{ color: "var(--text-muted)" }}>{todayCount} {t("page.agent_dashboard.today")}</span>
                   </div>
                 </div>
               );
@@ -216,7 +216,7 @@ export default function AgentDashboard() {
 
             {agentList.length === 0 && (
               <div style={{ gridColumn: "1 / -1", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "48px 0", textAlign: "center" }}>
-                <p style={{ fontSize: 14, color: "#78716c" }}>{t("page.agent_dashboard.no_agents_yet")}</p>
+                <p style={{ fontSize: 14, color: "var(--text-muted)" }}>{t("page.agent_dashboard.no_agents_yet")}</p>
                 <button onClick={() => navigate("/agents")} className="btn-manor" style={{ marginTop: 12, fontSize: 13 }}>
                   {t("page.agent_dashboard.create_first_agent")}
                 </button>
@@ -227,10 +227,10 @@ export default function AgentDashboard() {
 
         {/* Recent Executions - glass-table */}
         <div>
-          <h2 style={{ fontSize: 14, fontWeight: 700, color: "#44403c", marginBottom: 12 }}>{t("page.agent_dashboard.recent_executions")}</h2>
+          <h2 style={{ fontSize: 14, fontWeight: 700, color: "var(--text-default)", marginBottom: 12 }}>{t("page.agent_dashboard.recent_executions")}</h2>
           {recentExecs.length === 0 ? (
             <div className="glass-card" style={{ padding: 32, textAlign: "center" }}>
-              <p style={{ fontSize: 13, color: "#a8a29e" }}>{t("page.agent_dashboard.no_executions_recorded")}</p>
+              <p style={{ fontSize: 13, color: "var(--text-muted)" }}>{t("page.agent_dashboard.no_executions_recorded")}</p>
             </div>
           ) : (
             <div className="glass-panel" style={{ overflow: "hidden", padding: 0 }}>
@@ -257,7 +257,7 @@ export default function AgentDashboard() {
                                 {execAgent!.name[0]?.toUpperCase() || "A"}
                               </div>
                             )}
-                            <span style={{ fontSize: 13, color: "#44403c", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            <span style={{ fontSize: 13, color: "var(--text-default)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                               {execAgent?.name || exec.agent_id || "--"}
                             </span>
                           </div>
@@ -270,13 +270,13 @@ export default function AgentDashboard() {
                             {exec.status || t("page.browser_sessions.unknown")}
                           </StatusBadge>
                         </td>
-                        <td style={{ padding: "12px 16px", color: "#57534e", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 200 }}>
+                        <td style={{ padding: "12px 16px", color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 200 }}>
                           {exec.input_preview || exec.input?.substring(0, 60) || "--"}
                         </td>
-                        <td style={{ padding: "12px 16px", color: "#57534e" }}>
+                        <td style={{ padding: "12px 16px", color: "var(--text-muted)" }}>
                           {exec.duration_ms ? `${(exec.duration_ms / 1000).toFixed(1)}s` : "--"}
                         </td>
-                        <td style={{ padding: "12px 16px", color: "#a8a29e", fontSize: 12 }}>
+                        <td style={{ padding: "12px 16px", color: "var(--text-muted)", fontSize: 12 }}>
                           {relativeTime(exec.created_at)}
                         </td>
                       </tr>
@@ -292,7 +292,7 @@ export default function AgentDashboard() {
         {(subscriptions || []).length > 0 && (
           <div>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-              <h2 style={{ fontSize: 14, fontWeight: 700, color: "#44403c" }}>{t("page.agent_dashboard.subscribed_agents")}</h2>
+              <h2 style={{ fontSize: 14, fontWeight: 700, color: "var(--text-default)" }}>{t("page.agent_dashboard.subscribed_agents")}</h2>
               <button onClick={() => navigate("/agents")} style={{ fontSize: 12, fontWeight: 600, color: "#436b65", background: "transparent", border: "none", cursor: "pointer" }}>
                 {t("page.agent_dashboard.manage")}
               </button>
@@ -306,7 +306,7 @@ export default function AgentDashboard() {
                       {(sub.name || "A")[0]?.toUpperCase()}
                     </div>
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <p style={{ fontSize: 13, fontWeight: 600, color: "#44403c", margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{sub.name}</p>
+                      <p style={{ fontSize: 13, fontWeight: 600, color: "var(--text-default)", margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{sub.name}</p>
                       {sub.category && <span style={{ fontSize: 10, color: "#436b65" }}>{sub.category}</span>}
                     </div>
                     <StatusBadge type="purple">{t("page.agent_dashboard.subscribed")}</StatusBadge>

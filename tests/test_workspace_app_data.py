@@ -1,4 +1,6 @@
+import copy
 from datetime import UTC, datetime, timedelta
+from urllib.parse import parse_qsl
 
 import pytest
 
@@ -8,9 +10,13 @@ from packages.core.models.document import Document, DocumentGroup, DocumentGroup
 from packages.core.models.scheduler import ScheduledJob
 from packages.core.models.workspace import Workspace, WorkspaceStaff
 from packages.core.models.workspace_stat import WorkspaceStat, WorkspaceStatObservation
-from packages.core.models.workflow import WorkflowBinding, WorkflowProject
+from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition, WorkflowProject
 from packages.core.models.workflow import WorkflowRun
+from packages.core.services.media_urls import (
+    MediaUrlSigner, content_version, media_url_scope, verify_media_url, window_expiry, with_recorded_variants,
+)
 from packages.core.services.workspace_app_data import (
+    _with_child_run,
     AppDataError, _launch_label, _normalized_order_value, _page, _present_configured_field, _present_items, _project_rollup,
     _projects, _source_rows, _validate_component_context, _verified_launch_projects, component_contexts, component_data,
 )
@@ -75,7 +81,8 @@ async def test_course_plan_rollup_is_scoped_filtered_and_keyset_sorted(db_sessio
                     "first": {"stages": ["scheduled", "ready"]}}, {"key": "items", "type": "progress", "source": "reminders", "fields": [
                         {"label": "Due", "field": ["due_at"], "format": "date"},
                         {"label": "Title", "field": ["title"], "hide_when_empty": True},
-                    ], "limit": 20}]}]}}
+                    ], "limit": 20}]}],
+        "i18n": {"zh": {"components": [{"blocks": [{}, {}, {"fields": [{"label": "截止"}, {}]}]}]}}}}
     async def catalog(*_args, **_kwargs):
         return {"workflow_definitions": {"course", "reminder"}, "workflow_bindings": set(), "stat_keys": set(), "workflows": [
             {"slug": "course", "steps": [{"config": {"project_type": "course", "state_schema": {"properties": {"title": {"type": "string"}}}}}]},
@@ -112,6 +119,10 @@ async def test_course_plan_rollup_is_scoped_filtered_and_keyset_sorted(db_sessio
         {"label": "Due", "format": "date", "value": "2026-11-03T09:00:00+00:00"},
         {"label": "Due", "format": "date", "value": "2026-11-03T17:00:00+08:00"},
     ]
+    # A field's label reads in the viewer's language.
+    translated = await component_data(db_session, workspace, user=user, component_key="course_plan", context_kind="project",
+                                      context_id=course.id, block_key="items", limit=1, locale="zh-CN")
+    assert translated["blocks"][0]["items"][0]["fields"][0]["label"] == "截止"
     second = await component_data(db_session, workspace, user=user, component_key="course_plan", context_kind="project", context_id=course.id, block_key="items", cursor=items["next_cursor"])
     assert len(second["blocks"][0]["items"]) == 6
     assert {item["fields"][0]["value"] for item in second["blocks"][0]["items"]} == {
@@ -132,6 +143,98 @@ async def test_course_plan_rollup_is_scoped_filtered_and_keyset_sorted(db_sessio
         page = await component_data(db_session, workspace, user=user, component_key="course_plan", context_kind="project", context_id=course.id, block_key="items", cursor=cursor, limit=1)
     assert len(seen) == 26
     assert all(_normalized_order_value(value) is None for value in invalid_datetimes)
+
+
+@pytest.mark.asyncio
+async def test_plain_dates_order_as_the_start_of_their_day(db_session, monkeypatch):
+    """An all-day plan (``2026-11-03``) sorts among timestamps; an impossible date stays unordered."""
+    entity = Entity(name="Day plans")
+    user = User(entity_id="pending", email="day-plans@test.com", password_hash="x", role="owner")
+    db_session.add_all([entity, user])
+    await db_session.flush()
+    user.entity_id = entity.id
+    workspace = Workspace(entity_id=entity.id, name="Week", operating_model={})
+    db_session.add(workspace)
+    await db_session.flush()
+    week = WorkflowProject(entity_id=entity.id, workspace_id=workspace.id, project_type="week", schema_version=1,
+                           project_key="week", current_stage="planned", state={}, created_by=user.id)
+    db_session.add(week)
+    await db_session.flush()
+    for key, due in [("late", "2026-11-04"), ("bad", "2026-11-31"), ("mid", "2026-11-03T09:00:00+00:00"), ("early", "2026-11-03")]:
+        db_session.add(WorkflowProject(entity_id=entity.id, workspace_id=workspace.id, project_type="slot", schema_version=1,
+                                       project_key=key, current_stage="draft", state={"week_id": week.id, "due_at": due}, created_by=user.id))
+    await db_session.commit()
+    sources = {"weeks": {"type": "workflow_projects", "project_type": "week", "schema_versions": [1], "fields": [],
+                         "producer_workflows": ["workflow_definition:week"], "launch_workflows": []},
+               "slots": {"type": "related_projects", "project_type": "slot", "schema_versions": [1], "parent": "weeks",
+                         "parent_state_path": ["week_id"], "fields": [["due_at"]], "producer_workflows": ["workflow_definition:slot"],
+                         "order": {"field": ["due_at"], "type": "datetime", "direction": "asc"}}}
+    rows = await _source_rows(db_session, workspace, user, sources, "slots", {"kind": "project", "id": week.id}, {})
+    assert [row["fields"]["due_at"] for row in rows] == ["2026-11-03", "2026-11-03T09:00:00+00:00", "2026-11-04", "2026-11-31"]
+    assert _normalized_order_value("2026-11-03") == datetime(2026, 11, 3, tzinfo=UTC)
+    assert _normalized_order_value("2026-11-31") is None
+
+
+@pytest.mark.asyncio
+async def test_a_menu_list_narrows_by_category_stage_and_search_and_reads_prices(db_session, monkeypatch):
+    """Restaurant marketing (staging 2026-11-08): the menu needs prices, spice, on/off and a category filter."""
+    entity = Entity(name="Menu narrowing")
+    user = User(entity_id="pending", email="menu-narrowing@test.com", password_hash="x", role="owner")
+    db_session.add_all([entity, user])
+    await db_session.flush()
+    user.entity_id = entity.id
+    workspace = Workspace(entity_id=entity.id, name="Shuxiang", operating_model={})
+    other = Workspace(entity_id=entity.id, name="Other kitchen", operating_model={})
+    db_session.add_all([workspace, other])
+    await db_session.flush()
+    for home, key, stage, state in (
+            (workspace, "fish", "active", {"name": "Boiled fish", "category": "Mains", "price": "38", "spicy": True, "rating": 4.6}),
+            (workspace, "tofu", "active", {"name": "Mapo tofu", "category": "Mains", "price": 22, "spicy": "yes", "rating": 4}),
+            (workspace, "cake", "retired", {"name": "Rice cake", "category": "Desserts", "price": 12, "spicy": False, "rating": 9}),
+            (other, "foreign", "active", {"name": "Foreign fish", "category": "Mains", "price": 1})):
+        db_session.add(WorkflowProject(entity_id=entity.id, workspace_id=home.id, project_type="dish", schema_version=1,
+                                       project_key=key, current_stage=stage, created_by=user.id, state=state))
+    fields = [["name"], ["category"], ["price"], ["spicy"], ["rating"]]
+    workspace.operating_model = {"app_view": {"data_sources": {"dishes": {
+        "type": "workflow_projects", "project_type": "dish", "schema_versions": [1], "fields": fields,
+        "label_fields": [["name"]], "producer_workflows": ["workflow_definition:dish"], "stages": ["active", "retired"]}},
+        "components": [{"type": "data_view", "schema_version": 1, "key": "menu", "context": {"kind": "workspace"}, "blocks": [
+            {"key": "dishes", "type": "progress", "source": "dishes", "limit": 50, "view": "board",
+             "stage_labels": {"active": "On the menu", "retired": "Off the menu"}, "fields": [
+                 {"label": "Price", "field": ["price"], "format": "money", "currency": "CNY"},
+                 {"label": "Spicy", "field": ["spicy"], "format": "boolean"},
+                 {"label": "Rating", "field": ["rating"], "format": "rating"}],
+             "filters": [{"field": ["category"], "label": "Category"}, {"by": "stage", "label": "Status"}],
+             "search": {"fields": [["name"]], "label": "Find a dish"}}]}]}}
+    await db_session.commit()
+
+    async def catalog(*_args, **_kwargs):
+        return {"workflow_definitions": {"dish"}, "workflow_bindings": set(), "stat_keys": set(), "workflows": [
+            {"slug": "dish", "steps": [{"config": {"project_type": "dish", "state_schema": {"properties": {
+                name[0]: {"type": "string"} for name in fields}}}}]}]}
+    monkeypatch.setattr("packages.core.services.workspace_app_data.load_workspace_app_data_catalog", catalog)
+
+    async def read(**narrowing):
+        result = await component_data(db_session, workspace, user=user, component_key="menu", context_kind="workspace",
+                                      context_id=workspace.id, block_key="dishes", **narrowing)
+        return result["blocks"][0]
+
+    everything = await read()
+    assert everything["filters"] == [
+        {"key": "0", "label": "Category", "options": [{"value": "Desserts", "label": "Desserts"}, {"value": "Mains", "label": "Mains"}]},
+        {"key": "1", "label": "Status", "options": [{"value": "active", "label": "On the menu"}, {"value": "retired", "label": "Off the menu"}]}]
+    fish = next(item for item in everything["items"] if item["label"] == "Boiled fish")
+    assert fish["fields"] == [{"label": "Price", "format": "money", "value": 38, "currency": "CNY"},
+                              {"label": "Spicy", "format": "boolean", "value": True},
+                              {"label": "Rating", "format": "rating", "value": 4.6}]
+    assert next(item for item in everything["items"] if item["label"] == "Rice cake")["fields"][2]["value"] == 5
+
+    assert {item["label"] for item in (await read(filters={"0": "Mains"}))["items"]} == {"Boiled fish", "Mapo tofu"}
+    assert [item["label"] for item in (await read(filters={"1": "retired"}))["items"]] == ["Rice cake"]
+    # A board's columns follow the source's stages, an empty one included, however the list is narrowed.
+    assert everything["stages"] == (await read(filters={"1": "retired"}))["stages"] == ["active", "retired"]
+    assert [item["label"] for item in (await read(query="TOFU"))["items"]] == ["Mapo tofu"]
+    assert (await read(query="100%_off"))["items"] == []
 
 
 @pytest.mark.asyncio
@@ -225,7 +328,7 @@ async def test_calendar_contexts_batch_project_summaries_and_progress_dates(db_s
         "id": first_summary["next"]["id"], "label": "Prepare", "status": "scheduled",
         "fields": [{"label": "Due", "format": "date", "value": "2026-11-03T09:00:00+00:00"}],
         "detail": "course_reminder", "updated_at": None, "execution": None,
-        "calendar_at": "2026-11-03T09:00:00+00:00",
+        "calendar_at": "2026-11-03T09:00:00+00:00", "parent_id": first.id,
     }
     assert summaries[second.id]["total"] == 1
     assert summaries[second.id]["counts_by_stage"] == {"published": 1}
@@ -235,6 +338,23 @@ async def test_calendar_contexts_batch_project_summaries_and_progress_dates(db_s
                                     context_kind="project", context_id=first.id, block_key="calendar")
     assert [item["calendar_at"] for item in calendar["blocks"][0]["items"]] == [
         "2026-11-03T09:00:00+00:00", "2026-11-04T09:00:00+00:00",
+    ]
+
+    # Read as one Workspace-wide calendar, every reminder of this Workspace is on its date.
+    model = copy.deepcopy(workspace.operating_model)
+    model["app_view"]["data_sources"]["reminders"] = {
+        **{key: value for key, value in model["app_view"]["data_sources"]["reminders"].items()
+           if key not in {"parent", "parent_state_path"}}, "type": "workflow_projects"}
+    model["app_view"]["components"] = [{"type": "data_view", "schema_version": 1, "key": "posting",
+        "context": {"kind": "workspace"}, "blocks": [model["app_view"]["components"][0]["blocks"][0]],
+        "display": {"calendar": {"block": "calendar", "date_field": ["schedule", "due_at"],
+                                 "attention_stages": [], "collection_title": "Reminders"}}}]
+    workspace.operating_model = model
+    await db_session.commit()
+    everything = await component_data(db_session, workspace, user=user, component_key="posting",
+                                      context_kind="workspace", context_id=workspace.id)
+    assert [item["calendar_at"] for item in everything["blocks"][0]["items"]] == [
+        "2026-11-03T09:00:00+00:00", "2026-11-04T09:00:00+00:00", "2026-11-05T09:00:00+00:00",
     ]
 
 
@@ -269,8 +389,8 @@ async def test_project_source_is_scoped_to_selected_workspace_and_context(db_ses
     assert [row["id"] for row in rows] == [selected.id]
     assert rows[0]["fields"] == {"status": "ready"}
     assert rows[0]["execution"] == {
-        "run_id": failed_run.id, "status": "failed", "current_step_id": "publish", "error": "Upload rejected",
-        "href": f"/flows/{failed_run.workflow_id}/runs/{failed_run.id}",
+        "run_id": failed_run.id, "status": "failed", "current_step_id": "publish", "current_step_label": None,
+        "workflow_name": None, "error": "Upload rejected", "href": f"/flows/{failed_run.workflow_id}/runs/{failed_run.id}",
     }
     source["fields"] = [["client", "name"], ["edition"]]
     source["label_fields"] = [["client", "name"], ["edition"]]
@@ -282,6 +402,39 @@ async def test_project_source_is_scoped_to_selected_workspace_and_context(db_ses
     rows = await _source_rows(db_session, workspace, user, {"deliveries": source}, "deliveries",
                              {"kind": "project", "id": selected.id}, {})
     assert rows[0]["label"] == "Client Delivery"
+
+
+@pytest.mark.asyncio
+async def test_project_source_can_leave_out_hidden_stages(db_session):
+    """An ended campaign stays listed; one ended and hidden (cancelled) leaves the list, its data kept."""
+    from packages.core.services.workspace_app_view import normalize_app_view_data_contract
+
+    entity = Entity(name="Hidden stages entity")
+    user = User(entity_id="pending", email="hidden-stages@test.com", password_hash="x", role="owner")
+    db_session.add_all([entity, user])
+    await db_session.flush()
+    user.entity_id = entity.id
+    workspace = Workspace(entity_id=entity.id, name="Campaigns", operating_model={})
+    db_session.add(workspace)
+    await db_session.flush()
+    projects = {
+        stage: WorkflowProject(entity_id=entity.id, workspace_id=workspace.id, project_type="campaign",
+                               schema_version=1, project_key=stage, current_stage=stage,
+                               state={"title": stage}, created_by=user.id)
+        for stage in ("deployed", "ended", "cancelled")
+    }
+    db_session.add_all(projects.values())
+    await db_session.commit()
+    raw = {"type": "workflow_projects", "project_type": "campaign", "schema_versions": [1],
+           "producer_workflows": ["workflow_definition:test"], "launch_workflows": [], "fields": [["title"]],
+           "exclude_stages": ["cancelled"]}
+    sources = normalize_app_view_data_contract({"campaigns": raw}, [])[0]
+    assert sources["campaigns"]["exclude_stages"] == ["cancelled"]
+    rows = await _source_rows(db_session, workspace, user, sources, "campaigns",
+                              {"kind": "workspace", "id": workspace.id}, {})
+    assert sorted(row["fields"]["title"] for row in rows) == ["deployed", "ended"]
+    with pytest.raises(ValueError, match="exclude_stages"):
+        normalize_app_view_data_contract({"campaigns": {**raw, "exclude_stages": []}}, [])
 
 
 @pytest.mark.asyncio
@@ -355,6 +508,22 @@ async def test_inspection_records_bind_exact_readable_media_without_publication_
     db_session.add(DocumentGroupMember(group_id=group.id, document_id=private.id))
     await db_session.flush()
     assert (await data(projects[1]))["blocks"][0]["items"][0]["media"][0]["document_id"] == private.id
+    # A browser session's signer adds a URL only for the recorded variant of a readable, unrestricted file.
+    secret = b"media-signing-secret-for-tests-0001"
+    signer = MediaUrlSigner(key_id="k1", secret=secret, user_id=user.id, expires=window_expiry())
+    photo.fs_path, photo.file_size, photo.content_sha256 = "inspection.jpg", 10, "a" * 64
+    photo.metadata_ = with_recorded_variants({}, version=content_version(photo), variants=["thumb"])
+    await db_session.flush()
+    with media_url_scope(signer):
+        signed = (await data(projects[0]))["blocks"][0]["items"][0]["media"][0]
+    path, _, query = signed["thumbnail_url"].partition("?")
+    assert verify_media_url(path, dict(parse_qsl(query)), {"k1": secret})
+    assert "thumbnail_url" not in (await data(projects[0]))["blocks"][0]["items"][0]["media"][0]
+    photo.classification = "restricted"
+    await db_session.flush()
+    with media_url_scope(signer):
+        assert "thumbnail_url" not in (await data(projects[0]))["blocks"][0]["items"][0]["media"][0]
+    photo.classification = "internal"
     photo.is_trashed = True
     await db_session.flush()
     assert "media" not in (await data(projects[0]))["blocks"][0]["items"][0]
@@ -365,6 +534,116 @@ async def test_inspection_records_bind_exact_readable_media_without_publication_
     # Ordinary project rows use the same presentation without inventing a receipt.
     workspace.operating_model["app_view"]["components"][0]["blocks"][0]["source"] = "inspections"
     assert (await data(empty))["blocks"][0]["items"][0]["title"] == "Site C"
+
+
+def test_a_run_whose_sub_flow_is_working_reads_as_running_and_one_waiting_for_a_person_keeps_its_decision():
+    from types import SimpleNamespace
+
+    parent = {"run_id": "parent", "status": "paused", "current_step_id": "make_video", "error": None, "href": "/flows/p/runs/parent"}
+    working = SimpleNamespace(id="child", workflow_id="w", status="running", current_step_id="produce", definition_snapshot={})
+    shown = _with_child_run(parent, working)
+    # The App counts the publish time as making its video, not as waiting on a person.
+    assert shown["status"] == "running" and shown["current_step_id"] == "produce" and "waiting_run" not in shown
+    assert shown["href"] == "/flows/w/runs/child"
+    decision = SimpleNamespace(id="child", workflow_id="w", status="paused", current_step_id="review_storyboard",
+                               definition_snapshot={})
+    waiting = _with_child_run(parent, decision)
+    assert waiting["status"] == "paused" and waiting["waiting_run"] == {
+        "run_id": "child", "status": "paused", "current_step_id": "review_storyboard", "href": "/flows/w/runs/child"}
+    assert parent["status"] == "paused"  # the parent's own record is not changed
+
+
+def test_a_failed_publish_time_names_the_step_its_sub_flow_stopped_in():
+    from types import SimpleNamespace
+
+    from packages.core.i18n import t
+
+    parent = {"run_id": "parent", "status": "failed", "current_step_id": "held",
+              "error": "The video for this publish time was not made or approved.", "href": "/flows/p/runs/parent"}
+    child = SimpleNamespace(
+        id="child", workflow_id="w", status="failed", current_step_id="produce", step_results={},
+        error="Workflow execution was interrupted while step 'Generate the shots' (agent) was running. It may ...",
+        trigger_data={"_execution_recovery": {"outcome": "failed_effects_unknown", "attempts": 1}},
+        definition_snapshot={"nodes": [{"id": "produce", "name": "Generate the shots"}]},
+    )
+    shown = _with_child_run(parent, child)
+    # The card says what stopped and what to do, in the user's words, and links to the run that stopped.
+    assert shown["error"] == t("workflow.failure.interrupted", step="Generate the shots")
+    assert shown["href"] == "/flows/w/runs/child" and shown["current_step_id"] == "produce"
+
+
+def test_a_held_publish_time_whose_sub_flow_failed_names_the_step_that_stopped_it():
+    from types import SimpleNamespace
+
+    from packages.core.i18n import t
+
+    # The shape of a held Campaign period (its sub-flow stopped in the keyframe read): the period's own held
+    # reason is generic, and the sub-flow's run error is the scheduler's stall text, not the step's reason.
+    parent = {"run_id": "period", "status": "failed", "current_step_id": "held",
+              "error": "The video for this publish time was not made or approved; its posts were not scheduled.",
+              "href": "/flows/p/runs/period"}
+    child = SimpleNamespace(
+        id="child", workflow_id="w", status="failed", current_step_id="read_review_keyframe",
+        step_results={"read_review_keyframes": {"status": "failed", "error": (
+            "'read_review_keyframes' contains inline file data at 0.image.data_url. Save the file as a Document "
+            "and keep its document_id; workflow variables cannot hold file contents.")}},
+        error="No runnable steps and workflow not complete (current step: read_review_keyframe).",
+        trigger_data={"parent_run_id": "period"},
+        definition_snapshot={"nodes": [{"id": "read_review_keyframes", "name": "Read the keyframes"}]},
+    )
+    shown = _with_child_run(parent, child)
+    assert shown["error"] == t("workflow.failure.inline_file_data", step="Read the keyframes")
+    assert shown["href"] == "/flows/w/runs/child"
+    # The card's Held field says the same thing, not the generic reason stored on the period.
+    block = {"type": "progress", "fields": [{"field": ["held_reason"], "format": "text", "hide_when_empty": True,
+                                            "label": "Held"}]}
+    row = {"id": "period", "label": "Made to Spark", "stage": "held", "fields": {
+        "held_reason": "The video for this publish time was not made or approved, so nothing was scheduled for it."},
+        "execution": shown}
+    item = _present_items(block, [row])[0]
+    assert {"label": "Held", "format": "text", "value": shown["error"]} in item["fields"]
+
+
+def test_a_stored_held_reason_shows_only_while_the_item_is_held():
+    block = {"type": "progress", "fields": [{"field": ["held_reason"], "format": "text", "hide_when_empty": True,
+                                            "label": "Held"}]}
+    stored = {"held_reason": "The video for this publish time was not made or approved, so nothing was scheduled for it."}
+    running = {"id": "period", "label": "Country", "stage": "leased", "fields": stored,
+               "execution": {"run_id": "run", "status": "running", "current_step_id": "make_video"}}
+    # The reason outlives its hold: a leased item that is producing again does not repeat it.
+    assert all(field["label"] != "Held" for field in _present_items(block, [running])[0]["fields"])
+    held = {**running, "stage": "held", "execution": None}
+    assert {"label": "Held", "format": "text", "value": stored["held_reason"]} in _present_items(block, [held])[0]["fields"]
+
+
+def test_a_working_sub_flow_names_its_workflow_and_the_step_it_is_on():
+    from types import SimpleNamespace
+
+    parent = {"run_id": "period", "status": "running", "current_step_id": "make_video", "current_step_label": None,
+              "href": "/flows/p/runs/period"}
+    child = SimpleNamespace(
+        id="child", workflow_id="w", status="running", current_step_id="produce", error=None,
+        definition_snapshot={"name": "Make a music video", "nodes": [{"id": "produce", "name": "Produce"}]},
+    )
+    shown = _with_child_run(parent, child)
+    assert shown["status"] == "running" and shown["current_step_id"] == "produce"
+    assert shown["current_step_label"] == "Make a music video · Produce"
+    # The phase the App shows is the sub-flow's workflow, not the parent's stage label shared by its sub-flows.
+    assert shown["workflow_name"] == "Make a music video"
+    # A step the definition does not name leaves the label empty, so the App reads the step id as before.
+    unnamed = SimpleNamespace(**{**vars(child), "definition_snapshot": {"name": "Make a music video", "nodes": []}})
+    assert _with_child_run(parent, unnamed)["current_step_label"] is None
+
+
+def test_a_run_is_named_by_the_workflow_it_executes():
+    from types import SimpleNamespace
+
+    from packages.core.services.workspace_app_data import _workflow_name
+
+    # The App shows a running publish as "Publishing", not the stage its campaign shares with video making.
+    assert _workflow_name(SimpleNamespace(definition_snapshot={"name": "Publishing", "nodes": []})) == "Publishing"
+    assert _workflow_name(SimpleNamespace(definition_snapshot={"name": "  "})) is None
+    assert _workflow_name(SimpleNamespace(definition_snapshot=None)) is None
 
 
 def test_launch_context_label_uses_workflow_metadata_not_internal_run_id():
@@ -431,6 +710,7 @@ async def test_project_records_expose_only_the_parent_recent_execution(db_sessio
     rows = await _source_rows(db_session, workspace, user, sources, "receipts", context, {})
     assert rows[0]["execution"] == {
         "run_id": related_run.id, "status": "completed", "current_step_id": "done", "error": None,
+        "current_step_label": None, "workflow_name": None,
         "href": f"/flows/{related_run.workflow_id}/runs/{related_run.id}",
     }
     assert _present_items({"type": "records", "fields": []}, rows)[0]["execution"] == rows[0]["execution"]
@@ -448,7 +728,8 @@ async def test_a_plain_list_a_project_keeps_is_listed_whole(db_session):
     db_session.add(workspace)
     await db_session.flush()
     plan = [{"code": "E01", "title": "Farming", "synopsis": "Why farm?", "status": "made"},
-            {"code": "E02", "title": "Cities", "synopsis": "Who feeds a potter?"}, "not a record"]
+            {"code": "E02", "title": "Cities", "synopsis": "Who feeds a potter?"}, "not a record",
+            {"synopsis": "Untitled pitch"}]
     series = WorkflowProject(
         entity_id=entity.id, workspace_id=workspace.id, project_type="series", schema_version=1,
         project_key="series", created_by=user.id, state={"episodes": plan},
@@ -466,8 +747,10 @@ async def test_a_plain_list_a_project_keeps_is_listed_whole(db_session):
     context = {"kind": "project", "id": series.id}
     rows = await _source_rows(db_session, workspace, user, sources, "plan", context, {})
     items = _present_items({"type": "records", "fields": [["synopsis"]]}, rows)
-    assert [(item["title"], item["status"]) for item in items] == [("E01 · Farming", "made"), ("E02 · Cities", None)]
+    # An entry with no title of its own (a decision in a history) reads by its fields, not its row id.
+    assert [(item["title"], item["status"]) for item in items] == [("E01 · Farming", "made"), ("E02 · Cities", None), ("", None)]
     assert items[1]["fields"] == [{"label": "synopsis", "value": "Who feeds a potter?"}]
+    assert items[2]["fields"] == [{"label": "synopsis", "value": "Untitled pitch"}]
     # The series' own last run did not make its plan items.
     assert all(item["execution"] is None for item in items)
     assert await _source_rows(db_session, workspace, user, sources, "versioned", context, {}) == []
@@ -523,6 +806,7 @@ async def test_project_source_can_pin_execution_to_a_declared_state_run_id(db_se
     rows = await _source_rows(db_session, workspace, user, sources, "deliveries", {"kind": "project", "id": project.id}, {})
     assert rows[0]["execution"] == {
         "run_id": publication_retry.id, "status": "completed", "current_step_id": "complete", "error": None,
+        "current_step_label": None, "workflow_name": None,
         "href": f"/flows/{publication_retry.workflow_id}/runs/{publication_retry.id}",
     }
 
@@ -538,6 +822,7 @@ async def test_project_source_can_pin_execution_to_a_declared_state_run_id(db_se
     )
     assert rows[0]["execution"] == {
         "run_id": verification_run.id, "status": "completed", "current_step_id": "check", "error": None,
+        "current_step_label": None, "workflow_name": None,
         "href": f"/flows/{verification_run.workflow_id}/runs/{verification_run.id}",
     }
 
@@ -559,6 +844,19 @@ def test_provider_field_shows_logo_key_label_and_first_available_account():
         {"label": "Platform", "format": "provider", "value": "TikTok", "provider": "tiktok", "secondary": "jrmusic"},
     ]
     assert items[1]["fields"] == []
+
+
+def test_a_status_field_reads_through_the_blocks_stage_labels_then_its_own():
+    status = {"label": "Status", "field": ["status"], "format": "status", "hide_when_empty": False,
+              "labels": {"retired": "Off the menu"}}
+    block = {"type": "progress", "stage_labels": {"active": "On the menu", "retired": "Retired"}, "fields": [status]}
+    items = _present_items(block, [{"id": "a", "fields": {"status": "active"}},
+                                   {"id": "b", "fields": {"status": "retired"}}])
+    assert [item["fields"][0]["value"] for item in items] == ["On the menu", "Off the menu"]
+    # Stage labels name a stage, not every field: a text field keeps its own labels only.
+    text = {**status, "format": "text"}
+    assert _present_items({**block, "fields": [text]}, [{"id": "a", "fields": {"status": "active"}}])[0][
+        "fields"][0]["value"] == "active"
 
 
 def test_metric_links_are_limited_to_public_http_urls():
@@ -701,6 +999,13 @@ async def test_course_video_records_attach_only_their_own_metrics_and_deduplicat
                                              block_key="published", cursor=second_page["blocks"][0]["next_cursor"])
     assert configured_pending["blocks"][0]["items"][0]["metrics"] == []
     assert configured_pending["blocks"][0]["items"][0]["tracking_status"] == "pending"
+    # "zero": an untracked post shows each declared counter as 0, without a tracking notice.
+    publication_block["metrics_display"] = "zero"
+    zero_pending = await component_data(db_session, workspace, user=user, component_key="course", context_kind="project", context_id=course.id,
+                                        block_key="published", cursor=second_page["blocks"][0]["next_cursor"])
+    zero_item = zero_pending["blocks"][0]["items"][0]
+    assert {metric["metric_key"]: metric["value"] for metric in zero_item["metrics"]} == {"views": 0, "likes": 0}
+    assert zero_item["tracking_status"] == "configured"
     publication_block.pop("metrics_display")
 
     # Tracking-only sections qualify both the picker and its records before
@@ -1407,6 +1712,150 @@ async def test_project_summary_projects_only_declared_launch_context_and_safe_li
     assert [field["label"] for field in fields] == ["Launch status", "Tracking through"]
 
 
+@pytest.mark.asyncio
+async def test_an_episode_list_reads_its_host_recording_pictures_and_measures(db_session, monkeypatch):
+    """A podcast's episodes (a second scenario beside the menu): people by name, files by viewer link, never an id."""
+    from packages.core.models.user import UserMembership
+    from packages.core.models.workspace import Agent
+
+    entity, elsewhere = Entity(name="Podcast"), Entity(name="Another company")
+    owner = User(entity_id="pending", email="podcast-owner@test.com", password_hash="x", role="owner")
+    guest = User(entity_id="pending", email="podcast-guest@test.com", password_hash="x", display_name="Ada Guest",
+                 avatar_url="https://cdn.example.com/ada.png")
+    stranger = User(entity_id="pending", email="podcast-stranger@test.com", password_hash="x", display_name="Not ours")
+    db_session.add_all([entity, elsewhere, owner, guest, stranger])
+    await db_session.flush()
+    owner.entity_id, stranger.entity_id = entity.id, elsewhere.id
+    guest.entity_id = elsewhere.id  # Their own company is elsewhere; they belong to this one too.
+    db_session.add(UserMembership(user_id=guest.id, entity_id=entity.id, role="member", status="active"))
+    producer = Agent(entity_id=entity.id, name="Producer Mia")
+    foreign_agent = Agent(entity_id=elsewhere.id, name="Their producer")
+    workspace = Workspace(entity_id=entity.id, name="The show", operating_model={})
+    db_session.add_all([producer, foreign_agent, workspace])
+    await db_session.flush()
+    recording, cover, still = (generate_ulid() for _ in range(3))
+    db_session.add(WorkflowProject(
+        entity_id=entity.id, workspace_id=workspace.id, project_type="episode", schema_version=1, project_key="e01",
+        current_stage="published", created_by=owner.id, state={
+            "title": "Pilot", "length": 5_415, "listened": 62.5, "airs_on": "2026-11-14", "airs_until": "2026-11-16",
+            "chapters_done": 3, "chapters": 4, "topics": ["#ai", "#podcast", "#ai"],
+            "host": [guest.id, producer.id, stranger.id, foreign_agent.id], "recording": recording,
+            "pictures": [cover, {"document_id": still, "label": "Studio"}, "https://cdn.example.com/x.jpg", "not-an-id"],
+            "notes": "Show notes", "color": "#0A8", "phone": 8613800138000}))
+    names = ["title", "length", "listened", "airs_on", "airs_until", "chapters_done", "chapters", "topics", "host",
+             "recording", "pictures", "notes", "color", "phone"]
+    workspace.operating_model = {"app_view": {"data_sources": {"episodes": {
+        "type": "workflow_projects", "project_type": "episode", "schema_versions": [1], "fields": [[name] for name in names],
+        "label_fields": [["title"]], "producer_workflows": ["workflow_definition:episode"]}},
+        "components": [{"type": "data_view", "schema_version": 1, "key": "show", "context": {"kind": "workspace"}, "blocks": [
+            {"key": "episodes", "type": "progress", "source": "episodes", "view": "table", "fields": [
+                {"label": "Length", "field": ["length"], "format": "duration"},
+                {"label": "Listened", "field": ["listened"], "format": "percent", "scale": 100},
+                {"label": "Airs", "field": ["airs_on"], "format": "date_range", "end_field": ["airs_until"]},
+                {"label": "Chapters", "field": ["chapters_done"], "format": "progress", "max_field": ["chapters"]},
+                {"label": "Topics", "field": ["topics"], "format": "tags", "copy": True},
+                {"label": "Host", "field": ["host"], "format": "member"},
+                {"label": "Recording", "field": ["recording"], "format": "audio"},
+                {"label": "Pictures", "field": ["pictures"], "format": "images"},
+                {"label": "Notes", "field": ["notes"], "format": "text", "copy": True},
+                {"label": "Colour", "field": ["color"], "format": "color"},
+                {"label": "Phone", "field": ["phone"], "format": "phone"}]}]}]}}
+    await db_session.commit()
+
+    async def catalog(*_args, **_kwargs):
+        return {"workflow_definitions": {"episode"}, "workflow_bindings": set(), "stat_keys": set(), "workflows": [
+            {"slug": "episode", "steps": [{"config": {"project_type": "episode", "state_schema": {"properties": {
+                name: {"type": "string"} for name in names}}}}]}]}
+    monkeypatch.setattr("packages.core.services.workspace_app_data.load_workspace_app_data_catalog", catalog)
+
+    result = await component_data(db_session, workspace, user=owner, component_key="show", context_kind="workspace",
+                                  context_id=workspace.id, block_key="episodes")
+    fields = {field["label"]: field for field in result["blocks"][0]["items"][0]["fields"]}
+    assert fields["Length"]["value"] == 5_415
+    assert fields["Listened"]["value"] == 0.625
+    assert (fields["Airs"]["value"], fields["Airs"]["end"]) == ("2026-11-14", "2026-11-16")
+    assert (fields["Chapters"]["value"], fields["Chapters"]["max"]) == (3, 4)
+    assert (fields["Topics"]["tags"], fields["Topics"]["copy"]) == (["#ai", "#podcast"], True)
+    # Someone of this company (a member from elsewhere too) and its own AI staff, by name; others only count.
+    assert fields["Host"]["members"] == [
+        {"name": "Ada Guest", "kind": "user", "avatar_url": "https://cdn.example.com/ada.png"},
+        {"name": "Producer Mia", "kind": "agent"}]
+    assert fields["Host"]["unavailable"] == 2
+    assert fields["Recording"]["href"] == f"/viewer/{recording}"
+    assert fields["Pictures"]["images"] == [
+        {"document_id": cover, "href": f"/viewer/{cover}"},
+        {"document_id": still, "href": f"/viewer/{still}", "label": "Studio"},
+        {"image_url": "https://cdn.example.com/x.jpg", "href": "https://cdn.example.com/x.jpg"}]
+    assert (fields["Colour"]["value"], fields["Phone"]["value"]) == ("#00aa88", "8613800138000")
+    payload = repr(result)
+    assert not any(member_id in payload for member_id in (guest.id, producer.id, stranger.id, foreign_agent.id))
+
+
+def test_text_like_formats_keep_only_what_they_can_show():
+    def shown(fmt, value, **options):
+        return _present_configured_field({"label": "X", "field": ["x"], "format": fmt, "hide_when_empty": True, **options}, value)
+
+    assert shown("code", "\n  print('hi')\n")["value"] == "  print('hi')"
+    assert shown("number", "300", unit="g") == {"label": "X", "format": "number", "value": 300, "unit": "g"}
+    assert shown("file_size", 2_516_582)["value"] == 2_516_582
+    assert shown("images", ["https://[", "https://example.com/photo.png"])["images"] == [
+        {"image_url": "https://example.com/photo.png", "href": "https://example.com/photo.png"},
+    ]
+    # Nothing to show hides the field: a bad colour, a negative size, a progress with no whole, no tags.
+    for fmt, value, options in (("color", "teal", {}), ("file_size", -1, {}), ("progress", 3, {"max_field": ["missing"]}),
+                                ("tags", [], {}), ("date_range", None, {"end_field": ["missing"]}), ("email", True, {}),
+                                ("percent", "NaN", {"scale": 100}), ("duration", "Infinity", {})):
+        assert shown(fmt, value, **options) is None
+    assert shown("tags", "solo", labels={"solo": "Solo show"})["tags"] == ["Solo show"]
+    assert shown("date", "2026-11-09T09:00:00Z", relative=True)["relative"] is True
+
+
+def test_a_media_field_shows_its_file_with_what_goes_with_it():
+    """A music release's track (a scenario beside the menu): chapters, words and a take to compare, never a raw value."""
+    track, demo, captions, take = (generate_ulid() for _ in range(4))
+    state = {"master": track, "demo": demo, "lyrics": [
+        {"start": "0:12", "end": 15, "text": "  First   line ", "speaker": "Ana"}, {"start": 3, "text": "Intro"},
+        {"start": "soon", "text": "no time"}, {"start": 20}],
+        "sections": [{"at": "1:05", "title": "Chorus"}, {"at": 0, "label": "Intro"}, {"at": 5}, {"title": "no time"}],
+        "captions": captions, "words": captions, "stems": [take, {"document_id": take}, {"document_id": demo, "label": "Demo"}, "not an id"],
+        "edit": [{"start": 5, "duration": 10, "label": "Verse", "track": "video"}, {"start": 0, "end": 5, "label": "Hook"},
+                 {"start": 9, "end": 3}, {"start": "0:20", "end": "0:30", "track": "music"}]}
+
+    def shown(fmt, path, **options):
+        return _present_configured_field({"label": "X", "field": [path], "format": fmt, "hide_when_empty": True, **options},
+                                         state.get(path), lambda field: state.get(".".join(field)))
+
+    audio = shown("audio", "master", transcript_field=["lyrics"], chapters_field=["sections"])
+    assert audio["transcript"] == [{"start": 3.0, "text": "Intro"}, {"start": 12.0, "end": 15.0, "text": "First line", "speaker": "Ana"}]
+    assert audio["chapters"] == [{"at": 0.0, "title": "Intro"}, {"at": 65.0, "title": "Chorus"}]
+    video = shown("video", "master", aspect="9:16", captions_field=["captions"], transcript_field=["words"],
+                  compare_field=["demo"], compare="side_by_side")
+    assert video["aspect"] == "9:16" and video["captions_document_id"] == captions == video["transcript_document_id"]
+    assert video["compare"] == {"document_id": demo, "href": f"/viewer/{demo}", "mode": "side_by_side"}
+    reference = shown("image", "master", compare_field=["sketch"], compare="slider")
+    assert "compare" not in reference  # Nothing to compare with shows nothing, not a broken slider.
+    assert shown("clips", "stems")["clips"] == [{"document_id": take, "href": f"/viewer/{take}"},
+                                                {"document_id": demo, "href": f"/viewer/{demo}", "label": "Demo"}]
+    assert shown("timeline", "edit")["segments"] == [
+        {"start": 0.0, "end": 5.0, "label": "Hook"}, {"start": 5.0, "end": 15.0, "label": "Verse", "track": "video"},
+        {"start": 20.0, "end": 30.0, "track": "music"}]
+    assert shown("clips", "missing") is None and shown("timeline", "missing") is None
+
+
+def test_a_file_says_its_size_shape_length_and_how_it_was_made():
+    from packages.core.services.workspace_app_media import media_details, media_facts, media_seconds
+
+    assert media_facts({"generation": {"params": {"size": "1080x1350"}}}) == {"width": 1080, "height": 1350}
+    assert media_facts({"generation": {"params": {"aspect_ratio": "9:16", "duration": 8}}}) == {"aspect": "9:16", "duration": 8.0}
+    assert media_facts({"width": 1920, "height": "1080", "generation": {"params": {"size": "512x512"}}}) == {"width": 1920, "height": 1080}
+    assert media_facts({"generation": {"params": {"size": "huge", "duration": -3}}}) == {}
+    assert media_facts(None) == {}
+    assert media_details({"generation": {"model": "gpt-image-1", "prompt": "A  poster\nfor the tour"}},
+                         source="generated", created_at=None) == {"source": "generated", "model": "gpt-image-1",
+                                                                   "prompt": "A poster for the tour"}
+    assert [media_seconds(value) for value in ("1:02:03.5", "07", 7, True, -1, "1:75:00")] == [3723.5, 7.0, 7.0, None, None, None]
+
+
 def test_document_field_opens_only_a_bare_document_id_in_the_viewer():
     """A document field links to the viewer for a stored Document ID; anything else is hidden instead of linked."""
     configured = {"label": "Video", "field": ["production", "video_document_id"], "format": "document", "hide_when_empty": True}
@@ -1581,9 +2030,18 @@ async def test_each_episode_shows_as_one_pack_of_its_results(db_session, monkeyp
                               created_by=owner.id, current_stage="in_production",
                               state={"parent_project_id": series.id, "code": "E02", "title": "Tomb",
                                      "project_root": "projects/ghost/e02-tomb"})
+    # The Flow names its production stages; a card names the one its run works in, as the run page does.
+    make_flow = WorkflowDefinition(id="make-flow", entity_id=entity.id, name="Make an episode", steps=[
+        {"id": "start", "type": "trigger", "config": {"production": {"stages": [
+            {"label": "Script", "steps": ["write"]},
+            {"label": "Shots", "steps": ["render"], "i18n": {"zh": {"label": "镜头"}}},
+        ]}}},
+        {"id": "write", "type": "agent", "config": {}},
+        {"id": "render", "type": "tool", "config": {}},
+    ])
     failed_run = WorkflowRun(entity_id=entity.id, workspace_id=workspace.id, workflow_id="make-flow",
                              binding_id="make-binding", status="failed", current_step_id="render")
-    db_session.add_all([stalled, failed_run])
+    db_session.add_all([make_flow, stalled, failed_run])
     await db_session.flush()
     stalled.last_run_id = failed_run.id
     # Retrying the stopped run is a new attempt in its lineage; the card follows it.
@@ -1631,8 +2089,21 @@ async def test_each_episode_shows_as_one_pack_of_its_results(db_session, monkeyp
     cards = {item["pack"]["label"]: item["pack"] for item in items if not item["document_id"]}
     assert set(cards) == {"E01 · Lantern", "E02 · Tomb"}
     assert cards["E02 · Tomb"]["run"] == {"id": retry.id, "workflow_id": "make-flow", "binding_id": "make-binding",
-                                          "status": "running", "needs_you": False}
+                                          "status": "running", "needs_you": False, "stage": "Shots"}
     assert "run" not in cards["E01 · Lantern"]
+    # The stage reads in the viewer's language.
+    from packages.core.i18n import get_locale, set_locale
+
+    before = get_locale()
+    set_locale("zh")
+    try:
+        shown = await component_data(db_session, workspace, user=owner, component_key="series",
+                                     context_kind="project", context_id=series.id, locale="zh")
+    finally:
+        set_locale(before)
+    runs = [item["pack"]["run"] for item in shown["blocks"][0]["items"]
+            if not item["document_id"] and item["pack"].get("run")]
+    assert [run["stage"] for run in runs] == ["镜头"]
 
 
 @pytest.mark.asyncio
@@ -1715,7 +2186,7 @@ async def test_series_are_cards_showing_their_key_visual_and_how_many_episodes_a
     db_session.add_all([entity, owner])
     await db_session.flush()
     owner.entity_id = entity.id
-    workspace = Workspace(entity_id=entity.id, name="Cards", operating_model={}, artifact_folder_id="folder3")
+    workspace = Workspace(entity_id=entity.id, name="Cards", operating_model={}, artifact_folder_id="folder-candles")
     db_session.add(workspace)
     await db_session.flush()
     art = "Workspaces/_by_id/folder3/projects/ghost/references/key.png"
@@ -1840,6 +2311,113 @@ async def test_a_gallery_shows_the_latest_version_of_each_result_a_flow_made(db_
     night, *finished = data["blocks"][0]["items"]
     assert 1 <= night["progress_percent"] <= 99
     assert all("progress_percent" not in item for item in finished)
+
+
+@pytest.mark.asyncio
+async def test_a_cover_gallery_keeps_each_results_sizes_together_with_its_versions_and_details(db_session, monkeypatch):
+    """A release's cover in three sizes is one group; its earlier version and how each file was made come along."""
+    entity = Entity(name="Label")
+    user = User(entity_id="pending", email="label-art@test.com", password_hash="x", role="owner")
+    db_session.add_all([entity, user])
+    await db_session.flush()
+    user.entity_id = entity.id
+    steps = [{"id": "start", "type": "trigger", "config": {}},
+             {"id": "art", "type": "agent", "config": {"output_var": "cover", "output_schema": {"type": "object", "properties": {
+                 "title": {"type": "string"}, "files": {"type": "array"}}}}}]
+    view = {"data_sources": {"covers": {
+        "type": "workflow_results", "producer_workflows": ["workflow_definition:cover"], "versions": True,
+        "label_fields": [["cover", "title"]], "fields": [["cover", "title"]], "media": [{"field": ["cover", "files"]}]}},
+        "components": [{"type": "data_view", "key": "art", "context": {"kind": "workspace"}, "blocks": [
+            {"key": "covers", "type": "gallery", "source": "covers",
+             "media": {"layout": "grid", "group": "record", "details": True, "size_label": True}}]}]}
+    workspace = Workspace(entity_id=entity.id, name="Release", operating_model={"app_view": view})
+    db_session.add(workspace)
+    await db_session.flush()
+
+    def picture(name, size, prompt):
+        return Document(entity_id=entity.id, name=name, mime_type="image/png", file_type="png", visibility="workspace",
+                        owner_id=user.id, source="generated", metadata_={"generation": {
+                            "model": "image-model", "prompt": prompt, "params": {"size": size}}})
+    first = picture("cover-v1.png", "1024x1024", "Neon city, first try")
+    square, story, wide = (picture(f"cover-{shape}.png", size, "Neon city at dawn")
+                           for shape, size in (("square", "1080x1080"), ("story", "1080x1920"), ("wide", "1920x1080")))
+    db_session.add_all([first, square, story, wide])
+    await db_session.flush()
+    clock = datetime(2026, 11, 9, 9, tzinfo=UTC)
+    v1 = WorkflowRun(entity_id=entity.id, workspace_id=workspace.id, workflow_id="cover", status="completed", created_at=clock,
+                     variables={"cover": {"title": "Neon City", "files": [first.id]}})
+    db_session.add(v1)
+    await db_session.flush()
+    v2 = WorkflowRun(entity_id=entity.id, workspace_id=workspace.id, workflow_id="cover", status="completed",
+                     lineage_root_run_id=v1.id, created_at=clock + timedelta(minutes=5), variables={"cover": {
+                         "title": "Neon City", "files": [{"document_id": square.id, "label": "Square"}, story.id, wide.id]}})
+    db_session.add(v2)
+    await db_session.commit()
+
+    async def catalog(*_args, **_kwargs):
+        return {"workflow_definitions": {"cover"}, "workflow_bindings": set(), "stat_keys": set(),
+                "workflows": [{"slug": "cover", "steps": steps}]}
+    monkeypatch.setattr("packages.core.services.workspace_app_data.load_workspace_app_data_catalog", catalog)
+
+    data = await component_data(db_session, workspace, user=user, component_key="art", context_kind="workspace",
+                                context_id=workspace.id)
+    items = data["blocks"][0]["items"]
+    # Each size is a tile of the one result, and the page groups them by it.
+    assert [(item["media"][0]["title"], item["group"]) for item in items] == [
+        ("cover-square.png", v1.id), ("cover-story.png", v1.id), ("cover-wide.png", v1.id)]
+    story_tile = items[1]["media"][0]
+    assert (story_tile["width"], story_tile["height"]) == (1080, 1920)
+    assert story_tile["details"] == {"source": "generated", "model": "image-model", "prompt": "Neon city at dawn",
+                                     "created_at": story_tile["details"]["created_at"]}
+    # The shown result is v2; v1 is kept with its own file and how it was made.
+    assert items[0]["version"] == 2
+    assert [(version["number"], version["run_id"], [media["title"] for media in version["media"]])
+            for version in items[0]["versions"]] == [(1, v1.id, ["cover-v1.png"])]
+    assert items[0]["versions"][0]["media"][0]["details"]["prompt"] == "Neon city, first try"
+
+    # A gallery that does not show details sends none, and without versions it keeps only the latest.
+    view["data_sources"]["covers"].pop("versions")
+    view["components"][0]["blocks"][0]["media"] = {"layout": "strip"}
+    workspace.operating_model = {"app_view": copy.deepcopy(view)}
+    await db_session.commit()
+    data = await component_data(db_session, workspace, user=user, component_key="art", context_kind="workspace",
+                                context_id=workspace.id)
+    items = data["blocks"][0]["items"]
+    assert all("details" not in item["media"][0] and "versions" not in item and "group" not in item for item in items)
+
+
+@pytest.mark.asyncio
+async def test_a_text_gallery_skips_a_finished_run_that_made_nothing(db_session, monkeypatch):
+    """A run that ended asking for input completed with no declared value: no untitled card."""
+    entity = Entity(name="Brief shelf")
+    user = User(entity_id="pending", email="brief-shelf@test.com", password_hash="x", role="owner")
+    db_session.add_all([entity, user])
+    await db_session.flush()
+    user.entity_id = entity.id
+    source = {"type": "workflow_results", "producer_workflows": ["workflow_definition:create-song"],
+              "label_fields": [["song_plan", "title"]], "fields": [["song_plan", "title"]]}
+    view = {"data_sources": {"songs": source}, "components": [{**SONG_VIEW["components"][0], "blocks": [
+        {"key": "songs", "type": "gallery", "source": "songs"}]}]}
+    workspace = Workspace(entity_id=entity.id, name="Briefs", operating_model={"app_view": view})
+    db_session.add(workspace)
+    await db_session.flush()
+    clock = datetime(2026, 10, 29, 9, tzinfo=UTC)
+    db_session.add_all([
+        WorkflowRun(entity_id=entity.id, workspace_id=workspace.id, workflow_id="create-song", status="completed",
+                    variables={"song_plan": {"title": "Weekly plan"}}, created_at=clock),
+        WorkflowRun(entity_id=entity.id, workspace_id=workspace.id, workflow_id="create-song", status="completed",
+                    variables={"style": "synth-pop"}, created_at=clock + timedelta(minutes=1)),
+    ])
+    await db_session.commit()
+
+    async def catalog(*_args, **_kwargs):
+        return {"workflow_definitions": {"create-song"}, "workflow_bindings": set(), "stat_keys": set(),
+                "workflows": [{"slug": "create-song", "steps": SONG_STEPS}]}
+    monkeypatch.setattr("packages.core.services.workspace_app_data.load_workspace_app_data_catalog", catalog)
+
+    data = await component_data(db_session, workspace, user=user, component_key="songs",
+                                context_kind="workspace", context_id=workspace.id)
+    assert [item["title"] for item in data["blocks"][0]["items"]] == ["Weekly plan"]
 
 
 @pytest.mark.parametrize("change, message", [
@@ -2018,3 +2596,424 @@ async def test_course_card_and_open_course_count_reminders_by_their_runs_alike(d
                                   context_kind="project", context_id=course.id, block_key="rollup")
     rollup = inside["blocks"][0]["items"][0]
     assert (rollup["total"], rollup["counts_by_stage"], rollup["counts_include_execution"]) == (4, expected, True)
+
+
+@pytest.mark.asyncio
+async def test_a_page_shows_what_the_workflow_says_a_person_should_see(db_session, monkeypatch):
+    """A weekly post batch reads by its display, lists only its finished files and shows each post's image;
+    a dish's photo field shows the picture, not a link."""
+    entity = Entity(name="Candle shop")
+    user = User(entity_id="pending", email="candle-shop@test.com", password_hash="x", role="owner")
+    db_session.add_all([entity, user])
+    await db_session.flush()
+    user.entity_id = entity.id
+    workspace = Workspace(entity_id=entity.id, name="Candles", operating_model={}, artifact_folder_id="folder-weekly-posts")
+    db_session.add(workspace)
+    await db_session.flush()
+    home = "Workspaces/_by_id/folder-weekly-posts/projects/weekly"
+
+    def doc(name, mime="image/png"):
+        return Document(entity_id=entity.id, name=name, mime_type=mime, file_type=name.rsplit(".", 1)[1],
+                        source="generated", visibility="workspace", owner_id=user.id, fs_path=f"{home}/{name}")
+    finals = [doc(f"{scent}.png") for scent in ("fig", "cedar", "amber")]
+    captions, drafts = doc("captions-final.md", "text/markdown"), doc("captions.md", "text/markdown")
+    # A reference copy and another format of the same image are in the folder, but the state never names them.
+    extras = [doc("fig-reference.png"), doc("fig.jpg", "image/jpeg"), drafts]
+    dish_photo = doc("mapo-tofu.jpg", "image/jpeg")
+    db_session.add_all([*finals, captions, *extras, dish_photo])
+    await db_session.flush()
+    posts = [{"title": f"{scent.title()} post", "image_document_id": image.id}
+             for scent, image in zip(("fig", "cedar", "amber"), finals)]
+    batch = WorkflowProject(entity_id=entity.id, workspace_id=workspace.id, project_type="weekly_content", schema_version=1,
+                            created_by=user.id, current_stage="awaiting_approval", state={
+                                "brief": "Push three winter scents, warm and quiet, post Mon/Wed/Fri 9am",
+                                "project_root": "projects/weekly", "posts": posts, "deliverable_document_id": captions.id,
+                                "display": {"title": "Winter scents week", "status": "3 posts ready for your review",
+                                            "summary": "Fig, Cedar and Amber, Mon/Wed/Fri at 9am.",
+                                            "media": [finals[0].id]}})
+    dish = WorkflowProject(entity_id=entity.id, workspace_id=workspace.id, project_type="dish", schema_version=1,
+                           created_by=user.id, current_stage="active", state={"name": "Mapo tofu", "photo": dish_photo.id})
+    db_session.add_all([batch, dish])
+    workspace.operating_model = {"app_view": {"data_sources": {
+        "batches": {"type": "workflow_projects", "project_type": "weekly_content", "producer_workflows": ["workflow_definition:posts"],
+                    "fields": [["display", "summary"]]},
+        "posts": {"type": "project_records", "parent": "batches", "record_path": ["posts"], "fields": [["image_document_id"]]},
+        "files": {"type": "project_files", "parent": "batches"},
+        "dishes": {"type": "workflow_projects", "project_type": "dish", "producer_workflows": ["workflow_definition:dishes"],
+                   "fields": [["name"], ["photo"]], "label_fields": [["name"]]},
+    }, "components": [
+        {"type": "data_view", "schema_version": 1, "key": "overview", "context": {"kind": "workspace"},
+         "blocks": [{"key": "batches", "type": "progress", "source": "batches"}]},
+        {"type": "data_view", "schema_version": 1, "key": "week", "context": {"kind": "project", "source": "batches", "display": "cards"},
+         "blocks": [{"key": "files", "type": "documents", "source": "files"},
+                    {"key": "images", "type": "gallery", "source": "posts",
+                     "fields": [{"field": ["image_document_id"], "label": "Image", "format": "image"}]}]},
+        {"type": "data_view", "schema_version": 1, "key": "dishes", "context": {"kind": "project", "source": "dishes"},
+         "blocks": [{"key": "details", "type": "summary", "source": "dishes",
+                     "fields": [{"field": ["photo"], "label": "Photo", "format": "image"}]}]},
+    ]}}
+    await db_session.commit()
+
+    async def catalog(*_args, **_kwargs):
+        return {"workflow_definitions": {"posts", "dishes"}, "workflow_bindings": set(), "stat_keys": set(), "workflows": []}
+    monkeypatch.setattr("packages.core.services.workspace_app_data.load_workspace_app_data_catalog", catalog)
+
+    overview = await component_data(db_session, workspace, user=user, component_key="overview",
+                                    context_kind="workspace", context_id=workspace.id)
+    item = overview["blocks"][0]["items"][0]
+    # Its own title, status words and summary, never the brief, the stage key or the project type.
+    assert (item["label"], item["status_label"], item["detail"]) == (
+        "Winter scents week", "3 posts ready for your review", "Fig, Cedar and Amber, Mon/Wed/Fri at 9am.")
+    cards = (await component_contexts(db_session, workspace, user=user, component_key="week"))["items"]
+    assert (cards[0]["label"], cards[0]["status_label"], cards[0]["cover"]["document_id"]) == (
+        "Winter scents week", "3 posts ready for your review", finals[0].id)
+
+    week = await component_data(db_session, workspace, user=user, component_key="week",
+                                context_kind="project", context_id=batch.id)
+    files, images = week["blocks"][0]["items"], week["blocks"][1]["items"]
+    # Only the files the batch names: no reference copy, other format or draft.
+    assert sorted(item["title"] for item in files) == ["amber.png", "captions-final.md", "cedar.png", "fig.png"]
+    # One tile per post image, named by its post.
+    assert [(tile["title"], tile["media"][0]["document_id"]) for tile in images] == [
+        (post["title"], post["image_document_id"]) for post in posts]
+    assert all(tile["fields"] == [] for tile in images)
+
+    dishes = await component_data(db_session, workspace, user=user, component_key="dishes",
+                                  context_kind="project", context_id=dish.id)
+    photo = dishes["blocks"][0]["items"][0]["fields"][0]
+    assert (photo["format"], photo["document_id"], photo["href"]) == ("image", dish_photo.id, f"/viewer/{dish_photo.id}")
+    # A photo entered as an address shows as that picture too; anything else shows nothing.
+    image = {"label": "Photo", "format": "image", "hide_when_empty": True}
+    assert _present_configured_field(image, "https://cdn.example.com/mapo.jpg")["image_url"] == "https://cdn.example.com/mapo.jpg"
+    assert _present_configured_field(image, "javascript:alert(1)") is None
+
+
+@pytest.mark.asyncio
+async def test_a_record_field_shows_the_records_it_names_by_their_names(db_session, monkeypatch):
+    """Staging 2026-11-08: a promotion's dishes read as a list of ids. Each record now shows by its name;
+    one that is gone, in another Workspace or of another type only counts as unavailable."""
+    entity = Entity(name="Noodle bar")
+    user = User(entity_id="pending", email="noodle-bar@test.com", password_hash="x", role="owner")
+    db_session.add_all([entity, user])
+    await db_session.flush()
+    user.entity_id = entity.id
+    workspace = Workspace(entity_id=entity.id, name="Marketing desk", operating_model={})
+    elsewhere = Workspace(entity_id=entity.id, name="Other desk", operating_model={})
+    db_session.add_all([workspace, elsewhere])
+    await db_session.flush()
+
+    def project(project_type, state, *, home=workspace, key=None):
+        return WorkflowProject(entity_id=entity.id, workspace_id=home.id, project_type=project_type, schema_version=1,
+                               project_key=key, current_stage="active", state=state, created_by=user.id)
+    mapo, dumplings = project("dish", {"name": "Mapo tofu"}), project("dish", {"display": {"title": "Pork dumplings"}})
+    # Nothing to name it by but an opaque key: it reads as untitled, never by the key or its id.
+    unnamed = project("dish", {}, key=f"dish:{generate_ulid()}")
+    foreign = project("dish", {"name": "Their dish"}, home=elsewhere)
+    poster = project("poster", {"name": "Spring poster"})
+    db_session.add_all([mapo, dumplings, unnamed, foreign, poster])
+    await db_session.flush()
+    deleted = generate_ulid()
+    promotion = project("promotion", {"title": "Spring week", "hero_dish_id": mapo.id,
+                                      "dish_ids": [mapo.id, dumplings.id, unnamed.id, deleted, foreign.id, poster.id]})
+    db_session.add(promotion)
+    dishes = {"field": ["dish_ids"], "label": "Dishes", "format": "record", "project_type": "dish"}
+    workspace.operating_model = {"app_view": {"data_sources": {
+        "promotions": {"type": "workflow_projects", "project_type": "promotion", "producer_workflows": ["workflow_definition:promote"],
+                       "fields": [["title"], ["dish_ids"], ["hero_dish_id"]], "label_fields": [["title"]]},
+    }, "components": [
+        {"type": "data_view", "schema_version": 1, "key": "overview", "context": {"kind": "workspace"},
+         "blocks": [{"key": "promotions", "type": "progress", "source": "promotions", "fields": [dishes]}]},
+        {"type": "data_view", "schema_version": 1, "key": "promotion", "context": {"kind": "project", "source": "promotions"},
+         "blocks": [{"key": "details", "type": "summary", "source": "promotions", "fields": [
+             {"field": ["hero_dish_id"], "label": "Hero dish", "format": "record"},
+             {"field": ["dish_ids"], "label": "Any record", "format": "record"}]}]},
+    ]}}
+    await db_session.commit()
+
+    async def catalog(*_args, **_kwargs):
+        return {"workflow_definitions": {"promote"}, "workflow_bindings": set(), "stat_keys": set(), "workflows": []}
+    monkeypatch.setattr("packages.core.services.workspace_app_data.load_workspace_app_data_catalog", catalog)
+
+    overview = await component_data(db_session, workspace, user=user, component_key="overview",
+                                    context_kind="workspace", context_id=workspace.id)
+    field = overview["blocks"][0]["items"][0]["fields"][0]
+    # The deleted dish, the other Workspace's dish and the poster are not dishes of this Workspace.
+    assert field == {"label": "Dishes", "format": "record", "value": None, "unavailable": 3, "records": [
+        {"id": mapo.id, "label": "Mapo tofu"}, {"id": dumplings.id, "label": "Pork dumplings"},
+        {"id": unnamed.id, "label": None}]}
+    assert foreign.id not in str(field["records"]) and "Their dish" not in str(field)
+
+    details = await component_data(db_session, workspace, user=user, component_key="promotion",
+                                   context_kind="project", context_id=promotion.id)
+    hero, any_record = details["blocks"][0]["items"][0]["fields"]
+    # One id is one record; with no project_type a field names any record of this Workspace.
+    assert (hero["records"], "unavailable" in hero) == ([{"id": mapo.id, "label": "Mapo tofu"}], False)
+    assert [record["label"] for record in any_record["records"]] == ["Mapo tofu", "Pork dumplings", None, "Spring poster"]
+    assert any_record["unavailable"] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_gallery_shows_each_image_one_run_made(db_session, monkeypatch):
+    """A run that made three scene images is three tiles, not one card of its first file."""
+    entity = Entity(name="Scene shelf")
+    user = User(entity_id="pending", email="scene-shelf@test.com", password_hash="x", role="owner")
+    db_session.add_all([entity, user])
+    await db_session.flush()
+    user.entity_id = entity.id
+    workspace = Workspace(entity_id=entity.id, name="Scenes", operating_model={})
+    db_session.add(workspace)
+    await db_session.flush()
+    scenes = [Document(entity_id=entity.id, name=f"scene-{index}.png", mime_type="image/png", file_type="png",
+                       visibility="workspace", owner_id=user.id) for index in range(3)]
+    db_session.add_all(scenes)
+    await db_session.flush()
+    db_session.add(WorkflowRun(entity_id=entity.id, workspace_id=workspace.id, workflow_id="scenes", status="completed",
+                               variables={"prepare": {"title": "Winter week", "images": [
+                                   {"document_id": scene.id, "label": f"Scene {index}"} for index, scene in enumerate(scenes)]}}))
+    workspace.operating_model = {"app_view": {"data_sources": {"scenes": {
+        "type": "workflow_results", "producer_workflows": ["workflow_definition:scenes"],
+        "label_fields": [["prepare", "title"]], "fields": [["prepare", "title"]],
+        "media": [{"field": ["prepare", "images"]}]}},
+        "components": [{"type": "data_view", "key": "scenes", "context": {"kind": "workspace"},
+                        "blocks": [{"key": "scenes", "type": "gallery", "source": "scenes"}]}]}}
+    await db_session.commit()
+
+    async def catalog(*_args, **_kwargs):
+        return {"workflow_definitions": {"scenes"}, "workflow_bindings": set(), "stat_keys": set(), "workflows": []}
+    monkeypatch.setattr("packages.core.services.workspace_app_data.load_workspace_app_data_catalog", catalog)
+
+    data = await component_data(db_session, workspace, user=user, component_key="scenes",
+                                context_kind="workspace", context_id=workspace.id)
+    assert [(tile["title"], tile["media"][0]["title"]) for tile in data["blocks"][0]["items"]] == [
+        ("Scene 0", "scene-0.png"), ("Scene 1", "scene-1.png"), ("Scene 2", "scene-2.png")]
+
+
+@pytest.mark.asyncio
+async def test_each_post_shows_as_it_will_look_and_as_it_went_out(db_session, monkeypatch):
+    """A B2B founder's insight as a LinkedIn post and an X thread: each in its platform's frame, the X one's receipt
+    with the words that went out, and the week laid out by platform."""
+    entity = Entity(name="Thought leadership")
+    user = User(entity_id="pending", email="thought-leadership@test.com", password_hash="x", role="owner")
+    db_session.add_all([entity, user])
+    await db_session.flush()
+    user.entity_id = entity.id
+    workspace = Workspace(entity_id=entity.id, name="Founder voice", operating_model={})
+    db_session.add(workspace)
+    await db_session.flush()
+    insight = WorkflowProject(entity_id=entity.id, workspace_id=workspace.id, project_type="insight", schema_version=1,
+                              project_key="pricing", state={"title": "Pricing is a product"}, created_by=user.id)
+    db_session.add(insight)
+    await db_session.flush()
+    chart = generate_ulid()
+    common = {"insight_id": insight.id, "author": "Dana Reyes", "images": [chart]}
+    linkedin = WorkflowProject(entity_id=entity.id, workspace_id=workspace.id, project_type="post", schema_version=1,
+        project_key="pricing-linkedin", current_stage="scheduled", created_by=user.id, state={**common,
+            "platform": "LinkedIn", "caption": "Most SaaS teams price last.", "hashtags": "#pricing #saas, #b2b",
+            "scheduled_at": "2026-11-10T15:00:00Z"})
+    x_post = WorkflowProject(entity_id=entity.id, workspace_id=workspace.id, project_type="post", schema_version=1,
+        project_key="pricing-x", current_stage="published", created_by=user.id, state={**common,
+            "platform": "twitter", "caption": "Pricing is a product. A thread:", "hashtags": ["#pricing"],
+            "thread": ["1/ Price before you build.", {"text": "2/ Then test it."}, ""],
+            "comments": [{"author": "Sam", "text": "Strong take", "likes": 4, "at": "2026-11-11T09:00:00Z"}, {"author": "Nobody"}],
+            "scheduled_at": "2026-11-11T16:00:00Z", "publication": {
+                "schema_version": "publication-receipt/v1", "verification_status": "verified", "platform": "x",
+                "published_url": "https://x.com/dana/status/1", "published_at": "2026-11-11T16:02:00Z",
+                "title": "Pricing thread"}})
+    weibo = WorkflowProject(entity_id=entity.id, workspace_id=workspace.id, project_type="post", schema_version=1,
+        project_key="pricing-weibo", current_stage="draft", created_by=user.id, state={
+            "insight_id": insight.id, "platform": "Weibo", "caption": "定价就是产品。", "scheduled_at": "2026-11-12T02:00:00Z"})
+    db_session.add_all([linkedin, x_post, weibo])
+    fields = [["platform"], ["caption"], ["hashtags"], ["thread"], ["images"], ["author"], ["scheduled_at"],
+              ["insight_id"], ["comments"]]
+    order = {"field": ["scheduled_at"], "type": "datetime", "direction": "asc"}
+    preview = {"fields": {"platform": ["platform"], "caption": ["caption"], "hashtags": ["hashtags"],
+                          "thread": ["thread"], "images": ["images"], "account": ["author"],
+                          "published_at": ["scheduled_at"], "comments": ["comments"]},
+               "layout": "side_by_side", "group_field": ["insight_id"]}
+    workspace.operating_model = {"app_view": {"data_sources": {
+        "insights": {"type": "workflow_projects", "project_type": "insight", "fields": [["title"]],
+                     "producer_workflows": ["workflow_definition:insight"]},
+        "posts": {"type": "related_projects", "project_type": "post", "parent": "insights", "parent_state_path": ["insight_id"],
+                  "fields": fields, "order": order, "producer_workflows": ["workflow_definition:post"]},
+        "receipts": {"type": "project_records", "parent": "posts", "record_path": ["publication"],
+                     "record_schema": "publication-receipt/v1"},
+        "schedule": {"type": "workflow_projects", "project_type": "post", "fields": fields, "order": order,
+                     "producer_workflows": ["workflow_definition:post"]},
+    }, "components": [
+        {"type": "data_view", "key": "insight", "context": {"kind": "project", "source": "insights"}, "blocks": [
+            {"key": "versions", "type": "progress", "source": "posts", "preview": preview},
+            {"key": "published", "type": "records", "source": "receipts", "preview": {
+                "platform": "linkedin", "fields": {"caption": ["caption"], "images": ["images"], "account": ["author"]}}}]},
+        {"type": "data_view", "key": "schedule", "context": {"kind": "workspace"},
+         "blocks": [{"key": "calendar", "type": "progress", "source": "schedule"}],
+         "display": {"calendar": {"block": "calendar", "date_field": ["scheduled_at"], "attention_stages": [],
+                                  "collection_title": "Posts", "span": "week", "lane_field": ["platform"]}}},
+    ]}}
+    await db_session.commit()
+
+    async def catalog(*_args, **_kwargs):
+        def flow(slug, project_type, properties):
+            return {"slug": slug, "steps": [{"type": "workflow_project", "config": {"project_type": project_type, "state_schema": {
+                "type": "object", "properties": properties}}}]}
+        post = {name: {"type": "string"} for name in ("platform", "caption", "author", "scheduled_at", "insight_id")}
+        post.update(hashtags={}, thread={"type": "array"}, images={"type": "array"}, comments={"type": "array"},
+                    publication={"type": "object"})
+        return {"workflow_definitions": {"insight", "post"}, "workflow_bindings": set(), "stat_keys": set(), "workflows": [
+            flow("insight", "insight", {"title": {"type": "string"}}), flow("post", "post", post)]}
+    monkeypatch.setattr("packages.core.services.workspace_app_data.load_workspace_app_data_catalog", catalog)
+
+    data = await component_data(db_session, workspace, user=user, component_key="insight", context_kind="project",
+                                context_id=insight.id)
+    versions, published = data["blocks"]
+    previews = [item["preview"] for item in versions["items"]]
+    image = {"document_id": chart, "href": f"/viewer/{chart}"}
+    assert previews == [
+        {"platform": "linkedin", "caption": "Most SaaS teams price last.", "account": "Dana Reyes", "images": [image],
+         "hashtags": ["pricing", "saas", "b2b"], "published_at": "2026-11-10T15:00:00Z", "group": insight.id},
+        {"platform": "x", "caption": "Pricing is a product. A thread:", "account": "Dana Reyes", "images": [image],
+         "hashtags": ["pricing"], "published_at": "2026-11-11T16:00:00Z",
+         "thread": ["1/ Price before you build.", "2/ Then test it."],
+         "comments": [{"text": "Strong take", "author": "Sam", "at": "2026-11-11T09:00:00Z", "likes": 4}], "group": insight.id},
+        # A platform with no frame of its own is a plain post under its own name, never another platform's frame.
+        {"platform": None, "platform_label": "Weibo", "caption": "定价就是产品。", "published_at": "2026-11-12T02:00:00Z",
+         "group": insight.id}]
+    # The receipt is the post as it went out: its words from the post, where and when from the receipt.
+    receipt = published["items"][0]
+    assert receipt["href"] == "https://x.com/dana/status/1" and receipt["published_at"] == "2026-11-11T16:02:00Z"
+    assert receipt["preview"] == {"platform": "x", "title": "Pricing thread", "caption": "Pricing is a product. A thread:",
+                                  "account": "Dana Reyes", "images": [image]}
+
+    schedule = await component_data(db_session, workspace, user=user, component_key="schedule",
+                                    context_kind="workspace", context_id=workspace.id)
+    assert [(item["calendar_lane"], item.get("calendar_lane_platform")) for item in schedule["blocks"][0]["items"]] == [
+        ("LinkedIn", "linkedin"), ("twitter", "x"), ("Weibo", None)]
+
+
+@pytest.mark.asyncio
+async def test_a_sales_pipeline_charts_totals_groups_and_trees_its_records(db_session, monkeypatch):
+    """A B2B pipeline: revenue by month against its Goal, a win-rate funnel, the biggest deals, totals that follow a
+    filter, deals grouped by region with their office; and a series → episode → shot tree beside it."""
+    from packages.core.models.goal import Goal
+
+    entity = Entity(name="Northwind")
+    user = User(entity_id="pending", email="pipeline@test.com", password_hash="x", role="owner")
+    db_session.add_all([entity, user])
+    await db_session.flush()
+    user.entity_id = entity.id
+    workspace = Workspace(entity_id=entity.id, name="Sales", operating_model={})
+    db_session.add(workspace)
+    await db_session.flush()
+
+    def project(project_type, key, stage, **state):
+        return WorkflowProject(entity_id=entity.id, workspace_id=workspace.id, project_type=project_type, schema_version=1,
+                               project_key=key, current_stage=stage, state=state, created_by=user.id)
+    deals = [
+        project("deal", "acme", "won", account="Acme", amount=12000, closed_at="2026-09-03T10:00:00-07:00", region="west",
+                office="1 Market St, San Francisco", lat=37.79, lng=-122.39),
+        project("deal", "beta", "proposal", account="Beta", amount="8,000", closed_at="2026-11-12", region="east",
+                office="5 Main St, Boston"),
+        project("deal", "cora", "lost", account="Cora", amount=3000, closed_at="2026-11-20T19:00:00+08:00", region="west",
+                office="1 market st, san francisco"),
+        project("deal", "dyn", "lead", account="Dyn", amount=None, region=None),
+    ]
+    series = project("series", "stickman", "active", title="Stickman")
+    db_session.add_all([*deals, series])
+    await db_session.flush()
+    episodes = [project("episode", f"e{index}", "made", title=f"Episode {index}", series_id=series.id) for index in (1, 2)]
+    db_session.add_all(episodes)
+    await db_session.flush()
+    db_session.add_all([project("shot", f"s{index}", "drawn", title=f"Shot {index}", episode_id=episodes[0].id) for index in (1, 2, 3)])
+    stat = WorkspaceStat(entity_id=entity.id, workspace_id=workspace.id, key="mrr", name="MRR", unit="USD",
+                         description="Monthly recurring revenue from signed contracts", collector_type="manual")
+    db_session.add_all([stat, Goal(entity_id=entity.id, workspace_id=workspace.id, title="Q4 revenue", metric_key="revenue",
+                                   goal_key="q4_revenue", target_value=20000, status="active")])
+    await db_session.flush()
+    now = datetime.now(UTC)
+    db_session.add_all([WorkspaceStatObservation(entity_id=entity.id, workspace_id=workspace.id, stat_id=stat.id, value=value,
+                                                 observed_at=now - timedelta(days=days), source="test", idempotency_key=f"mrr-{days}")
+                        for days, value in ((2, 41000), (1, 43000), (40, 30000))])
+    amount = {"field": ["amount"], "label": "Amount", "format": "money", "currency": "USD", "bar": True}
+    deal_source = {"type": "workflow_projects", "project_type": "deal", "producer_workflows": ["workflow_definition:deal"],
+                   "fields": [["account"], ["amount"], ["closed_at"], ["region"], ["office"], ["lat"], ["lng"]],
+                   "label_fields": [["account"]], "stages": ["lead", "qualified", "proposal", "won", "lost"]}
+    workspace.operating_model = {"app_view": {"data_sources": {
+        "deals": deal_source,
+        "mrr": {"type": "workspace_stats", "stat_keys": ["mrr"]},
+        "series": {"type": "workflow_projects", "project_type": "series", "fields": [["title"]], "label_fields": [["title"]],
+                   "producer_workflows": ["workflow_definition:series"]},
+        "episodes": {"type": "related_projects", "project_type": "episode", "parent": "series", "parent_state_path": ["series_id"],
+                     "fields": [["title"]], "label_fields": [["title"]], "producer_workflows": ["workflow_definition:series"]},
+        "shots": {"type": "related_projects", "project_type": "shot", "parent": "episodes", "parent_state_path": ["episode_id"],
+                  "fields": [["title"]], "label_fields": [["title"]], "producer_workflows": ["workflow_definition:series"]},
+    }, "components": [
+        {"type": "data_view", "key": "pipeline", "context": {"kind": "workspace"}, "display": {"layout": "grid"}, "blocks": [
+            {"key": "revenue", "type": "chart", "source": "deals", "chart": {
+                "kind": "bar", "x": {"field": ["closed_at"], "bucket": "month"}, "value": {"agg": "sum", "field": ["amount"]},
+                "format": "money", "currency": "USD", "target": {"goal": "q4_revenue"}}},
+            {"key": "funnel", "type": "chart", "source": "deals", "stage_labels": {"won": "Won"},
+             "chart": {"kind": "funnel", "x": {"by": "stage"}, "order": ["lead", "qualified", "proposal", "won"]}},
+            {"key": "biggest", "type": "chart", "source": "deals", "chart": {"kind": "leaderboard", "value": {"field": ["amount"]}, "limit": 2}},
+            {"key": "mrr_trend", "type": "chart", "source": "mrr", "chart": {"kind": "line", "x": {"bucket": "day"}}},
+            {"key": "deals", "type": "progress", "source": "deals", "view": "table", "fields": [amount],
+             "filters": [{"field": ["region"], "label": "Region"}], "group_by": [{"field": ["region"], "label": "Region"}],
+             "select": True, "export": True, "totals": [{"field": ["amount"], "agg": "sum"}, {"field": ["amount"], "agg": "avg"}]},
+            {"key": "offices", "type": "progress", "source": "deals", "view": "places",
+             "places": {"address_field": ["office"], "lat_field": ["lat"], "lng_field": ["lng"]}},
+        ]},
+        {"type": "data_view", "key": "studio", "context": {"kind": "workspace"}, "blocks": [
+            {"key": "tree", "type": "progress", "source": "series", "view": "tree", "tree": {"children": ["episodes", "shots"]}}]},
+    ]}}
+    await db_session.commit()
+
+    async def catalog(*_args, **_kwargs):
+        return {"workflow_definitions": {"deal", "series"}, "workflow_bindings": set(), "stat_keys": {"mrr"}, "workflows": []}
+    monkeypatch.setattr("packages.core.services.workspace_app_data.load_workspace_app_data_catalog", catalog)
+
+    data = await component_data(db_session, workspace, user=user, component_key="pipeline", context_kind="workspace",
+                                context_id=workspace.id, window="7d")
+    blocks = {block["key"]: block for block in data["blocks"]}
+    revenue = blocks["revenue"]["chart"]
+    # Each month adds up its deals (a quiet October included); "8,000" is a number too; the Goal is the line to reach.
+    assert [category["key"] for category in revenue["categories"]] == ["2026-09", "2026-10", "2026-11"]
+    assert revenue["series"][0]["values"] == [12000.0, 0.0, 11000.0]
+    assert revenue["target"] == {"value": 20000.0, "label": "Q4 revenue"} and revenue["currency"] == "USD"
+    # A deal at a later stage passed every earlier one; the lost one is no step of the funnel.
+    funnel = blocks["funnel"]["chart"]
+    assert [(category["label"], value) for category, value in zip(funnel["categories"], funnel["series"][0]["values"])] == [
+        ("lead", 3.0), ("qualified", 2.0), ("proposal", 2.0), ("Won", 1.0)]
+    # The phone lists a chart as its rows; a stage shown by its stored name says so, for the self-check.
+    assert [(item["title"], item["value"], item["labelled"]) for item in blocks["funnel"]["items"]][-1] == ("Won", 1, True)
+    assert blocks["funnel"]["items"][0]["labelled"] is False
+    biggest = blocks["biggest"]["chart"]
+    assert [category["label"] for category in biggest["categories"]] == ["Acme", "Beta"] and biggest["hidden_categories"] == 1
+    mrr = blocks["mrr_trend"]["chart"]
+    # Only the readings inside the window, a series per Stat, named and defined as the Stat is.
+    assert [value for value in mrr["series"][0]["values"] if value is not None] == [41000.0, 43000.0]
+    assert mrr["series"][0]["label"] == "MRR" and mrr["series"][0]["description"].startswith("Monthly recurring") and mrr["unit"] == "USD"
+
+    table = blocks["deals"]
+    assert [(total["agg"], total["value"]) for total in table["totals"]] == [("sum", 23000), ("avg", 7666.666666666667)]
+    assert table["totals"][0]["currency"] == "USD"
+    assert {item["label"]: item["groups"] for item in table["items"]} == {"Acme": ["west"], "Beta": ["east"], "Cora": ["west"], "Dyn": [""]}
+    assert next(field for field in table["items"][0]["fields"] if field["label"] == "Amount")["bar"] is True
+    # Totals follow the person's filter, over every record it keeps.
+    west = await component_data(db_session, workspace, user=user, component_key="pipeline", context_kind="workspace",
+                                context_id=workspace.id, block_key="deals", filters={"0": "west"})
+    assert [(total["agg"], total["value"]) for total in west["blocks"][0]["totals"]] == [("sum", 15000), ("avg", 7500)]
+    places = {item["label"]: item["place"] for item in blocks["offices"]["items"]}
+    assert places["Acme"] == {"address": "1 Market St, San Francisco", "lat": 37.79, "lng": -122.39}
+    assert places["Dyn"] == {"address": None}
+
+    studio = await component_data(db_session, workspace, user=user, component_key="studio", context_kind="workspace",
+                                  context_id=workspace.id)
+    assert [(item["label"], item["child_count"]) for item in studio["blocks"][0]["items"]] == [("Stickman", 2)]
+    level_one = await component_data(db_session, workspace, user=user, component_key="studio", context_kind="workspace",
+                                     context_id=workspace.id, block_key="tree", tree_parent=series.id, tree_level=1)
+    assert sorted((item["label"], item["child_count"]) for item in level_one["blocks"][0]["items"]) == [("Episode 1", 3), ("Episode 2", 0)]
+    shots = await component_data(db_session, workspace, user=user, component_key="studio", context_kind="workspace",
+                                 context_id=workspace.id, block_key="tree", tree_parent=episodes[0].id, tree_level=2, limit=2)
+    assert len(shots["blocks"][0]["items"]) == 2 and shots["blocks"][0]["next_cursor"] and shots["blocks"][0]["tree_level"] == 2
+    assert "child_count" not in shots["blocks"][0]["items"][0]
+    bad = await component_data(db_session, workspace, user=user, component_key="studio", context_kind="workspace",
+                               context_id=workspace.id, block_key="tree", tree_parent=series.id, tree_level=3)
+    assert bad["blocks"][0]["error"]["code"] == "invalid_tree_level"

@@ -127,6 +127,7 @@ async def test_collaborator_token_reaches_only_its_live_workspace(client, db_ses
         assert response.status_code == 403, (path, response.text)
         assert response.json()["detail"] == "This page is not available to external collaborators"
     assert (await client.get(f"/api/v1/workspaces/{other.json()['id']}", headers=inside)).status_code == 404
+    assert (await client.get(f"/api/v1/workspaces/{other.json()['id']}/attention-items", headers=inside)).status_code == 404
     assert (await client.get("/api/v1/tasks", headers=inside)).status_code == 404
     assert (await client.get("/api/v1/jobs", headers=inside)).status_code == 404
     assert (await client.get(f"/api/v1/tasks/{entity_level.id}", headers=inside)).status_code == 404
@@ -137,6 +138,7 @@ async def test_collaborator_token_reaches_only_its_live_workspace(client, db_ses
         f"/api/v1/tasks/{in_workspace.id}",
         f"/api/v1/workspaces/{target}/chat/messages",
         f"/api/v1/workspaces/{target}/activity",
+        f"/api/v1/workspaces/{target}/attention-items",
     ):
         response = await client.get(path, headers=inside)
         assert response.status_code == 200, (path, response.text)
@@ -152,9 +154,19 @@ async def test_collaborator_token_reaches_only_its_live_workspace(client, db_ses
             json={"body_md": "Reviewed starter"},
         ),
     ]
-    assert [response.status_code for response in refused] == [403, 403, 403, 403]
+    refused += [
+        await client.delete(f"/api/v1/workspaces/trash/{target}", headers=inside),
+        await client.post(
+            "/api/v1/workspaces/trash/purge", headers=inside, json={"workspace_ids": [target]},
+        ),
+    ]
+    assert [response.status_code for response in refused] == [403] * 6
     assert refused[-1].json()["detail"] == "This page is not available to external collaborators"
     current = (await client.get(f"/api/v1/workspaces/{target}", headers=inside)).json()["settings"]
+    # The API hides the package alias, but an echo of that record still
+    # reaches the collaborator policy for both allowed and forbidden changes.
+    assert current["_blueprint"]["package"]["ref"]
+    assert "name" not in current["_blueprint"]["package"]
     shared = await client.put(
         f"/api/v1/workspaces/{target}", headers=inside, json={"settings": {**current, "access_mode": "entity_visible"}}
     )
@@ -186,6 +198,9 @@ async def test_collaborator_token_reaches_only_its_live_workspace(client, db_ses
     ended = await client.get(f"/api/v1/workspaces/{target}", headers=inside)
     assert ended.status_code == 401, ended.text
     assert ended.json()["detail"]["code"] == "collaboration_ended"
+    attention_ended = await client.get(f"/api/v1/workspaces/{target}/attention-items", headers=inside)
+    assert attention_ended.status_code == 401, attention_ended.text
+    assert attention_ended.json()["detail"]["code"] == "collaboration_ended"
 
 
 @pytest.mark.asyncio
@@ -193,7 +208,7 @@ async def test_collaborator_app_design_stages_only_in_live_granted_workspace(cli
     from packages.core.services import workspace_app_designer
     from packages.core.services.workspace_app_designer import AppDesignResult
 
-    _ph, provider, _rh, _customer_user, target, customer, inside = await minted_in(client, db_session)
+    _ph, provider, _rh, customer_user, target, customer, inside = await minted_in(client, db_session)
     outside = Workspace(entity_id=customer, name="Customer private workspace")
     db_session.add(outside)
     await db_session.commit()
@@ -206,6 +221,11 @@ async def test_collaborator_app_design_stages_only_in_live_granted_workspace(cli
         return AppDesignResult(candidate, [], warnings, "Local provider fixture", 1)
 
     monkeypatch.setattr(workspace_app_designer, "run_app_designer", designer)
+    audience = await client.get(f"/api/v1/workspaces/{target}/app-view/design/audience", headers=inside)
+    assert audience.status_code == 200, audience.text
+    assert audience.json()["purpose"]["name"] == (await db_session.get(Workspace, target)).name
+    assert (await client.get(f"/api/v1/workspaces/{outside.id}/app-view/design/audience",
+                             headers=inside)).status_code == 404
     original = (await client.get(f"/api/v1/workspaces/{target}", headers=inside)).json()["operating_model"]
     response = await client.post(
         f"/api/v1/workspaces/{target}/app-view/design", headers=inside, json={"brief": "Design the trial page"}
@@ -222,6 +242,49 @@ async def test_collaborator_app_design_stages_only_in_live_granted_workspace(cli
     )
     assert denied.status_code == 404, denied.text
     assert calls == [(target, provider.id)]
+    issuer = await db_session.scalar(select(UserMembership).where(
+        UserMembership.user_id == customer_user.id, UserMembership.entity_id == customer,
+    ))
+    issuer.status = "inactive"
+    await db_session.commit()
+    assert (await client.get(f"/api/v1/workspaces/{target}/app-view/design/audience",
+                             headers=inside)).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_collaborator_reads_app_components_built_on_a_flow_they_cannot_open(client, db_session):
+    # 2026-11-02 prod: in a client trial every App component failed with
+    # invalid_component because a producer Flow the trial seat could not open
+    # dropped out of the catalog the saved config is checked against.
+    # Catches: App reads checking the config against the viewer's readable
+    # Flows instead of the Workspace's own.
+    from sqlalchemy.orm.attributes import flag_modified
+    from packages.core.models.workflow import WorkflowDefinition
+
+    _ph, _p, rh, customer_user, target, customer, inside = await minted_in(client, db_session)
+    workspace = await db_session.get(Workspace, target)
+    db_session.add(WorkflowDefinition(
+        id="creatorflow", entity_id=customer, workspace_id=target, name="Creator", visibility="private",
+        created_by=customer_user.id, steps=[{"id": "make", "type": "project", "config": {
+            "project_type": "creator", "state_schema": {"properties": {"priority": {"type": "string"}}}}}],
+    ))
+    workspace.operating_model = {**(workspace.operating_model or {}), "app_view": {
+        "data_sources": {"creators": {"type": "workflow_projects", "project_type": "creator", "fields": [["priority"]],
+                                      "producer_workflows": ["workflow_definition:creatorflow"]}},
+        "components": [{"type": "data_view", "key": "tracked", "context": {"kind": "workspace"},
+                        "blocks": [{"key": "creators", "type": "progress", "source": "creators",
+                                    "fields": [{"label": "Priority", "field": ["priority"]}]}]}],
+    }}
+    flag_modified(workspace, "operating_model")
+    await db_session.commit()
+
+    base = f"/api/v1/workspaces/{target}/app-view/components/tracked"
+    for headers in (rh, inside):
+        contexts = await client.get(f"{base}/contexts", headers=headers)
+        assert contexts.status_code == 200, contexts.text
+        data = await client.get(f"{base}/data", headers=headers,
+                                params={"context_kind": "workspace", "context_id": target})
+        assert data.status_code == 200, data.text
 
 
 class _Socket:

@@ -1,8 +1,8 @@
 """Background analysis of uploaded Knowledge media (see services/knowledge_media_analysis)."""
-import asyncio
 import logging
 
 from packages.core.celery_app import celery_app
+from packages.core.tasks._runtime import run_in_worker
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +12,7 @@ def analyze_document_media_task(document_id: str):
     """Describe one uploaded image/video/audio file. Claims make redelivery safe."""
     from packages.core.services.knowledge_media_analysis import analyze_document_media
 
-    status = asyncio.run(analyze_document_media(document_id))
+    status = run_in_worker(analyze_document_media(document_id))
     return {"document_id": document_id, "status": status}
 
 
@@ -26,7 +26,7 @@ def sweep_media_analysis():
         async with create_worker_session()() as db:
             return await pending_media_analysis_ids(db)
 
-    due = asyncio.run(_due())
+    due = run_in_worker(_due())
     dispatched = 0
     for document_id in due:
         try:

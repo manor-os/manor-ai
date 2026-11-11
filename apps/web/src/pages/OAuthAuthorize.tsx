@@ -23,6 +23,8 @@ import { resolveIntegrationBrand } from "../lib/brands/catalog";
 import CurrentEmailVerification from "../components/auth/CurrentEmailVerification";
 import Button from "../components/ui/Button";
 import { isSameAuthIdentity } from "../lib/authToken";
+import Checkbox from "../components/ui/Checkbox";
+import LoadingSpinner from "../components/ui/LoadingSpinner";
 
 interface ClientInfo {
   client_id: string;
@@ -36,16 +38,37 @@ interface ClientInfo {
   verified?: boolean;
   /** Server-side match of the requested redirect URI (loopback ports vary). */
   redirect_uri_allowed?: boolean | null;
+  /** Repeated as RFC 9207 `iss` on every response, so the app can detect mix-ups. */
+  issuer?: string;
+  /** The app is asking for MCP access, which the user may narrow to read-only. */
+  read_only_available?: boolean;
+  /** For an app identified by a Client ID Metadata Document: the host serving it. */
+  client_host?: string | null;
 }
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || "";
 
-function redirectWithError(redirectUri: string, error: string, state: string | null) {
+// MCP scopes: `mcp` reaches every tool, `mcp:read` only the read-only ones.
+const MCP_SCOPE = "mcp";
+const MCP_READ_SCOPE = "mcp:read";
+
+function redirectWithError(redirectUri: string, error: string, state: string | null, issuer?: string) {
   if (!redirectUri) return;
   const sep = redirectUri.includes("?") ? "&" : "?";
   const qs = new URLSearchParams({ error });
   if (state) qs.set("state", state);
+  if (issuer) qs.set("iss", issuer);
   window.location.href = `${redirectUri}${sep}${qs.toString()}`;
+}
+
+/** The scope to send: `mcp` swapped for `mcp:read` when the user chose read-only access. */
+function consentedScope(scope: string, readOnly: boolean): string {
+  if (!readOnly) return scope;
+  return scope
+    .split(/\s+/)
+    .filter((s) => s && s !== MCP_SCOPE && s !== MCP_READ_SCOPE)
+    .concat(MCP_READ_SCOPE)
+    .join(" ");
 }
 
 function safeDomain(url: string): string {
@@ -83,9 +106,18 @@ function splitClientName(name: string): { title: string; qualifier: string } {
 // mark of the coding agents that register this way, never any catalog brand.
 const UNVERIFIED_APP_BRANDS = new Set(["claude", "openai", "cursor", "googlegemini", "continue"]);
 
-function appBrandKey(title: string, verified: boolean): string | null {
+/**
+ * The official mark to show. An app identified by its metadata document's host
+ * names itself in that document, so its mark is shown only when the host is
+ * the brand's own (e.g. "ChatGPT" served from chatgpt.com).
+ */
+function appBrandKey(title: string, verified: boolean, clientHost?: string | null): string | null {
   const brand = resolveIntegrationBrand(title);
   if (!brand?.icon) return null;
+  if (clientHost) {
+    const label = clientHost.split(".").slice(-2)[0];
+    return resolveIntegrationBrand(label)?.key === brand.key ? brand.key : null;
+  }
   return verified || UNVERIFIED_APP_BRANDS.has(brand.key) ? brand.key : null;
 }
 
@@ -136,8 +168,16 @@ export default function OAuthAuthorize() {
   const responseType = searchParams.get("response_type") || "code";
   const codeChallenge = searchParams.get("code_challenge");
   const codeChallengeMethod = searchParams.get("code_challenge_method");
+  const resource = searchParams.get("resource");
 
   const [info, setInfo] = useState<ClientInfo | null>(null);
+  const [readOnly, setReadOnly] = useState(false);
+  // A request for full MCP access (the default without a scope) can be narrowed
+  // to read-only by the user; one already asking only for read-only stays so.
+  const requestedScopes = scope.split(/\s+/);
+  const asksReadOnly = requestedScopes.includes(MCP_READ_SCOPE) && !requestedScopes.includes(MCP_SCOPE);
+  const offersReadOnly = !!info?.read_only_available && !asksReadOnly;
+  const grantsReadOnly = !!info?.read_only_available && (asksReadOnly || readOnly);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>("");
   const [submitting, setSubmitting] = useState(false);
@@ -289,9 +329,10 @@ export default function OAuthAuthorize() {
         body: JSON.stringify({
           client_id: clientId,
           redirect_uri: redirectUri,
-          scope,
+          scope: consentedScope(scope, offersReadOnly && readOnly),
           state,
           ...(codeChallenge !== null ? { code_challenge: codeChallenge, code_challenge_method: codeChallengeMethod } : {}),
+          ...(resource !== null ? { resource } : {}),
         }),
       });
       if (!r.ok) {
@@ -309,7 +350,7 @@ export default function OAuthAuthorize() {
   }
 
   function handleDeny() {
-    redirectWithError(redirectUri, "access_denied", state);
+    redirectWithError(redirectUri, "access_denied", state, info?.issuer);
   }
 
   // ── Render frames ──
@@ -329,7 +370,7 @@ export default function OAuthAuthorize() {
     return (
       <Frame>
         <div className="flex flex-col items-center py-6">
-          <div className="w-10 h-10 rounded-full border-2 border-stone-200 border-t-manor-600 animate-spin mb-4" />
+          <LoadingSpinner size={20} className="mb-4 text-[var(--text-muted)]" />
           <p className="text-sm text-stone-600">
             {retryCount > 0 ? `Connecting to Manor… (retry ${retryCount}/3)` : "Loading…"}
           </p>
@@ -360,7 +401,7 @@ export default function OAuthAuthorize() {
           <button
             type="button"
             className="flex-1 px-4 py-2.5 rounded-lg bg-stone-900 text-white hover:bg-stone-800 text-sm font-medium"
-            onClick={() => redirectWithError(redirectUri, "server_error", state)}
+            onClick={() => redirectWithError(redirectUri, "server_error", state, info?.issuer)}
           >
             Back to {info?.name ? info.name.split(" ")[0] : "app"}
           </button>
@@ -374,7 +415,7 @@ export default function OAuthAuthorize() {
   const userEmail = user?.email || "";
   const appHost = safeDomain(redirectUri);
   const { title: appTitle, qualifier: appQualifier } = splitClientName(info?.name || "");
-  const appBrand = appBrandKey(appTitle, info?.verified !== false);
+  const appBrand = appBrandKey(appTitle, info?.verified !== false, info?.client_host);
 
   return (
     <Frame>
@@ -398,6 +439,11 @@ export default function OAuthAuthorize() {
       </h1>
       <p className="text-sm text-stone-500 text-center mt-1 mb-6">
         {appQualifier ? <>{appQualifier} · </> : null}with your Manor account
+        {info?.client_host && (
+          <span className="block mt-0.5 text-xs text-stone-400">
+            Provided by <span className="font-medium text-stone-600">{info.client_host}</span>
+          </span>
+        )}
       </p>
 
       {/* Signed-in account */}
@@ -432,12 +478,25 @@ export default function OAuthAuthorize() {
         <li className="flex items-start gap-2.5">
           <CheckIcon />
           <span className="text-sm text-stone-700">
-            {info?.verified === false
-              ? "Build and change Workspaces as you"
-              : `Act on your behalf within ${appTitle}`}
+            {grantsReadOnly
+              ? "Read your Workspaces, Knowledge and tasks"
+              : info?.verified === false
+                ? "Build and change Workspaces as you"
+                : `Act on your behalf within ${appTitle}`}
           </span>
         </li>
       </ul>
+
+      {offersReadOnly && (
+        <div className="mb-5">
+          <Checkbox
+            checked={readOnly}
+            onChange={setReadOnly}
+            size="sm"
+            label={<span className="text-sm text-stone-600">Read-only access: {appTitle} can't make changes</span>}
+          />
+        </div>
+      )}
 
       {info?.verified === false && (
         <p className="flex items-start gap-2 mb-5 text-xs leading-relaxed text-stone-500">

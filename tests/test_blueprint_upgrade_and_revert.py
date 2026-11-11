@@ -43,17 +43,18 @@ from packages.core.blueprints.freshness import (
 )
 from tests.blueprint_test_payload import load_upgrade_blueprint as load_test_blueprint
 from packages.core.blueprints.upgrade import (
-    RESTORE_POINT_KEY,
     BlueprintUpgradeAccessDeniedError,
     BlueprintUpgradeIncompleteError,
     BlueprintUpgradePlanChangedError,
     UpgradeAction,
     apply,
+    legacy_restore_point,
     plan,
     revert,
 )
 from packages.core.models.base import generate_ulid
 from packages.core.models.blueprint import WorkspaceBlueprint
+from packages.core.models.blueprint_upgrade import WorkspaceBlueprintUpgradeState
 from packages.core.models.channel import ChannelConfig
 from packages.core.models.document import (
     Channel,
@@ -99,6 +100,15 @@ def test_workflow_reconcile_locks_mapping_and_definition_before_authorizing():
 @pytest.fixture
 def payload():
     return load_upgrade_blueprint(SLUG)
+
+
+async def stored_restore_point(db_session, workspace):
+    """The legacy undo as stored: in the upgrade state row, never settings."""
+    assert "restore_point" not in workspace.settings.get(BLUEPRINT_SETTINGS_KEY, {})
+    state = await db_session.get(
+        WorkspaceBlueprintUpgradeState, workspace.id, populate_existing=True,
+    )
+    return legacy_restore_point(state)
 
 
 async def _workspace(db_session, entity_id, *, installed_from):
@@ -1190,6 +1200,84 @@ async def test_a_live_exact_blueprint_id_wins_over_a_matching_platform_slug(
     resolved = await _blueprint_payloads_for(db_session, [workspace])
 
     assert resolved[workspace.id] == (custom_payload, "2.0.0", custom_id)
+
+
+@pytest.mark.asyncio
+async def test_the_list_badge_from_digests_follows_every_edit_of_the_blueprint(
+    db_session, opc_payload, monkeypatch,
+):
+    """The workspace list reads fingerprints, not payloads; an edited Blueprint
+    is never answered from the digest of what it was."""
+    from apps.api.routers.workspaces import _blueprint_payloads_for, _blueprint_update_for
+    from packages.core.blueprints.freshness import (
+        SECTION_FINGERPRINTS_KEY,
+        BlueprintDigest,
+        blueprint_section_fingerprints,
+    )
+
+    entity_id = generate_ulid()
+    row = WorkspaceBlueprint(
+        id=generate_ulid(), entity_id=entity_id, slug=SLUG, title="Studio",
+        payload=opc_payload, content_version="1.0.0", status="published",
+    )
+    workspace = Workspace(entity_id=entity_id, name="Installed studio", settings={BLUEPRINT_SETTINGS_KEY: {
+        BLUEPRINT_ID_KEY: row.id, BLUEPRINT_VERSION_KEY: "1.0.0",
+        CONTENT_FINGERPRINT_KEY: blueprint_content_fingerprint(opc_payload),
+        SECTION_FINGERPRINTS_KEY: blueprint_section_fingerprints(opc_payload),
+    }})
+    db_session.add_all([row, workspace])
+    await db_session.commit()
+
+    async def badge():
+        full = (await _blueprint_payloads_for(db_session, [workspace])).get(workspace.id)
+        digest = (await _blueprint_payloads_for(db_session, [workspace], digests=True)).get(workspace.id)
+        assert isinstance(digest[0], BlueprintDigest)
+        summary = _blueprint_update_for(workspace, digest)
+        assert summary == _blueprint_update_for(workspace, full)
+        return summary["status"], summary["changed"]
+
+    assert await badge() == ("current", [])
+    assert await badge() == ("current", [])
+
+    edited = copy.deepcopy(opc_payload)
+    edited["policy"] = {**(edited.get("policy") or {}), "edited": 1}
+    row.payload = edited
+    await db_session.commit()
+    assert await badge() == ("update_available", ["policy"])
+
+    # A transaction's rewrites of one row share a row version, in a savepoint
+    # as at the top level.
+    rewrites = ((opc_payload, ("current", [])), (edited, ("update_available", ["policy"])))
+    async with db_session.begin_nested():
+        for payload, expected in rewrites:
+            row.payload = payload
+            await db_session.flush()
+            assert await badge() == expected
+    for payload, expected in rewrites:
+        row.payload = payload
+        await db_session.flush()
+        assert await badge() == expected
+
+    from sqlalchemy import update
+    from packages.core.blueprints import seed
+
+    resolve = seed.resolve_blueprint_rows
+    changes = {"payload": opc_payload, "content_version": "2.0.0"}
+
+    async def resolve_before_edit(db, references, **kwargs):
+        resolved = await resolve(db, references, **kwargs)
+        await db.execute(
+            update(WorkspaceBlueprint).where(WorkspaceBlueprint.id == row.id)
+            .values(**changes).execution_options(synchronize_session=False)
+        )
+        return resolved
+
+    monkeypatch.setattr(seed, "resolve_blueprint_rows", resolve_before_edit)
+    release = (await _blueprint_payloads_for(db_session, [workspace], digests=True))[workspace.id]
+    assert release == (BlueprintDigest.of(opc_payload), "2.0.0", row.id)
+
+    changes["status"] = "archived"
+    assert workspace.id not in await _blueprint_payloads_for(db_session, [workspace], digests=True)
 
 
 @pytest.mark.asyncio
@@ -2805,9 +2893,7 @@ async def test_revert_rejects_an_item_edited_after_upgrade(
         await revert(db_session, workspace=scenario["workspace"])
 
     assert scenario["skill"].system_prompt == operator_prompt
-    assert RESTORE_POINT_KEY in (
-        scenario["workspace"].settings[BLUEPRINT_SETTINGS_KEY]
-    )
+    assert await stored_restore_point(db_session, scenario["workspace"])
 
 
 @pytest.mark.asyncio
@@ -2841,9 +2927,7 @@ async def test_revert_requires_resource_edit_permission_before_writing(
         )
 
     assert scenario["skill"].system_prompt == blueprint_prompt
-    assert RESTORE_POINT_KEY in (
-        scenario["workspace"].settings[BLUEPRINT_SETTINGS_KEY]
-    )
+    assert await stored_restore_point(db_session, scenario["workspace"])
 
 
 @pytest.mark.asyncio
@@ -2878,7 +2962,7 @@ async def test_nothing_to_revert_before_any_upgrade(db_session, scenario):
 async def test_the_restore_point_holds_only_what_was_overwritten(db_session, scenario, payload):
     """A snapshot of the workspace would be the easy way and the wrong size."""
     await apply(db_session, workspace=scenario["workspace"], payload=payload)
-    point = scenario["workspace"].settings[BLUEPRINT_SETTINGS_KEY][RESTORE_POINT_KEY]
+    point = await stored_restore_point(db_session, scenario["workspace"])
 
     assert len(point["items"]) == 1
     assert set(point["items"][0]["before"]) <= {"system_prompt", "tools", "status"}
@@ -2988,7 +3072,7 @@ async def test_confirming_already_matching_content_advances_only_the_version(
     assert result["updated"] == []
     assert result["kept_yours"] == []
     assert result["can_revert"] is False
-    assert RESTORE_POINT_KEY not in ws.settings[BLUEPRINT_SETTINGS_KEY]
+    assert await stored_restore_point(db_session, ws) is None
     assert blueprint_freshness(
         ws.settings, matching_payload, current_version="1.0.2",
     ) is BlueprintFreshness.CURRENT
@@ -3507,19 +3591,16 @@ async def test_reverting_a_preversion_restore_point_falls_back_to_fingerprints(
     from_version. Revert must not leave the post-apply version behind — that
     would claim currency over content it just rolled back."""
     from packages.core.blueprints.freshness import BLUEPRINT_VERSION_KEY
-    from packages.core.blueprints.upgrade import RESTORE_POINT_KEY as _RP
 
     ws = scenario["workspace"]
     await apply(db_session, workspace=ws, payload=payload, current_version="1.0.2")
 
     # Simulate the old restore point shape: no from_version recorded.
-    settings = dict(ws.settings)
-    record = dict(settings[BLUEPRINT_SETTINGS_KEY])
-    point = dict(record[_RP])
+    state = await db_session.get(WorkspaceBlueprintUpgradeState, ws.id)
+    point = dict(state.restore_point)
     point.pop("from_version", None)
-    record[_RP] = point
-    settings[BLUEPRINT_SETTINGS_KEY] = record
-    ws.settings = settings
+    state.restore_point = point
+    await db_session.flush()
 
     await revert(db_session, workspace=ws)
 

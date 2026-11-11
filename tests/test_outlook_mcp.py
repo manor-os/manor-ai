@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import json
+
 import pytest
 
 
@@ -7,16 +10,20 @@ class _Response:
     status_code = 200
     text = "{}"
 
+    def __init__(self, payload: dict | None = None) -> None:
+        self._payload = payload if payload is not None else {"value": []}
+
     @property
     def is_success(self) -> bool:
         return True
 
     def json(self) -> dict:
-        return {"value": []}
+        return self._payload
 
 
 class _Client:
     calls: list[dict] = []
+    routes: dict[str, dict] = {}
 
     def __init__(self, *args, **kwargs) -> None:
         pass
@@ -37,6 +44,9 @@ class _Client:
                 "params": params,
             }
         )
+        for suffix, payload in self.routes.items():
+            if url.endswith(suffix):
+                return _Response(payload)
         return _Response()
 
 
@@ -45,6 +55,7 @@ def outlook_http(monkeypatch):
     from packages.core.ai.mcp import outlook
 
     _Client.calls = []
+    _Client.routes = {}
     monkeypatch.setattr(outlook.httpx, "AsyncClient", _Client)
     return outlook
 
@@ -139,3 +150,58 @@ async def test_outlook_rejects_non_object_arguments_and_non_string_tokens_before
     assert result["isError"] is True
     assert message in result["content"][0]["text"]
     assert _Client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_outlook_message_reads_as_text_and_attachment_saves_whole(outlook_http, monkeypatch):
+    from packages.core.services import email_attachments
+
+    html = "<p>Basic and Starter product structure</p>" + "<p>Feedback sentence.</p>" * 900
+    pdf = b"%PDF-1.7\n" + bytes(range(256)) * 200
+    _Client.routes = {
+        "/me/messages/msg-1": {
+            "id": "msg-1",
+            "subject": "Product feedback",
+            "from": {"emailAddress": {"name": "Gary", "address": "gary@example.com"}},
+            "toRecipients": [{"emailAddress": {"address": "me@example.com"}}],
+            "receivedDateTime": "2026-11-02T17:00:00Z",
+            "hasAttachments": True,
+            "body": {"contentType": "html", "content": html},
+        },
+        "/me/messages/msg-1/attachments": {"value": [{
+            "id": "att-1", "name": "Product structure.pdf",
+            "contentType": "application/pdf", "size": len(pdf), "isInline": False,
+        }]},
+        "/me/messages/msg-1/attachments/att-1": {
+            "name": "Product structure.pdf",
+            "contentType": "application/pdf",
+            "contentBytes": base64.b64encode(pdf).decode("ascii"),
+        },
+    }
+
+    result = await outlook_http.call_tool("get_message", {"message_id": "msg-1"}, "t")
+    message = json.loads(result["content"][0]["text"])
+    assert message["from"] == "Gary <gary@example.com>"
+    assert message["content"].startswith("Basic and Starter product structure")
+    assert "<p>" not in message["content"]
+    assert message["next_offset"] is not None
+    assert [a["attachment_id"] for a in message["attachments"]] == ["att-1"]
+
+    captured = {}
+
+    async def persist_attachment(**kwargs):
+        captured.update(kwargs)
+        return {"saved": True, "document_id": "document-1"}
+
+    monkeypatch.setattr(email_attachments, "persist_workspace_email_attachment", persist_attachment)
+    outlook_http.set_call_context({"entity_id": "entity-1", "user_id": "user-1"})
+    try:
+        saved = await outlook_http.call_tool(
+            "save_attachment_to_workspace", {"message_id": "msg-1", "attachment_id": "att-1"}, "t",
+        )
+    finally:
+        outlook_http.clear_call_context()
+
+    assert saved["isError"] is False
+    assert captured["data"] == pdf
+    assert captured["filename"] == "Product structure.pdf"

@@ -170,3 +170,41 @@ def _valid_workspace_document_claims(payload: dict[str, Any]) -> bool:
         and isinstance(digest, str)
         and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
     )
+
+
+DOCUMENT_STREAM_TOKEN_SECONDS = 2 * 60 * 60
+
+
+def create_document_stream_token(*, document_id: str, claims: dict[str, Any],
+                                 expires_in_seconds: int = DOCUMENT_STREAM_TOKEN_SECONDS) -> str:
+    """A media element's address for one Document, acting as the signed-in person.
+
+    ``<video>``/``<audio>`` cannot send a bearer header, so the token carries the
+    person's access-token claims for this one Document only. Every request it
+    makes is admitted again from those claims (revocation, membership, support
+    sessions) and the Document is authorized again, so a revoked grant stops it.
+    """
+    payload = {"kind": "document_stream", "document_id": str(document_id), "claims": claims,
+               "exp": int(time.time()) + min(DOCUMENT_STREAM_TOKEN_SECONDS, max(60, int(expires_in_seconds)))}
+    payload_b64 = _b64_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    return f"{payload_b64}.{_sign(payload_b64)}"
+
+
+def verify_document_stream_token(token: str, *, document_id: str) -> dict[str, Any] | None:
+    """The access-token claims a stream token carries for ``document_id``, or None."""
+    try:
+        payload_b64, sig = token.split(".", 1)
+    except ValueError:
+        return None
+    if not hmac.compare_digest(sig, _sign(payload_b64)):
+        return None
+    try:
+        payload = json.loads(_b64_decode(payload_b64).decode("utf-8"))
+        expires_at = int(payload.get("exp") or 0)
+    except Exception:
+        return None
+    if (not isinstance(payload, dict) or payload.get("kind") != "document_stream"
+            or payload.get("document_id") != str(document_id) or expires_at < int(time.time())
+            or not isinstance(payload.get("claims"), dict) or not payload["claims"].get("sub")):
+        return None
+    return payload["claims"]

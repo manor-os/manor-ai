@@ -19,6 +19,7 @@
   ],
   "workspace_operations": {
     "workspace_actions": [
+      "list_attention",
       "get_goal_status",
       "update_goal_value",
       "get_stat_status",
@@ -52,11 +53,18 @@
       "批准",
       "阻塞",
       "待处理",
-      "拒绝"
+      "拒绝",
+      "attention",
+      "waiting on me",
+      "needs me",
+      "等我",
+      "需要我",
+      "在盯",
+      "关注"
     ]
   },
   "search": {
-    "terms": ["okr", "kpi", "metrics", "stats", "approval", "human in the loop", "blocked task", "strategist", "review decision", "goal progress"],
-    "examples": ["show workspace goal progress", "task blocked needs my input", "ask strategist to plan goals", "review configuration approval decision"]
+    "terms": ["okr", "kpi", "metrics", "stats", "approval", "waiting on me", "needs my attention", "human in the loop", "blocked task", "strategist", "review decision", "goal progress"],
+    "examples": ["what is waiting on me", "show workspace goal progress", "task blocked needs my input", "ask strategist to plan goals", "review configuration approval decision"]
   }
 }

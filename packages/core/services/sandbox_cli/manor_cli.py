@@ -16,7 +16,8 @@ deleted in it are saved back when the command finishes (approval may be
 required). Use /tmp for scratch output.
 
 Exit codes: 0 ok, 1 the server refused or the file was not found, 2 usage
-error, 3 no or expired token / not configured, 4 the API was unreachable.
+error, 3 no or expired token / not configured, 4 the API was unreachable,
+141 the reader closed stdout early (``manor ls | head``; nothing is printed).
 
 This module is imported by the server for ``COMMANDS`` (the prompt text is
 generated from it), so importing it must have no side effects.
@@ -38,6 +39,7 @@ EXIT_REFUSED = 1
 EXIT_USAGE = 2
 EXIT_AUTH = 3
 EXIT_UNREACHABLE = 4
+EXIT_BROKEN_PIPE = 128 + 13  # SIGPIPE, what a shell reports for `ls | head`
 
 _DEFAULT_WORKSPACE = "/workspace"
 _TIMEOUT_SECONDS = 120
@@ -408,6 +410,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        try:
+            return _run(argv)
+        finally:
+            sys.stdout.flush()
+    except BrokenPipeError:
+        # The reader closed the pipe (``manor ls | head``): stop writing and
+        # exit like a tool killed by SIGPIPE, without a message. Point stdout
+        # at devnull so the interpreter's final flush cannot fail again.
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except (AttributeError, OSError, ValueError):
+            pass
+        return EXIT_BROKEN_PIPE
+
+
+def _run(argv: list[str] | None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if not args.command:
@@ -421,6 +441,8 @@ def main(argv: list[str] | None = None) -> int:
     except CliError as exc:
         print(exc.message, file=sys.stderr)
         return exc.code
+    except BrokenPipeError:
+        raise
     except OSError as exc:
         print(f"manor {args.command}: {exc}", file=sys.stderr)
         return EXIT_REFUSED

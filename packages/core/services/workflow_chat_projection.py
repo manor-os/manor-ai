@@ -20,6 +20,7 @@ from packages.core.i18n import t, text_locale
 from packages.core.models.task import Conversation, Message
 from packages.core.models.workflow import WorkflowRun
 from packages.core.models.workspace import AgentSubscription
+from packages.core.services.workflow_contracts import workflow_step_label, workflow_wait_options
 from packages.core.services.workflow_step_resilience import (
     is_transient_retry_record,
     transient_retry_status_message,
@@ -60,6 +61,17 @@ _FINAL_ARTIFACT_CONTAINER_KEYS = {
     "final_videos",
     "knowledge_artifacts",
     "outputs",
+}
+# Fields that name what a result was made from (the Knowledge it read, the
+# claims it cites). Their file links are sources, never something delivered.
+_SOURCE_REFERENCE_KEYS = {
+    "citations",
+    "evidence",
+    "knowledge_refs",
+    "references",
+    "source_refs",
+    "sources",
+    "supported_claims",
 }
 logger = logging.getLogger(__name__)
 
@@ -129,6 +141,89 @@ def workflow_chat_context(run: Any) -> dict[str, Any] | None:
     if not context.get("conversation_id") or not context.get("activity_message_id"):
         return None
     return context
+
+
+def scheduled_workflow_chat_origin(conversation_id: str | None, workspace_id: str | None) -> dict[str, Any]:
+    """The chat a scheduled run reports to, attached only once it needs a person.
+
+    A schedule starts the same Flow every few minutes; posting each run would
+    bury the chat. The run carries this dormant origin, and the first time it
+    stops for a person (see ``attach_workflow_chat_on_wait``) the run gets its
+    chat row and the decision card, as a run started from chat would. Without
+    a chat of its own it uses the Workspace chat, made then if nobody has
+    written there yet.
+    """
+    return {
+        "enabled": True,
+        "route_source": "schedule",
+        "conversation_id": conversation_id,
+        "workspace_id": workspace_id,
+        "wait_bridge": True,
+        "attach_on_wait": True,
+        "projection": {"progress": True, "step_outputs": "none", "final_output": True},
+    }
+
+
+async def attach_workflow_chat_on_wait(
+    db: AsyncSession,
+    *,
+    run: Any,
+    step: dict[str, Any],
+    result: dict[str, Any] | None,
+) -> bool:
+    """Give a dormant-origin run its chat row when it pauses on a person."""
+    if workflow_chat_context(run) is not None or not isinstance(result, dict):
+        return False
+    if result.get("status") != "paused":
+        return False
+    trigger_data = dict(run.trigger_data) if isinstance(run.trigger_data, dict) else {}
+    origin = trigger_data.get("_workflow_chat_origin")
+    if not isinstance(origin, dict) or not origin.get("attach_on_wait"):
+        return False
+    from packages.core.services.workflow_chat_approvals import workflow_chat_wait_config
+
+    if workflow_chat_wait_config(run, step) is None:
+        return False
+    if origin.get("conversation_id"):
+        conversation = await db.get(Conversation, str(origin["conversation_id"]))
+    elif origin.get("workspace_id") and str(origin["workspace_id"]) == str(run.workspace_id or ""):
+        from packages.core.workspace_chat.service import ensure_main_conversation
+
+        conversation = await ensure_main_conversation(
+            db, entity_id=str(run.entity_id), workspace_id=str(run.workspace_id),
+        )
+    else:
+        return False
+    if conversation is None or str(conversation.entity_id) != str(run.entity_id):
+        return False
+    from packages.core.models.workflow import WorkflowDefinition
+    from packages.core.services.conversation_messages import add_message
+
+    workflow = await db.get(WorkflowDefinition, run.workflow_id) if run.workflow_id else None
+    title = str(getattr(workflow, "name", "") or "Workflow")
+    activity = await add_message(
+        db,
+        conversation.id,
+        role="system",
+        content=f"{title}: {workflow_step_label(step) or step.get('id')} needs you.",
+        message_kind="workflow_activity",
+        refs=[
+            {"type": "workflow", "id": run.workflow_id, "title": title},
+            {"type": "workflow_run", "id": run.id},
+        ],
+        meta={
+            "workflow_run_id": run.id,
+            "workflow_binding_id": run.binding_id,
+            "workflow_title": title,
+            "workflow_status": "paused",
+            "workflow_route_source": "schedule",
+            "workflow_steps": workflow_progress_steps(run, activity_status="paused"),
+        },
+    )
+    origin = {**origin, "conversation_id": conversation.id, "activity_message_id": activity.id}
+    trigger_data["_workflow_chat_origin"] = origin
+    run.trigger_data = trigger_data
+    return True
 
 
 def _entrypoint_context(run: Any) -> dict[str, Any] | None:
@@ -226,6 +321,15 @@ def workflow_retry_from_step_id(run: Any, retry_state: dict[str, Any]) -> str:
         ).strip()
         if prior_retry_from and not is_retry_attempt:
             return prior_retry_from
+        # A stop only reports why the run ended; the retry redoes the work before it.
+        snapshot = getattr(run, "execution_snapshot", None)
+        steps = [item for item in (snapshot.get("steps") if isinstance(snapshot, dict) else None) or [] if isinstance(item, dict)]
+        from packages.core.services.workflow_retry import TERMINAL_STEP_TYPES, error_route_origin, work_step_before
+
+        current_step_id = error_route_origin(steps, step_results, current_step_id) or current_step_id
+        if any(item.get("id") == current_step_id and item.get("type") in TERMINAL_STEP_TYPES for item in steps):
+
+            return work_step_before(steps, step_results, current_step_id) or current_step_id
         return current_step_id
     return str(getattr(run, "effective_retry_from_step_id", "") or "").strip()
 
@@ -559,6 +663,8 @@ def _workflow_final_output_attachments(
         artifacts.extend(extract_artifacts_for_chat(candidate))
         for key, nested in candidate.items():
             normalized_key = str(key).strip().lower()
+            if normalized_key in _SOURCE_REFERENCE_KEYS:
+                continue
             if normalized_key == "assets":
                 preferred_assets.extend(extract(nested))
             elif normalized_key in _FINAL_ARTIFACT_CONTAINER_KEYS:
@@ -578,9 +684,24 @@ def workflow_result_files(value: Any, *, entity_id: str) -> list[dict[str, Any]]
     return _workflow_final_output_attachments(value, entity_id=entity_id)
 
 
+def workflow_project_result_view(value: Any) -> dict[str, Any] | None:
+    """A WorkflowProject record read as the project it is, without its bookkeeping.
+
+    A Flow that ends on a project step returns the project record (id,
+    revision, key, schema version, folder). A person reads the project: its
+    name and its own fields.
+    """
+    record = _workflow_result_record(value)
+    if not record or not {"project_id", "project_type", "project_key"} <= set(record):
+        return None
+    state = record.get("state") if isinstance(record.get("state"), dict) else {}
+    fields = {key: deepcopy(item) for key, item in state.items() if key != "project_root" and not str(key).startswith("_")}
+    return {**fields, "title": str(state.get("title") or state.get("name") or record.get("project_key") or "")}
+
+
 def workflow_result_headline(value: Any) -> tuple[str, str]:
     """What a final result is called and says, from the fields results use for that."""
-    record = _workflow_result_record(value)
+    record = workflow_project_result_view(value) or _workflow_result_record(value)
     if record and not any(record.get(key) for key in ("title", "name", "topic_id", "summary", "message")):
         # A result that wraps its record ({decision, topic_brief}) is named by it.
         record = next((
@@ -615,6 +736,18 @@ def workflow_run_display_name(run: Any) -> str:
     return str(
         trigger.get("_workflow_name") or snapshot.get("name") or run.workflow_id or "Workflow"
     ).strip()
+
+
+def _reviewed_summaries(run: Any) -> set[str]:
+    """Summaries the person already read on this run's review cards."""
+    results = run.step_results if isinstance(getattr(run, "step_results", None), dict) else {}
+    seen: set[str] = set()
+    for result in results.values():
+        review = result.get("review") if isinstance(result, dict) else None
+        summary = review.get("summary") if isinstance(review, dict) else None
+        if isinstance(summary, str) and summary.strip():
+            seen.add(_compact_result_text(summary, limit=_RESULT_MESSAGE_LIMIT))
+    return seen
 
 
 def workflow_result_chat_projection(
@@ -673,6 +806,8 @@ def workflow_result_chat_projection(
             lead = f"{verified_publications} publications verified."
     elif result_kind == "topic_brief":
         lead = f"Topic brief ready: {result_title}" if result_title else "Topic brief ready."
+    elif workflow_completion_message(run):
+        lead = f"{workflow_name}: {workflow_completion_message(run)}"
     else:
         # Lead in the language the result is written in, so a Chinese
         # summary is not introduced by an English status line.
@@ -683,7 +818,8 @@ def workflow_result_chat_projection(
             lead = t("workflow.result.completed", locale=locale, name=workflow_name)
 
     lines = [lead]
-    if result_summary and result_summary != result_title:
+    # A summary the person just approved on the review card is not said again.
+    if result_summary and result_summary != result_title and result_summary not in _reviewed_summaries(run):
         lines.append(result_summary)
     if platforms:
         lines.append(f"Target platforms: {', '.join(platforms)}")
@@ -709,6 +845,16 @@ def workflow_result_chat_projection(
         } if publication_receipts else None,
     }
     return "\n\n".join(line for line in lines if line), reference
+
+
+def workflow_completion_message(run: Any) -> str:
+    """What the end a completed run reached says it means, if it says."""
+    if str(getattr(run, "status", "") or "") != "completed":
+        return ""
+    results = getattr(run, "step_results", None)
+    result = results.get(str(getattr(run, "current_step_id", "") or "")) if isinstance(results, dict) else None
+    message = result.get("completion_message") if isinstance(result, dict) else None
+    return " ".join(str(message or "").split())[:500]
 
 
 def _workflow_business_state(run: Any) -> tuple[str, dict[str, Any]]:
@@ -893,7 +1039,8 @@ async def _activity_message(db: AsyncSession, run: Any, context: dict[str, Any])
             Message.id == str(context["activity_message_id"]),
             Message.conversation_id == str(context["conversation_id"]),
             Message.message_kind == "workflow_activity",
-            Message.meta["workflow_binding_id"].as_string() == str(run.binding_id),
+            # A scheduled Flow job may start its run without a binding (IS NULL).
+            Message.meta["workflow_binding_id"].as_string() == (str(run.binding_id) if run.binding_id else None),
             Conversation.entity_id == str(run.entity_id),
         ).with_for_update()
     )).scalar_one_or_none()
@@ -1023,6 +1170,27 @@ async def close_stale_workflow_cards(db: AsyncSession, *, run: Any) -> list[Mess
     return messages
 
 
+def _workflow_progress_event(message: Message) -> dict[str, Any]:
+    """Where a run's row stands, so an open Chat moves it without refetching.
+
+    The row was posted once and its message is already loaded; each step only
+    changes its statuses, which travel here as ids and statuses.
+    """
+    meta = message.meta if isinstance(message.meta, dict) else {}
+    if message.message_kind != "workflow_activity" or not meta.get("workflow_run_id"):
+        return {}
+    return {"workflow_progress": {
+        "workflow_run_id": str(meta["workflow_run_id"]),
+        "workflow_status": meta.get("workflow_status"),
+        "workflow_current_step_id": meta.get("workflow_current_step_id"),
+        "workflow_steps": [
+            {"id": step.get("id"), "status": step.get("status")}
+            for step in meta.get("workflow_steps") or []
+            if isinstance(step, dict) and step.get("id")
+        ],
+    }}
+
+
 async def _notify_update(db: AsyncSession, message: Message) -> None:
     try:
         conversation = (await db.execute(
@@ -1047,6 +1215,7 @@ async def _notify_update(db: AsyncSession, message: Message) -> None:
                     "message_kind": message.message_kind,
                     "author_kind": message.author_kind,
                     "has_pending_action": bool(message.pending_action),
+                    **_workflow_progress_event(message),
                 },
             }
         else:
@@ -1138,7 +1307,7 @@ async def _project_step_output(
         message_kind="agent_update" if subscription_id else "step_event",
         refs=[
             {"type": "workflow_run", "id": run.id},
-            {"type": "workflow_step", "id": step_id, "title": step.get("name") or step_id},
+            {"type": "workflow_step", "id": step_id, "title": workflow_step_label(step) or step_id},
         ],
         meta={
             "workflow_run_id": run.id,
@@ -1146,6 +1315,29 @@ async def _project_step_output(
             "workflow_step_status": "completed",
         },
     )
+
+
+def workflow_step_recommendation(*sources: Any, options: list[str]) -> dict[str, Any] | None:
+    """A paused step's configured recommended answer, when it names one.
+
+    Read from the step's result (a step that worked one out at run time) and
+    then its configuration: ``recommended`` (one of the step's options) and
+    ``recommendation_reason`` (one sentence). Steps without one get the shared
+    default for their options when the card is written.
+    """
+    from packages.core.services.decision_recommendation import recommendation
+
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        option = source.get("recommended")
+        if isinstance(option, str) and option in options:
+            reason = " ".join(str(source.get("recommendation_reason") or "").split())
+            return (
+                recommendation(option, reason=reason[:280])
+                if reason else recommendation(option, reason_code="most_likely")
+            )
+    return None
 
 
 async def _project_wait_action(
@@ -1187,7 +1379,7 @@ async def _project_wait_action(
         return
     from packages.core.services.conversation_messages import add_message
 
-    message = str(result.get("output") or config.get("message") or step.get("name") or "Input required")
+    message = str(result.get("output") or config.get("message") or workflow_step_label(step) or "Input required")
     response_variable = str(
         wait_config.get("response_variable")
         or config.get("response_variable")
@@ -1198,7 +1390,7 @@ async def _project_wait_action(
         if wait_type == "approval"
         else PendingActionKind.WORKFLOW_INPUT.value
     )
-    options = wait_config.get("options", config.get("options"))
+    options = wait_config.get("options", workflow_wait_options(config))
     if not isinstance(options, list) or not options:
         options = (
             ["approve", "cancel"]
@@ -1225,10 +1417,15 @@ async def _project_wait_action(
         "prompt": message,
         "options": [str(option) for option in options],
     }
+    step_recommendation = workflow_step_recommendation(
+        result, wait_config, config, options=pending_action["options"],
+    )
+    if step_recommendation is not None:
+        pending_action["recommendation"] = step_recommendation
     if isinstance(result.get("collection_fields"), list):
         pending_action["inputs"] = result["collection_fields"]
         pending_action["values"] = result.get("collection_values") or {}
-        pending_action["title"] = str(step.get("name") or t("workflow.input.title_default"))
+        pending_action["title"] = workflow_step_label(step) or t("workflow.input.title_default")
         pending_action["collection_round"] = result.get("collection_round")
     elif kind == PendingActionKind.WORKFLOW_INPUT.value:
         input_schema = result.get("input_schema")
@@ -1259,9 +1456,13 @@ async def _project_wait_action(
     review_read_only = not workflow_review_is_editable(config)
     if review_read_only:
         pending_action["review_read_only"] = True
+    if isinstance(config.get("review_editable_fields"), list):
+        pending_action["review_editable_fields"] = config["review_editable_fields"]
+    if isinstance(config.get("review_revision_field"), str):
+        pending_action["review_revision_field"] = config["review_revision_field"]
     workflow_name = workflow_run_display_name(run)
     workflow_url = _workflow_run_url(run)
-    node_name = str(step.get("name") or step_id)
+    node_name = workflow_step_label(step) or step_id
     hitl_message = await add_message(
         db,
         str(context["conversation_id"]),
@@ -1270,7 +1471,7 @@ async def _project_wait_action(
         message_kind="hitl_request",
         refs=[
             {"type": "workflow_run", "id": run.id},
-            {"type": "workflow_step", "id": step_id, "title": step.get("name") or step_id},
+            {"type": "workflow_step", "id": step_id, "title": workflow_step_label(step) or step_id},
         ],
         pending_action=pending_action,
         meta={
@@ -1291,6 +1492,16 @@ async def _project_wait_action(
         "options": [str(option) for option in options],
         "review_title": str(result.get("review_title") or node_name),
         "review_read_only": review_read_only,
+        **(
+            {"review_editable_fields": config["review_editable_fields"]}
+            if isinstance(config.get("review_editable_fields"), list)
+            else {}
+        ),
+        **(
+            {"review_revision_field": config["review_revision_field"]}
+            if isinstance(config.get("review_revision_field"), str)
+            else {}
+        ),
         "workflow": {
             "id": run.workflow_id,
             "name": workflow_name,
@@ -1346,6 +1557,17 @@ async def _project_final_output(
         raw_output,
         entity_id=str(getattr(run, "entity_id", "") or ""),
     )
+    if not attachments:
+        # A result that names no file (a project record) delivered what the run made.
+        from packages.core.services.workflow_review_files import review_files_from_refs, workflow_run_made_files
+
+        made = await review_files_from_refs(db, entity_id=str(getattr(run, "entity_id", "") or ""), refs=[
+            item.get("document_id") or item.get("fs_path") for item in workflow_run_made_files(run)
+        ])
+        attachments = _workflow_final_output_attachments(
+            {"files": made[:6]},
+            entity_id=str(getattr(run, "entity_id", "") or ""),
+        )
     if existing:
         # Runs completed before structured result cards were introduced stored
         # the full JSON payload directly in Chat. Upgrade that projection when
@@ -1458,7 +1680,7 @@ async def project_workflow_step(
         if row is None and not snapshot_nodes:
             row = {
                 "id": step_id,
-                "name": str(step.get("name") or step_id),
+                "name": workflow_step_label(step) or step_id,
                 "type": str(step.get("type") or ""),
                 "status": str(status or "running"),
                 **({"subscription_id": subscription_id} if subscription_id else {}),
@@ -1550,7 +1772,7 @@ async def _project_workflow_run_status_chat(
     settings = workflow_projection_settings(context)
     meta = dict(activity.meta or {})
     meta["workflow_run_id"] = str(run.id)
-    meta["workflow_binding_id"] = str(run.binding_id)
+    meta["workflow_binding_id"] = str(run.binding_id) if run.binding_id else None
     meta["workflow_steps"] = workflow_progress_steps(
         run,
         activity_status=str(meta.get("workflow_status") or ""),
@@ -1562,6 +1784,8 @@ async def _project_workflow_run_status_chat(
     meta["workflow_attempt_number"] = run.effective_attempt_number
     if run.effective_retry_of_run_id:
         meta["workflow_retry_of_run_id"] = run.effective_retry_of_run_id
+    # Every attempt of one run family shares this id: Chat keeps them on one row.
+    meta["workflow_root_run_id"] = str(getattr(run, "lineage_root_run_id", None) or run.id)
     retry_from_step_id = workflow_retry_from_step_id(run, retry_state)
     if retry_from_step_id:
         meta["workflow_retry_from_step_id"] = retry_from_step_id
@@ -1611,7 +1835,8 @@ async def _project_workflow_run_status_chat(
     elif business_outcome == "accepted":
         activity.content = f"{title} was accepted."
     elif run.status == "completed":
-        activity.content = f"{title} completed."
+        completion_message = workflow_completion_message(run)
+        activity.content = f"{title}: {completion_message}" if completion_message else f"{title} completed."
     elif run.status == "running":
         activity.content = f"{title} is starting."
     elif run.status == "failed":

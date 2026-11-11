@@ -16,16 +16,22 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 from email.mime.text import MIMEText
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 import httpx
 
+from packages.core.ai.mcp import _email_message as readable
+
 logger = logging.getLogger(__name__)
 
 _API = "https://gmail.googleapis.com/gmail/v1"
 _MAX_CHARS = 12_000
+_call_context = readable.CallContext("gmail_mcp_call_context")
+set_call_context = _call_context.set
+clear_call_context = _call_context.clear
 
 
 def _path_segment(value: Any) -> str:
@@ -54,11 +60,20 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         },
     },
     "get_message": {
-        "description": "Fetch a single Gmail message by ID (headers + body).",
+        "description": (
+            "Read one Gmail message: sender, recipients, subject, date, the decoded "
+            "body text and its attachments. A long body comes in pages; when "
+            "next_offset is set, call again with that offset to read the rest."
+        ),
         "required": ["message_id"],
         "properties": {
             "message_id": {"type": "string"},
-            "format": {"type": "string", "enum": ["full", "metadata", "minimal"], "description": "Default 'full'."},
+            "format": {
+                "type": "string",
+                "enum": ["full", "metadata", "minimal"],
+                "description": "Default 'full' (with body). 'metadata' returns headers only.",
+            },
+            "offset": {"type": "integer", "description": "Body character offset to continue from (default 0)."},
         },
     },
     # ── Messages: write ────────────────────────────────────────────────────
@@ -141,6 +156,7 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "properties": {
             "draft_id": {"type": "string"},
             "format": {"type": "string", "enum": ["full", "metadata", "minimal"]},
+            "offset": {"type": "integer", "description": "Body character offset to continue from (default 0)."},
         },
     },
     "create_draft": {
@@ -190,7 +206,10 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         },
     },
     "get_thread": {
-        "description": "Fetch a thread including every message in it.",
+        "description": (
+            "Read a whole conversation: every message with its own text (quoted "
+            "earlier replies removed) and attachments, oldest first."
+        ),
         "required": ["thread_id"],
         "properties": {
             "thread_id": {"type": "string"},
@@ -203,15 +222,33 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "properties": {"thread_id": {"type": "string"}},
     },
     # ── Attachments ────────────────────────────────────────────────────────
-    "download_attachment": {
+    "save_attachment_to_workspace": {
         "description": (
-            "Fetch the body bytes of a single attachment (base64url-encoded). "
-            "Get attachment_id from get_message → payload.parts[].body.attachmentId."
+            "Save one attachment to the current Workspace (or Knowledge without a "
+            "Workspace) and return its readable text and a document link. Use this "
+            "to read or keep an attachment."
         ),
         "required": ["message_id", "attachment_id"],
         "properties": {
             "message_id": {"type": "string"},
-            "attachment_id": {"type": "string"},
+            "attachment_id": {
+                "type": "string",
+                "description": "attachment_id from get_message / get_thread attachments.",
+            },
+        },
+    },
+    "download_attachment": {
+        "description": (
+            "Return one attachment's raw bytes as base64. Prefer "
+            "save_attachment_to_workspace to read or keep a file."
+        ),
+        "required": ["message_id", "attachment_id"],
+        "properties": {
+            "message_id": {"type": "string"},
+            "attachment_id": {
+                "type": "string",
+                "description": "attachment_id from get_message / get_thread attachments.",
+            },
         },
     },
     # ── Labels ─────────────────────────────────────────────────────────────
@@ -386,13 +423,14 @@ def _sim_get_message(args: Dict) -> str:
         (m for m in _DEMO_INBOX if m["id"] == msg_id),
         _DEMO_INBOX[0],
     )
-    # Return Gmail-style envelope (subset — what the briefing prompt reads)
-    return json.dumps({
+    # Same readable shape get_message returns for a real Gmail message.
+    projected = _readable_message({
         "id": msg["id"],
         "threadId": msg["thread_id"],
         "snippet": msg["snippet"],
         "labelIds": ["INBOX", "UNREAD"],
         "payload": {
+            "mimeType": "text/plain",
             "headers": [
                 {"name": "From", "value": msg["from"]},
                 {"name": "Subject", "value": msg["subject"]},
@@ -400,8 +438,9 @@ def _sim_get_message(args: Dict) -> str:
             ],
             "body": {"data": msg["body_b64"]},
         },
-        "_simulated": True,
     })
+    projected["_simulated"] = True
+    return json.dumps(projected, ensure_ascii=False)
 
 
 def _sim_send_message(args: Dict) -> str:
@@ -508,6 +547,23 @@ async def _api(
     body: Optional[Dict] = None,
     params: Optional[Dict] = None,
 ) -> str:
+    data = await _request(token, method, path, body=body, params=params)
+    if isinstance(data, str):
+        return data[:_MAX_CHARS]
+    out = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+    if len(out) > _MAX_CHARS:
+        return out[:_MAX_CHARS] + "\n… (truncated)"
+    return out
+
+
+async def _request(
+    token: str,
+    method: str,
+    path: str,
+    body: Optional[Dict] = None,
+    params: Optional[Dict] = None,
+) -> Any:
+    """Call Gmail and return the parsed JSON (or the raw text) uncut."""
     url = f"{_API}/{path.lstrip('/')}"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -526,18 +582,142 @@ async def _api(
     if resp.status_code == 404:
         raise RuntimeError("Not found.")
     if resp.status_code == 204:
-        return json.dumps({"success": True})
+        return {"success": True}
     if not resp.is_success:
         raise RuntimeError(f"Gmail API error ({resp.status_code}): {resp.text[:300]}")
 
     try:
-        data = resp.json()
+        return resp.json()
     except Exception:
-        return resp.text[:_MAX_CHARS]
-    out = json.dumps(data, ensure_ascii=False, indent=2, default=str)
-    if len(out) > _MAX_CHARS:
-        return out[:_MAX_CHARS] + "\n… (truncated)"
+        return resp.text
+
+
+# ── Readable messages ────────────────────────────────────────────────────────
+
+def _decode_part_data(data: Any) -> bytes:
+    text = str(data or "")
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4)) if text else b""
+
+
+def _part_text(part: Dict[str, Any]) -> str:
+    raw = _decode_part_data((part.get("body") or {}).get("data"))
+    charset = "utf-8"
+    for header in part.get("headers") or []:
+        if str(header.get("name") or "").lower() == "content-type":
+            found = re.search(r'charset="?([\w.-]+)', str(header.get("value") or ""), re.IGNORECASE)
+            if found:
+                charset = found.group(1)
+    try:
+        return raw.decode(charset, errors="replace")
+    except LookupError:
+        return raw.decode("utf-8", errors="replace")
+
+
+def _walk_parts(part: Dict[str, Any]):
+    yield part
+    for child in part.get("parts") or []:
+        if isinstance(child, dict):
+            yield from _walk_parts(child)
+
+
+def _part_disposition(part: Dict[str, Any]) -> str:
+    for header in part.get("headers") or []:
+        if str(header.get("name") or "").lower() == "content-disposition":
+            return str(header.get("value") or "").split(";")[0].strip().lower()
+    return ""
+
+
+def _is_attachment(part: Dict[str, Any]) -> bool:
+    # Gmail can store the message's own text in an attachmentId as well.
+    return (
+        bool(part.get("filename"))
+        or _part_disposition(part) == "attachment"
+        or (
+            bool((part.get("body") or {}).get("attachmentId"))
+            and str(part.get("mimeType") or "").lower() not in {"text/plain", "text/html"}
+        )
+    )
+
+
+def _attachment_ref(part: Dict[str, Any]) -> str:
+    """Short, stable id for an attachment: its MIME part id."""
+    return str(part.get("partId") or (part.get("body") or {}).get("attachmentId") or "")
+
+
+def _attachments(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out = []
+    for part in _walk_parts(payload):
+        if part.get("parts") or not _is_attachment(part):
+            continue
+        out.append({
+            "attachment_id": _attachment_ref(part),
+            "filename": part.get("filename") or f"attachment-{_attachment_ref(part)}",
+            "content_type": part.get("mimeType") or "application/octet-stream",
+            "size": (part.get("body") or {}).get("size") or 0,
+            "inline": _part_disposition(part) == "inline",
+        })
     return out
+
+
+def _message_body(payload: Dict[str, Any]) -> str:
+    plain = html = ""
+    for part in _walk_parts(payload):
+        if part.get("parts") or _is_attachment(part):
+            continue
+        mime = str(part.get("mimeType") or "").lower()
+        if mime == "text/plain" and not plain:
+            plain = _part_text(part)
+        elif mime == "text/html" and not html:
+            html = _part_text(part)
+    return readable.body_text(plain, html)
+
+
+async def _load_message_body(token: str, data: Dict[str, Any]) -> None:
+    """Load externally stored text parts without downloading user files."""
+    for part in _walk_parts(data.get("payload") or {}):
+        if part.get("parts") or _is_attachment(part):
+            continue
+        if str(part.get("mimeType") or "").lower() not in {"text/plain", "text/html"}:
+            continue
+        body = part.get("body") or {}
+        if not body.get("attachmentId") or body.get("data"):
+            continue
+        fetched = await _request(
+            token, "GET",
+            f"users/me/messages/{_path_segment(data['id'])}"
+            f"/attachments/{_path_segment(body['attachmentId'])}",
+        )
+        encoded = fetched.get("data") if isinstance(fetched, dict) else None
+        if not isinstance(encoded, str):
+            raise RuntimeError("Gmail returned an unreadable message body.")
+        body["data"] = encoded
+        part["body"] = body
+
+
+def _message_fields(data: Dict[str, Any]) -> Dict[str, Any]:
+    payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
+    headers = {
+        str(h.get("name") or "").lower(): str(h.get("value") or "")
+        for h in payload.get("headers") or []
+        if isinstance(h, dict)
+    }
+    return {
+        "message_id": data.get("id"),
+        "thread_id": data.get("threadId"),
+        "from": headers.get("from", ""),
+        "to": headers.get("to", ""),
+        "cc": headers.get("cc", ""),
+        "subject": headers.get("subject", ""),
+        "date": headers.get("date", ""),
+        "labels": list(data.get("labelIds") or []),
+        "snippet": data.get("snippet") or "",
+        "attachments": _attachments(payload),
+    }
+
+
+def _readable_message(data: Dict[str, Any], *, offset: int = 0) -> Dict[str, Any]:
+    payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
+    return readable.paged_message(_message_fields(data), _message_body(payload), offset=offset)
 
 
 # ── Tool handlers ────────────────────────────────────────────────────────────
@@ -611,11 +791,18 @@ async def _list_messages(token: str, args: Dict) -> str:
 
 async def _get_message(token: str, args: Dict) -> str:
     fmt = args.get("format") or "full"
-    return await _api(
+    offset = readable.page_offset(args.get("offset"))
+    data = await _request(
         token, "GET",
         f"users/me/messages/{_path_segment(args['message_id'])}",
         params={"format": fmt},
     )
+    if not isinstance(data, dict):
+        raise RuntimeError("Gmail returned an unreadable message.")
+    if fmt != "full":
+        return json.dumps(_message_fields(data), ensure_ascii=False)
+    await _load_message_body(token, data)
+    return json.dumps(_readable_message(data, offset=offset), ensure_ascii=False)
 
 
 async def _send_message(token: str, args: Dict) -> str:
@@ -839,10 +1026,19 @@ async def _list_drafts(token: str, args: Dict) -> str:
 
 
 async def _get_draft(token: str, args: Dict) -> str:
-    return await _api(
+    offset = readable.page_offset(args.get("offset"))
+    data = await _request(
         token, "GET", f"users/me/drafts/{_path_segment(args['draft_id'])}",
         params={"format": args.get("format") or "full"},
     )
+    message = data.get("message") if isinstance(data, dict) else None
+    if not isinstance(message, dict):
+        raise RuntimeError("Gmail returned an unreadable draft.")
+    if (args.get("format") or "full") == "full":
+        await _load_message_body(token, message)
+    out = _readable_message(message, offset=offset)
+    out["draft_id"] = data.get("id")
+    return json.dumps(out, ensure_ascii=False)
 
 
 async def _create_draft(token: str, args: Dict) -> str:
@@ -893,10 +1089,29 @@ async def _list_threads(token: str, args: Dict) -> str:
 
 
 async def _get_thread(token: str, args: Dict) -> str:
-    return await _api(
+    fmt = args.get("format") or "full"
+    data = await _request(
         token, "GET", f"users/me/threads/{_path_segment(args['thread_id'])}",
-        params={"format": args.get("format") or "full"},
+        params={"format": fmt},
     )
+    if not isinstance(data, dict):
+        raise RuntimeError("Gmail returned an unreadable thread.")
+    messages = [m for m in data.get("messages") or [] if isinstance(m, dict)]
+    if fmt == "full":
+        for message in messages:
+            await _load_message_body(token, message)
+        items = [
+            (_message_fields(m), _message_body(m.get("payload") or {}))
+            for m in messages
+        ]
+        projected = readable.thread_messages(items)
+    else:
+        projected = [_message_fields(m) for m in messages]
+    return json.dumps({
+        "thread_id": data.get("id"),
+        "message_count": len(projected),
+        "messages": projected,
+    }, ensure_ascii=False)
 
 
 async def _trash_thread(token: str, args: Dict) -> str:
@@ -907,11 +1122,65 @@ async def _trash_thread(token: str, args: Dict) -> str:
 
 # ── Attachments ─────────────────────────────────────────────────────────────
 
-async def _download_attachment(token: str, args: Dict) -> str:
-    return await _api(
-        token, "GET",
-        f"users/me/messages/{_path_segment(args['message_id'])}/attachments/{_path_segment(args['attachment_id'])}",
+async def _fetch_attachment(token: str, args: Dict) -> tuple[Dict[str, Any], bytes]:
+    """Find an attachment by part id (or Gmail attachmentId) and fetch its bytes."""
+    message_id = args["message_id"]
+    wanted = str(args["attachment_id"]).strip()
+    data = await _request(
+        token, "GET", f"users/me/messages/{_path_segment(message_id)}",
+        params={"format": "full"},
     )
+    payload = data.get("payload") if isinstance(data, dict) else None
+    part = next(
+        (
+            p for p in _walk_parts(payload or {})
+            if not p.get("parts") and _is_attachment(p) and wanted in {
+                str(p.get("partId") or ""),
+                str((p.get("body") or {}).get("attachmentId") or ""),
+            }
+        ),
+        None,
+    )
+    if part is None:
+        raise RuntimeError(f"Attachment {wanted} not found on message {message_id}.")
+    body = part.get("body") or {}
+    if body.get("attachmentId"):
+        fetched = await _request(
+            token, "GET",
+            f"users/me/messages/{_path_segment(message_id)}"
+            f"/attachments/{_path_segment(body['attachmentId'])}",
+        )
+        encoded = fetched.get("data") if isinstance(fetched, dict) else None
+    else:
+        encoded = body.get("data")
+    meta = {
+        "message_id": message_id,
+        "attachment_id": _attachment_ref(part),
+        "filename": part.get("filename") or f"attachment-{_attachment_ref(part)}",
+        "content_type": part.get("mimeType") or "application/octet-stream",
+    }
+    return meta, _decode_part_data(encoded)
+
+
+async def _download_attachment(token: str, args: Dict) -> str:
+    # Lossless: a cut base64 payload would be a corrupt file.
+    meta, content = await _fetch_attachment(token, args)
+    meta["size"] = len(content)
+    meta["data"] = base64.urlsafe_b64encode(content).decode("ascii").rstrip("=")
+    return json.dumps(meta, ensure_ascii=False)
+
+
+async def _save_attachment_to_workspace(token: str, args: Dict) -> str:
+    meta, content = await _fetch_attachment(token, args)
+    saved = await readable.save_attachment(
+        _call_context.get(),
+        data=content,
+        filename=meta["filename"],
+        content_type=meta["content_type"],
+        source={"message_id": meta["message_id"], "attachment_id": meta["attachment_id"]},
+        tool_name="mcp__gmail__save_attachment_to_workspace",
+    )
+    return json.dumps(saved, ensure_ascii=False)
 
 
 # ── Labels CRUD ─────────────────────────────────────────────────────────────
@@ -966,6 +1235,7 @@ _HANDLERS = {
     "get_thread": _get_thread,
     "trash_thread": _trash_thread,
     # Attachments
+    "save_attachment_to_workspace": _save_attachment_to_workspace,
     "download_attachment": _download_attachment,
     # Labels
     "list_labels": _list_labels,

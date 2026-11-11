@@ -189,17 +189,18 @@ async def transcribe_chat_upload(
                 503, "Cannot reach the speech provider. Check the server network and try again."
             ) from exc
         raise HTTPException(502, "Transcription failed. Check the speech-to-text provider settings and retry.") from exc
+    # Billed on the provider's seconds at the official per-minute rate; a
+    # gateway's own reported cost is kept on the result for reconciliation only.
     await record_media_usage(
         db,
         **scope.usage_fields(),
         kind="whisper",
         model=result.model,
-        cost_usd=getattr(result, "cost_usd", None)
-        if getattr(result, "cost_usd", None) is not None
-        else whisper_cost_usd(result.duration_seconds, result.model),
+        cost_usd=whisper_cost_usd(result.duration_seconds, result.model, getattr(result, "usage", None)),
         units=int(result.duration_seconds),
         source=RUNTIME_AUDIO_TRANSCRIBE_SOURCE,
         byok=bool(key),
+        pricing_source="official_seconds",
     )
     await db.commit()
     return {"text": result.text, "duration_seconds": round(result.duration_seconds, 3), "model": result.model}
@@ -235,7 +236,8 @@ async def chat_speech_response(
     voice_instructions: str | None = None,
     language: str | None = None,
 ) -> Response:
-    from packages.core.services.model_pricing_gateway import estimate_audio_cost_usd
+    from packages.core.ai.tools.extended_tools import _generated_audio_cost_usd
+    from packages.core.services.usage_service import record_media_call_unknown_cost
 
     text = speech_text(text)
     language = normalize_workspace_audio_language(language) if str(language or "").strip() else None
@@ -253,16 +255,37 @@ async def chat_speech_response(
             result["audio_format"]
         ]
         # Preserve media pricing and BYOK, without a filesystem/Knowledge row.
-        await record_media_usage(
-            db,
-            **scope.usage_fields(),
-            kind="tts",
-            model=result["model"],
-            cost_usd=estimate_audio_cost_usd(result["model"], purpose="speech", characters=len(text)),
-            units=len(text),
-            source=RUNTIME_FLOATING_CHAT_VOICE_SOURCE,
-            byok=result["is_byok"],
+        # Priced like any generated audio: the provider's own billing unit.
+        cost, basis = _generated_audio_cost_usd(
+            result["model"],
+            purpose="speech",
+            prompt=text,
+            provider_cost_usd=result.get("provider_cost_usd"),
+            audio_bytes=audio,
+            audio_format=result["audio_format"],
         )
+        if cost is None and not result["is_byok"]:
+            await record_media_call_unknown_cost(
+                db,
+                scope.entity_id,
+                kind="tts",
+                model=result["model"],
+                workspace_id=scope.workspace_id,
+                units=len(text),
+                pricing_source=basis,
+            )
+        else:
+            await record_media_usage(
+                db,
+                **scope.usage_fields(),
+                kind="tts",
+                model=result["model"],
+                cost_usd=cost or 0.0,
+                units=len(text),
+                source=RUNTIME_FLOATING_CHAT_VOICE_SOURCE,
+                byok=result["is_byok"],
+                pricing_source=basis,
+            )
         await db.commit()
         return ""
 

@@ -41,6 +41,13 @@ async def list_tasks(ctx: ToolContext, args: dict) -> Any:
             "tasks": [{key: task.get(key) for key in _TASK_LIST_KEYS} for task in page.get("items") or []]}
 
 
+async def list_attention(ctx: ToolContext, args: dict) -> Any:
+    workspace_id = require(args, "workspace_id")
+    return await ctx.api.get(
+        f"/api/v1/workspaces/{workspace_id}/attention-items", limit=_limit(args, 50),
+    )
+
+
 def _log(entry: dict) -> dict:
     content = entry.get("content") or ""
     if len(content) > _LOG_CONTENT_CHARS:
@@ -136,6 +143,15 @@ TOOLS = [
                      "limit": {**_LIMIT, "default": 50},
                      "offset": {"type": "integer", "minimum": 0}},
          required=("workspace_id",), read_only=True, idempotent=True),
+    Tool("list_attention", "List what needs attention",
+         "What in a Workspace may need a person now, most urgent first: approvals and inputs "
+         "waiting on someone, Strategist proposals waiting for a decision, connected accounts "
+         "to reconnect, unfinished setup, paused automations, budget used, goals off pace, "
+         "blocked or overdue work. Each item has its kind, urgency, how long it has waited (stage) and "
+         "the ids it came from (evidence). Kept in step with the Workspace every few minutes.",
+         list_attention,
+         properties={"workspace_id": _WORKSPACE_ID, "limit": {**_LIMIT, "default": 50}},
+         required=("workspace_id",), read_only=True, idempotent=True),
     Tool("get_task", "Get task",
          "One task: its details and result (actual_output), what blocks it (its current "
          "blocker, e.g. a pending approval or question), and its most recent activity log "
@@ -157,7 +173,8 @@ TOOLS = [
          read_only=True, idempotent=True),
     Tool("get_scheduled_job", "Get scheduled job",
          "One scheduled job with its full configuration and its most recent runs "
-         "(status, result, error, duration).",
+         "(status, result, error, duration). A run whose Task needs a person shows status "
+         "waiting with waiting_task_id and waiting_reason.",
          get_scheduled_job,
          properties={"job_id": _JOB_ID,
                      "run_limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}},
@@ -166,7 +183,8 @@ TOOLS = [
          "Create (no job_id) or update a scheduled job. Schedule: schedule_kind cron + cron_expr "
          "(with timezone), every + every_seconds, or at + run_at (ISO time). What it runs: "
          "execution_type workflow with execution_target {workflow_id}, skill with {skill_id}, "
-         "or agent with agent_id + payload_message. On update only the fields you pass change.",
+         "or agent with agent_id + payload_message. On update only the fields you pass change. "
+         "A job created while its Workspace is paused waits and starts when the Workspace starts.",
          upsert_scheduled_job,
          properties={"job_id": _JOB_ID | {"description": "Update this job; omit to create."},
                      "name": string("Job name (required to create)."),

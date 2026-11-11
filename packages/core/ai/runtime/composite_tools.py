@@ -91,6 +91,7 @@ class WorkspaceToolAction(StrEnum):
     RESOLVE_HITL = "resolve_hitl"
     ANSWER_TASK_BLOCKER = "answer_task_blocker"
     VISUALIZE_LEDGERS = "visualize_ledgers"
+    LIST_ATTENTION = "list_attention"
 
     @classmethod
     def values(cls) -> tuple[str, ...]:

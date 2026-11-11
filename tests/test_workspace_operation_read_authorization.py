@@ -42,6 +42,7 @@ _SURFACES = ("workspace_operation", "workspace_agent", "manor")
     {"action": "get_current"},
     {"action": "preview_diff", "draft_id": "draft"},
     {"action": "validate_draft", "draft_id": "draft"},
+    {"action": "app_audience"},
     {"op": "get"},
     {"operation": "preview", "draft_id": "draft"},
 ])

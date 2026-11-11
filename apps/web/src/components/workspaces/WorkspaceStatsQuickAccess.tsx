@@ -218,7 +218,7 @@ function WorkspaceStatsQuickBody({
     return (
       <div className="workspace-chat-stats-quick-state" aria-live="polite">
         <LoadingSpinner size={18} />
-        <span>{t("component.workspace_chat.loading")}</span>
+        <span className="sr-only">{t("component.workspace_chat.loading")}</span>
       </div>
     );
   }
@@ -300,7 +300,7 @@ function WorkspaceStatsQuickAdder({
     return (
       <div className="workspace-chat-stats-quick-state" aria-live="polite">
         <LoadingSpinner size={18} />
-        <span>{t("component.workspace_chat.loading")}</span>
+        <span className="sr-only">{t("component.workspace_chat.loading")}</span>
       </div>
     );
   }
@@ -611,7 +611,7 @@ function WorkspaceFilesQuickBody({
     return (
       <div className="workspace-chat-stats-quick-state" aria-live="polite">
         <LoadingSpinner size={18} />
-        <span>{t("component.workspace_chat.loading")}</span>
+        <span className="sr-only">{t("component.workspace_chat.loading")}</span>
       </div>
     );
   }
@@ -893,7 +893,7 @@ function WorkspaceTasksQuickBody({
     return (
       <div className="workspace-chat-stats-quick-state" aria-live="polite">
         <LoadingSpinner size={18} />
-        <span>{t("component.workspace_chat.loading")}</span>
+        <span className="sr-only">{t("component.workspace_chat.loading")}</span>
       </div>
     );
   }
@@ -984,7 +984,7 @@ function WorkspaceSettingsQuickBody({
     return (
       <div className="workspace-chat-stats-quick-state" aria-live="polite">
         <LoadingSpinner size={18} />
-        <span>{t("component.workspace_chat.loading")}</span>
+        <span className="sr-only">{t("component.workspace_chat.loading")}</span>
       </div>
     );
   }

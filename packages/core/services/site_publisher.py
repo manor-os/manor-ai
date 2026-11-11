@@ -775,6 +775,42 @@ def site_serving_root(entity_id: str, site) -> str:
     return os.path.join(get_entity_root(entity_id), ".sites", site.id, f"rev{site.revision}")
 
 
+# ── public addresses ───────────────────────────────────────────────────────
+# The single builder of a site's address. Host routing (``{slug}.{domain}`` or
+# the custom domain, port ignored) lives in the sites router.
+
+def sites_domain() -> str:
+    from packages.core.config import get_settings
+
+    return (get_settings().MANOR_SITES_DOMAIN or "").strip().lower().rstrip(".")
+
+
+def site_platform_url(site) -> str:
+    """``{scheme}://{slug}.{MANOR_SITES_DOMAIN}[:port]``; empty when hosting is off."""
+    from packages.core.config import get_settings
+
+    domain = sites_domain()
+    slug = str(getattr(site, "slug", "") or "").strip().lower()
+    if not domain or not slug:
+        return ""
+    settings = get_settings()
+    scheme = (settings.MANOR_SITES_PUBLIC_SCHEME or "").strip().lower()
+    if scheme not in {"http", "https"}:
+        scheme = "https"
+    port = str(settings.MANOR_SITES_PUBLIC_PORT or "").strip()
+    default_port = "443" if scheme == "https" else "80"
+    suffix = f":{port}" if port.isdigit() and port != default_port else ""
+    return f"{scheme}://{slug}.{domain}{suffix}"
+
+
+def site_public_url(site) -> str:
+    """The address visitors use: an active custom domain, else the platform address."""
+    custom = str(getattr(site, "custom_domain", "") or "").strip().lower()
+    if custom and getattr(site, "domain_status", None) == "active":
+        return f"https://{custom}"
+    return site_platform_url(site)
+
+
 async def _resolve_ips(host: str) -> set[str]:
     import asyncio
     import socket

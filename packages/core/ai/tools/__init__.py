@@ -44,10 +44,10 @@ def register_all_tools(pool) -> None:
         dashboard_tools,
         workflow_tools,
         site_tools,
-        stickman_topic_tools,
         video_edit_tools,
         request_input_tool,
         file_delivery_tools,
+        memory_tools,
     )
 
     # request_input is always-loaded: any agent may need to stop and ask the
@@ -118,9 +118,9 @@ def register_all_tools(pool) -> None:
         dashboard_tools,
         workflow_tools,
         site_tools,
-        stickman_topic_tools,
         video_edit_tools,
         file_delivery_tools,
+        memory_tools,
     ]:
         for schema, handler in module.get_tools():
             name = schema["function"]["name"]

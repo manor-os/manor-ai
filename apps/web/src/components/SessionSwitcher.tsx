@@ -160,7 +160,7 @@ export default function SessionSwitcher({ currentConvId, disabled, onNewChat, on
           {!conversationsLoading && conversations && conversations.length > 0 && (
             <>
               <div style={{ height: 1, background: "var(--border-subtle)" }} />
-              <div style={{ padding: "8px 16px 4px", fontSize: 10, fontWeight: 700, color: "var(--text-faint)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+              <div style={{ padding: "8px 16px 4px", fontSize: 10, fontWeight: 700, color: "var(--text-faint)", }}>
                 {t("page.knowledge.recent")}</div>
               <div style={{ maxHeight: 240, overflowY: "auto", paddingBottom: 6 }}>
                 {conversations.slice(0, 10).map((conv) => {

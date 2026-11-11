@@ -10,7 +10,8 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy.orm import defer
 
 from packages.core.blueprints.exporter import ExportContext, export_workspace
 from packages.core.blueprints.freshness import (
@@ -22,6 +23,7 @@ from packages.core.blueprints.freshness import (
 )
 from packages.core.blueprints.installer import InstallMode, install_blueprint
 from packages.core.blueprints.registry import next_release_version, record_release
+from packages.core.blueprints.release_diff import diff_releases
 from packages.core.models.base import generate_ulid
 from packages.core.models.client_delivery import (
     DELIVERY_BLUEPRINT_ID_PREFIX,
@@ -41,6 +43,7 @@ from packages.core.services.user_email_proof import email_is_verified
 from packages.core.services.workspace_access import (
     lock_workspace_access_boundary,
     lock_workspace_recipient_authorization,
+    manageable_workspace_ids_for_user,
     user_can_manage_workspace,
 )
 from packages.core.services.scheduler_service import pause_workspace_automations
@@ -212,6 +215,40 @@ async def export_source(db, ws, knowledge_document_ids):
     )
 
 
+def _uploaded_release(row, payload):
+    """A Blueprint built elsewhere, checked as this delivery's next release."""
+    from packages.core.blueprints.payload import validate_payload
+    from packages.core.blueprints.release_diff import _components
+
+    if not isinstance(payload, dict):
+        raise ValueError("The file is not a Blueprint")
+    payload = deepcopy(payload)
+    validate_payload(payload)
+    payload.setdefault("manifest", {})
+    current, uploaded = set(_components(row.payload or {})), set(_components(payload))
+    if current and not current & uploaded:
+        # Every component would be retired and replaced in the customer's
+        # Workspace: almost certainly another Workspace's file.
+        raise ValueError(
+            "This file shares no Workflows, Skills or Agents with the delivery's current version; "
+            "it looks like a different Workspace. Start from the delivery's current release."
+        )
+    return payload
+
+
+async def _store_release_assets(db, row, payload, assets):
+    """Write a package's files where the customer's Workspace can read them."""
+    from packages.core.blueprints.package import restore_assets, store_assets
+
+    target = await db.get(Workspace, row.target_workspace_id) if row.target_workspace_id else None
+    if target is None:
+        raise ValueError(
+            "This package carries files, and the customer has not accepted the delivery yet. "
+            "Send it after they accept, or send a Blueprint without files."
+        )
+    return restore_assets(payload, await store_assets(target.entity_id, list(assets)))
+
+
 def delivery_blueprint_id(delivery_id):
     """The update source a delivered Workspace records, in place of a Marketplace id."""
     return f"{DELIVERY_BLUEPRINT_ID_PREFIX}{delivery_id}"
@@ -221,12 +258,18 @@ def content_version(row):
     return (row.content_release or {}).get("version") or FIRST_CONTENT_VERSION
 
 
-async def publish_update(db, *, user, client_id, delivery_id, knowledge_document_ids=None, release_notes=None):
-    """Re-export the source Workspace as the delivery's next release.
+async def publish_update(
+    db, *, user, client_id, delivery_id, knowledge_document_ids=None, release_notes=None,
+    payload=None, assets=(), dry_run=False,
+):
+    """Send the delivery's next release: the source Workspace re-exported, or a
+    Blueprint ``payload`` built elsewhere (a teammate's git merge, a staging
+    Workspace) with the ``assets`` its ``.manor`` package carried.
 
     The customer's Workspace takes it through the ordinary Blueprint upgrade
-    (plan, apply, revert); nothing is written to it here. A pending invitation
-    simply installs the newer release when accepted.
+    (plan, apply, revert); nothing in it changes here. A pending invitation
+    simply installs the newer release when accepted. ``dry_run`` reports the
+    version and changes the customer would get without sending anything.
     """
     row = await db.scalar(
         select(ClientWorkspaceDelivery)
@@ -258,11 +301,27 @@ async def publish_update(db, *, user, client_id, delivery_id, knowledge_document
         selected = release.get("knowledge_document_ids") or []
     else:
         selected = knowledge_document_ids
-    ws = await db.get(Workspace, row.source_workspace_id)
-    payload = await export_source(db, ws, selected)
+    if payload is None:
+        ws = await db.get(Workspace, row.source_workspace_id)
+        payload = await export_source(db, ws, selected)
+    else:
+        payload = _uploaded_release(row, payload)
     if release_notes:
         payload["manifest"]["release_notes"] = release_notes
     previous = content_version(row)
+    if dry_run:
+        changes = diff_releases(row.payload, payload)
+        version = await next_release_version(
+            db, delivery_blueprint_id(row.id), payload,
+            current_version=previous, stored_fingerprint=blueprint_content_fingerprint(row.payload),
+        )
+        return {
+            **receipt(row, can_manage=True), "dry_run": True, "version": version,
+            "published": False, "would_publish": version != previous,
+            "level": changes["min_bump"], "reasons": changes["reasons"], "components": changes["components"],
+        }
+    if assets:
+        payload = await _store_release_assets(db, row, payload, assets)
     version = await next_release_version(
         db, delivery_blueprint_id(row.id), payload,
         current_version=previous, stored_fingerprint=blueprint_content_fingerprint(row.payload),
@@ -278,8 +337,33 @@ async def publish_update(db, *, user, client_id, delivery_id, knowledge_document
         "published_at": datetime.now(timezone.utc).isoformat(),
         "published_by": user.id,
     }
+    offered = None
+    if row.target_workspace_id and version != previous:
+        from packages.core.services.workspace_update_offer import offer_update
+
+        # The customer sees the release in their Workspace chat, one click from applied.
+        await offer_update(
+            db, workspace=target, version=version, previous_version=previous,
+            release_notes=payload["manifest"].get("release_notes"),
+            publisher_name=await db.scalar(select(Entity.name).where(Entity.id == row.entity_id)),
+        )
+        offered = {"workspace_id": target.id, "version": version}
     await db.flush()
-    return {**receipt(row, can_manage=True), "published": version != previous}
+    return {**receipt(row, can_manage=True), "published": version != previous, "offered": offered}
+
+
+async def notify_offered_update(db, result):
+    """After the release commits, tell the customer's Workspace owner."""
+    from packages.core.services.workspace_update_offer import notify_update_owners
+
+    offered = (result or {}).get("offered")
+    if not offered:
+        return
+    workspace = await db.get(Workspace, offered["workspace_id"])
+    if workspace is not None and workspace.deleted_at is None:
+        row = await db.get(ClientWorkspaceDelivery, result["id"])
+        publisher = await db.scalar(select(Entity.name).where(Entity.id == row.entity_id)) if row else None
+        await notify_update_owners(db, workspace=workspace, version=offered["version"], publisher_name=publisher)
 
 
 async def prepare_delivery(db, **kwargs):
@@ -493,13 +577,14 @@ class ContactRequest(BaseModel):
     is_primary: bool = False
 
 
-def receipt(row, *, can_manage=False, status=None, provider_access="none"):
+def receipt(row, *, can_manage=False, status=None, provider_access="none", title=None):
+    """``title`` spares a caller that read it in SQL from loading the payload."""
     return {
         "id": row.id,
         "client_id": row.client_id,
         "contact_id": row.contact_id,
         "source_workspace_id": row.source_workspace_id,
-        "title": row.payload["manifest"]["title"],
+        "title": row.payload["manifest"]["title"] if title is None else title,
         "recipient_email": row.recipient_email,
         "status": status or delivery_status(row),
         "expires_at": row.expires_at,
@@ -611,16 +696,24 @@ async def deliveries(client_id: str, user: User = None, db: AsyncSession = None)
             .order_by(ClientWorkspaceDelivery.created_at.desc())
         )
     ).all()
-    contacts = {
-        r.id: r
-        for r in (
-            await db.scalars(
-                select(ClientContact).where(
-                    ClientContact.entity_id == user.entity_id, ClientContact.client_id == client_id
-                )
+    contacts = (
+        await db.scalars(
+            select(ClientContact).where(
+                ClientContact.entity_id == user.entity_id, ClientContact.client_id == client_id
             )
-        ).all()
-    }
+        )
+    ).all()
+    managed_sources = set()
+    for source in {row.source_workspace_id: row for row in rows}.values():
+        if await can_manage_delivery(db, user, source):
+            managed_sources.add(source.source_workspace_id)
+    return await _delivery_rows(db, user, rows, [client], contacts, managed_sources)
+
+
+async def _delivery_rows(db, user, rows, clients, contacts, managed_sources, titles=None):
+    """The response rows for deliveries, reading what they share in one query each."""
+    clients = {client.id: client for client in clients}
+    contacts = {contact.id: contact for contact in contacts}
     from packages.core.models.workspace_collaboration import WorkspaceCollaboration
     from packages.core.services.workspace_collaboration import public_grant
     maintenance_rows = (await db.scalars(select(WorkspaceCollaboration).where(
@@ -631,14 +724,10 @@ async def deliveries(client_id: str, user: User = None, db: AsyncSession = None)
 
     # The provider team's access, shown to everyone who manages the source
     # Workspace: each of them can open the customer trial from their company.
-    managed_sources = {}
-    for row in rows:
-        if row.source_workspace_id not in managed_sources:
-            managed_sources[row.source_workspace_id] = await can_manage_delivery(db, user, row)
-    team_roles = await team_access_many(db, [row for row in rows if managed_sources[row.source_workspace_id]])
+    team_roles = await team_access_many(db, [row for row in rows if row.source_workspace_id in managed_sources])
     result = []
     for row in rows:
-        source_manager = managed_sources[row.source_workspace_id]
+        client = clients[row.client_id]
         team = team_roles.get(row.id)
         contact = contacts.get(row.contact_id)
         changed = (
@@ -652,12 +741,102 @@ async def deliveries(client_id: str, user: User = None, db: AsyncSession = None)
         result.append(
             {**receipt(
                 row,
-                can_manage=client.status == "active" and source_manager,
+                can_manage=client.status == "active" and row.source_workspace_id in managed_sources,
                 status="revoked" if row.status == "pending" and changed else None,
                 provider_access=access_label(team) if team else "none",
+                title=titles[row.id] if titles else None,
             ), "maintenance": maintenance.get(row.id), "can_open_trial": team is not None}
         )
     return result
+
+
+def live_delivery_query(entity_id, *columns):
+    """Select from a company's deliveries that are live: of a client that still
+    exists, and reading as anything but revoked in ``deliveries``, where a
+    pending invitation counts as revoked once its client or contact changed.
+
+    The rule is in SQL, so a caller never has to load rows, or their payloads,
+    to count or filter them.
+    """
+    delivery = ClientWorkspaceDelivery
+    invitation_still_valid = and_(
+        Client.status == "active",
+        func.coalesce(Client.meta["crm_invite_version"].as_integer(), 0) == delivery.client_version,
+        ClientContact.deleted_at.is_(None),
+        ClientContact.invite_version == delivery.contact_version,
+        ClientContact.email == delivery.recipient_email,
+    )
+    return (
+        select(*columns)
+        .select_from(delivery)
+        .join(Client, and_(
+            Client.id == delivery.client_id, Client.entity_id == delivery.entity_id, Client.deleted_at.is_(None),
+        ))
+        .outerjoin(ClientContact, and_(
+            ClientContact.id == delivery.contact_id,
+            ClientContact.entity_id == delivery.entity_id,
+            ClientContact.client_id == delivery.client_id,
+        ))
+        .where(
+            delivery.entity_id == entity_id,
+            delivery.status != "revoked",
+            or_(delivery.status != "pending", invitation_still_valid),
+        )
+    )
+
+
+async def managed_delivery_sources(db, user):
+    """The source Workspaces of live deliveries this person manages.
+
+    Same rule as ``can_manage_delivery`` (a company admin who reads every
+    Workspace, or an active Workspace owner), decided for all of them at once.
+    """
+    sources = live_delivery_query(user.entity_id, ClientWorkspaceDelivery.source_workspace_id)
+    workspaces = (await db.execute(
+        select(Workspace.id, Workspace.entity_id, Workspace.deleted_at).where(Workspace.id.in_(sources))
+    )).all()
+    return await manageable_workspace_ids_for_user(
+        db, workspaces=workspaces, entity_id=user.entity_id, user_id=user.id, entity_role=user.role,
+    )
+
+
+async def all_deliveries(user: User = None, db: AsyncSession = None, *, limit: int = 100, offset: int = 0):
+    """One page of the live deliveries of the Workspaces this person manages,
+    across clients, newest first, and whether more follow it.
+
+    Each row is what ``deliveries`` returns for it, plus the client's name.
+    Payloads stay in the database: only their titles are read.
+    """
+    managed_sources = await managed_delivery_sources(db, user)
+    if not managed_sources:
+        return [], False
+    delivery = ClientWorkspaceDelivery
+    found = (await db.execute(
+        live_delivery_query(user.entity_id, delivery, delivery.payload["manifest"]["title"].astext)
+        .where(delivery.source_workspace_id.in_(managed_sources))
+        .options(defer(delivery.payload))
+        .order_by(delivery.created_at.desc(), delivery.id.desc())
+        .limit(limit + 1)
+        .offset(offset)
+    )).all()
+    has_more = len(found) > limit
+    found = found[:limit]
+    rows = [row for row, _title in found]
+    client_ids = {row.client_id for row in rows}
+    clients = (await db.scalars(
+        select(Client).where(Client.id.in_(client_ids), Client.entity_id == user.entity_id)
+    )).all()
+    contacts = (await db.scalars(
+        select(ClientContact).where(ClientContact.entity_id == user.entity_id, ClientContact.client_id.in_(client_ids))
+    )).all()
+    names = {client.id: client.name for client in clients}
+    return [
+        {**row, "client_name": names[row["client_id"]]}
+        for row in await _delivery_rows(
+            db, user, rows, clients, contacts, managed_sources,
+            titles={row.id: title or "" for row, title in found},
+        )
+    ], has_more
 
 
 async def change_invite(client_id: str, delivery_id: str, action: str, user: User = None, db: AsyncSession = None):

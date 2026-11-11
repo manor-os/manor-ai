@@ -112,10 +112,10 @@ export default function ReadOnlyFilePreview({
   if (previewContent == null) return <PreviewLoading />;
 
   if (kind === "markdown") {
-    return <div className="markdown-body" style={{ fontSize: 14, lineHeight: 1.7, color: "#292524" }}><Markdown remarkPlugins={[remarkGfm]} components={{ table: ({ children }) => <MarkdownTable>{children}</MarkdownTable> }}>{previewContent}</Markdown></div>;
+    return <div className="markdown-body" style={{ fontSize: 14, lineHeight: 1.7, color: "var(--text-strong)" }}><Markdown remarkPlugins={[remarkGfm]} components={{ table: ({ children }) => <MarkdownTable>{children}</MarkdownTable> }}>{previewContent}</Markdown></div>;
   }
   if (kind === "html") {
-    return <iframe title={file.name || "HTML preview"} srcDoc={previewContent} sandbox="" referrerPolicy="no-referrer" style={{ width: "100%", minHeight: "75vh", border: "1px solid rgba(28,25,23,0.06)" }} />;
+    return <iframe title={file.name || "HTML preview"} srcDoc={previewContent} sandbox="" referrerPolicy="no-referrer" style={{ width: "100%", minHeight: "75vh", border: "0.5px solid rgba(29, 29, 31,0.06)" }} />;
   }
   if (kind === "csv") return <CsvPreview content={previewContent} />;
   if (kind === "json") return <CodePreview content={formatJson(previewContent)} />;
@@ -132,7 +132,7 @@ export default function ReadOnlyFilePreview({
 
 
 function CodePreview({ content }: { content: string }) {
-  return <pre style={{ margin: 0, padding: 16, background: "#fafaf9", overflowX: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", color: "#292524" }}><code>{content}</code></pre>;
+  return <pre style={{ margin: 0, padding: 16, background: "var(--surface-muted)", overflowX: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "var(--font-mono)", color: "var(--text-strong)" }}><code>{content}</code></pre>;
 }
 
 function formatJson(content: string): string {
@@ -144,9 +144,9 @@ function formatJson(content: string): string {
 }
 
 function PreviewLoading() {
-  return <p style={{ color: "#a8a29e", textAlign: "center", padding: "24px 0" }}>{t("page.shared_doc.loading")}</p>;
+  return <p style={{ color: "var(--text-muted)", textAlign: "center", padding: "24px 0" }}>{t("page.shared_doc.loading")}</p>;
 }
 
 function PreviewFallback({ message = t("page.shared_doc.preview_unavailable") }: { message?: string }) {
-  return <p style={{ color: "#a8a29e", textAlign: "center", padding: "24px 0" }}>{message}</p>;
+  return <p style={{ color: "var(--text-muted)", textAlign: "center", padding: "24px 0" }}>{message}</p>;
 }

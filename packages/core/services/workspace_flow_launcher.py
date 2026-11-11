@@ -5,6 +5,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
+import logging
 from typing import Any, Literal
 
 from sqlalchemy import and_, or_, select
@@ -24,10 +25,13 @@ from packages.core.services.workflow_record_source import resolve_record_select_
 from packages.core.services.workspace_workflow_router import (
     WorkspaceChatEntrypoint,
     assemble_workspace_workflow_inputs,
+    input_rule_fields,
     prepare_workspace_workflow_inputs,
     validate_workspace_workflow_inputs,
     workflow_attachment_descriptors,
 )
+
+logger = logging.getLogger(__name__)
 
 
 async def _prepare_chat_inputs(
@@ -380,6 +384,8 @@ async def launch_workspace_flow(
     explicit_keys = {str(key) for key in (input_values or {})}
     # Choices named in Chat that the input does not offer: ask, never guess.
     unmatched: dict[str, list[str]] = {}
+    # Supplied answers the Flow's inputs rejected, with the reason shown on the form.
+    rejected: dict[str, str] = {}
     if input_values is None:
         initial_values = await _prepare_chat_inputs(
             db,
@@ -406,7 +412,17 @@ async def launch_workspace_flow(
                 entrypoint,
                 supplied_values,
             )
-        except ValueError:
+        except ValueError as exc:
+            # The form is asked again with what was rejected and why.
+            try:
+                errors = json.loads(str(exc))
+            except ValueError:
+                errors = {}
+            for path, message in (errors if isinstance(errors, dict) else {}).items():
+                key = str(path).partition(".")[0]
+                if key in supplied_values:
+                    rejected.setdefault(key, str(message))
+            logger.info("Workflow %s launch inputs rejected: %s", entrypoint.workflow_id, sorted(rejected))
             initial_values = await _prepare_chat_inputs(
                 db,
                 entrypoint,
@@ -418,9 +434,15 @@ async def launch_workspace_flow(
                 unmatched=unmatched,
             )
             for key, value in supplied_values.items():
+                # Judge each value alone: a rule across inputs ("choose at least
+                # one platform") cannot reject an answer it does not involve.
                 single_input_entrypoint = replace(
                     entrypoint,
                     run_inputs=(declared_inputs[key],),
+                    input_rules=tuple(
+                        rule for rule in entrypoint.input_rules
+                        if set(input_rule_fields(rule)) <= {key}
+                    ),
                 )
                 try:
                     normalized = validate_workspace_workflow_inputs(
@@ -501,6 +523,8 @@ async def launch_workspace_flow(
             "workflow_title": entrypoint.title,
             "workflow_status": activity_status,
             "workflow_route_source": source,
+            # Chat folds a system "Started …" notice into this run's one row.
+            "workflow_origin_message_id": origin_message_id,
             "workflow_steps": workflow_progress_steps(
                 run,
                 activity_status=activity_status,
@@ -536,9 +560,12 @@ async def launch_workspace_flow(
                 "inputs": [dict(item) for item in entrypoint.run_inputs],
                 "values": initial_values,
                 **({"input_notes": {
-                    key: "Not found among the available choices: " + ", ".join(names)
-                    for key, names in unmatched.items()
-                }} if unmatched else {}),
+                    **rejected,
+                    **{
+                        key: "Not found among the available choices: " + ", ".join(names)
+                        for key, names in unmatched.items()
+                    },
+                }} if unmatched or rejected else {}),
                 "options": ["run", "cancel"],
             },
             meta={
@@ -639,8 +666,10 @@ async def start_binding_run(
             execution_binding.workflow_id,
             user.entity_id,
         )
+        # A person's run is reported in the Workspace Chat whether or not the
+        # Flow is also offered there as a Chat entry.
         entrypoint = (
-            normalize_chat_entrypoint(execution_binding, workflow)
+            normalize_chat_entrypoint(execution_binding, workflow, include_unpublished=True)
             if workflow is not None
             else None
         )

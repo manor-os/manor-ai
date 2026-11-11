@@ -9,16 +9,32 @@ version: 1.0.0
 Inspect existing work and open blockers before creating or retrying a Task.
 Use Workspace search for scoped task/agent lookup and task details for actual
 status, outputs and recovery state. A Task coordinator owns final status.
+When someone asks what needs them, what is waiting or what you are watching,
+call list_attention: the Workspace's open approvals and inputs, undecided
+proposals, accounts to reconnect, unfinished setup, paused automations, budget,
+goals off pace and blocked or overdue work, most urgent first.
 
 For concrete one-off work, use Workspace create_task. task.prepare is reserved
 for tasks included in a reviewed configuration change; it queues creation on
-approved apply and is not an immediate execution shortcut. Include the complete
+approved apply and is not an immediate execution shortcut. Approving it approves
+the change, not the start: set start on its patch only when the user asks for the
+Task to start once approved. Include the complete
 task-local instructions, required references, knowledge query and task rules.
-Set start=true when the user asks to do/prepare/run the work now; leave it false
-when they explicitly request a Task for later. Starting an installed Flow uses
-start_workspace_flow instead; load workspace-workflows for that operation.
+Long or multi-step work runs as a Task, not in the Chat turn: making, editing or
+rendering video or other media, a long sandbox or script run, research or a
+document with several stages, anything an Agent cannot finish in a few minutes.
+This holds when the user names an Agent and says now: set owner_service_key to
+that Agent. The Task survives a restart and queues for a sandbox, which a
+delegated child cannot. The Task starts by
+default and the Workspace Agent assigns it: "Create a task: X" asks for X to be
+done. Set start=false only when the user says it is for later or not to start
+yet. Set assignee_id only when they name a person to do it; that Task waits for
+them. Starting an installed Flow uses start_workspace_flow instead; load
+workspace-workflows for that operation.
 
-Use delegate_to_agent when asked to use an installed service or its Agent now:
+Use delegate_to_agent when asked to use an installed service or its Agent for
+quick work that finishes in this turn (an answer, a calculation, a short draft,
+one short file), or when the user says not to create a Task:
 pass the agent's name exactly as that tool lists it, and the task. Independent
 tasks for different agents go in one call's tasks list and run at the same time;
 a task that needs another's result goes in a later call. Without that tool, use

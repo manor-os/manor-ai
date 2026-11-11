@@ -129,6 +129,69 @@ async def test_personal_workflow_update_notification_carries_entity_scope(
 
 
 @pytest.mark.asyncio
+async def test_workspace_run_row_update_announces_where_the_run_stands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An open Workspace Chat already holds the run's row; each step's event
+    carries the step statuses so the row moves without reading the chat again."""
+    conversation = Conversation(
+        id=generate_ulid(), entity_id=generate_ulid(), user_id=None,
+        workspace_id=generate_ulid(), title="Workspace Chat", scope="workspace_main",
+    )
+    message = Message(
+        id=generate_ulid(), conversation_id=conversation.id, role="system",
+        content="Article: Write is running.", author_kind="system", message_kind="workflow_activity",
+        meta={
+            "workflow_run_id": "run-1",
+            "workflow_status": "running",
+            "workflow_current_step_id": "write",
+            "workflow_steps": [
+                {"id": "research", "name": "Research", "type": "agent", "status": "completed"},
+                {"id": "write", "name": "Write", "type": "agent", "status": "running", "subscription_id": "sub-1"},
+            ],
+        },
+    )
+
+    class FakeResult:
+        def scalar_one_or_none(self):
+            return conversation
+
+    class FakeAsyncSession:
+        def __init__(self) -> None:
+            self.sync_session = Session()
+
+        async def execute(self, _statement):
+            return FakeResult()
+
+    db_session = FakeAsyncSession()
+    published: list[str] = []
+
+    class FakeRedis:
+        async def publish(self, _channel: str, payload: str) -> None:
+            published.append(payload)
+
+    async def fake_get_redis():
+        return FakeRedis()
+
+    monkeypatch.setattr("packages.core.cache._get_redis", fake_get_redis)
+
+    await _notify_update(db_session, message)
+    db_session.sync_session.commit()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    payload = json.loads(published[0])
+    assert payload["event"] == "workspace_chat_message"
+    assert payload["data"]["workflow_progress"] == {
+        "workflow_run_id": "run-1",
+        "workflow_status": "running",
+        "workflow_current_step_id": "write",
+        "workflow_steps": [{"id": "research", "status": "completed"}, {"id": "write", "status": "running"}],
+    }
+    db_session.sync_session.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("read_only", "review", "projected_read_only"),
     [
@@ -277,6 +340,8 @@ async def test_variable_backed_video_review_resumes_non_cancel_decisions(
         ],
         "title": "A verified Stickman video",
         "description": "Publication description",
+        "tags": ["music"],
+        "video_change_request": "",
         "visibility": "public",
         "audience": "not_made_for_kids",
         "selected_topic": "A concrete topic",
@@ -321,6 +386,14 @@ async def test_variable_backed_video_review_resumes_non_cancel_decisions(
                     "approval_values": ["approve"],
                     "response_variable": "video_decision",
                     "review": review,
+                    **(
+                        {
+                            "review_editable_fields": ["title", "description", "tags"],
+                            "review_revision_field": "video_change_request",
+                        }
+                        if isinstance(review, str)
+                        else {}
+                    ),
                 },
                 "next": ["done"],
             },
@@ -388,10 +461,20 @@ async def test_variable_backed_video_review_resumes_non_cancel_decisions(
         "packages.core.ai.workflow_runner.WorkflowRunner.enqueue",
         staticmethod(lambda run_id, *args, **kwargs: queued.append(run_id) or True),
     )
+    submitted_review = approval.pending_action["review"]
+    if isinstance(review, str):
+        submitted_review = {
+            **submitted_review,
+            "title": "Edited final post",
+            "description": "",
+            "tags": [],
+        }
+        assert approval.pending_action["review_editable_fields"] == ["title", "description", "tags"]
+        assert approval.meta["hitl_requests"][0]["review_revision_field"] == "video_change_request"
     action_message = json.dumps({
         "hitl_id": approval.id,
         "action": choice,
-        "payload": {"review": approval.pending_action["review"]},
+        "payload": {"review": submitted_review},
     })
     assert await chat_hitl_action_is_pending(
         db_session,
@@ -423,6 +506,48 @@ async def test_variable_backed_video_review_resumes_non_cancel_decisions(
     assert run.status == "running"
     assert run.variables["video_decision"]["choice"] == choice
     assert run.step_results["approve_video"]["approved"] is approved
+    if isinstance(review, str):
+        assert run.variables["publication_review"] == submitted_review
+
+
+@pytest.mark.asyncio
+async def test_a_run_started_outside_chat_is_still_in_the_app_queue(db_session) -> None:
+    """Regression (jr acceptance 2026-11-04): a Flow started through the API paused
+    at its approval with no chat card, so a page without its own list had no way in."""
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.workspace_app_sections import _queue_items
+
+    entity_id, user_id, workspace_id = generate_ulid(), generate_ulid(), generate_ulid()
+    workspace = Workspace(id=workspace_id, entity_id=entity_id, name="Music", status="active")
+    db_session.add(workspace)
+    await db_session.flush()
+    workflow = await create_workflow(
+        db_session, entity_id=entity_id, created_by=user_id, name="Plan", variables={},
+        steps=[
+            {"id": "start", "type": "trigger", "name": "Start", "config": {}, "next": ["review"]},
+            {"id": "review", "type": "wait", "name": "Review", "next": [],
+             "config": {"wait_type": "approval", "message": "Approve the plan?", "options": ["approve", "revise"]}},
+        ],
+    )
+    run = await start_workflow(
+        db_session, entity_id, workflow.id, started_by=user_id, trigger_source="manual", workspace_id=workspace_id,
+    )
+    await db_session.commit()
+    await WorkflowRunner().run(run.id)
+    await db_session.refresh(run)
+    assert run.status == "paused", (run.status, run.error)
+
+    viewer = SimpleNamespace(id=user_id, entity_id=entity_id, preferences={})
+    items = await _queue_items(db_session, workspace, user=viewer)
+    assert [(item["kind"], item["summary"]) for item in items] == [("workflow_approval", "Approve the plan?")]
+    assert items[0]["workflow_run"] == {"workflow_id": workflow.id, "run_id": run.id}
+
+    # A chat-started run decides on its card, which the queue lists on its own.
+    run.trigger_data = {**run.trigger_data, "_workflow_chat_origin": {
+        "enabled": True, "conversation_id": generate_ulid(), "activity_message_id": generate_ulid(),
+    }}
+    await db_session.commit()
+    assert await _queue_items(db_session, workspace, user=viewer) == []
 
 
 @pytest.mark.asyncio

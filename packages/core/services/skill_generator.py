@@ -361,6 +361,7 @@ async def update_skill(
     if existing.entity_id != entity_id:
         raise PermissionError(f"Skill {skill_id} does not belong to entity {entity_id}")
 
+    base_edit_version = int(existing.edit_version or 1)
     patch = await build_skill_update_patch(
         existing,
         change_description,
@@ -368,8 +369,10 @@ async def update_skill(
         user_id=user_id,
     )
 
+    # The patch was written against this edit version; a save made while the
+    # model was working is refused rather than overwritten.
     updated = await skill_service.update_skill(
-        db, skill_id, entity_id, **patch,
+        db, skill_id, entity_id, expected_edit_version=base_edit_version, **patch,
     )
 
     if not updated:

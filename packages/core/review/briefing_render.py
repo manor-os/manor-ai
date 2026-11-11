@@ -149,6 +149,11 @@ def _render_workflow_runs(briefing: ReviewBriefingModel) -> list[str]:
             details.append(f"completed_at={run.completed_at}")
         if details:
             lines.append("  - " + " · ".join(details))
+        if run.project_id:
+            lines.append(
+                f"  - owns project={run.project_id} ({run.project_type})"
+                + (f" folder={run.project_folder}" if run.project_folder else "")
+            )
         if run.result_summary is not None:
             lines.append(f"  - result: {_workflow_value(run.result_summary)}")
         if run.blocker is not None:

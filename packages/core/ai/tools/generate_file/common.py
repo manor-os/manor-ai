@@ -14,6 +14,9 @@ def _merge_params(kwargs: dict[str, Any]) -> dict[str, Any]:
     for key in (
         "size",
         "quality",
+        "output_format",
+        "frame_count",
+        "frame_duration_ms",
         "duration",
         "frames",
         "resolution",

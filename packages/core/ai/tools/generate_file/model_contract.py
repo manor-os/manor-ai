@@ -178,21 +178,33 @@ async def selected_media_model_contract(
             "narration_note": "Pass narration_voice_mode and the active Task/Conversation/Workspace context to inspect a pinned narrator model." if selected_purpose == AudioGenerationPurpose.NARRATION else None,
         }
     if kind == "image":
+        from packages.core.constants.models import CATALOG
+
         model = await extended_tools._resolve_user_image_model(actor_id, entity_id, False)
         provider = model.split("/", 1)[0]
+        image_models = [str(entry.get("id") or "") for entry in CATALOG.get("image") or []]
+        size_schema = (
+            {"type": "string", "default": "auto", "note": "GIF accepts auto or positive WIDTHxHEIGHT dimensions that are multiples of 16; the provider applies its current total-pixel budget."}
+            if model in extended_tools._GIF_IMAGE_MODELS
+            else {"type": "string", "enum": ["1024x1024", "1536x1024", "1024x1536"], "default": "1024x1024", "note": "Sent as a provider parameter on native OpenAI; other routes may use aspect_ratio or prompt guidance."}
+        )
         return {
             "kind": kind,
             "model": model,
             "expected_model": model,
             "generation_schema": {
                 "prompt": {"type": "string", "required": True},
-                "size": {"type": "string", "enum": ["1024x1024", "1536x1024", "1024x1536"], "default": "1024x1024", "note": "Sent as a provider parameter on native OpenAI; other routes may use aspect_ratio or prompt guidance."},
+                "model": {"type": "string", "enum": image_models, "note": "Optional explicit catalog image model. Without it, the Account-selected model is used."},
+                "size": size_schema,
                 "aspect_ratio": {"type": "string", "enum": ["16:9", "9:16", "1:1"], "note": "Output is padded to this ratio if necessary; composition is also requested in the prompt."},
                 "reference_urls": {"type": "array", "maxItems": 16},
                 "reference_assets": {"type": "array", "items": {"type": "string"}, "note": "Names of images the project (a series) or Workspace keeps (workspace_asset_key); the runtime sends those exact files as references. An unknown name lists the names that exist."},
                 "workspace_asset_key": {"type": "string", "note": "Keeps this image under a name; inside a project that holds images (a series) the project keeps it for every episode. With reuse_if_exists=true an image already kept under the name is returned without generating."},
                 "quality": {"type": "string", "enum": ["low", "medium", "high"], "default": "medium", "provider_parameter": provider == "openai", "note": "Native OpenAI uses this field; other routes may ignore it."},
                 "input_fidelity": {"type": "string", "enum": ["low", "high"], "provider_parameter": provider == "openai", "requires_reference": True, "note": "Native OpenAI image edits only; other routes may ignore it."},
+                "output_format": {"type": "string", "enum": ["png", "gif"] if model in extended_tools._GIF_IMAGE_MODELS else ["png"], "default": "png", "note": "GIF requires explicit or selected GPT Image 2.6 Sunburst or Flare, through native OpenAI or the managed Vercel route."},
+                "frame_count": {"type": "integer", "minimum": 2, "maximum": 16, "default": 9, "requires": {"output_format": "gif"}},
+                "frame_duration_ms": {"type": "integer", "minimum": 20, "maximum": 2000, "multipleOf": 10, "default": 200, "requires": {"output_format": "gif"}},
             },
             "route_note": "The selected credential and deployment choose the provider route at execution time; provider-specific fields are not guaranteed on every route.",
         }

@@ -64,8 +64,6 @@ class _FakeScalarResult:
 @pytest.mark.parametrize(
     "tool_name",
     [
-        "mcp__stripe__retrieve_balance",
-        "mcp__stripe__list_invoices",
         "mcp__paypal__list_invoices",
         "mcp__paypal__get_order",
     ],
@@ -77,8 +75,6 @@ def test_official_remote_read_tools_support_all_accounts(tool_name: str) -> None
 @pytest.mark.parametrize(
     "tool_name",
     [
-        "mcp__stripe__create_refund",
-        "mcp__stripe__create_payment_link",
         "mcp__paypal__create_order",
         "mcp__paypal__pay_invoice",
     ],

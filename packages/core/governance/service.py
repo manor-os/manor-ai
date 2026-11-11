@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from typing import Any, Optional
 
@@ -171,7 +171,23 @@ async def get_policy(
     return policy
 
 
-async def workflow_run_is_executable(
+@dataclass(frozen=True)
+class WorkflowExecutionBlock:
+    """Why a started Workflow may not execute a step right now.
+
+    ``code`` is ``workflow_origin_not_executable`` when the run, its actor or
+    its Workspace no longer permit execution, and ``workspace_setup_incomplete``
+    when the Workspace still has setup this Workflow reaches; ``reason`` then
+    names what is missing (e.g. connecting Chrome).
+    """
+
+    code: str
+    reason: str = ""
+    # Which check failed, for logs and support; never shown to the person.
+    detail: str = ""
+
+
+async def workflow_run_execution_block(
     db: AsyncSession,
     *,
     entity_id: str,
@@ -179,28 +195,40 @@ async def workflow_run_is_executable(
     user_id: str | None,
     workflow_run_id: str | None,
     statuses: set[str] | None = None,
-) -> bool:
+) -> WorkflowExecutionBlock | None:
     """Validate delegated execution against the current durable Workflow origin.
 
     A started Workflow owns its tool execution; human decisions belong to its
     explicit wait nodes. This is not a substitute for tool permissions, hard
-    governance rules, or credit checks.
+    governance rules, or credit checks. ``None`` means the run may execute.
     """
     from packages.core.models.workflow import WorkflowRun
 
+    def origin(detail: str) -> WorkflowExecutionBlock:
+        # The code alone cannot tell a paused run from a removed actor; log which.
+        logger.warning(
+            "workflow_origin_not_executable run=%s entity=%s workspace=%s user=%s: %s",
+            workflow_run_id, entity_id, workspace_id, user_id, detail,
+        )
+        return WorkflowExecutionBlock("workflow_origin_not_executable", detail=detail)
+
     if not entity_id or not user_id or not workflow_run_id:
-        return False
+        return origin("missing " + ", ".join(
+            name for name, value in (("entity", entity_id), ("user", user_id), ("run", workflow_run_id)) if not value
+        ))
     run = await db.get(WorkflowRun, workflow_run_id, populate_existing=True)
-    if not (
-        run is not None
-        and run.entity_id == entity_id
-        and (run.workspace_id or None) == (workspace_id or None)
-        and run.started_by == user_id
-        and run.status in (statuses or {"running"})
-    ):
-        return False
+    if run is None:
+        return origin("run not found")
+    if run.entity_id != entity_id:
+        return origin("run belongs to another entity")
+    if (run.workspace_id or None) != (workspace_id or None):
+        return origin(f"run workspace {run.workspace_id} differs from {workspace_id}")
+    if run.started_by != user_id:
+        return origin(f"run was started by {run.started_by}, not this actor")
+    if run.status not in (statuses or {"running"}):
+        return origin(f"run status is {run.status}, not {'/'.join(sorted(statuses or {'running'}))}")
     if not workspace_id:
-        return True
+        return None
 
     from packages.core.models.user import User
     from packages.core.models.workspace import Workspace
@@ -218,17 +246,18 @@ async def workflow_run_is_executable(
         entity_id=entity_id,
         legacy_role=(actor.role if actor is not None and actor.entity_id == entity_id else None),
     )
-    if (
-        actor is None
-        or actor.status != "active"
-        or actor.deleted_at is not None
-        or not actor_role
-        or workspace is None
-        or workspace.entity_id != entity_id
-        or not workspace_allows_configured_work(workspace)
-        or is_sandbox_workspace(workspace)
-    ):
-        return False
+    if actor is None or actor.deleted_at is not None:
+        return origin("actor not found")
+    if actor.status != "active":
+        return origin(f"actor status is {actor.status}")
+    if not actor_role:
+        return origin("actor has no role in the entity")
+    if workspace is None or workspace.entity_id != entity_id:
+        return origin("workspace not found in the entity")
+    if not workspace_allows_configured_work(workspace):
+        return origin(f"workspace does not allow configured work (status {getattr(workspace, 'status', None)})")
+    if is_sandbox_workspace(workspace):
+        return origin("workspace is a sandbox")
     if not await user_can_read_workspace_by_identity(
         db,
         workspace=workspace,
@@ -236,9 +265,47 @@ async def workflow_run_is_executable(
         user_id=user_id,
         role=actor_role,
     ):
-        return False
-    setup_status = await evaluate_workspace_blocking_setup(db, workspace)
-    return setup_status is None or not setup_status.blocks_work
+        return origin("actor cannot read the workspace")
+    # The run executes with its starter's connections, so theirs are the ones that count.
+    setup_status = await evaluate_workspace_blocking_setup(db, workspace, actor_user_id=user_id)
+    if setup_status is None or not setup_status.blocks_work:
+        return None
+    # The run holds what it executes; setup it never reaches does not stop it.
+    from packages.core.models.workflow import WorkflowDefinition
+    from packages.core.services.workspace_readiness import blocking_setup_blocks_workflow
+
+    snapshot = run.execution_snapshot if isinstance(run.execution_snapshot, dict) else {}
+    steps = snapshot.get("steps")
+    if not isinstance(steps, list):
+        definition = await db.get(WorkflowDefinition, run.workflow_id)
+        steps = definition.steps if definition is not None else None
+    if not blocking_setup_blocks_workflow(setup_status, steps):
+        return None
+    reasons = [
+        str(check.get("reason") or "").strip()
+        for check in setup_status.details.get("incomplete_checks") or []
+        if str(check.get("reason") or "").strip()
+    ]
+    return WorkflowExecutionBlock(
+        "workspace_setup_incomplete",
+        " ".join(dict.fromkeys(reasons)) or setup_status.summary,
+    )
+
+
+async def workflow_run_is_executable(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str | None,
+    user_id: str | None,
+    workflow_run_id: str | None,
+    statuses: set[str] | None = None,
+) -> bool:
+    """Whether a started Workflow may execute now (see ``workflow_run_execution_block``)."""
+    return await workflow_run_execution_block(
+        db, entity_id=entity_id, workspace_id=workspace_id, user_id=user_id,
+        workflow_run_id=workflow_run_id, statuses=statuses,
+    ) is None
 
 
 async def automated_run_always_allowed(
@@ -862,6 +929,8 @@ async def post_hitl_card(
                 return
 
         card_payload = dict(payload or {})
+        from packages.core.services.decision_recommendation import readable_action, user_facing_reason
+
         if hitl_type == HitlType.ERROR.value:
             # The step already ran and failed. Say what broke and what to do
             # about it — never "approval needed", which is what buried the
@@ -878,19 +947,18 @@ async def post_hitl_card(
             # Retry / cancel, not approve / always / reject.
             options = decision_options_for_hitl(hitl_type)
         elif hitl_type == HitlType.REVIEW.value:
-            body = f"📄 **Review needed** — step `{step_key}` is waiting for your feedback."
-            prompt = reason or f"Review the material produced by step `{step_key}`."
+            # Words for people: no step keys, rule ids or action keys.
+            title = user_facing_reason(card_payload.get("title") or card_payload.get("review_title"))
+            body = f"📄 **Review needed** — {title or 'this step'} is waiting for your feedback."
+            prompt = user_facing_reason(reason) or "Review what this step produced."
             options = decision_options_for_hitl(hitl_type)
         else:
-            body = (
-                f"⛔ **Approval needed** — step `{step_key}` "
-                f"({kind}/{action_key or capability_id or '—'}) was paused by your governance "
-                f"policy (rule: `{matched_rule}`)."
+            action_words = (
+                user_facing_reason(card_payload.get("title") or card_payload.get("summary"))
+                or readable_action(action_key or capability_id)
             )
-            prompt = reason or (
-                f"Approve this step once? {kind}/{action_key or capability_id or 'unknown action'} "
-                f"matched governance rule {matched_rule or 'unknown'}."
-            )
+            body = f"⛔ **Approval needed** — {action_words} is waiting for your approval."
+            prompt = user_facing_reason(reason) or f"{action_words}?"
             # Authorize keeps the standing-grant option. Review is handled in
             # the branch above and can never grant a future diff.
             options = decision_options_for_hitl(hitl_type)

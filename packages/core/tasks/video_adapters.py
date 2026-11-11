@@ -316,7 +316,7 @@ class VideoAdapterRuntime:
     public_url_kwargs: Callable[[str], dict[str, Any]]
     remember_provider_poll: Callable[[str, str, str, str | None], Awaitable[None]]
     poll_openrouter_generation: Callable[..., Awaitable[str]]
-    poll_volcengine_task: Callable[..., Awaitable[str]]
+    poll_volcengine_task: Callable[..., Awaitable[dict[str, Any]]]
     poll_generic_video_task: Callable[..., Awaitable[str]]
     download_and_save: Callable[..., Awaitable[dict[str, Any]]]
     extract_video_url: Callable[[Any], str]
@@ -720,25 +720,32 @@ class VercelGatewayVideoAdapter(VideoGenerationAdapter):
                 continue
 
             state = str(status.get("status") or "").strip().lower()
+            usage = provider_video_usage(status)
             if state == "completed":
                 video_url = _vercel_video_result_url(status)
                 if not video_url:
-                    return {"error": "Vercel completed without video data."}
-                return await _download_adapter_result(
-                    runtime,
-                    job,
-                    video_url,
-                    model,
-                    duration,
-                    resolution,
+                    return apply_provider_usage({"error": "Vercel completed without video data."}, usage)
+                return apply_provider_usage(
+                    await _download_adapter_result(
+                        runtime,
+                        job,
+                        video_url,
+                        model,
+                        duration,
+                        resolution,
+                    ),
+                    usage,
                 )
             if state in {"error", "cancelled"}:
-                return {
-                    "error": str(
-                        status.get("error")
-                        or "Vercel video generation was cancelled."
-                    )
-                }
+                return apply_provider_usage(
+                    {
+                        "error": str(
+                            status.get("error")
+                            or "Vercel video generation was cancelled."
+                        )
+                    },
+                    usage,
+                )
 
         raise TimeoutError("Vercel video generation is still pending after 720 seconds")
 
@@ -999,14 +1006,18 @@ class VolcengineSeedanceAdapter(VideoGenerationAdapter):
 
         task_id = runtime.extract_task_id(data)
         video_url = runtime.extract_video_url(data)
+        usage = provider_video_usage(data)
         if not video_url and task_id:
             poll_url = f"{base}/contents/generations/tasks/{task_id}"
             await runtime.remember_provider_poll(job.id, self.poll_provider, poll_url, task_id)
-            video_url = await runtime.poll_volcengine_task(poll_url, headers)
+            completed = await runtime.poll_volcengine_task(poll_url, headers)
+            video_url = runtime.extract_video_url(completed)
+            usage = provider_video_usage(completed) or usage
         if not video_url:
             return {"error": "No video URL in Seedance response", "raw": str(data)[:500]}
 
-        return await _download_adapter_result(runtime, job, video_url, model, duration, resolution)
+        downloaded = await _download_adapter_result(runtime, job, video_url, model, duration, resolution)
+        return apply_provider_usage(downloaded, usage)
 
 
 ATLASCLOUD_API_BASE = "https://api.atlascloud.ai"
@@ -1583,16 +1594,23 @@ class GoogleInteractionsVideoAdapter(VideoGenerationAdapter):
                 + provider_error_hint(resp.status_code, message),
             )
         mime_type, video = _google_interaction_video(data)
+        usage = provider_video_usage(data)
         if not video:
             status = str((data or {}).get("status") or "") if isinstance(data, dict) else ""
-            return {"error": f"Gemini returned no video (status {status or 'unknown'}). The prompt may have been blocked."}
-        return await _download_adapter_result(
-            runtime,
-            job,
-            f"data:{mime_type};base64,{video}",
-            model,
-            duration,
-            "720p",
+            return apply_provider_usage(
+                {"error": f"Gemini returned no video (status {status or 'unknown'}). The prompt may have been blocked."},
+                usage,
+            )
+        return apply_provider_usage(
+            await _download_adapter_result(
+                runtime,
+                job,
+                f"data:{mime_type};base64,{video}",
+                model,
+                duration,
+                "720p",
+            ),
+            usage,
         )
 
 
@@ -1654,6 +1672,91 @@ def video_adapter_metadata(model: str, provider: str, api_key: str) -> dict[str,
         "video_route": meta.route,
         "native_model": meta.native_model,
     }
+
+
+def provider_video_usage(payload: Any) -> dict[str, Any] | None:
+    """Tokens and cost a gateway or provider reports on a video response, if any.
+
+    The gateway reports its cost under ``providerMetadata.gateway.cost``, as it
+    does for speech; token counts come from a ``usage`` object under any of the
+    common field names. Missing values stay out of the result.
+    """
+    if not isinstance(payload, dict):
+        return None
+    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+    metadata = payload.get("providerMetadata") if isinstance(payload.get("providerMetadata"), dict) else {}
+    gateway = metadata.get("gateway") if isinstance(metadata.get("gateway"), dict) else {}
+
+    def number(value: Any) -> float | None:
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    cost = number(gateway.get("cost") if gateway.get("cost") is not None else usage.get("cost"))
+    prompt = number(next(
+        (usage[key] for key in ("inputTokens", "prompt_tokens", "total_input_tokens") if usage.get(key) is not None),
+        None,
+    ))
+    output = number(next(
+        (usage[key] for key in ("outputTokens", "completion_tokens", "total_output_tokens") if usage.get(key) is not None),
+        None,
+    ))
+    # Google bills thinking tokens at the output rate, so they count as output.
+    thought = number(usage.get("total_thought_tokens"))
+    if output is None and thought is None:
+        completion = None
+    else:
+        completion = (output or 0) + (thought or 0)
+    if cost is None and prompt is None and completion is None:
+        return None
+    return {
+        "cost_usd": cost,
+        "prompt_tokens": int(prompt or 0),
+        "completion_tokens": int(completion) if completion is not None else None,
+        "output_tokens": int(output) if output is not None else None,
+        "thought_tokens": int(thought) if thought is not None else None,
+        "output_tokens_by_modality": _output_tokens_by_modality(usage),
+        "raw": {"usage": usage, "gateway": gateway},
+    }
+
+
+def _output_tokens_by_modality(usage: dict[str, Any]) -> dict[str, int]:
+    """Output tokens per modality (``video``, ``text``, ...) from a per-modality list.
+
+    Each entry is read for its modality and its count under the common field
+    names; an entry without both is left out.
+    """
+    counts: dict[str, int] = {}
+    for entry in usage.get("output_tokens_by_modality") or []:
+        if not isinstance(entry, dict):
+            continue
+        modality = str(entry.get("modality") or "").strip().lower()
+        count = next(
+            (entry[key] for key in ("tokens", "token_count", "count") if entry.get(key) is not None),
+            None,
+        )
+        if modality and count is not None:
+            counts[modality] = counts.get(modality, 0) + int(count)
+    return counts
+
+
+def apply_provider_usage(result: dict[str, Any], usage: dict[str, Any] | None) -> dict[str, Any]:
+    """Attach the provider's usage: its official output tokens and its raw response.
+
+    The cost is not taken from here. The job's cost comes from the official
+    tokens at the model's token price, so a gateway-reported cost stays in
+    ``provider_usage`` as the figure to reconcile against, and is never billed.
+    """
+    if not usage:
+        return result
+    updated = {**result, "provider_usage": usage}
+    if "error" in result:
+        return updated
+    if usage.get("completion_tokens") is not None:
+        updated["completion_tokens"] = usage["completion_tokens"]
+        updated["prompt_tokens"] = usage["prompt_tokens"]
+    return updated
 
 
 async def _download_adapter_result(

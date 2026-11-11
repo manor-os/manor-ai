@@ -40,6 +40,7 @@ async function mockWorkspace(page: Page, failures: { mapping?: boolean; registra
     if (path.endsWith("/operating-model")) return route.fulfill({ json: { services, agent_mappings: mappings } });
     if (path.endsWith("/connection-status")) return route.fulfill({ json: { workspace_id: "agent-fixture", requirements: [], required_issue_count: 0 } });
     if (path === "/api/v1/workspaces/agent-fixture/agents") return route.fulfill({ json: mappings });
+    if (path === "/api/v1/agents/catalog") return route.fulfill({ json: { version: `v${agents.length}`, items: agents } });
     if (path === "/api/v1/agents") {
       if (request.method() === "POST") {
         const agent = { id: `created-agent-${createdAgents.length + 1}`, entity_id: "fixture-entity", status: "active", ...request.postDataJSON() };
@@ -65,6 +66,7 @@ async function mockWorkspace(page: Page, failures: { mapping?: boolean; registra
       }
       return route.fulfill({ json: { id: "fixture-worker-binding" } });
     }
+    if (path === "/api/v1/skills/catalog") return route.fulfill({ json: { version: "v1", items: [{ id: "video-skill", name: "Video production", description: "Create product videos" }] } });
     if (path === "/api/v1/skills") return route.fulfill({ json: [{ id: "video-skill", name: "Video production", description: "Create product videos" }] });
     if (path.endsWith("/bindings/video-skill")) {
       skillWrites += 1;
@@ -88,7 +90,7 @@ async function mockWorkspace(page: Page, failures: { mapping?: boolean; registra
 
 async function openHttpsAgent(page: Page) {
   await page.goto("/e2e/fixtures/workspace-agent-config.html");
-  await page.getByRole("button", { name: "Add agent", exact: true }).click();
+  await page.getByRole("button", { name: "Add AI staff", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Add agent to workspace" });
   await dialog.getByLabel("New service name").fill("Marketing Video");
   await dialog.getByRole("button", { name: /HTTPS agent/i }).click();
@@ -137,7 +139,7 @@ for (const width of [1440, 390]) {
     await page.setViewportSize({ width, height: 1000 });
     const state = await mockWorkspace(page);
     await page.goto("/e2e/fixtures/workspace-agent-config.html");
-    await page.getByRole("button", { name: "Add agent", exact: true }).click();
+    await page.getByRole("button", { name: "Add AI staff", exact: true }).click();
     const dialog = page.getByRole("dialog", { name: "Add agent to workspace" });
     await expect(dialog.getByRole("button", { name: "Add agent", exact: true })).toBeDisabled();
     await dialog.getByLabel("New service name").fill("Marketing Video");
@@ -151,11 +153,11 @@ for (const width of [1440, 390]) {
     expect(await dialog.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
     await dialog.getByRole("button", { name: "Add agent", exact: true }).press("Enter");
     await expect(dialog).not.toBeVisible();
-    await expect(page.getByRole("cell", { name: "Marketing Video", exact: true })).toBeVisible();
+    await expect(page.getByText("Responsible for Marketing Video", { exact: false })).toBeVisible();
     expect(state.writes[0]).toEqual({ service_key: "marketing_video", agent_id: "video-agent", new_service: { key: "marketing_video", name: "Marketing Video" } });
     expect(state.mappings).toHaveLength(4);
     expect(state.mappings.find((mapping) => mapping.service_key === "content")?.agent_id).toBe("content-agent");
-    await page.getByRole("button", { name: "Add agent", exact: true }).click();
+    await page.getByRole("button", { name: "Add AI staff", exact: true }).click();
     await dialog.getByLabel("New service name").fill("Marketing Video");
     await expect(dialog.getByRole("alert")).toContainText("already exists");
     await expect(dialog.getByRole("button", { name: "Add agent", exact: true })).toBeDisabled();
@@ -172,7 +174,7 @@ for (const width of [1440, 390]) {
 test("failed skill update stays open and retries before reporting success", async ({ page }) => {
   const state = await mockWorkspace(page);
   await page.goto("/e2e/fixtures/workspace-agent-config.html");
-  await page.getByRole("button", { name: "Edit agent", exact: true }).first().click();
+  await page.getByRole("button", { name: "Edit", exact: true }).first().click();
   const dialog = page.getByRole("dialog", { name: "Edit Agent", exact: true });
   await dialog.getByRole("button", { name: /Video production/i }).click();
   await dialog.getByRole("button", { name: "Update Agent", exact: true }).click();
@@ -183,7 +185,7 @@ test("failed skill update stays open and retries before reporting success", asyn
   await dialog.getByRole("button", { name: "Update Agent", exact: true }).click();
   await expect(dialog).not.toBeVisible();
   expect(state.skillWrites()).toBe(2);
-  await page.getByRole("button", { name: "Edit agent", exact: true }).first().click();
+  await page.getByRole("button", { name: "Edit", exact: true }).first().click();
   await expect(dialog.getByRole("button", { name: /Video production/i }).getByRole("checkbox")).toBeChecked();
   expect(state.errors).toEqual([]);
 });

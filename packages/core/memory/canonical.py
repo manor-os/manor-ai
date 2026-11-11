@@ -224,6 +224,11 @@ WORKSPACE_MEMORY_DEFAULT_LOAD_ORDER = (
     "STATE.md",
     "FILES.md",
 )
+# Generated from runtime state for people and the Strategist; chat reads live
+# records instead of a cache that only refreshes on Strategist/Task events.
+WORKSPACE_GENERATED_CACHE_FILES = frozenset({"STATE.md", "FILES.md"})
+# Rendered by the memory layers instead of Workspace operating memory.
+WORKSPACE_PROMPT_LAYERED_FILES = frozenset({"MEMORY.md"})
 
 _SAFE_RE = re.compile(r"[^A-Za-z0-9_\-]")
 _FILE_PROMPT_MAX_CHARS = 1800
@@ -535,6 +540,66 @@ from KNOWLEDGE.md instead of pasting it here.
 - STATE.md records current goals, agents, active work, recent tasks, and plans.
 - FILES.md is the workspace file wiki: what exists, what it is, and where it lives.
 """
+
+
+def is_default_memory_doc(
+    filename: str,
+    content: str | None,
+    *,
+    agent: bool = False,
+    workspace_name: str | None = None,
+    workspace_kind: str | None = None,
+) -> bool:
+    """True when a fixed memory doc still holds only its seeded template."""
+    text = (content or "").strip()
+    if not text:
+        return True
+    files = WORKSPACE_AGENT_MEMORY_FILES if agent else WORKSPACE_MEMORY_FILES
+    spec = files.get(filename)
+    if spec is not None and text == spec.default_body.strip():
+        return True
+    return (
+        not agent
+        and filename == "WORKSPACE.md"
+        and text == _workspace_doc_template(workspace_name, workspace_kind).strip()
+    )
+
+
+_WORKSPACE_SETUP_SOURCE_LINE = "- Source: workspace_setup."
+
+
+def workspace_memory_text(content: str | None) -> str:
+    """A Workspace MEMORY.md as people wrote it.
+
+    Drops what setup put there: the template's placeholder lines and starter
+    notes mirrored into it (Workspaces created before setup stopped
+    mirroring). Learned blocks stay; returns "" when nothing else is left.
+    """
+    text = _RUNTIME_LEARNING_BLOCK_RE.sub(
+        lambda m: "" if _WORKSPACE_SETUP_SOURCE_LINE in m.group(0) else m.group(0), content or "",
+    )
+    placeholders = {
+        line.strip() for line in WORKSPACE_MEMORY_FILES["MEMORY.md"].default_body.splitlines()
+        if line.strip().startswith("- ")
+    }
+    lines = [line for line in text.splitlines() if line.strip() not in placeholders]
+    kept: list[str] = []
+    for i, line in enumerate(lines):
+        heading = re.match(r"^(#{2,6})\s", line)
+        if heading:
+            # A section heading whose section is now empty goes too.
+            level = len(heading.group(1))
+            body = []
+            for other in lines[i + 1:]:
+                nested = re.match(r"^(#{1,6})\s", other)
+                if nested and len(nested.group(1)) <= level:
+                    break
+                body.append(other)
+            if not any(other.strip() and not other.lstrip().startswith("#") for other in body):
+                continue
+        kept.append(line)
+    result = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+    return "" if not any(line.strip() and not line.startswith("# ") for line in result.splitlines()) else result
 
 
 def _append_managed_block(

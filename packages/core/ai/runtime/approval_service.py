@@ -1626,6 +1626,16 @@ def _runtime_hitl_payload(
         if reviewer is not None and isinstance(render.get("review"), dict)
         else {}
     )
+    one_time = reviewer is not None and reviewer.one_time
+    choices: dict[str, Any] = {
+        "options": one_time_approval_options() if one_time else approval_options(),
+    }
+    if not one_time:
+        from packages.core.governance.always_allow import authorization_card_fields
+
+        choices.update(authorization_card_fields(
+            render.get("decision"), action_label=action.title, action_key=action.action_key,
+        ))
     return json.dumps({
         "__hitl__": True,
         "error": "approval_required",
@@ -1641,7 +1651,7 @@ def _runtime_hitl_payload(
             "paths": render.get("paths"),
             "content": render.get("content"),
             "args_preview": render.get("args_preview"),
-            "options": one_time_approval_options() if reviewer is not None and reviewer.one_time else approval_options(),
+            **choices,
             **confirmation_receipt,
             **publish_review,
             **({"review_read_only": True} if reviewer is not None and reviewer.read_only else {}),
@@ -2109,17 +2119,23 @@ async def guard_runtime_tool_action(
         workflow_execution = False
         workflow_run_id = None
         if _is_workflow_runtime_surface(runtime_surface):
-            from packages.core.governance.service import workflow_run_is_executable
+            from packages.core.governance.service import workflow_run_execution_block
 
             workflow_run_id = arguments.get("_workflow_run_id_from_context")
-            workflow_execution = await workflow_run_is_executable(
+            execution_block = await workflow_run_execution_block(
                 db, entity_id=entity_id, user_id=user_id, workspace_id=workspace_id,
                 workflow_run_id=workflow_run_id,
             )
-            if not workflow_execution:
+            workflow_execution = execution_block is None
+            if execution_block is not None:
+                # Setup a Workflow still needs is its own, actionable answer.
+                setup = execution_block.code == "workspace_setup_incomplete"
                 return json.dumps({
-                    "error": "workflow_origin_not_executable", "action_executed": False,
-                    "message": "The Workflow is missing, paused, stopped, or outside the current actor's scope.",
+                    "error": execution_block.code, "action_executed": False,
+                    "message": (
+                        execution_block.reason if setup
+                        else "The Workflow is missing, paused, stopped, or outside the current actor's scope."
+                    ),
                     "tool": name,
                 })
 
@@ -2160,6 +2176,13 @@ async def guard_runtime_tool_action(
             )
 
         if not operation_id and not arguments.get("approval_token") and classification.effect is not RuntimeToolEffect.READ_ONLY:
+            if not preview:
+                # Not a choice the model made: a host reached the gate without a
+                # run identity, and every gated call it makes will be refused.
+                logger.error(
+                    "Tool call refused for missing run identity: tool=%s entity=%s workspace=%s conversation=%s task=%s",
+                    name, entity_id, workspace_id, conversation_id, task_id,
+                )
             return json.dumps({"error": "approval_operation_identity_missing", "action_executed": False,
                 "message": "This action requires a persisted runtime call identity.", "tool": name})
 

@@ -71,6 +71,16 @@ class ChatConcurrencyExceeded(Exception):
         self.retry_after_seconds = retry_after_seconds
 
 
+# Strong references keep a stream's cleanup alive after its caller is cancelled.
+_pending_stream_cleanups: set[asyncio.Future[None]] = set()
+
+
+def _forget_stream_cleanup(cleanup: asyncio.Future[None]) -> None:
+    _pending_stream_cleanups.discard(cleanup)
+    if not cleanup.cancelled() and cleanup.exception() is not None:
+        logger.warning("Chat stream cleanup failed", exc_info=cleanup.exception())
+
+
 class ChatConcurrencyLease:
     def __init__(
         self,
@@ -117,43 +127,89 @@ class ChatConcurrencyLease:
                     heartbeat.cancel()
                     await asyncio.gather(heartbeat, return_exceptions=True)
 
-    async def wrap(self, source: AsyncIterator[str]) -> AsyncIterator[str]:
+    async def wrap(
+        self,
+        source: AsyncIterator[str],
+        *,
+        stall_timeout_seconds: float | None = None,
+        is_progress: Callable[[str], bool] | None = None,
+        stalled_chunk: Callable[[], str] | None = None,
+    ) -> AsyncIterator[str]:
+        """Stream ``source`` while this lease holds its slot.
+
+        With ``stall_timeout_seconds``, a source that yields no progress chunk
+        (``is_progress``; any chunk by default) for that long is stopped: the
+        ``stalled_chunk`` frame is sent, the source is closed, which cancels
+        its work, and the slot is released. Keepalive frames alone would
+        otherwise renew a stuck operation's slot for as long as it hangs.
+        """
         heartbeat_task: asyncio.Task | None = None
         if self._redis_token and self._gate.config.heartbeat_interval_seconds > 0:
             heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         iterator = source.__aiter__()
         next_task: asyncio.Future[str] | None = None
+        last_progress = time.monotonic()
         try:
             while True:
                 next_task = asyncio.ensure_future(anext(iterator))
+                timeout = None
+                if stall_timeout_seconds and stall_timeout_seconds > 0:
+                    timeout = max(0.0, last_progress + stall_timeout_seconds - time.monotonic())
+                done, _ = await asyncio.wait(
+                    (next_task, heartbeat_task) if heartbeat_task else (next_task,),
+                    timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if heartbeat_task in done:
+                    raise ChatConcurrencyExceeded("Chat capacity lease was lost; please reconnect.")
+                if next_task not in done:
+                    logger.warning(
+                        "chat_stream_stalled seconds=%.0f held_seconds=%.0f",
+                        stall_timeout_seconds,
+                        time.monotonic() - self._acquired_at,
+                    )
+                    if stalled_chunk is not None:
+                        yield stalled_chunk()
+                    return
                 try:
-                    if heartbeat_task:
-                        done, _ = await asyncio.wait(
-                            (next_task, heartbeat_task),
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-                        if heartbeat_task in done:
-                            raise ChatConcurrencyExceeded("Chat capacity lease was lost; please reconnect.")
-                    chunk = await next_task
+                    chunk = next_task.result()
                 except StopAsyncIteration:
                     break
-                finally:
-                    if next_task:
-                        if not next_task.done():
-                            next_task.cancel()
-                        await asyncio.gather(next_task, return_exceptions=True)
-                    next_task = None
+                next_task = None
+                if is_progress is None or is_progress(chunk):
+                    last_progress = time.monotonic()
                 yield chunk
         finally:
-            if heartbeat_task:
+            # Starlette cancels a response through an anyio cancel scope when
+            # the client disconnects, and re-cancels every await made inside
+            # it. Cleanup awaited here would stop at its first await, leaving
+            # the source running and the slot held until its TTL, so it runs
+            # in a task of its own that the caller's cancellation cannot stop.
+            cleanup = asyncio.ensure_future(self._finish_stream(iterator, next_task, heartbeat_task))
+            _pending_stream_cleanups.add(cleanup)
+            cleanup.add_done_callback(_forget_stream_cleanup)
+            await asyncio.shield(cleanup)
+
+    async def _finish_stream(
+        self,
+        iterator: AsyncIterator[str],
+        next_task: asyncio.Future[str] | None,
+        heartbeat_task: asyncio.Task | None,
+    ) -> None:
+        try:
+            if next_task is not None and not next_task.done():
+                next_task.cancel()
+            if heartbeat_task is not None:
                 heartbeat_task.cancel()
-                await asyncio.gather(heartbeat_task, return_exceptions=True)
-            try:
-                close = getattr(iterator, "aclose", None)
-                if close:
-                    await close()
-            finally:
-                await self.release()
+            await asyncio.gather(
+                *(task for task in (next_task, heartbeat_task) if task is not None),
+                return_exceptions=True,
+            )
+            close = getattr(iterator, "aclose", None)
+            if close:
+                await close()
+        finally:
+            await self.release()
 
     async def _heartbeat_loop(self) -> None:
         interval = max(0.001, min(

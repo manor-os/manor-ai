@@ -281,6 +281,10 @@ class WorkspaceOperationDraft(Base, TimestampMixin):
         server_default=WorkspaceOperationDraftStatus.OPEN.value,
     )
     current_state: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    # The live state the draft started from (at ``base_revision``). When the
+    # Workspace changes before apply, the draft is merged onto the new state
+    # field by field instead of being thrown away. Older drafts have none.
+    base_state: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     patches: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
     validation: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     diff: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")

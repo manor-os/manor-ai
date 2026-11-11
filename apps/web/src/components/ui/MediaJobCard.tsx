@@ -8,8 +8,12 @@
  * versions are kept. Updates arrive over the socket (`manor:media-job-update`,
  * `manor:video-ready`) with a slow poll as the fallback.
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, resolveDisplayMediaUrl, type MediaJob, type MediaJobPhase } from "../../lib/api";
+import { getAuthToken, isSameAuthIdentity } from "../../lib/authToken";
+import { displayReadInterval } from "../../lib/readRefreshPolicy";
+import { usePageVisible } from "../../lib/usePageVisible";
 import { t } from "../../lib/i18n";
 import Button from "./Button";
 import TabSwitcher from "./TabSwitcher";
@@ -20,6 +24,7 @@ const DURATIONS = ["5", "10"];
 const RESOLUTIONS = ["720p", "1080p"];
 const ASPECTS = ["16:9", "9:16", "1:1"];
 const POLL_MS = 20000;
+const UNKNOWN_LINEAGE_RECONCILE_MS = 60_000;
 
 const isTerminal = (job: Partial<MediaJob> | null) => job?.status === "completed" || job?.status === "failed";
 
@@ -175,16 +180,32 @@ function choicesWith(options: string[], current: string): string[] {
 export default function MediaJobCard({ resultJson }: { resultJson: string }) {
   const initial = useMemo(() => parseResult(resultJson), [resultJson]);
   const [versions, setVersions] = useState<Partial<MediaJob>[]>(() => (initial ? [initial] : []));
-  const [selected, setSelected] = useState(0);
+  const [selectedId, setSelectedId] = useState(initial?.id);
+  const selectedIdRef = useRef(selectedId);
+  selectedIdRef.current = selectedId;
   const [draft, setDraft] = useState<Draft | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [lineageRoot, setLineageRoot] = useState<string | null>(null);
+  const visible = usePageVisible();
+  const queryClient = useQueryClient();
+  const lineageEventTimer = useRef<number | null>(null);
+  const lineageRefreshQueued = useRef(false);
+  const lineageRefreshDueAt = useRef(0);
+  const lineageRefreshIdentity = useRef<ReturnType<typeof getAuthToken>>(null);
+  const unknownLineageStale = useRef(false);
+  const lineageRefreshBounded = useRef(false);
+  const versionsRef = useRef(versions);
+
+  useEffect(() => { versionsRef.current = versions; }, [versions]);
 
   useEffect(() => {
     setVersions(initial ? [initial] : []);
-    setSelected(0);
+    setSelectedId(initial?.id);
+    setLineageRoot(null);
   }, [initial]);
 
+  const selected = Math.max(0, versions.findIndex(item => item.id === selectedId));
   const job = versions[selected] || null;
   const latest = versions[versions.length - 1] || null;
   const jobId = initial?.id;
@@ -198,50 +219,155 @@ export default function MediaJobCard({ resultJson }: { resultJson: string }) {
     setVersions((current) => current.map((item) => (item.id === id ? { ...item, ...update, id } : item)));
   }, []);
 
-  // Load the full record (progress, ETA) and every version of this clip.
-  useEffect(() => {
-    if (!jobId || !canRegenerate) return;
-    let active = true;
-    api.mediaJobs.get(jobId)
-      .then((full) => api.mediaJobs.versions(full.lineage_root || full.id).catch(() => [full]))
-      .then((all) => {
-        if (!active || !all.length) return;
-        setVersions(all);
-        setSelected(Math.max(0, all.findIndex((item) => item.id === jobId)));
-      })
-      .catch(() => { /* the tool result still renders */ });
-    return () => { active = false; };
-  }, [jobId, canRegenerate]);
+  const unknownLineageDelay = useCallback((): number | false => {
+    const state = queryClient.getQueryState(["media-job-versions", lineageRoot]);
+    const interval = displayReadInterval(state || {}, UNKNOWN_LINEAGE_RECONCILE_MS);
+    if (interval === false) return false;
+    const lastAttemptAt = Math.max(state?.dataUpdatedAt || 0, state?.errorUpdatedAt || 0);
+    return Math.max(0, interval - Math.max(0, Date.now() - lastAttemptAt));
+  }, [lineageRoot, queryClient]);
+
+  const scheduleLineageRefresh = useCallback((delay: number | false, bounded = false) => {
+    if (delay === false) return;
+    if (!lineageRoot) return;
+    if (!visible) {
+      unknownLineageStale.current = true;
+      return;
+    }
+    const dueAt = Date.now() + delay;
+    if (lineageEventTimer.current !== null && lineageRefreshDueAt.current <= dueAt) return;
+    if (lineageEventTimer.current !== null) window.clearTimeout(lineageEventTimer.current);
+    lineageRefreshQueued.current = true;
+    lineageRefreshBounded.current = bounded;
+    lineageRefreshDueAt.current = dueAt;
+    lineageRefreshIdentity.current = getAuthToken();
+    lineageEventTimer.current = window.setTimeout(() => {
+      lineageEventTimer.current = null;
+      lineageRefreshDueAt.current = 0;
+      if (!lineageRefreshQueued.current || !isSameAuthIdentity(lineageRefreshIdentity.current, getAuthToken())) return;
+      if (lineageRefreshBounded.current) {
+        // A shared observer may have refreshed (or failed) while this timer
+        // waited. Re-evaluate before reading so errors cannot bypass the bound.
+        const remaining = unknownLineageDelay();
+        if (remaining === false) return;
+        if (remaining > 0) {
+          scheduleLineageRefresh(Math.max(500, remaining), true);
+          return;
+        }
+      }
+      lineageRefreshQueued.current = false;
+      lineageRefreshBounded.current = false;
+      void queryClient.invalidateQueries(
+        { queryKey: ["media-job-versions", lineageRoot], exact: true },
+        { cancelRefetch: false },
+      );
+    }, delay);
+  }, [lineageRoot, queryClient, unknownLineageDelay, visible]);
 
   useEffect(() => {
-    const onEvent = (event: Event) => merge((event as CustomEvent).detail || {});
+    if (!visible && lineageEventTimer.current !== null) {
+      window.clearTimeout(lineageEventTimer.current);
+      lineageEventTimer.current = null;
+      lineageRefreshDueAt.current = 0;
+      unknownLineageStale.current = true;
+    }
+    if (visible && unknownLineageStale.current) {
+      unknownLineageStale.current = false;
+      const delay = unknownLineageDelay();
+      scheduleLineageRefresh(delay === false ? false : Math.max(500, delay), true);
+    }
+  }, [lineageRoot, queryClient, scheduleLineageRefresh, visible]);
+
+  useEffect(() => {
+    const onEvent = (event: Event) => {
+      const update = (event as CustomEvent<Partial<MediaJob>>).detail || {};
+      merge(update);
+      const id = update.id || (update as { job_id?: string }).job_id;
+      if (update.lineage_root === lineageRoot || (id && versionsRef.current.some((item) => item.id === id && update.lineage_root))) {
+        scheduleLineageRefresh(500);
+      } else if (!update.lineage_root) {
+        // A real media progress event may omit lineage metadata. At most one
+        // refresh per lineage every 60s turns a burst into bounded recovery.
+        const delay = unknownLineageDelay();
+        scheduleLineageRefresh(delay === false ? false : Math.max(500, delay), true);
+      }
+    };
     window.addEventListener("manor:media-job-update", onEvent);
     window.addEventListener("manor:video-ready", onEvent);
     return () => {
       window.removeEventListener("manor:media-job-update", onEvent);
       window.removeEventListener("manor:video-ready", onEvent);
+      if (lineageEventTimer.current !== null) window.clearTimeout(lineageEventTimer.current);
+      lineageEventTimer.current = null;
     };
-  }, [merge]);
+  }, [lineageRoot, merge, queryClient, scheduleLineageRefresh, unknownLineageDelay]);
 
   const pendingId = latest && !isTerminal(latest) ? latest.id : undefined;
+  const queryJobId = pendingId || jobId;
+  const mediaJobQuery = useQuery({
+    queryKey: ["media-job", queryJobId],
+    queryFn: ({ signal }) => api.mediaJobs.get(queryJobId!, signal),
+    enabled: visible && Boolean(queryJobId),
+    staleTime: 0,
+    retry: false,
+    refetchInterval: (query) => displayReadInterval(query.state, pendingId ? POLL_MS : false),
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: true,
+  });
+
   useEffect(() => {
-    if (!pendingId) return;
-    const timer = window.setInterval(() => {
-      api.mediaJobs.get(pendingId).then(merge).catch(() => {});
-    }, POLL_MS);
-    return () => window.clearInterval(timer);
-  }, [pendingId, merge]);
+    const full = mediaJobQuery.data;
+    if (!full) return;
+    merge(full);
+    if (full.id === jobId) setLineageRoot(full.lineage_root || full.id);
+  }, [jobId, mediaJobQuery.data, merge]);
+
+  const versionsQuery = useQuery({
+    queryKey: ["media-job-versions", lineageRoot],
+    queryFn: ({ signal }) => api.mediaJobs.versions(lineageRoot!, AbortSignal.any([signal, AbortSignal.timeout(15_000)])),
+    enabled: visible && canRegenerate && Boolean(lineageRoot),
+    staleTime: 0,
+    retry: false,
+    refetchInterval: (query) => displayReadInterval(query.state,
+      pendingId ? POLL_MS : versions.length > 5 ? 300_000 : 120_000),
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: true,
+  });
+
+  // Apply only a new lineage read: picking a version must not replay an older
+  // cached list over progress that socket events merged since.
+  useEffect(() => {
+    const all = versionsQuery.data;
+    if (!all?.length) return;
+    const selected = selectedIdRef.current;
+    setVersions((current) => {
+      if (!selected || all.some((item) => item.id === selected)) return all;
+      const selectedVersion = current.find((item) => item.id === selected);
+      return selectedVersion ? [...all, selectedVersion] : all;
+    });
+  }, [versionsQuery.data]);
 
   const regenerate = async (input: Parameters<typeof api.mediaJobs.regenerate>[1]) => {
     if (!job?.id) return;
+    const identity = getAuthToken();
     setBusy(true);
     setError(null);
     try {
       const next = await api.mediaJobs.regenerate(job.id, input);
-      setVersions((current) => [...current, next]);
-      setSelected(versions.length);
+      if (!isSameAuthIdentity(identity, getAuthToken())) return;
+      // An older lineage read must not erase the newly created version. Publish
+      // the receipt to the shared cache so every card sees the same history.
+      const queryKey = ["media-job-versions", next.lineage_root || lineageRoot || jobId];
+      await queryClient.cancelQueries({ queryKey, exact: true });
+      if (!isSameAuthIdentity(identity, getAuthToken())) return;
+      queryClient.setQueryData<Partial<MediaJob>[]>(queryKey, current => [
+        ...(current || versions).filter(item => item.id !== next.id), next,
+      ]);
+      setVersions((current) => [...current.filter(item => item.id !== next.id), next]);
+      setSelectedId(next.id);
       setDraft(null);
     } catch (err) {
+      if (!isSameAuthIdentity(identity, getAuthToken())) return;
       setError(t("component.video_card.regenerate_failed", { error: err instanceof Error ? err.message : String(err) }));
     } finally {
       setBusy(false);
@@ -269,12 +395,12 @@ export default function MediaJobCard({ resultJson }: { resultJson: string }) {
             <button
               key={item.id || index}
               type="button"
-              onClick={() => setSelected(index)}
+              onClick={() => setSelectedId(item.id)}
               aria-pressed={index === selected}
               className="mono"
               style={{
                 fontSize: 11, padding: "2px 8px", borderRadius: 6, border: "none", cursor: "pointer",
-                background: index === selected ? "var(--ink)" : "rgba(28,25,23,0.045)",
+                background: index === selected ? "var(--ink)" : "rgba(29, 29, 31,0.045)",
                 color: index === selected ? "var(--surface-panel)" : "var(--text-muted)",
               }}
             >

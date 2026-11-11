@@ -28,6 +28,7 @@ import { formatUserFacingLabel, formatUserFacingStructuredText, friendlyPersonNa
 import { taskBlockerFromLog, taskBlockerView } from "../../lib/taskBlocker";
 import TaskBlockerNotice from "./TaskBlockerNotice";
 import TaskCommentResult from "./TaskCommentResult";
+import TaskAttachmentLink from "./TaskAttachmentLink";
 import { taskCommentResult } from "../../lib/taskCommentDisplay";
 
 
@@ -406,26 +407,26 @@ export default function TaskLogItem({
       <div style={{ flex: 1, minWidth: 0 }}>
         {/* Header row: name · badges · timestamp */}
         <div style={{ display: "flex", alignItems: "center", gap: v.rowGap - 2, marginBottom: 3, flexWrap: "wrap" }}>
-          <span style={{ fontSize: v.fontMeta, fontWeight: 600, color: "#292524" }}>
+          <span style={{ fontSize: v.fontMeta, fontWeight: 600, color: "var(--text-strong)" }}>
             {blocker && taskActorFromLog(log) === TASK_ACTORS.SYSTEM
               ? t("component.task_blocker.system_check")
               : isAIEvent && author.kind !== "agent" && author.kind !== "manor" ? t("page.workspace_detail.agent") : author.name}
           </span>
           {isStatus && (
-            <span style={{ fontSize: 10, fontWeight: 600, color: lcfg.color, padding: "1px 6px", borderRadius: 4, background: `${lcfg.color}0d`, textTransform: "uppercase", letterSpacing: "0.03em" }}>
+            <span style={{ fontSize: 10, fontWeight: 600, color: lcfg.color, padding: "1px 6px", borderRadius: 4, background: `${lcfg.color}0d`, }}>
               {t("component.task_log_item.status_change")}</span>
           )}
           {isEval && (
-            <span style={{ fontSize: 10, fontWeight: 600, color: "#c3a63f", padding: "1px 6px", borderRadius: 4, background: "rgba(195,166,63,0.08)", textTransform: "uppercase", letterSpacing: "0.03em" }}>
+            <span style={{ fontSize: 10, fontWeight: 600, color: "#c3a63f", padding: "1px 6px", borderRadius: 4, background: "rgba(195,166,63,0.08)", }}>
               {t("component.task_log_item.evaluation")}
             </span>
           )}
           {eventBadge && (
-            <span style={{ fontSize: 10, fontWeight: 700, color: eventBadge.color, padding: "1px 6px", borderRadius: 4, background: eventBadge.bg, textTransform: "uppercase", letterSpacing: "0.03em" }}>
+            <span style={{ fontSize: 10, fontWeight: 700, color: eventBadge.color, padding: "1px 6px", borderRadius: 4, background: eventBadge.bg, }}>
               {eventBadge.text}
             </span>
           )}
-          <span style={{ fontSize: v.fontTime, color: "#a8a29e" }}>
+          <span style={{ fontSize: v.fontTime, color: "var(--text-muted)" }}>
             {log.created_at && formatTime ? formatTime(log.created_at) : ""}
           </span>
         </div>
@@ -460,11 +461,11 @@ export default function TaskLogItem({
         {blocker && <TaskBlockerNotice blocker={blocker} technicalReason={log.content} showStatus={false} />}
         {!blocker && log.content && !skipContent && (
           isStatus ? (
-            <p style={{ fontSize: v.fontMain, color: "#78716c", margin: 0, lineHeight: 1.5, fontStyle: "italic" }}>
+            <p style={{ fontSize: v.fontMain, color: "var(--text-muted)", margin: 0, lineHeight: 1.5, fontStyle: "italic" }}>
               {formatUserFacingStructuredText(log.content)}
             </p>
           ) : (
-            <div style={{ fontSize: v.fontMain, color: "#57534e", lineHeight: 1.6 }}>
+            <div style={{ fontSize: v.fontMain, color: "var(--text-muted)", lineHeight: 1.6 }}>
               {commentResult ? (
                 <TaskCommentResult result={commentResult} raw={log.content} files={Array.isArray(task?.actual_output?.files) ? task.actual_output.files : []} returnTo={sourceReturnTo} />
               ) : (
@@ -484,15 +485,15 @@ export default function TaskLogItem({
                 style={{
                   display: "inline-flex", alignItems: "center", gap: 4,
                   padding: "2px 6px", borderRadius: 999,
-                  background: item.tone === "danger" ? "#f8f0ef" : "#fafaf9",
-                  border: `1px solid ${item.tone === "danger" ? "#ecc8c5" : "#e7e5e4"}`,
-                  color: item.tone === "danger" ? "#a23e38" : "#78716c",
+                  background: item.tone === "danger" ? "#f8f0ef" : "#fafafa",
+                  border: `1px solid ${item.tone === "danger" ? "#ecc8c5" : "#e5e5ea"}`,
+                  color: item.tone === "danger" ? "#a23e38" : "#8e8e93",
                   fontSize: v.fontTime,
                   fontWeight: 650,
                   fontFamily: item.label === "error" ? undefined : "ui-monospace, SFMono-Regular, Menlo, monospace",
                 }}
               >
-                <span style={{ color: item.tone === "danger" ? "#c14a44" : "#a8a29e", fontFamily: "inherit" }}>{item.label}</span>
+                <span style={{ color: item.tone === "danger" ? "#c14a44" : "#aeaeb2", fontFamily: "inherit" }}>{item.label}</span>
                 {item.value}
               </span>
             ))}
@@ -503,21 +504,20 @@ export default function TaskLogItem({
         {log.attachments && log.attachments.length > 0 && (
           <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 6 }}>
             {log.attachments.map((att: any, ai: number) => (
-              <a
+              <TaskAttachmentLink
                 key={ai}
                 href={att.url}
-                target="_blank"
-                rel="noopener noreferrer"
+                filename={att.original_name || att.filename}
                 style={{
                   display: "inline-flex", alignItems: "center", gap: 4,
                   padding: "3px 8px", borderRadius: 6,
-                  background: "#fafaf9", border: "1px solid rgba(28,25,23,0.06)",
+                  background: "var(--surface-muted)", border: "0.5px solid rgba(29, 29, 31,0.06)",
                   fontSize: v.attachFont, color: "#436b65", fontWeight: 500,
                   textDecoration: "none", transition: "border-color 0.15s",
                 }}
               >
                 <IconDocument size={v.attachIconSize} />{att.original_name || att.filename}
-              </a>
+              </TaskAttachmentLink>
             ))}
           </div>
         )}

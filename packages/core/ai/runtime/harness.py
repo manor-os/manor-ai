@@ -472,6 +472,7 @@ async def _runtime_execute_agentic_loop(
     temperature: float | None = None,
     max_tokens: int | None = None,
     billing_source: str = RUNTIME_AGENTIC_LOOP_SOURCE,
+    billing_operation_id: str | None = None,
     max_rounds: int | None = None,
     hard_max_rounds: int | None = None,
     initial_messages: list[dict[str, Any]] | None = None,
@@ -482,6 +483,7 @@ async def _runtime_execute_agentic_loop(
     tool_evidence: Any = None,
     on_round_end: Callable[..., Any] | None = None,
     on_round_end_strict: bool = False,
+    incoming_updates: Callable[[], Any] | None = None,
     carry_previous_checkpoint: bool = True,
     tool_result_max_chars: int | None = None,
     turn_context: str | None = None,
@@ -503,6 +505,7 @@ async def _runtime_execute_agentic_loop(
     output_schema: dict[str, Any] | None = None,
     non_success_outcomes: dict[str, Any] | None = None,
     final_response_contract: RuntimeFinalResponseContract | None = None,
+    round_text_processor: Callable[..., Any] | None = None,
     dynamic_tool_handlers: Mapping[str, RuntimeDynamicToolHandler] | None = None,
     capability_refresh_tool_names: Iterable[str] = (),
     runtime_tool_context: Mapping[str, Any] | None = None,
@@ -617,6 +620,9 @@ async def _runtime_execute_agentic_loop(
         "conversation_id": conversation_id,
         "task_id": task_id,
     }
+    if billing_operation_id:
+        # The run these calls belong to; written to each usage row.
+        billing_kwargs["operation_id"] = billing_operation_id
     if resolved_byok is not None:
         billing_kwargs["byok"] = resolved_byok
 
@@ -696,7 +702,10 @@ async def _runtime_execute_agentic_loop(
         if key in RUNTIME_TOOL_CONTEXT_KEYS
     }
     from packages.core.ai.runtime.performance import runtime_performance_run_id
+    from packages.core.models.base import generate_ulid
 
+    # Every loop has an identity, whichever host started it: the approval gate
+    # refuses each non-read-only call of a loop without one.
     performance_run_id = runtime_performance_run_id(
         performance_run_id=performance_run_id,
         runtime_run_id=runtime_run_id,
@@ -704,7 +713,7 @@ async def _runtime_execute_agentic_loop(
             "_workflow_run_id_from_context"
         ),
         task_id=task_id,
-    )
+    ) or generate_ulid()
     if runtime_envelope is not None and dynamic_handlers:
         scoped_dynamic_names = set(dynamic_handlers) & (allowed_tool_set if allowed_tool_set is not None else {"read_context_archive"})
         if scoped_dynamic_names:
@@ -753,6 +762,9 @@ async def _runtime_execute_agentic_loop(
                 step_id=step_id,
                 active_user_message=tool_context_message,
                 allowed_tool_names=allowed_tool_set,
+                # Staging 2026-11-05: a Workflow step's stop_step_needs_person was refused,
+                # because the workflow gate could not tell which run was asking.
+                gate_context=registered_tool_context,
             )
         registered_arguments = dict(arguments)
         registered_arguments.update(registered_tool_context)
@@ -975,6 +987,10 @@ async def _runtime_execute_agentic_loop(
         loop_kwargs["tool_result_max_chars"] = tool_result_max_chars
     if turn_context and _agentic_loop_accepts_keyword("turn_context"):
         loop_kwargs["turn_context"] = turn_context
+    if prompt_context is not None and _agentic_loop_accepts_keyword("answer_reminder"):
+        from packages.core.memory.layer_prompt import speaker_preferences_reminder
+
+        loop_kwargs["answer_reminder"] = speaker_preferences_reminder(prompt_context)
     if gateway_tool_schemas and _agentic_loop_accepts_keyword("gateway_tool_schemas"):
         loop_kwargs["gateway_tool_schemas"] = gateway_tool_schemas
     if prompt_context is not None and user_id and conversation_id:
@@ -1017,11 +1033,13 @@ async def _runtime_execute_agentic_loop(
         "human_input_suspension": human_input_suspension,
         "on_round_end": effective_on_round_end,
         "on_round_end_strict": on_round_end_strict,
+        "incoming_updates": incoming_updates,
         "initial_usage": initial_usage,
         "initial_rounds": initial_rounds,
         "initial_tool_calls_made": initial_tool_calls_made,
         "hard_max_rounds": hard_max_rounds,
         "capability_refresh_tool_names": refresh_tool_names,
+        "round_text_processor": round_text_processor,
     }.items():
         if _agentic_loop_accepts_keyword(keyword):
             loop_kwargs[keyword] = value
@@ -1251,6 +1269,7 @@ async def runtime_execute_subagent_loop(
     forced_tool_calls: list[dict[str, Any]] | None = None,
     runtime_checkpoint: dict[str, Any] | None = None,
     human_input_suspension: bool = False,
+    tool_result_max_chars: int | None = None,
 ) -> RuntimeSubAgentLoopResult:
     """Run a bounded subagent loop through the Runtime Harness adapters."""
 
@@ -1295,6 +1314,7 @@ async def runtime_execute_subagent_loop(
         on_tool_end=on_tool_end,
         runtime_checkpoint=runtime_checkpoint,
         human_input_suspension=human_input_suspension,
+        tool_result_max_chars=tool_result_max_chars,
     )
     subagent_run.record_end(rounds=getattr(result, "rounds", None))
     return RuntimeSubAgentLoopResult(result=result, run=subagent_run)

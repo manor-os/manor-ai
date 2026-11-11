@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable
 from starlette.requests import Request
 
 from apps.api.mcp.manor_api import ManorApi
+from packages.core.services.oauth_provider_service import mcp_read_only
 
 
 class ToolError(Exception):
@@ -36,6 +37,11 @@ class ToolContext:
     def entity_id(self) -> str:
         return str(self.claims["entity_id"])
 
+    @property
+    def read_only(self) -> bool:
+        """The token grants ``mcp:read``: only read-only tools may run."""
+        return mcp_read_only(self.claims)
+
     def transfer_url(self, transfer_id: str) -> str:
         from apps.api.routers.oauth_metadata import public_origin
 
@@ -63,6 +69,10 @@ class Tool:
     # Whether this caller has the tool at all (e.g. a feature flag). A tool it
     # lacks is neither listed nor callable, as if it did not exist.
     available: Callable[["ToolContext"], Awaitable[bool]] | None = None
+
+    def allowed(self, ctx: ToolContext) -> bool:
+        """Whether the token's scope reaches this tool (``read_only`` is the one source)."""
+        return self.read_only or not ctx.read_only
 
     def descriptor(self) -> dict:
         schema: dict[str, Any] = {"type": "object", "properties": self.properties}

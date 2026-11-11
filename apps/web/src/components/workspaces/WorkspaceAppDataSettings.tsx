@@ -206,7 +206,8 @@ export default function WorkspaceAppDataSettings({ components, dataSources, onCh
               aria-label={`${t("component.workspace_app_view.hide")} ${block.title || block.key}`}
               onClick={() => setBlockVisible(componentIndex, block.key, false)}>{t("component.workspace_app_view.hide")}</button>
           </div>
-          {block.metrics_source && <label className="workspace-app-data-settings__toggle">
+          {/* A page that shows every counter as 0 until read has no "configured only" choice to make. */}
+          {block.metrics_source && block.metrics_display !== "zero" && <label className="workspace-app-data-settings__toggle">
             <input type="checkbox" disabled={disabled} checked={block.metrics_display === "configured"}
               onChange={(event) => updateComponent(componentIndex, (current) => ({ ...current,
                 blocks: current.blocks.map((item) => item.key === block.key

@@ -39,6 +39,7 @@ from packages.core.models.workspace import Agent, AgentSubscription, Workspace
 from packages.core.permissions import Permission, has_permission, user_staff_role_assignment
 from packages.core.services.actor_authorization import AuthenticatedUserCredential, resolve_current_user_actor
 from packages.core.services.agent_subscription_service import ensure_default_subscription, ensure_personal_subscription
+from packages.core.services.chat_history_access import active_member_clause, live_room_clause
 from packages.core.services.conversation_transcript import discard_room_transcripts
 from packages.core.services.document_access import effective_document_folder_policy, user_has_document_capability
 from packages.core.services.document_service import DocumentMutationConflictError, StorageLimitExceeded, get_document_for_read
@@ -200,13 +201,26 @@ def _can_manage_ai_execution(room: ChatRoom, member: ChatRoomMember, user: User)
     return member.role == "owner" and _can_manage_bindings(room, member, user)
 
 
-async def _binding_view(db: AsyncSession, binding: ChatRoomAgentBinding, *, manager: bool) -> dict:
-    row = (await db.execute(
+async def _binding_subscriptions(db: AsyncSession, subscription_ids: set[str]) -> dict[str, tuple]:
+    if not subscription_ids:
+        return {}
+    rows = (await db.execute(
         select(AgentSubscription, Agent, Workspace)
         .join(Agent, Agent.id == AgentSubscription.agent_id)
         .outerjoin(Workspace, Workspace.id == AgentSubscription.workspace_id)
-        .where(AgentSubscription.id == binding.subscription_id)
-    )).one_or_none()
+        .where(AgentSubscription.id.in_(subscription_ids))
+    )).all()
+    return {row[0].id: tuple(row) for row in rows}
+
+
+async def _binding_view(
+    db: AsyncSession, binding: ChatRoomAgentBinding, *, manager: bool,
+    subscriptions: dict[str, tuple] | None = None,
+) -> dict:
+    """``subscriptions`` is the caller's batch read of the bound subscriptions."""
+    if subscriptions is None:
+        subscriptions = await _binding_subscriptions(db, {binding.subscription_id})
+    row = subscriptions.get(binding.subscription_id)
     if row is None:
         return {"id": binding.id, "name": "Unavailable Agent", "available": False}
     subscription, agent, workspace = row
@@ -285,30 +299,41 @@ async def _active_room(
 ) -> tuple[ChatRoom, ChatRoomMember]:
     query = (
         select(ChatRoom, ChatRoomMember)
-        .join(ChatRoomMember, ChatRoomMember.room_id == ChatRoom.id)
-        .where(
-            ChatRoom.id == room_id,
-            ChatRoom.status == "active",
-            ChatRoomMember.user_id == user_id,
-            ChatRoomMember.status == "active",
-        )
+        .join(ChatRoomMember, active_member_clause(user_id))
+        .where(ChatRoom.id == room_id, live_room_clause())
         .with_for_update(read=not write, of=(ChatRoom, ChatRoomMember))
     )
     row = (await db.execute(query)).one_or_none()
     if row is None:
         raise HTTPException(404, "Conversation not found")
     room, member = row
-    if room.owner_entity_id:
-        owner = (await db.execute(select(Entity.id).where(
-            Entity.id == room.owner_entity_id, Entity.deleted_at.is_(None),
-        ))).scalar_one_or_none()
-    else:
-        owner = (await db.execute(select(User.id).where(
-            User.id == room.owner_user_id, User.deleted_at.is_(None), User.status == "active",
-        ))).scalar_one_or_none()
-    if owner is None:
-        raise HTTPException(404, "Conversation not found")
     return room, member
+
+
+async def _staff_photos(db: AsyncSession, users: list[User | None]) -> dict[tuple[str, str], str]:
+    """Staff photos of the people without their own avatar, by (user, Entity)."""
+    missing = {user.id for user in users if user is not None and not real_avatar_url(user.avatar_url)}
+    staff_photos: dict[tuple[str, str], str] = {}
+    if missing:
+        rows = (await db.execute(select(Staff.user_id, Staff.entity_id, Staff.avatar_url).where(
+            Staff.user_id.in_(missing), Staff.deleted_at.is_(None), Staff.avatar_url.is_not(None),
+        ).order_by(Staff.created_at.desc()))).all()
+        for staff_user_id, entity_id, avatar_url in rows:
+            staff_photos.setdefault((staff_user_id, entity_id), avatar_url)
+    return staff_photos
+
+
+def _avatar_urls(
+    users: list[User | None], staff_photos: dict[tuple[str, str], str], *, owner_entity_id: str | None,
+) -> dict[str, str | None]:
+    return {
+        user.id: person_avatar_url(
+            user.avatar_url,
+            (owner_entity_id and staff_photos.get((user.id, owner_entity_id)))
+            or staff_photos.get((user.id, user.entity_id)),
+        )
+        for user in users if user is not None
+    }
 
 
 async def _person_avatar_urls(
@@ -319,68 +344,81 @@ async def _person_avatar_urls(
     Without an own avatar, the staff photo comes from the room's owning Entity
     (whose team page the members share), else from the person's home Entity.
     """
-    people = {user.id: user for user in users if user is not None}
-    missing = [user.id for user in people.values() if not real_avatar_url(user.avatar_url)]
-    staff_photos: dict[tuple[str, str], str] = {}
-    if missing:
-        rows = (await db.execute(select(Staff.user_id, Staff.entity_id, Staff.avatar_url).where(
-            Staff.user_id.in_(missing), Staff.deleted_at.is_(None), Staff.avatar_url.is_not(None),
-        ).order_by(Staff.created_at.desc()))).all()
-        for staff_user_id, entity_id, avatar_url in rows:
-            staff_photos.setdefault((staff_user_id, entity_id), avatar_url)
-    return {
-        user.id: person_avatar_url(
-            user.avatar_url,
-            (owner_entity_id and staff_photos.get((user.id, owner_entity_id)))
-            or staff_photos.get((user.id, user.entity_id)),
-        )
-        for user in people.values()
-    }
+    return _avatar_urls(users, await _staff_photos(db, users), owner_entity_id=owner_entity_id)
 
 
 async def _room_view(db: AsyncSession, room: ChatRoom, user_id: str) -> dict:
-    members = (await db.execute(
+    return (await _room_views(db, [room], user_id))[0]
+
+
+async def _room_views(db: AsyncSession, rooms: list[ChatRoom], user_id: str) -> list[dict]:
+    """Room views in order, reading each kind of room data once for all rooms."""
+    if not rooms:
+        return []
+    room_ids = [room.id for room in rooms]
+    members_by_room: dict[str, list] = {room_id: [] for room_id in room_ids}
+    for member, user in (await db.execute(
         select(ChatRoomMember, User).join(User, User.id == ChatRoomMember.user_id)
-        .where(ChatRoomMember.room_id == room.id, ChatRoomMember.status == "active")
+        .where(ChatRoomMember.room_id.in_(room_ids), ChatRoomMember.status == "active")
         .order_by(ChatRoomMember.joined_at, ChatRoomMember.id)
-    )).all()
-    other = next((user for member, user in members if user.id != user_id), None)
-    actor = next((member for member, user in members if user.id == user_id), None)
-    actor_user = next((user for member, user in members if user.id == user_id), None)
-    manager = bool(actor and actor_user and _can_manage_bindings(room, actor, actor_user))
-    ai_execution_manager = bool(actor and actor_user and _can_manage_ai_execution(room, actor, actor_user))
-    bindings = (await db.execute(select(ChatRoomAgentBinding).where(
-        ChatRoomAgentBinding.room_id == room.id,
+    )).all():
+        members_by_room[member.room_id].append((member, user))
+    bindings_by_room: dict[str, list[ChatRoomAgentBinding]] = {room_id: [] for room_id in room_ids}
+    for binding in (await db.execute(select(ChatRoomAgentBinding).where(
+        ChatRoomAgentBinding.room_id.in_(room_ids),
         ChatRoomAgentBinding.status == "active",
-    ).order_by(ChatRoomAgentBinding.created_at, ChatRoomAgentBinding.id))).scalars().all()
-    latest_message_at = (await db.execute(select(ChatRoomMessage.created_at).where(
-        ChatRoomMessage.room_id == room.id,
-    ).order_by(ChatRoomMessage.created_at.desc(), ChatRoomMessage.id.desc()).limit(1))).scalar_one_or_none()
-    avatars = await _person_avatar_urls(db, [user for _, user in members], owner_entity_id=room.owner_entity_id)
-    return {
-        "id": room.id,
-        "kind": room.kind,
-        "title": room.title if room.kind == "group" else (
-            (other.display_name or other.email) if other else room.title or "Pending private chat"
-        ),
-        "owner_scope": "entity" if room.owner_entity_id else "personal",
-        "member_count": len(members),
-        "members": [{
-            "user_id": user.id,
-            "name": user.display_name or user.email,
-            "avatar_url": avatars[user.id],
-            "role": member.role,
-        } for member, user in members],
-        "agents": [await _binding_view(db, binding, manager=manager) for binding in bindings],
-        "can_manage_agents": manager,
-        "ai_tool_execution_enabled": room.ai_tool_execution_enabled if room.kind == "group" else False,
-        "ai_file_actions_direct_enabled": room.ai_file_actions_direct_enabled if room.kind == "group" else False,
-        "ai_tool_execution_revision": room.ai_tool_execution_revision if room.kind == "group" else 0,
-        "can_manage_ai_execution": ai_execution_manager,
-        "notifications_muted": bool(actor and actor.notifications_muted),
-        "last_message_at": latest_message_at,
-        "created_at": room.created_at,
-    }
+    ).order_by(ChatRoomAgentBinding.created_at, ChatRoomAgentBinding.id))).scalars().all():
+        bindings_by_room[binding.room_id].append(binding)
+    latest_message_at = dict((await db.execute(
+        select(ChatRoomMessage.room_id, func.max(ChatRoomMessage.created_at))
+        .where(ChatRoomMessage.room_id.in_(room_ids))
+        .group_by(ChatRoomMessage.room_id)
+    )).all())
+    subscriptions = await _binding_subscriptions(db, {
+        binding.subscription_id for bindings in bindings_by_room.values() for binding in bindings
+    })
+    staff_photos = await _staff_photos(db, [
+        user for members in members_by_room.values() for _, user in members
+    ])
+    views = []
+    for room in rooms:
+        members = members_by_room[room.id]
+        other = next((user for member, user in members if user.id != user_id), None)
+        actor = next((member for member, user in members if user.id == user_id), None)
+        actor_user = next((user for member, user in members if user.id == user_id), None)
+        manager = bool(actor and actor_user and _can_manage_bindings(room, actor, actor_user))
+        ai_execution_manager = bool(actor and actor_user and _can_manage_ai_execution(room, actor, actor_user))
+        avatars = _avatar_urls(
+            [user for _, user in members], staff_photos, owner_entity_id=room.owner_entity_id,
+        )
+        views.append({
+            "id": room.id,
+            "kind": room.kind,
+            "title": room.title if room.kind == "group" else (
+                (other.display_name or other.email) if other else room.title or "Pending private chat"
+            ),
+            "owner_scope": "entity" if room.owner_entity_id else "personal",
+            "member_count": len(members),
+            "members": [{
+                "user_id": user.id,
+                "name": user.display_name or user.email,
+                "avatar_url": avatars[user.id],
+                "role": member.role,
+            } for member, user in members],
+            "agents": [
+                await _binding_view(db, binding, manager=manager, subscriptions=subscriptions)
+                for binding in bindings_by_room[room.id]
+            ],
+            "can_manage_agents": manager,
+            "ai_tool_execution_enabled": room.ai_tool_execution_enabled if room.kind == "group" else False,
+            "ai_file_actions_direct_enabled": room.ai_file_actions_direct_enabled if room.kind == "group" else False,
+            "ai_tool_execution_revision": room.ai_tool_execution_revision if room.kind == "group" else 0,
+            "can_manage_ai_execution": ai_execution_manager,
+            "notifications_muted": bool(actor and actor.notifications_muted),
+            "last_message_at": latest_message_at.get(room.id),
+            "created_at": room.created_at,
+        })
+    return views
 
 
 async def _online_room_members(db: AsyncSession, room_ids: list[str]) -> dict[str, set[str]]:
@@ -664,13 +702,14 @@ async def list_rooms(
         .order_by(func.coalesce(latest_message_at, ChatRoom.created_at).desc())
         .limit(100)
     )).scalars().all()
-    visible = []
-    for room in rooms:
-        try:
-            await _active_room(db, room.id, user.id)
-        except HTTPException:
-            continue
-        visible.append(await _room_view(db, room, user.id))
+    # The same membership check and share lock as ``_active_room``, for every room at once.
+    live_ids = set((await db.execute(
+        select(ChatRoom.id)
+        .join(ChatRoomMember, active_member_clause(user.id))
+        .where(ChatRoom.id.in_([room.id for room in rooms]), live_room_clause())
+        .with_for_update(read=True, of=(ChatRoom, ChatRoomMember))
+    )).scalars().all()) if rooms else set()
+    visible = await _room_views(db, [room for room in rooms if room.id in live_ids], user.id)
     online_by_room = await _online_room_members(db, [room["id"] for room in visible])
     unread_by_room = await _unread_room_counts(db, user.id, [room["id"] for room in visible])
     for room in visible:

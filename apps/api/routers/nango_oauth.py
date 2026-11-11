@@ -1004,6 +1004,16 @@ async def sync_connections(
             entity_id=user.entity_id,
             provider=provider_key,
         )
+    from packages.core.services.workspace_channel_routes import route_declared_channels_after_connect
+
+    for integration_id, provider_key in zip(synced_integration_ids, providers):
+        await route_declared_channels_after_connect(
+            db,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            provider=provider_key,
+            credential_source_id=integration_id,
+        )
     try:
         await db.commit()
     except Exception:

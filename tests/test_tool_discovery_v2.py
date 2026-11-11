@@ -800,9 +800,16 @@ async def test_handler_provider_search_reports_shown_vs_total_tool_count(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_key",
+    [
+        "paypal",
+    ],
+)
 async def test_handler_v2_discovers_bound_provider_without_static_schema(
     client: AsyncClient,
     monkeypatch,
+    provider_key: str,
 ) -> None:
     _, user_id, entity_id = await _register_owner(client, "tdv2_semantic_scope")
     import json
@@ -821,20 +828,20 @@ async def test_handler_v2_discovers_bound_provider_without_static_schema(
     from packages.core.services import agent_permission_service
 
     async def usable_providers(_db, **kwargs):
-        assert set(kwargs["provider_keys"]) == {"stripe"}
-        return frozenset({"stripe"})
+        assert set(kwargs["provider_keys"]) == {provider_key}
+        return frozenset({provider_key})
 
     async def annotate(matches, _entity_id, _user_id):
         for match in matches:
             match["available"] = True
         return matches
 
-    public_name = "mcp__stripe__create_future_settlement_mandate"
+    public_name = f"mcp__{provider_key}__create_future_settlement_mandate"
 
     async def load_live(provider_keys):
-        assert provider_keys == frozenset({"stripe"})
+        assert provider_keys == frozenset({provider_key})
         return {
-            "stripe": [
+            provider_key: [
                 (
                     public_name,
                     {
@@ -858,7 +865,7 @@ async def test_handler_v2_discovers_bound_provider_without_static_schema(
         "packages.core.ai.runtime.tool_search.runtime_annotate_tool_availability",
         annotate,
     )
-    provider_scopes = RuntimeMCPProviderToolScopeFactory.create({"stripe": None})
+    provider_scopes = RuntimeMCPProviderToolScopeFactory.create({provider_key: None})
     envelope = RuntimeEnvelope(
         surface=ChatSurface.WORKSPACE_CHAT,
         principal=RuntimePrincipal(kind=RuntimePrincipalKind.DELEGATED),
@@ -872,7 +879,7 @@ async def test_handler_v2_discovers_bound_provider_without_static_schema(
         await runtime_execute_search_tools_handler(
             arguments={
                 "mode": "provider",
-                "provider_key": "stripe",
+                "provider_key": provider_key,
                 "_runtime_envelope_from_context": envelope,
             },
             user_id=user_id,
@@ -925,7 +932,7 @@ async def test_handler_v2_does_not_probe_bound_but_unusable_provider(
         agent_id="agent-1",
         allowed_tool_names=("search_tools",),
         mcp_provider_scopes=RuntimeMCPProviderToolScopeFactory.create(
-            {"stripe": None}
+            {"paypal": None}
         ),
     )
 
@@ -933,7 +940,7 @@ async def test_handler_v2_does_not_probe_bound_but_unusable_provider(
         await runtime_execute_search_tools_handler(
             arguments={
                 "mode": "provider",
-                "provider_key": "stripe",
+                "provider_key": "paypal",
                 "_runtime_envelope_from_context": envelope,
             },
             user_id=user_id,

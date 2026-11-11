@@ -56,6 +56,69 @@ def test_installed_blueprint_job_id_is_scoped_and_idempotent() -> None:
     assert installed_blueprint_job_id(installed_id, workspace_id) == installed_id
 
 
+def test_a_missing_integration_holds_up_only_the_workflows_that_reach_it() -> None:
+    from packages.core.services.workspace_readiness import (
+        WorkspaceReadinessPartStatus,
+        blocking_setup_blocks_workflow,
+    )
+
+    def missing(*checks):
+        return WorkspaceReadinessPartStatus(
+            key="blocking_setup", name="", role="", check="", status="missing", summary="",
+            missing_setup_key="blocking_setup_incomplete", details={"incomplete_checks": list(checks)},
+        )
+
+    youtube = {"ready": False, "kind": "blueprint_install_todo", "todo_kind": "missing_integration", "provider": "youtube"}
+    gmail = {"ready": False, "kind": "integration_provider", "provider": "gmail"}
+    write = [{"id": "start", "type": "trigger"},
+             {"id": "draft", "type": "agent", "config": {"tools": ["generate_file", "generate_image"]}},
+             {"id": "save", "type": "tool", "config": {"tool": "generate_video"}}]
+    upload = [*write, {"id": "post", "type": "tool", "config": {"tool": "youtube_upload_video"}}]
+    mail = [*write, {"id": "send", "type": "agent", "config": {"tools": ["mcp__gmail__send_email"]}}]
+    open_agent = [{"id": "start", "type": "trigger"}, {"id": "think", "type": "agent", "config": {}}]
+    sub = [{"id": "start", "type": "trigger"}, {"id": "each", "type": "foreach_subworkflow", "config": {}}]
+
+    # Work that never calls the provider runs; work that does, waits for the connection.
+    assert not blocking_setup_blocks_workflow(missing(youtube), write)
+    assert blocking_setup_blocks_workflow(missing(youtube), upload)
+    assert not blocking_setup_blocks_workflow(missing(gmail), upload)
+    assert blocking_setup_blocks_workflow(missing(gmail), mail)
+    # Reach decided at run time, or a Workflow not found, counts as reaching it.
+    assert blocking_setup_blocks_workflow(missing(youtube), open_agent)
+    assert blocking_setup_blocks_workflow(missing(youtube), sub)
+    assert blocking_setup_blocks_workflow(missing(youtube), None)
+    # Any other setup still holds up every Workflow; ready setup holds up none.
+    assert blocking_setup_blocks_workflow(missing({"ready": False, "kind": "workspace_user_materials"}), write)
+    assert blocking_setup_blocks_workflow(missing(youtube, {"ready": False, "kind": "channel"}), write)
+    assert not blocking_setup_blocks_workflow(None, upload)
+
+
+@pytest.mark.asyncio
+async def test_integration_setup_is_read_from_the_person_acting(monkeypatch) -> None:
+    from packages.core.services import integration_resolution
+    from packages.core.services.workspace_readiness import evaluate_workspace_blocking_setup
+
+    asked: list[str | None] = []
+
+    async def readiness(db, *, entity_id, user_id=None, provider_keys=(), **_):
+        asked.append(user_id)
+        return {key: SimpleNamespace(ready=user_id == "alice", reason="paired" if user_id == "alice" else "not paired",
+                                     scope="user", setup_kind="browser_extension") for key in provider_keys}
+
+    monkeypatch.setattr(integration_resolution, "integration_provider_readiness", readiness)
+    workspace = SimpleNamespace(
+        id="ws", entity_id="entity", operating_model={},
+        settings={"created_by_user_id": "bob", "blocking_setup": {"checks": [
+            {"key": "chrome", "kind": "integration_provider", "provider": "chrome", "blocking": True}]}},
+    )
+    # Alice pairs her own Chrome; the Workspace's creator never did. Her runs are not held up by his list.
+    acting = await evaluate_workspace_blocking_setup(None, workspace, actor_user_id="alice")
+    assert not acting.blocks_work and asked[-1] == "alice"
+    # With no one acting (background readiness), the creator's connections are the ones read.
+    background = await evaluate_workspace_blocking_setup(None, workspace)
+    assert background.blocks_work and asked[-1] == "bob"
+
+
 def test_setup_request_keys_use_one_normalized_shape() -> None:
     assert normalize_workspace_setup_task_key(
         "Prepare-Workspace Identity"
@@ -258,6 +321,7 @@ async def test_generic_settings_update_preserves_server_owned_setup_contract(
     db_session,
 ) -> None:
     entity_id = generate_ulid()
+    package = {"ref": "package-ref", "version": "1.0.0", "name": "@original/blueprint"}
     workspace = Workspace(
         id=generate_ulid(),
         entity_id=entity_id,
@@ -268,6 +332,7 @@ async def test_generic_settings_update_preserves_server_owned_setup_contract(
             "_blueprint": {
                 "blueprint_id": "builtin:protected",
                 "live_setup_requirements": [],
+                "package": package,
             },
             "blocking_setup": {"checks": []},
             "created_by_user_id": "user_creator",
@@ -289,10 +354,32 @@ async def test_generic_settings_update_preserves_server_owned_setup_contract(
         "_blueprint": {
             "blueprint_id": "builtin:protected",
             "live_setup_requirements": [],
+            "package": package,
         },
         "blocking_setup": {"checks": []},
         "created_by_user_id": "user_creator",
     }
+
+    visible_blueprint = {
+        **updated.settings["_blueprint"],
+        "package": {"ref": "package-ref", "version": "1.0.0"},
+    }
+    echoed = await update_workspace(
+        db_session, workspace.id, entity_id,
+        settings={"_blueprint": visible_blueprint, "user_theme": "light"},
+    )
+    assert echoed is not None
+    assert echoed.settings["_blueprint"]["package"] == package
+    assert echoed.settings["user_theme"] == "light"
+
+    with pytest.raises(ProtectedWorkspaceSettingsError):
+        await update_workspace(
+            db_session, workspace.id, entity_id,
+            settings={"_blueprint": {
+                **visible_blueprint,
+                "package": {**package, "name": "@other/blueprint"},
+            }},
+        )
 
     with pytest.raises(ProtectedWorkspaceSettingsError):
         await update_workspace(

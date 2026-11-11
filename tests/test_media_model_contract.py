@@ -47,6 +47,32 @@ async def test_search_exposes_selected_model_contract(monkeypatch, kind, model, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["openai/gpt-image-2.6-flare", "openai/gpt-image-2.6-sunburst"])
+async def test_image_search_exposes_explicit_gif_model_capability(monkeypatch, model):
+    from packages.core.ai.tools import extended_tools
+    from packages.core.ai.tools.generate_file.tool import _generate_file_handler
+
+    async def actor(*_args):
+        return "user-1"
+
+    async def selected(*_args):
+        return model
+
+    monkeypatch.setattr(extended_tools, "_resolve_media_task_user_id", actor)
+    monkeypatch.setattr(extended_tools, "_resolve_user_image_model", selected)
+
+    selected_model = json.loads(await _generate_file_handler(
+        entity_id="entity-1", user_id="user-1", kind="search", params={"media_kind": "image"},
+    ))["selected_model"]
+    schema = selected_model["generation_schema"]
+    assert model in schema["model"]["enum"]
+    assert schema["output_format"]["enum"] == ["png", "gif"]
+    assert schema["size"]["default"] == "auto"
+    assert schema["frame_count"]["default"] == 9
+    assert schema["frame_duration_ms"]["default"] == 200
+
+
+@pytest.mark.asyncio
 async def test_image_generation_rejects_changed_model_before_credentials(monkeypatch):
     from packages.core.ai.tools import extended_tools
 
@@ -148,8 +174,20 @@ async def test_generate_file_forwards_expected_model_to_media_boundary(monkeypat
     await _generate_file_handler(
         entity_id="entity-1", user_id="user-1", kind=kind,
         prompt="A forest", expected_model="selected/model",
+        model="openai/gpt-image-2.6-flare" if kind == "image" else None,
+        output_format="gif" if kind == "image" else None,
+        frame_count=9 if kind == "image" else None,
+        frame_duration_ms=200 if kind == "image" else None,
     )
     assert captured["params"]["expected_model"] == "selected/model"
+    if kind == "image":
+        assert captured["params"] == {
+            "expected_model": "selected/model",
+            "model": "openai/gpt-image-2.6-flare",
+            "output_format": "gif",
+            "frame_count": 9,
+            "frame_duration_ms": 200,
+        }
 
 
 @pytest.mark.asyncio

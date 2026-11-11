@@ -1,3 +1,4 @@
+import { t } from "../../lib/i18n";
 import { useMemo, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, translateApiError } from "../../lib/api";
@@ -83,11 +84,11 @@ export default function WorkflowImportModal({
         reset();
         onClose();
       }}
-      title="Import workflow"
+      title={t("ui.import_workflow")}
       footer={
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
           <Button variant="ghost" onClick={() => { reset(); onClose(); }}>
-            Cancel
+            {t("ui.cancel")}
           </Button>
           {!preview ? (
             <Button
@@ -95,7 +96,7 @@ export default function WorkflowImportModal({
               loading={previewMut.isPending}
               disabled={!content.trim()}
             >
-              Preview
+              {t("ui.preview")}
             </Button>
           ) : (
             <Button onClick={() => importMut.mutate()} loading={importMut.isPending}>
@@ -113,13 +114,13 @@ export default function WorkflowImportModal({
         </p>
 
         <Input
-          placeholder="Name (optional — taken from the export if blank)"
+          placeholder={t("ui.name_optional_taken_from_the_export_if_blank")}
           value={name}
           onChange={(e) => setName(e.target.value)}
         />
 
         <Textarea
-          placeholder="Paste the exported workflow JSON / YAML here…"
+          placeholder={t("ui.paste_the_exported_workflow_json_yaml_here")}
           value={content}
           onChange={(e) => {
             setContent(e.target.value);
@@ -144,8 +145,6 @@ export default function WorkflowImportModal({
                 style={{
                   fontSize: 11,
                   fontWeight: 600,
-                  letterSpacing: 0.3,
-                  textTransform: "uppercase",
                   color: "var(--accent)",
                   background: "var(--accent-soft)",
                   padding: "3px 8px",
@@ -170,7 +169,7 @@ export default function WorkflowImportModal({
                   marginBottom: 4,
                 }}
               >
-                <span>Coverage</span>
+                <span>{t("ui.coverage")}</span>
                 <span className="mono" style={{ color: coverageTone, fontWeight: 600 }}>
                   {coveragePct}% · {preview.report.mapped}/{preview.report.node_count} nodes
                 </span>

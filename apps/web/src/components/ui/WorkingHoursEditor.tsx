@@ -1,3 +1,4 @@
+import { getLocale, t } from "../../lib/i18n";
 import { IconClock } from "../icons";
 import Checkbox from "./Checkbox";
 import Select from "./Select";
@@ -16,7 +17,7 @@ interface WorkingHoursEditorProps {
   title?: string;
 }
 
-const DEFAULT_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const DEFAULT_DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"].map((day) => t(`ui.weekday_${day}`));
 
 function pad(value: number): string {
   return String(value).padStart(2, "0");
@@ -32,6 +33,7 @@ function formatTimeLabel(value: string): string {
   const minutes = minutesFromTime(value);
   const hour24 = Math.floor(minutes / 60);
   const minute = minutes % 60;
+  if (getLocale() !== "en") return `${pad(hour24)}:${pad(minute)}`;
   const suffix = hour24 >= 12 ? "PM" : "AM";
   const hour12 = hour24 === 0 ? 12 : hour24 > 12 ? hour24 - 12 : hour24;
   return `${pad(hour12)}:${pad(minute)} ${suffix}`;
@@ -53,7 +55,7 @@ export default function WorkingHoursEditor({
   value,
   onChange,
   days = DEFAULT_DAYS,
-  title = "Working hours",
+  title = t("ui.working_hours"),
 }: WorkingHoursEditorProps) {
   const rows = value.length ? value : [];
 
@@ -64,14 +66,14 @@ export default function WorkingHoursEditor({
   return (
     <div className="working-hours-editor">
       <div className="working-hours-editor-heading" style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-        <IconClock size={14} style={{ color: "#78716c" }} />
-        <span style={{ fontSize: 13, fontWeight: 800, color: "#292524" }}>{title}</span>
+        <IconClock size={14} style={{ color: "var(--text-muted)" }} />
+        <span style={{ fontSize: 13, fontWeight: 800, color: "var(--text-strong)" }}>{title}</span>
       </div>
       <div
         className="working-hours-grid"
         style={{
           display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 360px), 1fr))",
+          gridTemplateColumns: "minmax(0, 480px)",
           gap: 8,
           maxWidth: 980,
         }}

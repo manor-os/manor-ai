@@ -256,19 +256,19 @@ def _model_callers(facts: dict[str, Any], billed: dict[str, Any]):
             kwargs["resolved_model"] = PLATFORM_STT_MODEL
         result = await transcribe_blob(audio, **kwargs)
         seconds = float(result.duration_seconds or duration or 0.0)
-        cost = whisper_cost_usd(seconds, result.model)
+        cost = whisper_cost_usd(seconds, result.model, getattr(result, "usage", None))
         billed["stt_model"] = result.model
-        if not user_key:
-            from packages.core.ai.runtime import RUNTIME_KNOWLEDGE_MEDIA_ANALYSIS_SOURCE as source
-            from packages.core.database import create_worker_session
-            from packages.core.services.usage_service import record_media_usage
+        # BYOK transcription is logged too (token row, no credit row).
+        from packages.core.ai.runtime import RUNTIME_KNOWLEDGE_MEDIA_ANALYSIS_SOURCE as source
+        from packages.core.database import create_worker_session
+        from packages.core.services.usage_service import record_media_usage
 
-            async with create_worker_session()() as db:
-                await record_media_usage(
-                    db, entity_id, kind="whisper", model=result.model, cost_usd=cost, units=int(seconds),
-                    workspace_id=workspace_id, source=source, byok=False,
-                )
-                await db.commit()
+        async with create_worker_session()() as db:
+            await record_media_usage(
+                db, entity_id, kind="whisper", model=result.model, cost_usd=cost, units=int(seconds),
+                workspace_id=workspace_id, source=source, byok=bool(user_key),
+            )
+            await db.commit()
         return result.text or "", {"cost_usd": cost}
 
     return complete, transcribe

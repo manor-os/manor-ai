@@ -17,7 +17,6 @@ import pytest
 import packages.core.ai.mcp.shopify as sh
 import packages.core.ai.mcp.woocommerce as wc
 import packages.core.ai.mcp.square as sq
-import packages.core.ai.mcp.stripe as st
 
 
 # ── httpx fake ───────────────────────────────────────────────────────────────
@@ -83,7 +82,11 @@ def _last():
 def http(monkeypatch):
     _FakeClient.calls = []
     _FakeClient.response = _FakeResp(200, {"ok": True})
-    for mod in (sh, wc, sq, st):
+    for mod in (
+        sh,
+        wc,
+        sq,
+    ):
         monkeypatch.setattr(mod.httpx, "AsyncClient", _FakeClient)
     return _FakeClient
 
@@ -649,36 +652,6 @@ async def test_square_blank_required_name_is_rejected_without_http(http):
     assert not http.calls
 
 
-# ── Stripe (REST, Basic auth) ────────────────────────────────────────────────
-
-
-async def test_stripe_blank_key_is_rejected_without_http(http):
-    out = await st.call_tool("get_balance", {}, "   ")
-    assert out["isError"] is True
-    assert "key" in out["content"][0]["text"]
-    assert not http.calls
-
-
-@pytest.mark.parametrize("limit", [0, -1, 101])
-async def test_stripe_list_customers_rejects_invalid_limit_without_http(http, limit):
-    out = await st.call_tool("list_customers", {"limit": limit}, STRIPE_KEY)
-    assert out["isError"] is True
-    assert "limit" in out["content"][0]["text"]
-    assert not http.calls
-
-
-async def test_stripe_non_2xx_surfaces_as_error(http):
-    http.response = _FakeResp(500, text="upstream down")
-    out = await st.call_tool("get_balance", {}, STRIPE_KEY)
-    assert out["isError"] is True
-    assert "500" in out["content"][0]["text"]
-
-
-async def test_stripe_json_error_preserves_provider_message(http):
-    http.response = _FakeResp(400, {"error": {"message": "amount is invalid"}})
-    out = await st.call_tool("get_balance", {}, STRIPE_KEY)
-    assert out["isError"] is True
-    assert out["content"][0]["text"] == "Stripe API error (400): amount is invalid"
 
 
 # ── Shared guards ────────────────────────────────────────────────────────────

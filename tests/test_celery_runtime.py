@@ -939,3 +939,28 @@ def test_worker_process_start_warms_the_tool_registry(monkeypatch):
 
     monkeypatch.setattr(tool_registry, "runtime_ensure_tool_registry_initialized", broken)
     module._warm_tool_registry()  # never blocks worker boot
+
+
+def test_run_in_worker_finishes_background_usage_writes_before_the_loop_closes(monkeypatch):
+    """A Task returning right after its last model call must keep that call's charge."""
+    from packages.core.ai.llm_client import fire_and_forget
+
+    class FakeEngine:
+        async def dispose(self, *, close: bool = True) -> None:
+            return None
+
+    import packages.core.database as dbmod
+
+    monkeypatch.setattr(dbmod, "engine", FakeEngine())
+    written: list[str] = []
+
+    async def usage_write() -> None:
+        await asyncio.sleep(0.05)
+        written.append("usage row")
+
+    async def work() -> str:
+        fire_and_forget(usage_write, label="auto-billing record")
+        return "done"
+
+    assert run_in_worker(work()) == "done"
+    assert written == ["usage row"]

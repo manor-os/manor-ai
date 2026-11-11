@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +17,7 @@ from packages.core.models.scheduler import ScheduledJob
 from packages.core.models.skill import AgentSkillBinding, Skill
 from packages.core.models.user import User
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
+from packages.core.revisions import StaleRevisionError
 from packages.core.services.resource_access import (
     ResourceDescriptor,
     is_read_capability,
@@ -38,8 +38,9 @@ from packages.core.services.skill_generator import (
 from packages.core.services.sse_events import format_sse
 from packages.core.services.github_skill_installer import install_from_github
 from apps.api.deps import get_current_user
+from apps.api.errors import CodedError
 from apps.api.catalog import CatalogResponse, catalog_response
-from apps.api.streaming_concurrency import acquire_chat_stream_lease
+from apps.api.streaming_concurrency import LeasedStreamingResponse, acquire_chat_stream_lease
 
 router = APIRouter(prefix="/api/v1/skills", tags=["skills"])
 
@@ -147,6 +148,8 @@ class SkillResponse(BaseModel):
     tags: list[str] = []
     is_public: bool = False
     version: str = "1.0.0"
+    # Moves on every save; send it back as ``expected_edit_version``.
+    edit_version: int = 1
     config: dict = {}
     status: str = "active"
     env_vars: list[dict] = []
@@ -203,6 +206,9 @@ class SkillUpdateRequest(BaseModel):
     scripts: dict[str, str] | None = None
     requirements: str | None = None
     extra_files: dict[str, str] | None = None
+    # The ``edit_version`` this edit started from; the save is refused with
+    # 409 if the Skill has been saved since. Omitted, the save applies as before.
+    expected_edit_version: int | None = Field(None, ge=1)
 
 
 class SkillGenerateRequest(BaseModel):
@@ -285,6 +291,7 @@ def _to_response(skill, *, bindings: list[dict] | None = None) -> dict:
         "tags": skill.tags or [],
         "is_public": skill.is_public,
         "version": skill.version or "1.0.0",
+        "edit_version": int(getattr(skill, "edit_version", None) or 1),
         "config": cfg,
         "status": skill.status,
         "env_vars": env_vars,
@@ -768,7 +775,7 @@ async def generate_skill_stream_endpoint(
             yield format_sse("error", {"message": str(exc)})
 
     lease = await acquire_chat_stream_lease(scope="skill-generate")
-    return StreamingResponse(
+    return LeasedStreamingResponse(
         lease.wrap(event_stream()),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -932,6 +939,7 @@ async def update_skill_endpoint(
     """Update a skill."""
     await _require_skill(db, user, skill_id, Capability.EDIT)
     updates = body.model_dump(exclude_none=True)
+    expected_edit_version = updates.pop("expected_edit_version", None)
 
     # Merge type/scripts/requirements/extra_files into config so they persist.
     # scripts/extra_files use REPLACE semantics — the file editor sends the
@@ -956,7 +964,20 @@ async def update_skill_endpoint(
                 removed_paths = sorted(set(_bundle_paths(old_config)) - set(new_paths))
             updates["config"] = merged
 
-    skill = await update_skill(db, skill_id, user.entity_id, **updates)
+    try:
+        skill = await update_skill(
+            db, skill_id, user.entity_id, expected_edit_version=expected_edit_version, **updates,
+        )
+    except StaleRevisionError as exc:
+        raise CodedError(
+            409,
+            code="skill.error.edited_elsewhere",
+            message=(
+                f"This Skill was saved by someone else after edit version {exc.expected} "
+                f"(it is now at {exc.actual}). Load it again and reapply your change."
+            ),
+            vars={"expected": exc.expected, "actual": exc.actual},
+        ) from exc
     if not skill:
         raise HTTPException(404, "Skill not found or not owned by your entity")
 

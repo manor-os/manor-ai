@@ -239,7 +239,11 @@ def get_tools():
                             },
                             "workspace_id": {
                                 "type": "string",
-                                "description": "Legacy exact Workspace ID filter.",
+                                "description": (
+                                    "Legacy exact Workspace ID filter. Omit it inside a Workspace: "
+                                    "the current Workspace is applied automatically. Never pass a "
+                                    "folder, project, or file ID."
+                                ),
                             },
                             "workspace_ids": {
                                 "type": "array",

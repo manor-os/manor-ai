@@ -24,8 +24,7 @@ export default function CategoryChip({ categoryKey, size = "md" }: CategoryChipP
     <span style={{
       display: "inline-flex", alignItems: "center", gap: 4,
       padding: pad, borderRadius: 20, fontSize: fs, fontWeight: 600,
-      color: "#57534e", background: "#f5f5f4",
-      letterSpacing: "0.01em",
+      color: "var(--text-muted)", background: "var(--surface-muted)",
     }}>
       <Icon size={iconSize} />
       {t(cat.labelKey)}

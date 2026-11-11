@@ -132,10 +132,17 @@ async def test_digest_and_option_cannot_be_substituted(command_db):
 
 
 @pytest.mark.asyncio
-async def test_unsupported_origin_hides_combo(command_db):
+async def test_non_task_origin_saves_the_rule_without_the_atomic_combo(command_db):
+    """A chat/Workflow tool approval offers "Always allow" as a rule save only;
+    its own card transport approves. A provider confirmation offers neither."""
     db, actor = command_db
     request = (await db.execute(select(HitlRequest))).scalar_one()
     request.origin_task_id = None
+    await db.flush()
+    projection = await commands.project_approval_command(db, request_id='h', actor=actor)
+    assert projection['available_decisions'] == ['approve_once', 'reject', 'save_rule']
+    assert projection['rule_options'] and projection['capabilities']['can_save_rule'] is True
+    request.context = {**request.context, 'kind': 'provider'}
     await db.flush()
     projection = await commands.project_approval_command(db, request_id='h', actor=actor)
     assert projection['available_decisions'] == ['approve_once', 'reject']

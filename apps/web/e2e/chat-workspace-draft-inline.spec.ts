@@ -433,8 +433,26 @@ async function mockApp(
       return;
     }
 
+    if (pathname.startsWith("/api/v1/approval-settings/")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          scope: { kind: "account", id: "entity-e2e", entity_id: "entity-e2e" },
+          revision: 1, version: "fixture-policy", policy: { mode: "risk_based", rules: [] },
+          effective_policy: { mode: "risk_based", rules: [] }, inheritance: "root", root_scope: null,
+          policy_versions: [], capabilities: { can_view: true, can_edit_root: true, can_edit_local: true, can_save_rule: true },
+          action_catalog: [], effective_rows: [], saved_rules: [], inherited_rules: [], rule_sources: [],
+        }),
+      });
+      return;
+    }
+
     if (
       pathname === "/api/v1/workspaces" ||
+      pathname === "/api/v1/chat/rooms" ||
+      pathname === "/api/v1/blueprints" ||
+      pathname === "/api/v1/integrations" ||
       pathname === "/api/v1/agents" ||
       pathname === "/api/v1/chat/flow-entrypoints" ||
       pathname === "/api/v1/auth/users" ||
@@ -587,39 +605,41 @@ for (const width of [1440, 390]) {
     await page.goto("/workspaces/new");
 
     const question = page.locator(".draft-msg-row.assistant");
-    await expect(question).toHaveText(OPENING_QUESTION);
+    await expect(question).toContainText("What should this workspace run?");
     await expect(page.locator(".draft-msg-row.user")).toHaveCount(0);
     await expect(page.locator(".draft-starters button")).toHaveCount(3);
-    await expect(page).toHaveURL(/\/workspaces\/new\?draft=[0-9A-Z]{26}$/);
-    expect(app.openingRequests).toHaveLength(1);
-    expect(app.openingRequests[0].initial_brief).toBeUndefined();
-    const savedUrl = page.url();
+    // Opening the page starts nothing: no model call and no draft until an answer.
+    expect(app.openingRequests).toHaveLength(0);
+    await expect(page).toHaveURL(/\/workspaces\/new$/);
 
     await page.reload();
-    await expect(question).toHaveText(OPENING_QUESTION);
-    expect(page.url()).toBe(savedUrl);
-    expect(app.openingRequests).toHaveLength(1);
+    await expect(question).toContainText("What should this workspace run?");
+    expect(app.openingRequests).toHaveLength(0);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
     expect(app.pageErrors).toEqual([]);
   });
 }
 
 for (const recovery of ["retry", "reload"]) {
-  test(`blank creation recovers its opening on the same draft via ${recovery}`, async ({ page }) => {
+  test(`a failed first answer recovers on the same draft via ${recovery}`, async ({ page }) => {
     const app = await mockDraftOpening(page, true);
     await page.goto("/workspaces/new");
+    const composer = page.locator(".draft-chat").getByRole("textbox");
+    await composer.fill("Help our design team plan the weekly delivery.");
+    await composer.press("Enter");
     const retry = page.getByRole("button", { name: "Retry", exact: true });
     await expect(retry).toBeVisible();
     expect(app.openingRequests).toHaveLength(1);
     const firstDraftId = app.openingRequests[0].draft_id;
+    await expect(page).toHaveURL(new RegExp(`draft=${firstDraftId}`));
 
     app.allowOpening();
     if (recovery === "reload") await page.reload();
     else await retry.click();
-    await expect(page.locator(".draft-msg-row.assistant")).toHaveText(OPENING_QUESTION);
+    await expect(page.locator(".draft-msg-row.assistant").last()).toBeVisible();
+    await expect(retry).toBeHidden();
     expect(app.openingRequests).toHaveLength(2);
     expect(app.openingRequests[1].draft_id).toBe(firstDraftId);
-    await expect(page.locator(".draft-msg-row.user")).toHaveCount(0);
     expect(app.pageErrors).toEqual([]);
   });
 }
@@ -627,15 +647,71 @@ for (const recovery of ["retry", "reload"]) {
 test("blank creation accepts the user's answer after the opening question", async ({ page }) => {
   const app = await mockDraftOpening(page);
   await page.goto("/workspaces/new");
-  await expect(page.locator(".draft-msg-row.assistant")).toHaveText(OPENING_QUESTION);
+  await expect(page.locator(".draft-msg-row.assistant")).toContainText("What should this workspace run?");
 
   const answer = "Help our design team plan the weekly delivery.";
   const composer = page.locator(".draft-chat").getByRole("textbox");
   await composer.fill(answer);
   await composer.press("Enter");
   await expect(page.locator(".draft-msg-row.user")).toHaveText(answer);
-  await expect(page.locator(".draft-msg-row.assistant").last()).toHaveText("What should your team deliver first?");
+  await expect(page.locator(".draft-msg-row.assistant").last()).toHaveText("Who will use this workspace?");
   expect(app.openingRequests).toHaveLength(1);
+  expect(app.openingRequests[0].initial_brief).toBe(answer);
+  expect(app.pageErrors).toEqual([]);
+});
+
+test("choosing a suggestion sends it straight away", async ({ page }) => {
+  const app = await mockDraftOpening(page);
+  await page.goto("/workspaces/new");
+  const suggestion = page.locator(".draft-starters button").first();
+  const label = (await suggestion.textContent()) || "";
+  await suggestion.click();
+  await expect(page.locator(".draft-msg-row.user")).toHaveText(label);
+  expect(app.openingRequests).toHaveLength(1);
+  expect(app.openingRequests[0].initial_brief).toBe(label);
+  await expect(page.locator(".draft-chat").getByRole("textbox")).toHaveText("");
+  expect(app.pageErrors).toEqual([]);
+});
+
+test("a turn the server stops answering rests quietly until the next message continues it", async ({ page }) => {
+  const app = await mockApp(page);
+  const reply = "Added the weekly report.";
+  let saved: Record<string, unknown> = {
+    ...draft("active"), working: true, messages: [{ role: "user", content: "Add a weekly report" }],
+  };
+  await page.route(`**/api/v1/workspace-drafts/${DRAFT_ID}**`, async (route) => {
+    if (new URL(route.request().url()).pathname.endsWith("/messages/stream")) {
+      saved = {
+        ...saved,
+        messages: [
+          ...(saved.messages as object[]),
+          { role: "user", content: route.request().postDataJSON().message },
+          { role: "assistant", content: reply },
+        ],
+      };
+      await route.fulfill({
+        status: 200,
+        contentType: "text/event-stream",
+        body: `event: token\ndata: ${JSON.stringify({ content: reply })}\n\nevent: done\ndata: ${JSON.stringify({ reply, draft: saved })}\n\n`,
+      });
+      return;
+    }
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(saved) });
+  });
+  await page.goto(`/workspaces/new?draft=${DRAFT_ID}`);
+  const paused = page.getByText("Send a message whenever you'd like to continue.");
+  await expect(page.locator(".draft-typing")).toBeVisible();
+  await expect(paused).toHaveCount(0);
+
+  saved = { ...saved, working: false };
+  await expect(paused).toBeVisible();
+  await expect(page.locator(".draft-typing")).toHaveCount(0);
+
+  const composer = page.locator(".draft-chat").getByRole("textbox");
+  await composer.fill("Please continue");
+  await composer.press("Enter");
+  await expect(page.locator(".draft-msg-row.assistant").last()).toHaveText(reply);
+  await expect(paused).toHaveCount(0);
   expect(app.pageErrors).toEqual([]);
 });
 
@@ -659,7 +735,9 @@ for (const width of [1440, 390]) {
       const open = () => page.locator("button.chat-artifact-summary-open", { hasText: "Focused product collaboration" }).click();
       await open();
       const panel = page.getByRole("region", { name: "Draft summary" });
-      const mode = panel.getByRole("switch", { name: "Run automatically after creation" });
+      const mode = panel.getByRole("switch", { name: "Review automatically after creation" });
+      const showMore = () => panel.getByText("More settings", { exact: true }).click();
+      await showMore();
       await expect(mode).toBeChecked();
       await expect(panel.getByText("Automatic (default)", { exact: true })).toBeVisible();
       if (manual) {
@@ -676,6 +754,7 @@ for (const width of [1440, 390]) {
       await expect(panel.getByRole("button", { name: "Create Workspace", exact: true })).toBeEnabled();
       await page.reload();
       if (!(await panel.isVisible())) await open();
+      await showMore();
       await expect(mode).toHaveAttribute("aria-checked", String(!manual));
       expect(state.runtimeMode()).toBe(!manual);
       await mode.scrollIntoViewIfNeeded();
@@ -722,6 +801,7 @@ test("ordinary Chat keeps Workspace creation inline and restores the saved draft
   await expect(panel.getByText("Retired launch notes", { exact: true })).toBeVisible();
   await expect(panel.getByText("Excluded", { exact: true })).toBeVisible();
   await expect(panel.getByText("Login required", { exact: false })).toBeVisible();
+  await panel.getByText("More settings", { exact: true }).click();
   await expect(panel.getByText("Commitment Rate", { exact: true })).toBeVisible();
   await expect(panel.getByText("Verified delivery rate", { exact: true })).toBeVisible();
   await expect(panel.getByText("Accepted weekly commitments divided by all agreed commitments × 100; no review stays unmeasured.", { exact: true })).toBeVisible();
@@ -788,6 +868,7 @@ for (const width of [1280, 390]) {
     await page.goto("/chat");
     await page.locator("button.chat-artifact-summary-open", { hasText: "Focused product collaboration" }).click();
     const panel = page.getByRole("region", { name: "Draft summary" });
+    await panel.getByText("More settings", { exact: true }).click();
     const collection = panel.getByText("Manual recording required · starts unmeasured", { exact: true });
     await collection.scrollIntoViewIfNeeded();
     await expect(collection).toBeVisible();
@@ -802,7 +883,7 @@ for (const width of [1280, 390]) {
     await page.goto("/chat");
     await page.locator("button.chat-artifact-summary-open", { hasText: "Focused product collaboration" }).click();
     const panel = page.getByRole("region", { name: "Draft summary" });
-    await expect(panel.getByRole("button", { name: "Keep chatting until ready", exact: true })).toBeDisabled();
+    await expect(panel.getByRole("button", { name: "Create Workspace", exact: true })).toHaveCount(0);
     const selector = panel.getByRole("button", { name: "Telegram alerts", exact: true });
     await selector.click();
     await page.getByRole("option", { name: "Backup bot", exact: true }).click();
@@ -841,10 +922,7 @@ test("a rejected finalize refreshes the persisted not-ready draft", async ({ pag
   await panel.getByRole("button", { name: "Create Workspace" }).click();
 
   await expect.poll(state.finalizeCalls).toBe(1);
-  await expect(
-    panel.getByRole("button", { name: "Keep chatting until ready" }),
-  ).toBeDisabled();
-  await expect(panel.getByText("Creation Preferences", { exact: true })).toBeVisible();
+  await expect(panel.getByRole("button", { name: "Create Workspace" })).toHaveCount(0);
   await expect(panel.getByRole("button", { name: "Open workspace", exact: true })).toHaveCount(0);
   expect(state.pageErrors).toEqual([]);
 });
@@ -946,9 +1024,7 @@ test("Blueprint application requires fresh conversational creation confirmation"
   state.releaseBlueprint();
   await expect(panel.getByText("Run the applied weekly product delivery playbook.")).toBeVisible();
   await expect(create).toHaveCount(0);
-  await expect(
-    panel.getByRole("button", { name: "Keep chatting until ready" }),
-  ).toBeDisabled();
+  await expect(panel.getByRole("button", { name: "Create Workspace" })).toHaveCount(0);
   expect(state.applyCalls()).toBe(1);
   expect(state.finalizeCalls()).toBe(0);
   expect(state.pageErrors).toEqual([]);

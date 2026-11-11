@@ -8,12 +8,15 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from test_client_workspace_delivery import prepared, register
-from packages.core.models.user import UserMembership
+from packages.core.models.base import generate_ulid
+from packages.core.models.client_delivery import ClientContact, ClientWorkspaceDelivery
+from packages.core.models.user import User, UserMembership
 from packages.core.models.staff import Staff
 from packages.core.models.workspace import Workspace, WorkspaceStaff
 from packages.core.models.workspace_collaboration import WorkspaceCollaboration, WorkspaceCollaborationEntry
 from packages.core.models.workflow import WorkflowRun
 from packages.core.models.chat_room import ChatRoom, ChatRoomMember
+from packages.core.services.auth_service import create_access_token
 
 
 async def accepted(client, db, *, phase="trial"):
@@ -1218,3 +1221,98 @@ async def test_deleted_trial_provider_is_not_replaced_by_the_customer_as_payer(c
     await db_session.commit()
     with pytest.raises(TrialSponsorUnavailable):
         await resolve_billing_payer(db_session, entity_id=customer, workspace_id=target)
+
+
+async def test_listing_all_deliveries_stays_inside_the_company_and_matches_the_client_list(client, db_session):
+    # Catches: the cross-client list leaking another company's deliveries, or
+    # returning a row the per-client list would not (the same fields, nothing more).
+    ph, _, _, _, cid, _, receipt, _ = await prepared(client, db_session)
+    other_ph, _, _, _, _, _, other_receipt, _ = await prepared(client, db_session, suffix="-other")
+
+    rows = (await client.get("/api/v1/client-deliveries", headers=ph)).json()
+    assert [row["id"] for row in rows] == [receipt["id"]]
+    per_client = (await client.get(f"/api/v1/clients/{cid}/deliveries", headers=ph)).json()
+    assert rows == [{**per_client[0], "client_name": "Customer"}]
+    other_rows = (await client.get("/api/v1/client-deliveries", headers=other_ph)).json()
+    assert [row["id"] for row in other_rows] == [other_receipt["id"]]
+
+
+async def test_listing_all_deliveries_covers_only_workspaces_the_person_manages(client, db_session):
+    # Catches: an ordinary member reading the company's client list here, and a
+    # Workspace owner seeing deliveries of Workspaces they don't manage.
+    ph, p, _, _, cid, source, receipt, _ = await prepared(client, db_session)
+    member = User(id=generate_ulid(), entity_id=p.entity_id, email=f"u-{generate_ulid()}@example.com",
+                  password_hash="x", role="member", status="active")
+    owner = User(id=generate_ulid(), entity_id=p.entity_id, email=f"u-{generate_ulid()}@example.com",
+                 password_hash="x", role="member", status="active")
+    db_session.add_all([
+        member, owner,
+        UserMembership(user_id=member.id, entity_id=p.entity_id, role="member", status="active"),
+        UserMembership(user_id=owner.id, entity_id=p.entity_id, role="member", status="active"),
+    ])
+    other_ws = await client.post(
+        "/api/v1/workspaces", headers=ph, json={"name": "Second", "kind": "campaign", "primary_work": "More"},
+    )
+    contact = (await client.get(f"/api/v1/clients/{cid}/contacts", headers=ph)).json()[0]
+    second = (await client.post(
+        f"/api/v1/clients/{cid}/deliveries", headers=ph,
+        json={"workspace_id": other_ws.json()["id"], "contact_id": contact["id"]},
+    )).json()
+    db_session.add(WorkspaceStaff(workspace_id=other_ws.json()["id"], user_id=owner.id, role="owner", status="active"))
+    await db_session.commit()
+
+    async def listed(user):
+        headers = {"Authorization": f"Bearer {create_access_token(user.id, user.entity_id, 'member')}"}
+        response = await client.get("/api/v1/client-deliveries", headers=headers)
+        assert response.status_code == 200, response.text
+        return [row["id"] for row in response.json()]
+
+    assert await listed(member) == []
+    assert await listed(owner) == [second["id"]]
+    both = (await client.get("/api/v1/client-deliveries", headers=ph)).json()
+    assert [row["id"] for row in both] == [second["id"], receipt["id"]]
+    assert {row["source_workspace_id"] for row in both} == {source, other_ws.json()["id"]}
+
+
+@pytest.mark.parametrize("change", ["revoked", "contact_removed", "contact_email", "client_inactive", "client_deleted"])
+async def test_listing_all_deliveries_leaves_out_invitations_that_read_as_revoked(client, db_session, change):
+    # Catches: this list disagreeing with the per-client one, which shows a
+    # pending invitation as revoked once its client or contact changed.
+    ph, _, _, _, cid, _, receipt, _ = await prepared(client, db_session)
+    row = await db_session.get(ClientWorkspaceDelivery, receipt["id"])
+    contact = await db_session.get(ClientContact, row.contact_id)
+    from packages.core.models.people import Client
+
+    customer = await db_session.get(Client, cid)
+    if change == "revoked":
+        row.status = "revoked"
+    elif change == "contact_removed":
+        contact.deleted_at = datetime.now(timezone.utc)
+    elif change == "contact_email":
+        contact.email = "someone-else@delivery.test"
+    elif change == "client_inactive":
+        customer.status = "inactive"
+    else:
+        customer.deleted_at = datetime.now(timezone.utc)
+    await db_session.commit()
+
+    assert (await client.get("/api/v1/client-deliveries", headers=ph)).json() == []
+
+
+async def test_listing_all_deliveries_keeps_an_expired_invitation_and_an_accepted_delivery(client, db_session):
+    # Catches: only pending invitations surviving the live filter, or an accepted
+    # delivery dropping out when its contact later changes.
+    ph, _, rh, _, _, _, target, delivery, _ = await accepted(client, db_session)
+    expired_ph, _, _, _, _, _, invitation, _ = await prepared(client, db_session, suffix="-late")
+    late = await db_session.get(ClientWorkspaceDelivery, invitation["id"])
+    late.expires_at = datetime.now(timezone.utc) - timedelta(days=1)
+    held = await db_session.get(ClientWorkspaceDelivery, delivery["id"])
+    (await db_session.get(ClientContact, held.contact_id)).email = "someone-else@delivery.test"
+    await db_session.commit()
+
+    assert [row["status"] for row in (await client.get("/api/v1/client-deliveries", headers=expired_ph)).json()] == ["expired"]
+    rows = (await client.get("/api/v1/client-deliveries", headers=ph)).json()
+    assert [(row["id"], row["status"], row["provider_access"], row["can_open_trial"]) for row in rows] == [
+        (delivery["id"], "delivered", "trial", True),
+    ]
+    assert rows[0]["target_workspace_id"] == target

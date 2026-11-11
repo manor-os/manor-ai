@@ -129,12 +129,11 @@ async def load_project(db, entity_id: str, project_id: str):
 async def sites_by_project(db, entity_id: str, project_ids: list[str]) -> dict[str, list[dict]]:
     from sqlalchemy import select
 
-    from packages.core.config import get_settings
     from packages.core.models.site import Site
+    from packages.core.services.site_publisher import site_public_url
 
     if not project_ids:
         return {}
-    domain = (get_settings().MANOR_SITES_DOMAIN or "").strip().lower()
     rows = (await db.scalars(
         select(Site).where(Site.entity_id == entity_id, Site.project_id.in_(project_ids))
     )).all()
@@ -142,7 +141,7 @@ async def sites_by_project(db, entity_id: str, project_ids: list[str]) -> dict[s
     for site in rows:
         grouped.setdefault(site.project_id, []).append({
             "site_id": site.id,
-            "url": f"https://{site.slug}.{domain}" if domain else "",
+            "url": site_public_url(site),
             "revision": site.revision,
             "status": site.status,
             "workspace_id": site.workspace_id,
@@ -604,13 +603,25 @@ async def find_or_adopt_code_project(
         return project, True
 
 
+async def new_project_parent(entity_id: str, ctx) -> str:
+    """Folder for a new project: the Workspace's ``code/``, or, in a Workflow
+    run that works on a WorkflowProject, that project's folder, where its App
+    view and reviews find what the run made."""
+    from packages.core.services.generated_media_naming import workflow_run_project_folder
+
+    home = await workspace_home(entity_id, ctx.workspace_id)
+    return workflow_run_project_folder(
+        home, workflow_run_id=ctx.workflow_run_id, workflow_project_root=ctx.workflow_project_root,
+    ) or cp.project_parent_dir(home)
+
+
 async def new_project_root(entity_id: str, entity_root: str, ctx, name: str) -> str:
     from sqlalchemy import select
 
     from packages.core.database import async_session
     from packages.core.models.code_project import CodeProject
 
-    parent = cp.project_parent_dir(await workspace_home(entity_id, ctx.workspace_id))
+    parent = await new_project_parent(entity_id, ctx)
     base = cp.project_slug(name)
     async with async_session() as db:
         taken = set((await db.scalars(

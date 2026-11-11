@@ -1,9 +1,10 @@
 """Scheduler service — scheduled jobs, job runs, agent executions."""
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from sqlalchemy import and_, delete, exists, func, or_, select, update
@@ -43,8 +44,16 @@ from packages.core.revisions import (
 
 # ── Scheduled Jobs ──
 
+logger = logging.getLogger(__name__)
+
 SCHEDULED_JOB_AUTO_PAUSE_ERROR_THRESHOLD = 3
 MANAGED_AGENT_INITIATIVE_MUTATION_CODE = "MANAGED_AGENT_INITIATIVE"
+# An Initiative's status is owned by its lifecycle, so a failing driver is
+# never paused behind it. It backs off instead: 1h after the third failure in
+# a row, doubling up to one attempt a day, until a run succeeds.
+INITIATIVE_DRIVER_BACKOFF_BASE = timedelta(hours=1)
+INITIATIVE_DRIVER_BACKOFF_CAP = timedelta(hours=24)
+INITIATIVE_REPEATED_FAILURE_FAULT_CODE = "initiative_repeated_failures"
 
 
 @dataclass(frozen=True)
@@ -218,6 +227,21 @@ def is_agent_initiative_driver(job: object) -> bool:
     )
 
 
+def keeps_running_through_failures(job: object) -> bool:
+    """A job that backs off instead of pausing: nobody would turn it back on.
+
+    An Initiative's driver, and the schedules a Workspace's own runtime derives
+    (Strategist review, evaluation, insight extraction, Goal measurement).
+    Staging 2026-11-03: one budget-check outage on 10-03 paused those jobs for
+    good, and three Workspaces with their heartbeat on went unwatched for a month.
+    """
+    from packages.core.constants.blueprints import is_runtime_derived_scheduled_job
+
+    return is_agent_initiative_driver(job) or is_runtime_derived_scheduled_job(
+        job_id=getattr(job, "job_id", None), execution_type=getattr(job, "execution_type", None),
+    )
+
+
 def _assert_scheduled_job_mutation_authority(
     job: object,
     *,
@@ -248,6 +272,94 @@ def scheduled_job_workspace_scope(
     return job_workspace_id
 
 
+def back_off_failing_initiative_driver(
+    job: ScheduledJob,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Space out a repeatedly failing Initiative driver instead of pausing it.
+
+    The Initiative stays active and its driver stays enabled, so the status the
+    owner sees matches the clock; only the next attempt moves later. Returns
+    whether the clock moved. The caller holds the Job row lock.
+    """
+    errors = int(job.consecutive_errors or 0)
+    if (
+        not keeps_running_through_failures(job)
+        or not bool(job.enabled)
+        or errors < SCHEDULED_JOB_AUTO_PAUSE_ERROR_THRESHOLD
+    ):
+        return False
+    now = now or datetime.now(timezone.utc)
+    steps = errors - SCHEDULED_JOB_AUTO_PAUSE_ERROR_THRESHOLD
+    delay = INITIATIVE_DRIVER_BACKOFF_CAP
+    if steps < 5:  # 2**5 hours already exceeds the cap.
+        delay = min(INITIATIVE_DRIVER_BACKOFF_BASE * (2 ** steps), delay)
+    retry_at = now + delay
+    current = job.next_run_at
+    if current is not None and current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    if current is not None and current >= retry_at:
+        return False
+    job.next_run_at = retry_at
+    logger.warning(
+        "Initiative driver %s backed off after %s consecutive failures; "
+        "next attempt %s",
+        job.job_id,
+        errors,
+        retry_at.isoformat(),
+    )
+    return True
+
+
+def _report_initiative_failures_after_commit(
+    db: AsyncSession,
+    job: ScheduledJob,
+) -> None:
+    """Tell Manor staff, not the owner, once the backoff is committed."""
+    import asyncio
+
+    from sqlalchemy import event as sa_event
+
+    initiative = is_agent_initiative_driver(job)
+    initiative_id = str(getattr(job, "agent_initiative_id", None) or job.job_id)
+    context = {
+        "initiative_id": initiative_id,
+        "scheduled_job_id": job.job_id,
+        "entity_id": job.entity_id,
+        "workspace_id": job.workspace_id,
+        "consecutive_errors": int(job.consecutive_errors or 0),
+        "next_run_at": job.next_run_at.isoformat() if job.next_run_at else None,
+    }
+    loop = asyncio.get_running_loop()
+
+    async def report() -> None:
+        from packages.core.services.platform_faults import report_platform_fault
+
+        await report_platform_fault(
+            target=f"initiative:{initiative_id}" if initiative else f"schedule:{job.job_id}",
+            code=INITIATIVE_REPEATED_FAILURE_FAULT_CODE,
+            summary=(
+                ("An Agent Initiative" if initiative else "A Workspace runtime schedule") + " failed "
+                f"{context['consecutive_errors']} runs in a row. Its driver "
+                "is backing off; the owner was not notified."
+            ),
+            context=context,
+        )
+
+    def after_commit(sync_session) -> None:
+        if sync_session.in_nested_transaction() or loop.is_closed():
+            return
+        task = loop.create_task(report())
+        _INITIATIVE_FAILURE_REPORTS.add(task)
+        task.add_done_callback(_INITIATIVE_FAILURE_REPORTS.discard)
+
+    sa_event.listen(db.sync_session, "after_commit", after_commit, once=True)
+
+
+_INITIATIVE_FAILURE_REPORTS: set = set()
+
+
 def project_scheduled_job_outcome(job: ScheduledJob, status: str) -> bool:
     """Project one terminal run onto its parent job.
 
@@ -259,6 +371,9 @@ def project_scheduled_job_outcome(job: ScheduledJob, status: str) -> bool:
     job.last_status = normalized_status
     if normalized_status == "error":
         job.consecutive_errors = (job.consecutive_errors or 0) + 1
+        if keeps_running_through_failures(job):
+            back_off_failing_initiative_driver(job)
+            return False
         if (
             job.consecutive_errors >= SCHEDULED_JOB_AUTO_PAUSE_ERROR_THRESHOLD
             and bool(job.enabled)
@@ -373,7 +488,17 @@ async def reconcile_scheduled_job_run_projection(
     ):
         consecutive_errors = max(consecutive_errors, previous_errors + 1)
     job.consecutive_errors = consecutive_errors
-    if (
+    if keeps_running_through_failures(job):
+        # Never paused with nobody to resume it: back off and alert ops instead.
+        auto_paused = False
+        if (
+            not disable_after_terminal_run
+            and newest_status == "error"
+            and finalized_run_id == newest.id
+            and back_off_failing_initiative_driver(job)
+        ):
+            _report_initiative_failures_after_commit(db, job)
+    elif (
         consecutive_errors >= SCHEDULED_JOB_AUTO_PAUSE_ERROR_THRESHOLD
         and bool(job.enabled)
     ):
@@ -483,11 +608,23 @@ async def notify_scheduled_job_auto_paused(
     *,
     failure_key: str,
 ) -> None:
-    """Notify the owning user once when repeated failures pause a job."""
+    """Notify the owning user once when repeated failures pause a job.
+
+    With ``attention_delivery`` on, a Workspace's automation is told by
+    attention delivery instead (automation_paused).
+    """
+    if is_agent_initiative_driver(job):
+        # Hidden driver: /jobs 404s it and it is never auto-paused.
+        return
     entity_id = str(getattr(job, "entity_id", None) or "").strip()
     user_id = str(getattr(job, "user_id", None) or "").strip()
     if not entity_id or not user_id:
         return
+    if getattr(job, "workspace_id", None):
+        from packages.core.attention.delivery import delivery_enabled
+
+        if await delivery_enabled(db, entity_id):
+            return
 
     from packages.core.services.notification_service import create_notification
 
@@ -513,6 +650,14 @@ async def notify_scheduled_job_auto_paused(
             f"scheduled-job:auto-paused:{job.id}:{failure_key}"
         )[:255],
     )
+
+
+def scheduled_job_delivery_mode(job: Any) -> str:
+    """Where a Job's result goes; a Workspace's own automation reports where its people read."""
+    return str(
+        job.default_delivery_mode
+        or ("workspace_chat" if str(job.job_id or "").startswith("wa:") else "")
+    ).strip()
 
 
 def scheduled_job_references(
@@ -735,6 +880,10 @@ async def create_scheduled_job(
         ).with_for_update())
         if owner is None:
             raise ValueError("owner_project_id must belong to this Workspace")
+        from packages.core.services.workflow_project_service import PROJECT_END_STAGES
+
+        if owner.current_stage in PROJECT_END_STAGES:
+            raise ValueError(f"The owning project has {owner.current_stage}; it cannot schedule new work")
     if idempotency_key:
         # The Workspace admission lock serializes competing creators. Check
         # replay only after lifecycle and actor authorization have succeeded.
@@ -819,14 +968,20 @@ async def create_scheduled_job(
         default_delivery_mode=default_delivery_mode,
         user_id=user_id,
         enabled=workspace_active,
+        # The creator asked for a running Job; only the Workspace lifecycle
+        # holds it back, and activation releases it.
+        workspace_hold=not workspace_active,
     )
     if runtime_agent_selection is not None:
         # Transient receipt evidence for the Runtime caller; the durable exact
         # deployment lives in execution_target and is revalidated at dispatch.
         job._runtime_agent_selection = runtime_agent_selection
-    if payload_message and agent_id and workspace_active:
+    if payload_message and agent_id:
+        # A held Job keeps its generation intent; it is claimed once enabled.
         job.skill_generation_revision = int(job.revision or 1)
-        job.skill_generation_next_attempt_at = datetime.now(timezone.utc)
+        job.skill_generation_next_attempt_at = (
+            datetime.now(timezone.utc) if workspace_active else None
+        )
     await persist_scheduled_job(db, job)
 
     if publish_realtime:
@@ -1450,6 +1605,14 @@ class ScheduledJobMutationFactory:
     ) -> ScheduledJobMutationResult:
         await assert_revision(locked, expected_revision)
 
+        if (
+            "enabled" in valid_updates
+            and "workspace_hold" not in valid_updates
+            and hasattr(locked, "workspace_hold")
+        ):
+            # Any explicit enable/disable is a decision about this Job, not
+            # a Workspace lifecycle hold; activation must not overrule it.
+            valid_updates = {**valid_updates, "workspace_hold": False}
         applied = {
             key: value
             for key, value in valid_updates.items()
@@ -1767,6 +1930,43 @@ async def toggle_scheduled_job(
     return job
 
 
+async def retire_project_owned_jobs(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    project_id: str,
+    causation_id: str | None = None,
+) -> int:
+    """Stop the scheduled work a project owns once the project is over.
+
+    A campaign, series or other project schedules its own jobs (prepare,
+    publish, collect results, report) with ``owner_project_id``. When the
+    project is ended or cancelled those jobs must not keep running until their
+    own ``stop_after``: each is disabled through the same Job mutation a
+    person's pause uses (which also cancels an occurrence already queued). The
+    jobs and their run history are kept. Caller commits.
+    """
+    jobs = list((await db.execute(
+        select(ScheduledJob).where(
+            ScheduledJob.entity_id == entity_id,
+            ScheduledJob.workspace_id == workspace_id,
+            ScheduledJob.owner_project_id == project_id,
+            ScheduledJob.enabled.is_(True),
+        ).order_by(ScheduledJob.id)
+    )).scalars())
+    retired = 0
+    for job in jobs:
+        result = await ScheduledJobMutationFactory.apply(
+            db, job, {"enabled": False},
+            changed_by_kind=TaskActor.SYSTEM.value,
+            causation_id=causation_id,
+            allow_agent_initiative_driver=True,
+        )
+        retired += result is not None
+    return retired
+
+
 async def pause_workspace_autonomy_jobs(
     db: AsyncSession,
     workspace_id: str,
@@ -1826,17 +2026,25 @@ async def _pause_workspace_automation_definitions(
     )).scalars().all())
     paused_jobs = 0
     for job in jobs:
-        if (
-            job.enabled
-            and (
-                include_configured
-                or not await scheduled_job_is_workspace_independent(db, job)
-            )
-        ):
+        if include_configured:
+            # Every Job now waits for the recipient's own decision, including
+            # one that was only held for activation.
+            if job.enabled or job.workspace_hold:
+                was_enabled = bool(job.enabled)
+                await ScheduledJobMutationFactory.apply_locked(
+                    db,
+                    job,
+                    {"enabled": False, "workspace_hold": False},
+                    allow_agent_initiative_driver=True,
+                )
+                paused_jobs += int(was_enabled)
+            continue
+        if job.enabled and not await scheduled_job_is_workspace_independent(db, job):
+            # Workspace pause holds the autonomy Job; resuming releases it.
             result = await ScheduledJobMutationFactory.apply_locked(
                 db,
                 job,
-                {"enabled": False},
+                {"enabled": False, "workspace_hold": True},
                 allow_agent_initiative_driver=True,
             )
             if result is not None and result.applied:
@@ -1872,6 +2080,56 @@ async def _pause_workspace_automation_definitions(
         "scheduled_jobs": paused_jobs,
         "workflow_bindings": paused_bindings,
     }
+
+
+async def release_workspace_held_jobs(
+    db: AsyncSession,
+    workspace: Workspace,
+) -> int:
+    """Turn on the Jobs the Workspace lifecycle was holding, once it admits them.
+
+    A Job created while the Workspace was provisioning or paused, or paused
+    with it, carries ``workspace_hold``. Every lifecycle transition reconciles
+    through here so no creation path has to remember to re-enable its Jobs.
+    Jobs a person or the system disabled carry no hold and stay off.
+    """
+    if workspace.deleted_at is not None:
+        return 0
+    jobs = list((await db.execute(
+        select(ScheduledJob)
+        .where(
+            ScheduledJob.entity_id == workspace.entity_id,
+            ScheduledJob.workspace_id == workspace.id,
+            ScheduledJob.workspace_hold.is_(True),
+        )
+        .order_by(ScheduledJob.id)
+        .with_for_update()
+    )).scalars().all())
+    released = 0
+    for job in jobs:
+        if await scheduled_job_is_workspace_independent(db, job):
+            admitted = workspace_allows_configured_work(workspace)
+        else:
+            admitted = workspace.status == "active"
+        if not admitted:
+            continue
+        result = await ScheduledJobMutationFactory.apply_locked(
+            db,
+            job,
+            {"enabled": True, "workspace_hold": False},
+            allow_agent_initiative_driver=True,
+        )
+        if result.applied.get("enabled"):
+            released += 1
+    if released:
+        from packages.core.services.realtime import broadcast_job_update
+
+        await broadcast_job_update(workspace.entity_id, {
+            "workspace_id": workspace.id,
+            "enabled": True,
+            "event": "workspace_activated",
+        })
+    return released
 
 
 async def delete_workspace_automations(
@@ -2057,6 +2315,59 @@ async def list_job_runs(
         .limit(limit)
     )
     return list(result.scalars().all())
+
+
+_TASK_STATUSES_WAITING_ON_PEOPLE = frozenset({"blocked", "waiting_on_customer", "on_hold"})
+
+
+async def scheduled_runs_waiting_on_people(
+    db: AsyncSession,
+    runs: Sequence[ScheduledJobRun],
+) -> dict[str, dict[str, str]]:
+    """Running occurrences whose own Task now waits on a person.
+
+    The occurrence settles only when its Task finishes (see
+    ``scheduled_task_terminal_delivery``). Until then it is not "running":
+    the Task already retried what it could and needs someone to act. Keyed
+    by run id: ``{"task_id", "task_status", "reason"}``.
+    """
+    from packages.core.models.task import Task
+
+    child_by_run: dict[str, str] = {}
+    for run in runs:
+        result = run.result if isinstance(run.result, dict) else {}
+        child_id = str(result.get("scheduled_child_id") or "").strip()
+        if (
+            run.status == ScheduledRunStatus.RUNNING.value
+            and result.get("scheduled_child_kind") == "agent_task"
+            and child_id
+        ):
+            child_by_run[run.id] = child_id
+    if not child_by_run:
+        return {}
+    tasks = {
+        row.id: row
+        for row in (await db.execute(
+            select(Task.id, Task.status, Task.actual_output).where(
+                Task.id.in_(set(child_by_run.values())),
+                Task.status.in_(_TASK_STATUSES_WAITING_ON_PEOPLE),
+            )
+        )).all()
+    }
+    waiting: dict[str, dict[str, str]] = {}
+    for run_id, task_id in child_by_run.items():
+        task = tasks.get(task_id)
+        if task is None:
+            continue
+        output = task.actual_output if isinstance(task.actual_output, dict) else {}
+        result = output.get("result") if isinstance(output.get("result"), dict) else {}
+        reason = str(result.get("summary") or output.get("response") or "").strip()
+        waiting[run_id] = {
+            "task_id": task_id,
+            "task_status": str(task.status),
+            "reason": reason[:300],
+        }
+    return waiting
 
 
 # ── Agent Executions ──

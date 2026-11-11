@@ -538,8 +538,4 @@ def get_tools() -> list[tuple[dict[str, Any], Any]]:
     return [
         (RECORD_YOUTUBE_PUBLICATION_SCHEMA, _record_youtube_publication),
         (READ_YOUTUBE_PUBLIC_METRICS_SCHEMA, _read_youtube_public_metrics),
-        (
-            RECORD_YOUTUBE_WORKSPACE_METRICS_SCHEMA,
-            _record_youtube_workspace_metrics,
-        ),
     ]

@@ -1,6 +1,8 @@
 """Company client contacts and private Workspace invitations."""
 
-from fastapi import APIRouter, Depends, HTTPException
+import json
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -14,6 +16,7 @@ from packages.core.database import get_db
 from packages.core.models.user import User
 from packages.core.services import client_delivery as service
 from packages.core.services.client_delivery import ContactRequest, receipt, save_contact
+from packages.core.services.entity_fs import EntityFilesystemError, assert_entity_filesystem_ready
 
 router = APIRouter(prefix="/api/v1", tags=["client-delivery"])
 
@@ -93,6 +96,8 @@ class PublishUpdateRequest(BaseModel):
     # Omitted: the Knowledge documents the delivery already carries.
     knowledge_document_ids: list[str] | None = Field(default=None, max_length=BLUEPRINT_KNOWLEDGE_MAX_DOCUMENTS)
     release_notes: str | None = Field(default=None, max_length=RELEASE_NOTES_MAX_CHARS)
+    # Report the version and changes the customer would get; send nothing.
+    dry_run: bool = False
 
     @field_validator("knowledge_document_ids")
     @classmethod
@@ -111,11 +116,56 @@ async def publish_update(
 ):
     """Send the source Workspace's current configuration as the delivery's next release."""
     try:
-        return await service.publish_update(
+        result = await service.publish_update(
             db, user=user, client_id=client_id, delivery_id=delivery_id, **req.model_dump(),
         )
     except (ExportError, ValueError) as exc:
         raise HTTPException(422, str(exc)) from exc
+    await db.commit()
+    await service.notify_offered_update(db, result)
+    return result
+
+
+@router.post("/clients/{client_id}/deliveries/{delivery_id}/publish-update-file")
+async def publish_update_file(
+    client_id: str,
+    delivery_id: str,
+    file: UploadFile = File(...),
+    release_notes: str | None = Form(None, max_length=RELEASE_NOTES_MAX_CHARS),
+    dry_run: bool = Form(False),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Send a Blueprint built elsewhere — a ``.manor`` package or its JSON
+    payload, e.g. merged in git or exported from staging — as the delivery's
+    next release, in place of re-exporting the source Workspace."""
+    from packages.core.blueprints.package import MAX_PACKAGE_BYTES, PackageError, is_package, unpack
+
+    data = await file.read(MAX_PACKAGE_BYTES + 1)
+    if len(data) > MAX_PACKAGE_BYTES:
+        raise HTTPException(413, "The file is larger than a Blueprint package may be")
+    try:
+        if is_package(data):
+            payload, assets = unpack(data)
+        else:
+            payload, assets = json.loads(data.decode("utf-8")), []
+    except (PackageError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, f"Not a Blueprint package or payload: {exc}") from exc
+    if assets and not dry_run:
+        try:
+            assert_entity_filesystem_ready()
+        except EntityFilesystemError as exc:
+            raise HTTPException(503, f"File storage is unavailable: {exc}") from exc
+    try:
+        result = await service.publish_update(
+            db, user=user, client_id=client_id, delivery_id=delivery_id,
+            release_notes=release_notes or None, payload=payload, assets=assets, dry_run=dry_run,
+        )
+    except (ExportError, ValueError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    await db.commit()
+    await service.notify_offered_update(db, result)
+    return result
 
 
 @router.post("/clients/{client_id}/deliveries/{delivery_id}/{action}")
@@ -127,6 +177,22 @@ async def change_invite(
     db: AsyncSession = Depends(get_db),
 ):
     return await service.change_invite(client_id=client_id, delivery_id=delivery_id, action=action, user=user, db=db)
+
+
+@router.get("/client-deliveries")
+async def all_deliveries(
+    response: Response,
+    limit: int = Query(100, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """One page of the live deliveries of the Workspaces this person manages,
+    across their company's clients, newest first. ``X-Has-More`` says whether
+    another page follows; the body stays the same array as the per-client route."""
+    rows, has_more = await service.all_deliveries(user=user, db=db, limit=limit, offset=offset)
+    response.headers["X-Has-More"] = "true" if has_more else "false"
+    return rows
 
 
 @router.get("/client-deliveries/invites/{token}")

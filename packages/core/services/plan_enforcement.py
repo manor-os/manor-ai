@@ -57,8 +57,8 @@ async def credit_usage_totals(db: AsyncSession, entity_id: str) -> dict[str, int
     }
 
 
-async def get_entity_plan(db: AsyncSession, entity_id: str) -> dict[str, Any]:
-    """Load the entity's current plan."""
+async def get_entity_plan(db: AsyncSession, entity_id: str, *, entity: Any = None) -> dict[str, Any]:
+    """Load the entity's current plan; ``entity`` is its row when already read."""
     if not is_cloud():
         from packages.core.constants.plans import OSS_PLAN
         return OSS_PLAN
@@ -67,11 +67,10 @@ async def get_entity_plan(db: AsyncSession, entity_id: str) -> dict[str, Any]:
     from packages.core.models.user import Entity
 
     await ensure_plans_fresh(db)
-    result = await db.execute(select(Entity).where(Entity.id == entity_id))
-    entity = result.scalar_one_or_none()
+    if entity is None:
+        entity = (await db.execute(select(Entity).where(Entity.id == entity_id))).scalar_one_or_none()
     if not entity:
         return get_plan("plan_free")
-
     plan_id = entity.plan_id or (entity.settings or {}).get("plan", "plan_free")
     return get_plan(plan_id)
 
@@ -139,21 +138,26 @@ async def record_ai_cost(
     }
 
 
-async def get_usage_summary(db: AsyncSession, entity_id: str) -> dict[str, Any]:
-    """Get current plan usage summary for the billing UI."""
-    plan = await get_entity_plan(db, entity_id)
-    credit_limits_enabled = ai_credit_limits_enabled()
+async def get_usage_summary(
+    db: AsyncSession, entity_id: str, *, balance: Any = None, entity: Any = None,
+) -> dict[str, Any]:
+    """Get current plan usage summary for the billing UI.
 
+    ``balance`` and ``entity`` are this entity's credit balance and row when
+    the caller already read them in the same request; they are read here
+    otherwise.
+    """
     from packages.core.models.user import Entity
-    result = await db.execute(select(Entity).where(Entity.id == entity_id))
-    entity = result.scalar_one_or_none()
+    if entity is None:
+        entity = (await db.execute(select(Entity).where(Entity.id == entity_id))).scalar_one_or_none()
+    plan = await get_entity_plan(db, entity_id, entity=entity)
+    credit_limits_enabled = ai_credit_limits_enabled()
     settings = dict(entity.settings) if entity and entity.settings else {}
 
     budget_usd = plan.get("ai_budget_usd") if credit_limits_enabled else None
     plan_credits = _plan_credit_amount(plan)
     usage_usd = float(settings.get("ai_usage_usd", 0.0))
 
-    usage_totals = await credit_usage_totals(db, entity_id)
     budget_credits: int | None = None
     usage_credits = 0
     credits_reserved = 0
@@ -162,6 +166,7 @@ async def get_usage_summary(db: AsyncSession, entity_id: str) -> dict[str, Any]:
     # then falls back to plan/settings totals. OSS keeps only the fallback path.
 
     if budget_credits is None:
+        usage_totals = await credit_usage_totals(db, entity_id)
         if credit_limits_enabled:
             settings_total_credits = int(settings.get("total_credits", 0) or 0)
             budget_credits = settings_total_credits or (plan_credits if plan_credits else None)

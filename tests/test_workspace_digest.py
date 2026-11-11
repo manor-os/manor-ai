@@ -232,6 +232,66 @@ async def test_open_cards_waiting_on_the_person_are_listed(db_session, monkeypat
     assert digest.waiting_more == 0
 
 
+@pytest.mark.asyncio
+async def test_a_paused_workflow_and_a_proposal_are_waiting_too(db_session, monkeypatch):
+    """Staging 2026-11-03: the digest named one of four things waiting, because it read only the cards."""
+    from packages.core.models.attention import AttentionItem
+    from packages.core.services import notification_workspace_callbacks
+
+    entity_id = generate_ulid()
+    user = await _member(db_session, entity_id)
+    growth = await _workspace(db_session, entity_id, "Growth", staff=user)
+
+    def _item(kind: str, subject_type: str, title: str, hours: int) -> AttentionItem:
+        at = NOW - timedelta(hours=hours)
+        return AttentionItem(entity_id=entity_id, workspace_id=growth.id, kind=kind, source=kind, state="open",
+                             subject_type=subject_type, subject_id=generate_ulid(), fingerprint=generate_ulid(),
+                             urgency="act_today", stage=1, title=title, evidence={"workflow_run_id": "run-1"},
+                             opened_at=at, last_changed_at=at)
+
+    db_session.add_all([_item("needs_input", "human_commitment", "Input needed: an old question", 900),
+                        _item("needs_input", "workflow_run", "Approval needed: client_article", 9),
+                        _item("decision_pending", "proposal_review", "Decide on the proposal", 2)])
+    await db_session.commit()
+
+    async def approvers(_db, **_kwargs):
+        return [user.id]
+
+    monkeypatch.setattr(notification_workspace_callbacks, "resolve_workspace_hitl_recipients", approvers)
+    digest = await build_user_digest(db_session, user, since=SINCE, now=NOW)
+    assert [item.text for item in digest.waiting] == ["Approval needed: client_article", "Decide on the proposal"]
+    assert digest.waiting[0].link and digest.waiting_more == 0
+
+    async def nobody(_db, **_kwargs):
+        return [generate_ulid()]
+
+    monkeypatch.setattr(notification_workspace_callbacks, "resolve_workspace_hitl_recipients", nobody)
+    assert (await build_user_digest(db_session, user, since=SINCE, now=NOW)).waiting == []
+
+    # What a run or proposal is held on comes before an old open question, however old that is.
+    from types import SimpleNamespace
+
+    from packages.core.attention import delivery as attention_delivery
+
+    async def told(_db, _item, **_kwargs):
+        return SimpleNamespace(recipients=[user.id], link="/chat")
+
+    monkeypatch.setattr(attention_delivery, "prepare_told", told)
+    assert [item.text for item in (await build_user_digest(db_session, user, since=SINCE, now=NOW)).waiting] == [
+        "Approval needed: client_article", "Decide on the proposal", "Input needed: an old question"]
+
+
+def test_a_card_never_reads_as_its_code():
+    """Staging 2026-11-03: "Waiting on you: approval.mode"."""
+    card = HitlRequest(id="a", entity_id="e", workspace_id="w", action_key="task.request_input", origin_kind="task",
+                       status="pending", dedup_key="k", hitl_type="approval", reason="approval.mode", payload={})
+    assert "approval.mode" not in hitl_reminders.summary(card)
+    card.payload = {"question": "approval.mode"}
+    assert "approval.mode" not in hitl_reminders.summary(card)
+    card.payload = {"question": "Which date works?"}
+    assert hitl_reminders.summary(card) == "Which date works?"
+
+
 def _card(workspace: Workspace, question: str, *, at: datetime, task: Task | None = None) -> HitlRequest:
     return HitlRequest(id=generate_ulid(), entity_id=workspace.entity_id, workspace_id=workspace.id,
                        action_key="task.request_input", origin_kind="task", status="pending",

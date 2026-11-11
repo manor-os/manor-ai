@@ -52,15 +52,18 @@ def _with_variants(view: dict[str, Any], flow: str, field: str, variants: tuple[
 
 
 def _agent_studio(eyebrow: str, title: str, description: str, service: str, agent: str, label: str, line: str,
-                  prompt: str, kinds: tuple[tuple[str, str, str, str], ...]) -> dict[str, Any]:
+                  prompt: str, kinds: tuple[tuple[str, str, str, str], ...],
+                  form: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """A studio run by one Agent: its service is the main function, each kind an entry to that Agent.
 
     ``kinds`` are (id, title, description, request): every entry asks only what
-    the work is about; the Agent assumes sensible defaults for the rest.
+    the work is about; the Agent assumes sensible defaults for the rest. ``form``
+    is what the page asks before it opens the Agent; by default a topic and a
+    source file.
     """
     hero = f"service:{service}"
     keys = [f"action:{kind_id}" for kind_id, *_ in kinds]
-    form = [
+    form = form or [
         {"key": "topic", "label": "What is it about?", "type": "long_text", "required": True,
          "placeholder": "Subject, audience, language and style. Anything you leave out gets a sensible default."},
         {"key": "source", "label": "Source file (optional)", "type": "file", "required": False},
@@ -155,6 +158,89 @@ def project_tree_view(flow: str, *, parent: tuple[str, str], child: tuple[str, s
                 *({"key": f"{kind}_references", "type": "references", "source": f"{kind}_references", "title": label}
                   for kind, label in references),
             ],
+        }],
+    }
+
+
+def content_calendar_view(*, key: str, title: str, period_label: str, collection_title: str,
+                          period: tuple[str, dict[str, Any]], slots: tuple[str, dict[str, Any]],
+                          stage_labels: dict[str, str], attention_stages: list[str],
+                          rollup: dict[str, Any], calendar: dict[str, Any], summary: dict[str, Any],
+                          group_titles: dict[str, str], documents: tuple[dict[str, Any], ...] = (),
+                          issues: dict[str, Any] | None = None, upcoming: dict[str, Any] | None = None,
+                          published: dict[str, Any] | None = None, automations: dict[str, Any] | None = None,
+                          sources: dict[str, dict[str, Any]] | None = None,
+                          description: str | None = None) -> dict[str, Any]:
+    """One App section for a plan of dated content: a campaign, a week.
+
+    Pick a period (a project) to see its progress and plan documents in its
+    header, every planned item on a calendar on its date (a time, or a whole
+    day), what was published with its results, and the period's details.
+    Groups, in order: ``overview`` (the rollup, the ``documents`` placed there
+    and the ``issues`` list of items at an attention stage), ``timeline`` (the
+    ``upcoming`` list and the calendar), ``results`` (``published``) and
+    ``reference`` (the period ``summary`` the header reads, the documents
+    placed there and the period's ``automations``). A group with no block is
+    left out.
+
+    ``period`` and ``slots`` are (source name, source): the period's
+    projects and the dated items inside them, ordered by the calendar's date
+    field. ``issues`` and ``upcoming`` list the same items at some stages (an
+    issue at the attention stages), each with its own source fields.
+    ``calendar`` may carry an ``item_action`` (script this slot, remake this
+    one). ``sources`` adds what documents, published records and automations
+    read. The music release campaign and the Instagram weekly plan are both
+    this layout.
+    """
+    period_name, period_source = period
+    slots_name, slots_source = slots
+    date_field = slots_source["order"]["field"]
+    data_sources: dict[str, Any] = {period_name: period_source, slots_name: slots_source, **(sources or {})}
+
+    def listing(spec: dict[str, Any], stages: list[str]) -> dict[str, Any]:
+        # The same items as the calendar, at some stages only.
+        data_sources[spec["source"]] = {**slots_source, "fields": spec["source_fields"], "stages": list(stages)}
+        return {"key": spec["key"], "type": "progress", "source": spec["source"], "title": spec["title"],
+                "fields": spec["fields"], "limit": spec.get("limit", 5), "stage_labels": stage_labels}
+
+    def document(spec: dict[str, Any]) -> dict[str, Any]:
+        return {"key": spec["key"], "type": "documents", "source": spec["source"], "title": spec["title"],
+                "limit": spec.get("limit", 1), **({"empty_message": spec["empty_message"]} if spec.get("empty_message") else {})}
+
+    rollup_block = {"key": rollup["key"], "type": "project_rollup", "source": slots_name, "title": rollup["title"],
+                    "count_by_stage": True, "completion": {"label": rollup["done_label"], "stages": rollup["done_stages"]},
+                    "first": {"stages": rollup["working_stages"]}, "stage_labels": rollup.get("stage_labels") or stage_labels,
+                    **({"empty_message": rollup["empty_message"]} if rollup.get("empty_message") else {})}
+    calendar_block = {"key": calendar["key"], "type": "progress", "source": slots_name, "title": calendar["title"],
+                      "fields": calendar["fields"], "limit": calendar.get("limit", 100), "stage_labels": stage_labels,
+                      **({"item_action": calendar["item_action"]} if calendar.get("item_action") else {})}
+    summary_block = {"key": summary["key"], "type": "summary", "source": period_name, "title": summary["title"],
+                     "fields": summary["fields"], "limit": 1}
+    groups = {
+        "overview": [rollup_block, *(document(spec) for spec in documents if spec.get("group", "overview") == "overview"),
+                     *([listing(issues, attention_stages)] if issues else [])],
+        "timeline": [*([listing(upcoming, upcoming["stages"])] if upcoming else []), calendar_block],
+        "results": [published] if published else [],
+        "reference": [summary_block, *(document(spec) for spec in documents if spec.get("group") == "reference"),
+                      *([{"key": automations["key"], "type": "progress", "source": automations["source"],
+                          "title": automations["title"]}] if automations else [])],
+    }
+    return {
+        "data_sources": data_sources,
+        "components": [{
+            "type": "data_view", "schema_version": 1, "key": key, "title": title, "description": description,
+            "context": {"kind": "project", "source": period_name, "label": period_label},
+            "blocks": [block for blocks in groups.values() for block in blocks],
+            "display": {
+                "layout": "stack", "hidden": False,
+                "groups": [{"key": name, "title": group_titles[name], "blocks": [block["key"] for block in blocks]}
+                           for name, blocks in groups.items() if blocks],
+                # The calendar draws the items; an automation list is for settings only.
+                "hidden_blocks": [*([automations["key"]] if automations else []), calendar["key"]],
+                "calendar": {"block": calendar["key"], "date_field": list(date_field), "rollup_block": rollup["key"],
+                             "context_block": summary["key"], "attention_stages": list(attention_stages),
+                             "collection_title": collection_title},
+            },
         }],
     }
 
@@ -271,8 +357,56 @@ _PODCAST_TYPES: tuple[tuple[str, str, str, str], ...] = (
      "works, how to try it today."),
 )
 
+# GIF styles the page offers as pictures: (key, label, picture on the page, how the Agent renders it).
+GIF_STYLES: tuple[tuple[str, str, str, str], ...] = (
+    ("illustration", "Illustration", "/blueprints/styles/gif/illustration.webp",
+     "clean outlined illustration with flat colour and soft shading"),
+    ("pixel-art", "Pixel art", "/blueprints/styles/gif/pixel-art.webp",
+     "16-bit pixel art: chunky square pixels, a limited palette, no anti-aliasing"),
+    ("clay", "Clay", "/blueprints/styles/gif/clay.webp",
+     "soft 3D claymation: matte surfaces, gentle highlights, fingerprint-like texture"),
+    ("minimal", "Minimal", "/blueprints/styles/gif/minimal.webp",
+     "flat shapes in a few colours, no outlines or texture"),
+    ("watercolor", "Watercolor", "/blueprints/styles/gif/watercolor.webp",
+     "soft watercolour washes on paper, with loose edges and visible grain"),
+    ("anime", "Anime", "/blueprints/styles/gif/anime.webp",
+     "anime cel style: bold dark outlines, two-tone cel shading and large expressive eyes"),
+    ("sticker", "Sticker", "/blueprints/styles/gif/sticker.webp",
+     "die-cut sticker: bold flat shapes with a thick white border and a soft drop shadow"),
+    ("halftone", "Halftone", "/blueprints/styles/gif/halftone.webp",
+     "vintage print: flat colours with halftone dot shading, like a retro poster"),
+    ("papercut", "Paper cut", "/blueprints/styles/gif/papercut.webp",
+     "layered paper-cut collage with soft shadows between the paper edges"),
+)
+
+# GIF kinds the GIF Animation Director starts from; each names one subject and one loop.
+_GIF_KINDS: tuple[tuple[str, str, str, str], ...] = (
+    ("gif-reaction", "Character reaction", "A wave, a nod or a little celebration.",
+     "A cheerful small cat waves one paw, then returns to its starting pose. A clean repeating loop."),
+    ("gif-brand", "Brand moment", "A small animated scene in your colors.",
+     "A coffee cup releases a gentle curl of steam that loops smoothly against a quiet background."),
+    ("gif-scene", "Looping scene", "A calm moment that keeps moving.",
+     "A glowing paper lantern sways gently in a quiet night scene, returning to its starting position."),
+)
 
 BUILTIN_APP_VIEWS: dict[str, dict[str, Any]] = {
+    # The GIF Studio is run by its Agent, which generates the GIF itself in the
+    # conversation; each kind is a starting point that opens that Agent.
+    "creative-gif-v1": _agent_studio(
+        "GIF Studio", "Make a little motion",
+        "Animated GIFs from a description; every version is kept.",
+        "creative.gif", "creative-gif-v1-director", "Make a GIF",
+        "One subject and one small movement that loops.",
+        "Make an animated GIF.", _GIF_KINDS,
+        form=[{"key": "brief", "label": "What should move?", "type": "long_text", "required": True,
+               "placeholder": "Subject, one small movement, and any colour notes. "
+                              "Anything you leave out gets a sensible default."},
+              {"key": "style", "label": "Style", "type": "picture_choice", "required": False,
+               "options": [key for key, *_ in GIF_STYLES],
+               "option_labels": [label for _, label, *_ in GIF_STYLES],
+               "option_images": [picture for _, _, picture, _ in GIF_STYLES]},
+              {"key": "character", "label": "Character picture (optional)", "type": "file", "required": False},
+              {"key": "style_reference", "label": "Your own style picture (optional)", "type": "file", "required": False}]),
     "creative-presentation-v1": _with_variants(_studio(
         "Presentation studio", "Make a presentation",
         "An editable deck in your style, with PDF and speaker notes.",
@@ -368,11 +502,16 @@ RETAINED_APP_VIEWS: dict[str, dict[str, Any]] = {
 # what its entry names happen to suggest. Series entries read the same everywhere.
 _SERIES_ICONS = {"action:series-new": "sparkles", "action:series-next": "refresh",
                  "action:series-remake": "refresh", "action:series-make": "play"}
+_GIF_ICONS = {
+    "service:creative.gif": "sparkles", "action:gif-reaction": "heart", "action:gif-brand": "star",
+    "action:gif-scene": "refresh",
+}
 _CAROUSEL_ICONS = {
     "action:carousel-howto": "checklist", "action:carousel-tips": "bolt", "action:carousel-myths": "scale",
     "action:carousel-product": "box", "action:carousel-event": "calendar", "action:carousel-takeaways": "document",
 }
 _APP_ICONS: dict[str, dict[str, str]] = {
+    "creative-gif-v1": _GIF_ICONS,
     "creative-presentation-v1": {
         "workflow:produce-presentation-v1": "presentation", "action:deck-product": "box", "action:deck-pitch": "rocket",
         "action:deck-report": "report", "action:deck-training": "academic", "action:deck-event": "calendar",
@@ -414,6 +553,7 @@ def _outputs(*shelves: tuple[str, str, str | None, str]) -> list[dict[str, Any]]
 # What each page keeps its made work under, so decks, episodes and articles do
 # not mix in one recent-files strip.
 _APP_OUTPUTS: dict[str, list[dict[str, Any]]] = {
+    "creative-gif-v1": _outputs(("animations", "Your GIFs", None, "gallery")),
     "creative-presentation-v1": _outputs(("decks", "Decks", "produce-presentation-v1", "gallery")),
     "creative-carousel-agent-v1": _outputs(("carousels", "Carousels", None, "gallery")),
     "creative-carousel-v1": _outputs(("carousels", "Carousels", "produce-carousel-v1", "gallery")),

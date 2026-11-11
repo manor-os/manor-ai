@@ -686,12 +686,13 @@ def test_unknown_legacy_prose_stays_suppressible():
 
 # ── 6/7. SUPERSEDED vocabulary placement ─────────────────────────────
 
-def test_superseded_is_a_valid_but_system_only_reason_code():
-    assert "SUPERSEDED" in REASON_CODES
-    # Never offered on the operator's reject dialog — it is system-generated,
-    # not a human's stated reason.
-    assert "SUPERSEDED" not in USER_REASON_CODES
-    assert LEARNING_EXCLUDED_REASON_CODES == frozenset({"SUPERSEDED"})
+def test_superseded_and_expired_are_valid_but_system_only_reason_codes():
+    # Never offered on the operator's reject dialog — they are system
+    # outcomes, not a human's stated reason, and no verdict on the proposal.
+    for code in ("SUPERSEDED", "EXPIRED"):
+        assert code in REASON_CODES
+        assert code not in USER_REASON_CODES
+    assert LEARNING_EXCLUDED_REASON_CODES == frozenset({"SUPERSEDED", "EXPIRED"})
 
 
 async def test_superseded_is_excluded_from_the_learning_rejection_distribution(
@@ -741,3 +742,94 @@ async def test_superseded_is_excluded_from_the_learning_rejection_distribution(
     # …a superseded cohort is not: it says nothing about the proposal.
     assert not any("Superseded" in key for key in distribution)
     assert "2 rejection(s)" in report.summary
+
+
+
+# ── 5. an undecided cohort stops blocking autonomous reviews ─────────
+
+async def _age(db, task: Task, hours: int) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    task.created_at = datetime.now(timezone.utc) - timedelta(hours=hours)
+    await db.commit()
+
+
+async def test_stale_cohort_is_replaced_once_and_not_counted_as_rejected(db_session, monkeypatch):
+    workspace = await _seed_workspace(db_session)
+    await _emit(db_session, workspace)
+    await _set_flag(db_session, True)
+    llm_calls: list[int] = []
+    _install_llm(monkeypatch, llm_calls)
+    _quiet_side_effects(monkeypatch)
+    stale = await _seed_open_proposal(db_session, workspace, review_id="rv_stale")
+    await _age(db_session, stale, 80)
+
+    result = await _execute_strategist_review_cycle(
+        db_session, workspace.id, ReviewTriggerKind.SCHEDULED,
+    )
+
+    assert result["task_count"] == 1 and llm_calls == [1]
+    await db_session.refresh(stale)
+    assert stale.status == "cancelled"
+    assert stale.details["rejection_reason_code"] == "SUPERSEDED"
+
+    # The replacement is a fresh cohort: the next tick waits for a decision.
+    again = await _execute_strategist_review_cycle(
+        db_session, workspace.id, ReviewTriggerKind.SCHEDULED,
+    )
+    assert again["skipped"] is True and again["reason"] == "open_proposals"
+    assert llm_calls == [1]
+
+
+async def test_stale_cohort_kept_when_review_has_nothing_new_and_not_rereviewed(
+    db_session, monkeypatch,
+):
+    workspace = await _seed_workspace(db_session)
+    await _emit(db_session, workspace)
+    await _set_flag(db_session, True)
+    llm_calls: list[int] = []
+
+    async def empty(system_prompt, user_prompt, **kwargs):
+        llm_calls.append(1)
+        return SimpleNamespace(content=json.dumps(proposal_with_execution_review(
+            {"summary": "Nothing new beyond the open proposal.", "tasks": []}, user_prompt,
+        )))
+
+    monkeypatch.setattr("packages.core.strategist.prompt.runtime_execute_strategist_completion", empty)
+    _quiet_side_effects(monkeypatch)
+    stale = await _seed_open_proposal(db_session, workspace, review_id="rv_stale")
+    await _age(db_session, stale, 80)
+
+    first = await _execute_strategist_review_cycle(
+        db_session, workspace.id, ReviewTriggerKind.SCHEDULED,
+    )
+    assert first["skipped"] is True and first["stale_cohort_kept"] is True
+    await db_session.refresh(stale)
+    assert stale.status == "proposed"
+
+    # One model call per window, however often the schedule ticks.
+    second = await _execute_strategist_review_cycle(
+        db_session, workspace.id, ReviewTriggerKind.SCHEDULED,
+    )
+    assert second["skipped"] is True and second["reason"] == "open_proposals"
+    assert llm_calls == [1]
+
+
+async def test_unanswered_cohort_expires_and_the_review_runs(db_session, monkeypatch):
+    workspace = await _seed_workspace(db_session)
+    await _emit(db_session, workspace)
+    await _set_flag(db_session, True)
+    llm_calls: list[int] = []
+    _install_llm(monkeypatch, llm_calls)
+    _quiet_side_effects(monkeypatch)
+    expired = await _seed_open_proposal(db_session, workspace, review_id="rv_old")
+    await _age(db_session, expired, 130)
+
+    result = await _execute_strategist_review_cycle(
+        db_session, workspace.id, ReviewTriggerKind.SCHEDULED,
+    )
+
+    assert result["task_count"] == 1 and llm_calls == [1]
+    await db_session.refresh(expired)
+    assert expired.status == "cancelled"
+    assert expired.details["rejection_reason_code"] == "EXPIRED"

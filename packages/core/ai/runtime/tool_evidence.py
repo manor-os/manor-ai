@@ -73,12 +73,29 @@ def _classifier_facts(classification: Any) -> dict[str, str]:
         "action_key": str(action.action_key or ""),
         "resource_kind": str(action.resource_kind or ""),
         "action_operation": str(action.operation or ""),
+        "action_category": _policy_category(action),
     }
     return {key: value for key, value in facts.items() if value}
 
 
+def _policy_category(action: Any) -> str:
+    """The approval category of an action: its own, else its declared effect's.
+
+    The category, not the action verb, says whether a call reached outside
+    the Workspace (communication, publishing): a status check is an action
+    too, but in no outward category.
+    """
+    from packages.core.governance.action_effects import declared_action_effect
+
+    category = str(getattr(action, "category", None) or "")
+    if not category or category == "unknown":
+        declared = declared_action_effect(getattr(action, "action_key", None))
+        category = str(declared.category) if declared is not None else ""
+    return "" if category == "unknown" else category
+
+
 # Bookkeeping for the effects ledger, never part of model-visible evidence.
-_CLASSIFIER_FACT_KEYS = frozenset({"effect", "action_key", "resource_kind", "action_operation"})
+_CLASSIFIER_FACT_KEYS = frozenset({"effect", "action_key", "resource_kind", "action_operation", "action_category"})
 
 
 def _is_file_receipt(receipt: dict) -> bool:
@@ -116,6 +133,7 @@ def _listed_effect(observation: dict, receipts: list[dict]) -> dict | None:
         "action_key": observation["action_key"],
         "resource_kind": observation.get("resource_kind"),
         "operation": operation,
+        "category": observation.get("action_category"),
         "targets": targets,
     }
 
@@ -309,6 +327,44 @@ def runtime_publish_child_evidence(observations: Iterable[dict] | None) -> bool:
         return False
     sink.extend(copy.deepcopy(item) for item in observations or () if isinstance(item, dict))
     return True
+
+
+# A tool whose only effects are its child loops' (delegation) settles its call
+# with this marker once every child it started has handed over its whole
+# ledger, or an effect-floor marker where that ledger is unknown.
+_CHILD_SETTLED_MARKER = {"call_id": "~children_settled", "tool": "ledger", "operation": "children_settled"}
+
+
+def runtime_publish_children_settled() -> bool:
+    """Declare the calling tool call settled by its children's ledgers.
+
+    The call then has no effect of its own: what its children changed, or may
+    have changed, is in their merged ledgers. Its reply (a child's status such
+    as ``partial`` or ``blocked``, a refusal before any child ran) is never
+    read as an effect. Only the tool that ran the children may call this,
+    after accounting for each of them.
+    """
+    return runtime_publish_child_evidence([dict(_CHILD_SETTLED_MARKER)])
+
+
+def runtime_publish_child_floor(run_id: str) -> bool:
+    """Account for a child whose ledger is unknown: its effects stay unconfirmed."""
+    return runtime_publish_child_evidence([{
+        **_EFFECT_FLOOR_MARKER,
+        "call_id": f"{run_id}/{_EFFECT_FLOOR_MARKER['call_id']}",
+        "effect_state": EffectState.UNCONFIRMED.value,
+    }])
+
+
+def runtime_split_children_settled(items: Iterable[dict] | None) -> tuple[list[dict], bool]:
+    """The published child items without the settled marker, and whether it was published."""
+    children, settled = [], False
+    for item in items or ():
+        if isinstance(item, dict) and _is_ledger_marker(item, _CHILD_SETTLED_MARKER):
+            settled = True
+        else:
+            children.append(item)
+    return children, settled
 
 
 def runtime_child_evidence_from_state(state: Any) -> list[dict]:
@@ -683,6 +739,7 @@ class RuntimeToolEvidence:
                     ("action_key", key),
                     ("resource_kind", effect.get("resource_kind")),
                     ("operation", effect.get("operation")),
+                    ("category", effect.get("category")),
                 ) if v
             }
             group["count"] = 0
@@ -714,7 +771,7 @@ class RuntimeToolEvidence:
             self._record_effect({
                 "call_id": f"{prefix}/{child_call_id}", "action_key": key,
                 "resource_kind": group.get("resource_kind"), "operation": group.get("operation"),
-                "targets": group.get("targets") or [],
+                "category": group.get("category"), "targets": group.get("targets") or [],
             })
         child_omitted = marker.get("effects_omitted")
         total = sum(int(g.get("count") or 0) for g in groups.values()) + (
@@ -739,7 +796,10 @@ class RuntimeToolEvidence:
             + [o.get("effect_state") for o in self.observations.values()]
         ).value
 
-    def observe_tool_result(self, tool_name: str, call_id: str, result: Any, arguments: dict | None = None) -> None:
+    def observe_tool_result(
+        self, tool_name: str, call_id: str, result: Any, arguments: dict | None = None,
+        *, settled_by_children: bool = False,
+    ) -> None:
         if not call_id:
             return
         from packages.core.ai.runtime.capabilities import capabilities_for_tool_names
@@ -816,6 +876,11 @@ class RuntimeToolEvidence:
         # One classification serves the effect state and the facts below.
         classification = _classify(tool_name, arguments)
         effect_state = runtime_tool_effect_state(tool_name, arguments, result, classification=classification)
+        if settled_by_children:
+            # Host proof from the child channel: every child this call ran is
+            # accounted in the ledgers merged right after this observation.
+            effect_state = EffectState.NONE
+            observation["effect_source"] = _CHILD_LEDGER_SOURCE
         observation["effect_state"] = effect_state.value
         if isinstance(result, RuntimeStructuredToolResult) and result.child_effect_state is not None:
             # Its state is its child ledger's, merged below call by call.

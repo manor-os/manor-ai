@@ -178,6 +178,13 @@ def test_pid_limit_failure_retries_once_at_reduced_concurrency(runner, monkeypat
         monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: set(range(8)))
     monkeypatch.setattr(runner, "_check", lambda **_: subprocess.CompletedProcess([], 0, "{}", ""))
     plans = []
+    from contextlib import contextmanager
+
+    @contextmanager
+    def memory_sampler():
+        yield {"memory_bytes": 9_000 if not plans else 2_000, "anon_bytes": 5_000 if not plans else 1_000}
+
+    monkeypatch.setattr(runner, "_memory_peak_sampler", memory_sampler)
 
     def run(args, *, timeout):
         if args[0] == "ffprobe":
@@ -194,6 +201,7 @@ def test_pid_limit_failure_retries_once_at_reduced_concurrency(runner, monkeypat
     result = json.loads(capsys.readouterr().out)
 
     assert len(plans) == 2, "exactly one automatic retry"
+    assert result["resources"]["memory_peak_breakdown"] == {"memory_bytes": 9_000, "anon_bytes": 5_000}
     first, retry = plans
     assert first[1]["reduced"] is False and first[1]["slots"] > 1
     assert retry[0] == "1"
@@ -962,3 +970,25 @@ def test_a_watched_render_past_its_deadline_is_stopped(runner, monkeypatch, tmp_
 
     assert time.monotonic() - started < 20
     assert "starting" in raised.value.stdout
+
+
+def test_the_render_reports_where_its_memory_went_at_the_peak(runner):
+    """Sizing the render machine (8 vs 16 GB) needs the split at the highest
+    point -- browsers/encoder (anon) vs the tmpfs work area (shmem) -- not just
+    the before/after totals the render reported until now."""
+
+    def write(current, anon, shmem, file):
+        # The sampler reads the total, then its split: write the split first so
+        # a sample between the two writes never pairs a new total with an old split.
+        (runner.CGROUP / "memory.stat").write_text(f"anon {anon}\nshmem {shmem}\nfile {file}\n")
+        (runner.CGROUP / "memory.current").write_text(str(current))
+
+    write(1_000, 600, 300, 400)
+    with runner._memory_peak_sampler(interval=0.02) as peak:
+        time.sleep(0.1)
+        write(9_000, 5_000, 3_000, 3_500)  # the peak
+        time.sleep(0.1)
+        write(2_000, 1_000, 500, 900)
+        time.sleep(0.1)
+
+    assert peak == {"memory_bytes": 9_000, "anon_bytes": 5_000, "shmem_bytes": 3_000, "file_bytes": 3_500}

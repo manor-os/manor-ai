@@ -70,10 +70,12 @@ from packages.core.models.review_run import ReviewRun
 from packages.core.models.workflow import (
     WorkflowBinding,
     WorkflowDefinition,
+    WorkflowProject,
     WorkflowRun,
 )
 from packages.core.models.workspace import Workspace
 from packages.core.models.workspace_event import WorkspaceEvent
+from packages.core.services.workflow_contracts import workflow_step_label
 from packages.core.services.workflow_run_trace import (
     summarize_trace_text,
     summarize_trace_value,
@@ -167,6 +169,10 @@ class WorkflowRunDigest(BaseModel):
     result_summary: Any = None
     blocker: Any = None
     error: Optional[str] = None
+    # The project an open run is working on, and the folder its files live in.
+    project_id: Optional[str] = None
+    project_type: Optional[str] = None
+    project_folder: Optional[str] = None
 
 
 class ReviewBriefingModel(BaseModel):
@@ -437,7 +443,7 @@ def _workflow_step_name(run: WorkflowRun, workflow: WorkflowDefinition) -> Optio
         nodes = workflow.steps if isinstance(workflow.steps, list) else []
     for node in nodes:
         if isinstance(node, dict) and str(node.get("id") or "") == run.current_step_id:
-            return str(node.get("name") or run.current_step_id)
+            return workflow_step_label(node) or run.current_step_id
     return run.current_step_id
 
 
@@ -447,6 +453,7 @@ def _workflow_run_digest(
     binding: WorkflowBinding | None,
     *,
     blueprint_slug: Optional[str],
+    project: WorkflowProject | None = None,
 ) -> WorkflowRunDigest:
     trigger_data = run.trigger_data if isinstance(run.trigger_data, dict) else {}
     history = (
@@ -483,6 +490,9 @@ def _workflow_run_digest(
         result_summary=_bounded_workflow_value(_workflow_result(run)),
         blocker=_bounded_workflow_value(blocker),
         error=_bounded_workflow_text(run.error),
+        project_id=project.id if project is not None else None,
+        project_type=project.project_type if project is not None else None,
+        project_folder=(str((project.state or {}).get("project_root") or "") or None) if project is not None else None,
     )
 
 
@@ -559,6 +569,17 @@ async def _workflow_runs(
         target.append(row)
     selected = (active + terminal)[:MAX_WORKFLOW_RUNS]
 
+    # An open run owns the project it last wrote, and that project's files:
+    # naming them keeps the review from proposing the same work beside the run.
+    open_ids = [run.id for run, _, _ in active]
+    projects = {
+        project.last_run_id: project
+        for project in (await db.execute(select(WorkflowProject).where(
+            WorkflowProject.entity_id == review.entity_id,
+            WorkflowProject.workspace_id == review.workspace_id,
+            WorkflowProject.last_run_id.in_(open_ids),
+        ))).scalars()
+    } if open_ids else {}
     blueprint_slug = workspace_blueprint_slug(workspace) or None
     return [
         _workflow_run_digest(
@@ -566,6 +587,7 @@ async def _workflow_runs(
             workflow,
             binding,
             blueprint_slug=blueprint_slug,
+            project=projects.get(run.id),
         )
         for run, workflow, binding in selected
     ]

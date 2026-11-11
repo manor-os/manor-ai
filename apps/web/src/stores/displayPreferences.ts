@@ -3,7 +3,6 @@ import { create } from "zustand";
 export type InterfaceMode = "simple" | "professional";
 
 const INTERFACE_MODE_STORAGE_KEY = "manor-interface-mode";
-const INTERFACE_MODE_RELEASE_AT = Date.parse("2026-09-18T08:11:13Z");
 
 interface DisplayPreferences {
   interfaceMode: InterfaceMode;
@@ -21,9 +20,11 @@ function storedDisplayPreferences(): Pick<DisplayPreferences, "interfaceMode" | 
       return { interfaceMode: savedMode, hasSelectedInterfaceMode: true };
     }
   } catch {
-    // A default is not an explicit selection when storage cannot be read.
+    // Storage may be unavailable; the default below still applies.
   }
-  return { interfaceMode: "simple", hasSelectedInterfaceMode: false };
+  // Nobody is asked to pick a mode on their first visit: everyone starts with
+  // the full interface, and Settings › Appearance can switch to simple.
+  return { interfaceMode: "professional", hasSelectedInterfaceMode: true };
 }
 
 // Like the theme preference, interface density belongs to this browser.
@@ -33,17 +34,11 @@ export const useDisplayPreferences = create<DisplayPreferences>((set) => {
 
   return {
     ...initial,
-    initializeForUser: (createdAt) => {
+    initializeForUser: () => {
       if (hasExplicitChoice) return;
-      const createdAtMs = typeof createdAt === "string" ? Date.parse(createdAt) : NaN;
-      // Older API responses may omit the date. Preserve their existing UI too.
-      const existingUser = !Number.isFinite(createdAtMs) || createdAtMs < INTERFACE_MODE_RELEASE_AT;
-      // This is an account default, not a browser choice: recompute it when a
-      // different account signs in, without persisting it for that next account.
-      set({
-        interfaceMode: existingUser ? "professional" : "simple",
-        hasSelectedInterfaceMode: existingUser,
-      });
+      // An account default, not a browser choice: reset it when a different
+      // account signs in, without persisting it for that next account.
+      set({ interfaceMode: "professional", hasSelectedInterfaceMode: true });
     },
     setInterfaceMode: (interfaceMode) => {
       hasExplicitChoice = true;

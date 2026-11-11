@@ -32,9 +32,9 @@ export default function FilterPills({ options, value, onChange, className }: Fil
             style={{
               padding: "4px 12px", borderRadius: 999, fontSize: 12, fontWeight: 600,
               border: "1px solid",
-              borderColor: active ? "#1c1917" : "rgba(231,229,228,0.6)",
-              background: active ? "#1c1917" : "rgba(255,255,255,0.75)",
-              color: active ? "#fff" : "#57534e",
+              borderColor: "transparent",
+              background: active ? "rgba(118, 118, 128, 0.14)" : "transparent",
+              color: active ? "var(--text-strong)" : "var(--text-muted)",
               cursor: "pointer", transition: "all 0.15s",
               display: "flex", alignItems: "center", gap: 6,
               minHeight: 32,
@@ -44,8 +44,8 @@ export default function FilterPills({ options, value, onChange, className }: Fil
             {o.count != null && (
               <span style={{
                 fontSize: 10, fontWeight: 700,
-                background: active ? "rgba(255,255,255,0.25)" : "#f5f5f4",
-                color: active ? "#fff" : "#78716c",
+                background: "transparent",
+                color: "var(--text-muted)",
                 padding: "1px 6px", borderRadius: 10,
               }}>{o.count}</span>
             )}

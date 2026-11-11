@@ -699,6 +699,42 @@ async def _get_post_comments(token: str, args: Dict) -> str:
     return await _api(token, "GET", f"socialActions/{post_urn}/comments?start=0&count={count}")
 
 
+async def _list_recent_post_comments(token: str, args: Dict) -> str:
+    """One call for what is new: comments on the latest posts of the person and the pages they run.
+
+    An author LinkedIn refuses to list is left out, since a person's own posts
+    and a company page need different permissions. It fails only when none can be read.
+    """
+    post_count = max(1, min(10, int(args.get("post_count") or 5)))
+    count = max(1, min(50, int(args.get("count") or 20)))
+    person = json.loads(await _get_profile(token, {})).get("sub")
+    authors = [f"urn:li:person:{person}"] if person else []
+    refused: List[str] = []
+    try:
+        organizations = json.loads(await _list_organizations(token, {})).get("elements") or []
+        authors.extend(row["organization"] for row in organizations if row.get("organization"))
+    except RuntimeError as exc:
+        refused.append(str(exc))
+    comments: List[Dict[str, Any]] = []
+    read = 0
+    for author in authors:
+        try:
+            posts = json.loads(await _get_my_posts(token, {"author_urn": author, "count": post_count})).get("elements") or []
+        except RuntimeError as exc:
+            refused.append(str(exc))
+            continue
+        read += 1
+        for post in posts:
+            found = json.loads(await _get_post_comments(token, {"post_urn": post["id"], "count": count}))
+            comments.extend({"id": row.get("$URN") or row.get("id"), "text": (row.get("message") or {}).get("text"),
+                             "actor": row.get("actor"), "created": (row.get("created") or {}).get("time"),
+                             "post_urn": post["id"], "author_urn": author}
+                            for row in found.get("elements") or [])
+    if not read:
+        raise RuntimeError(refused[0] if refused else "No LinkedIn author could be read.")
+    return json.dumps({"count": len(comments), "comments": comments})
+
+
 async def _get_post_reactions(token: str, args: Dict) -> str:
     """Get reactions on a post."""
     post_urn = quote(args["post_urn"], safe="")
@@ -874,6 +910,14 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         },
         "required": ["actor_urn", "post_urn"],
     },
+    "list_recent_post_comments": {
+        "description": "List the comments on the latest posts of the person and the company pages they run",
+        "properties": {
+            "post_count": _prop("Latest posts per author, 1-10, default 5", "integer"),
+            "count": _prop("Comments per post, 1-50, default 20", "integer"),
+        },
+        "required": [],
+    },
     "get_post_comments": {
         "description": "Get comments on a LinkedIn post",
         "properties": {
@@ -902,6 +946,7 @@ _HANDLERS = {
     "react_to_post": _react_to_post,
     "remove_reaction": _remove_reaction,
     "get_post_comments": _get_post_comments,
+    "list_recent_post_comments": _list_recent_post_comments,
     "get_post_reactions": _get_post_reactions,
     # Media uploads (PR1)
     "upload_image": _upload_image,

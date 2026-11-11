@@ -259,6 +259,10 @@ async def _resolve_message_attachment_refs(
     )
     if raw_attachments:
         for raw in raw_attachments:
+            if str(raw.get("type") or "").strip().casefold() == "site":
+                # A published website card, not a file: the reply and its
+                # tool activity already carry the address.
+                continue
             ref = dict(raw)
             document_id = _attachment_document_id(ref)
             if document_id:

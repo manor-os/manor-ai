@@ -165,7 +165,7 @@ def test_ordinary_governance_write_cannot_bypass_shared_policy_cas(field):
 async def test_mixed_approval_notification_requests_review_without_hiding_started_tasks(monkeypatch):
     import packages.core.database as database
     import packages.core.permissions as permissions
-    from packages.core.services import notification_service, workspace_access
+    from packages.core.services import notify as notify_module, workspace_access
 
     db = SimpleNamespace(
         execute=AsyncMock(return_value=_Rows([SimpleNamespace(id="user", role="owner")])),
@@ -177,7 +177,7 @@ async def test_mixed_approval_notification_requests_review_without_hiding_starte
     monkeypatch.setattr(permissions, "resolve_effective_user_role_name", AsyncMock(return_value="owner"))
     monkeypatch.setattr(workspace_access, "user_can_read_workspace_by_identity", AsyncMock(return_value=True))
     create = AsyncMock()
-    monkeypatch.setattr(notification_service, "create_notification", create)
+    monkeypatch.setattr(notify_module, "notify", create)
     await service._notify_proposal_users(
         SimpleNamespace(id="workspace", entity_id="entity", name="Workspace"),
         Proposal(review_id="review", summary="Draft and configure", tasks=[]),
@@ -185,7 +185,9 @@ async def test_mixed_approval_notification_requests_review_without_hiding_starte
         auto_approved_action_key=TASK_ACTION_KEY,
     )
     create.assert_awaited_once()
-    payload = create.await_args.kwargs
+    # Routed as the catalogued "proposal" kind, so the person's setting applies.
+    assert create.await_args.args[2] == "proposal"
+    payload = {"title": create.await_args.args[3], **create.await_args.kwargs}
     assert payload["title"].startswith("Proposal needs review:")
     assert "1 task already approved and started" in payload["body"]
     assert "1 other item still requires approval" in payload["body"]

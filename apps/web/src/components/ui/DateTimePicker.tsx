@@ -290,7 +290,7 @@ export default function DateTimePicker({
               {/* Day headers */}
               <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 2, marginBottom: 4 }}>
                 {DAYS.map((d) => (
-                  <div key={d} style={{ textAlign: "center", fontSize: 10, fontWeight: 700, color: "var(--text-faint)", padding: "4px 0", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                  <div key={d} style={{ textAlign: "center", fontSize: 10, fontWeight: 700, color: "var(--text-faint)", padding: "4px 0", }}>
                     {d}
                   </div>
                 ))}
@@ -383,7 +383,7 @@ function TimePanel({ hour, minute, onChange, onDone }: {
       <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
         {/* Hours */}
         <div style={{ flex: 1 }}>
-          <div style={{ fontSize: 10, fontWeight: 700, color: "var(--text-faint)", textAlign: "center", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.05em" }}>{t("component.date_time_picker.hour")}</div>
+          <div style={{ fontSize: 10, fontWeight: 700, color: "var(--text-faint)", textAlign: "center", marginBottom: 4, }}>{t("component.date_time_picker.hour")}</div>
           <div ref={hourRef} style={{ maxHeight: 168, overflowY: "auto", borderRadius: 10, border: "1px solid var(--border-default)", background: "var(--surface-muted)" }}>
             {Array.from({ length: 24 }).map((_, h) => {
               const sel = h === hour;
@@ -411,7 +411,7 @@ function TimePanel({ hour, minute, onChange, onDone }: {
         </div>
         {/* Minutes */}
         <div style={{ flex: 1 }}>
-          <div style={{ fontSize: 10, fontWeight: 700, color: "var(--text-faint)", textAlign: "center", marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.05em" }}>{t("component.date_time_picker.min")}</div>
+          <div style={{ fontSize: 10, fontWeight: 700, color: "var(--text-faint)", textAlign: "center", marginBottom: 4, }}>{t("component.date_time_picker.min")}</div>
           <div ref={minuteRef} style={{ maxHeight: 168, overflowY: "auto", borderRadius: 10, border: "1px solid var(--border-default)", background: "var(--surface-muted)" }}>
             {[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55].map((m) => {
               const sel = m === minute;

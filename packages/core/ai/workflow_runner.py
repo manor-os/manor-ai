@@ -29,13 +29,15 @@ import os
 import re
 import socket
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 from urllib.parse import urljoin, urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from defusedxml import ElementTree
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -59,7 +61,9 @@ from packages.core.ai.runtime import (
     runtime_workflow_run_context,
     runtime_workflow_tool_context_args,
 )
+from packages.core.ai.runtime.requests import WORKFLOW_PROJECT_FOLDER_METADATA_KEY
 from packages.core.contracts.json_schema import SchemaContractValidatorFactory
+from packages.core.contracts.project_display import PROJECT_DISPLAY_KEY, project_display_failure
 from packages.core.constants.execution import (
     WORKFLOW_TERMINAL_EFFECT_RETRY_SECONDS,
 )
@@ -73,6 +77,8 @@ from packages.core.database_runtime import release_read_transaction
 from packages.core.i18n import t, text_locale
 from packages.core.models.base import generate_ulid
 from packages.core.models.workflow import WorkflowDefinition, WorkflowRun
+from packages.core.services.workflow_contracts import workflow_step_label
+from packages.core.services.workflow_variable_limits import variable_limit_error
 from packages.core.services.dashboard_http import (
     PublicHttpsEndpoint,
     create_public_https_transport,
@@ -380,6 +386,42 @@ def _code_node_resources(config: dict) -> dict[str, Any]:
     }
 
 
+_MESSAGE_DOCUMENT_ID_RE = re.compile(r"(?<![/\w])[0-9A-HJKMNP-TV-Z]{26}(?!\w)")
+
+
+async def _name_documents_in_message(message: str, entity_id: str) -> tuple[str, str]:
+    """A message with its document ids as links for chat, and as names elsewhere.
+
+    A notify template often carries ``{{step.report_document_id}}``; chat hides
+    bare ids, which left "Your report is ready:" with nothing to open.
+    """
+    ids = set(_MESSAGE_DOCUMENT_ID_RE.findall(message))
+    if not ids:
+        return message, message
+    try:
+        from packages.core.ai.runtime.document_actions import runtime_document_markdown_link
+        from packages.core.database import create_worker_session
+        from packages.core.models.document import Document
+        from sqlalchemy import select
+
+        async with create_worker_session()() as db:
+            rows = (await db.execute(
+                select(Document.id, Document.name).where(
+                    Document.id.in_(ids), Document.entity_id == entity_id, Document.is_trashed.is_(False),
+                )
+            )).all()
+    except Exception as exc:  # noqa: BLE001 — the message still goes out
+        logger.warning("notify step could not name the documents in its message: %s", exc)
+        return message, message
+    names = {row.id: row.name for row in rows}
+    def swap(render) -> str:
+        return _MESSAGE_DOCUMENT_ID_RE.sub(
+            lambda match: render(names[match.group()], match.group()) if match.group() in names else match.group(),
+            message,
+        )
+    return swap(runtime_document_markdown_link), swap(lambda name, _id: name)
+
+
 def _is_cacheable(step: dict) -> bool:
     """Whether a step's result may be reused from cache (ComfyUI-style).
 
@@ -668,6 +710,35 @@ async def delegated_parent_workflow_approval(
     return None
 
 
+def preapproved_wait_decision(
+    config: dict[str, Any],
+    *,
+    step_id: str,
+    variables: dict[str, Any],
+) -> dict[str, Any] | None:
+    """The approval a run's trigger already gave this wait, or None when it must wait for a person.
+
+    A trigger carries answers as ``__preapproved = {"responses": {variable: choice}, "user_id": id}``.
+    Only an approving choice that the wait accepts completes it; anything else keeps the run waiting.
+    """
+    preapproved = variables.get("__preapproved")
+    if not isinstance(preapproved, dict):
+        return None
+    responses = preapproved.get("responses")
+    response_variable = str(config.get("response_variable") or f"{step_id}_response")
+    if not isinstance(responses, dict) or response_variable not in responses:
+        return None
+    try:
+        decided = workflow_approval_decision_metadata(
+            config,
+            decision=responses[response_variable],
+            actor_id=str(preapproved.get("user_id") or ""),
+        )
+    except ValueError:
+        return None
+    return decided if decided["approved"] else None
+
+
 def workflow_approval_decision_metadata(
     config: dict[str, Any],
     *,
@@ -680,13 +751,29 @@ def workflow_approval_decision_metadata(
     normalized_actor = str(actor_id or "").strip()
     if not normalized_decision or not normalized_actor:
         raise ValueError("Workflow approval requires a decision and actor")
-    options = {str(option).strip() for option in (config.get("options") or []) if str(option or "").strip()}
+    from packages.core.services.workflow_contracts import (
+        CONFIRMATION_CHOICES,
+        workflow_wait_is_confirmation,
+        workflow_wait_options,
+    )
+
+    # A card shown before its wait read as a confirmation still answers it.
+    options = {
+        str(option).strip()
+        for option in [*(config.get("options") or []), *(workflow_wait_options(config) or [])]
+        if str(option or "").strip()
+    }
     if options and normalized_decision not in options:
         raise ValueError("Unsupported Workflow approval choice")
+    # A confirmation ("the file was delivered") carries the run on like an approval.
     approval_values = {
         str(value).strip().lower()
-        for value in (config.get("approval_values") or ["approve", "approved", "accept", "accepted", "yes"])
+        for value in (config.get("approval_values") or [
+            "approve", "approved", "accept", "accepted", "yes", "confirm", "done",
+        ])
     }
+    if workflow_wait_is_confirmation(config):
+        approval_values |= CONFIRMATION_CHOICES
     if config.get("allow_always"):
         approval_values.add("always_approve")
     return {
@@ -741,6 +828,10 @@ def workflow_input_wait_value(
             for key in properties
             if key in source
         }
+        # Nothing was submitted: a form whose fields are all optional (an edit
+        # form opening with the record's current values) must still wait.
+        if not value:
+            raise ValueError("No answer has been submitted to this input wait.")
     validator = SchemaContractValidatorFactory.build(input_schema)
     errors = list(validator.iter_errors(value))
     if errors:
@@ -872,23 +963,119 @@ def _template_text(value: Any) -> str:
     return str(value)
 
 
+_UNRESOLVED = object()
+_REFERENCES_MUST_RESOLVE: ContextVar[bool] = ContextVar("workflow_references_must_resolve", default=False)
+
+
+class UnresolvedWorkflowReference(ValueError):
+    """A value a step stores or sends names a field of a value that has no fields."""
+
+    code = "workflow_reference_unresolved"
+
+    def __init__(self, reference: str, message: str):
+        self.reference = reference
+        super().__init__(message)
+
+    def step_failure(self) -> dict:
+        return {"status": "failed", "code": self.code, "error": str(self), "reference": self.reference}
+
+
+def _reference_without_fields(reference: str, variables: dict) -> str | None:
+    """Why ``reference`` can never resolve, or None when its value is only absent.
+
+    Absent is a step that did not run, an input nobody gave, or a field or item
+    an object or list does not have. A field read from text or a number is a
+    wiring mistake instead: an Agent step's result is its text, so
+    ``{{edit.document_id}}`` names something that step never outputs.
+    """
+    candidates = [name for name in variables if reference.startswith(f"{name}.")]
+    root = max(candidates, key=len) if candidates else reference.split(".")[0]
+    if root not in variables:
+        return None
+    current, walked = variables[root], root
+    for part in reference[len(root) + 1:].split("."):
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        elif isinstance(current, (list, tuple)) and part.isdigit() and int(part) < len(current):
+            current = current[int(part)]
+        else:
+            break
+        walked = f"{walked}.{part}"
+    else:
+        return None
+    # A wait answered with the bare choice (see ``_walk_path``) has an empty note, not a wiring mistake.
+    if current is None or isinstance(current, (dict, list, tuple)) or part == "note":
+        return None
+    kind = "text" if isinstance(current, str) else type(current).__name__
+    return (
+        f"'{{{{{reference}}}}}' has no value: '{walked}' is {kind}, with no field '{part}'. "
+        "Nothing was saved or sent. Make the step that produces it output that field "
+        "(an Agent step with its own output_schema lists it there), or refer to the value itself."
+    )
+
+
+def _strict_missing_value(reference: str, variables: dict) -> None:
+    """A reference with no value, inside :func:`_references_must_resolve`: absent, or a failed step."""
+    problem = _reference_without_fields(reference, variables)
+    if problem:
+        raise UnresolvedWorkflowReference(reference, problem)
+    return None
+
+
+# Steps that store what they render: a project, grant, deadline, effect record or receipt.
+_RECORD_STEP_TYPES = frozenset({
+    "workflow_project", "workflow_action_grant", "workflow_effect_deadline", "browser_effect", "publication_receipt",
+})
+# Steps that also send what they render: tool and connector arguments, HTTP requests.
+_STRICT_REFERENCE_STEP_TYPES = _RECORD_STEP_TYPES | {"tool", "connector", "http"}
+
+
+@contextmanager
+def _references_must_resolve():
+    """Never keep a reference's ``{{...}}`` text in place of its value.
+
+    Prompts keep an unknown reference visible to the model. A value a step
+    writes to a project or record, or sends to a tool or URL, must not: the
+    placeholder would be stored as if it were the value, such as a document id
+    reading ``{{edit.document_id}}``, and later steps would carry it on. Inside
+    this block an absent value leaves its key out of the object that holds it
+    (null anywhere else, empty in text), and a field read from a value that has
+    no fields fails the step.
+
+    Leaving the key out, rather than writing null, is what an optional run
+    input nobody gave needs: a project state checked against a schema typing
+    that field as text still passes, and a patch keeps the value already
+    stored instead of clearing it.
+    """
+    token = _REFERENCES_MUST_RESOLVE.set(True)
+    try:
+        yield
+    finally:
+        _REFERENCES_MUST_RESOLVE.reset(token)
+
+
 def _render_template(template: str, variables: dict) -> str:
     """Replace ``{{var}}`` / ``{{var.field.subfield}}`` placeholders.
 
     Plain ``{{x}}`` reads ``variables["x"]``; dotted ``{{x.a.b}}`` walks into
     dict values (e.g. a step output stored as a dict). Unknown refs are left
-    as-is so a missing variable is visible rather than silently blanked.
+    as-is so a missing variable is visible rather than silently blanked,
+    except inside :func:`_references_must_resolve`.
     """
 
     def _replacer(m: re.Match) -> str:
         key = m.group(1).strip()
-        val = _lookup_reference(key, variables, missing=m.group(0))
-        return _template_text(val) if val is not None else m.group(0)
+        val = _lookup_reference(key, variables, missing=_UNRESOLVED)
+        if _REFERENCES_MUST_RESOLVE.get():
+            if val is _UNRESOLVED:
+                val = _strict_missing_value(key, variables)
+            return "" if val is None else _template_text(val)
+        return m.group(0) if val is _UNRESOLVED or val is None else _template_text(val)
 
     # ``[^{}]+`` allows spaces and punctuation inside a ref so imported node
     # names resolve; non-variable expressions (``{{ $env.X }}``) simply fail
     # the lookup above and are left visible, unchanged.
-    return re.sub(r"\{\{([^{}]+?)\}\}", _replacer, template)
+    return _REFERENCE_RE.sub(_replacer, template)
 
 
 _SINGLE_REF_RE = re.compile(r"^\s*\{\{([^{}]+?)\}\}\s*$")
@@ -934,7 +1121,7 @@ def _lookup_reference(key: str, variables: dict, missing: Any = None) -> Any:
     return _walk_path(variables[parts[0]], parts[1:], missing=missing)
 
 
-def _resolve_binding(value: Any, variables: dict) -> Any:
+def _resolve_binding(value: Any, variables: dict, missing: Any = None) -> Any:
     """Resolve an input/output binding value against the variable scope.
 
     A value that is *exactly* a single reference (``{{step}}`` or
@@ -942,14 +1129,42 @@ def _resolve_binding(value: Any, variables: dict) -> Any:
     (dict / list / number) so a whole object can be mapped through. Anything
     else — mixed text, multiple refs, a literal — is string-interpolated via
     :func:`_render_template`. Non-string values pass through unchanged.
+    Inside :func:`_references_must_resolve` a single reference with no value
+    gives ``missing``.
     """
     if not isinstance(value, str):
         return value
     m = _SINGLE_REF_RE.match(value)
     if m:
         key = m.group(1).strip()
-        return _lookup_reference(key, variables, missing=value)
+        resolved = _lookup_reference(key, variables, missing=_UNRESOLVED)
+        if resolved is not _UNRESOLVED:
+            return resolved
+        if not _REFERENCES_MUST_RESOLVE.get():
+            return value
+        _strict_missing_value(key, variables)
+        return missing
     return _render_template(value, variables)
+
+
+def _bound_value(raw: Any, variables: dict) -> Any:
+    """What a named binding holds, or ``_UNRESOLVED`` when its reference has no value.
+
+    A step's named inputs and outputs and a Set field become values later
+    steps read as ``{{name}}``. One must never hold its own ``{{...}}`` text:
+    an optional run input nobody gave would then be stored by a project step
+    as if it were the value. A field read from a value that has no fields
+    fails a step that stores or sends what it renders; anywhere else the
+    binding is only left without a value.
+    """
+    strict = _REFERENCES_MUST_RESOLVE.get()
+    try:
+        with _references_must_resolve():
+            return _resolve_structure(raw, variables, missing=_UNRESOLVED)
+    except UnresolvedWorkflowReference:
+        if strict:
+            raise
+        return _UNRESOLVED
 
 
 _MAX_FIELD_SUGGESTIONS = 3
@@ -995,13 +1210,40 @@ def _collection_field_for_prompt(field: dict, variables: dict) -> dict:
     return resolved_field
 
 
-def _resolve_structure(value: Any, variables: dict) -> Any:
-    """Resolve Workflow references recursively while preserving JSON value types."""
+def _resolve_structure(value: Any, variables: dict, missing: Any = None) -> Any:
+    """Resolve Workflow references recursively while preserving JSON value types.
+
+    Inside :func:`_references_must_resolve` an object leaves out a key whose
+    value is a single reference with no value; a list keeps null in its place.
+    """
     if isinstance(value, dict):
-        return {key: _resolve_structure(item, variables) for key, item in value.items()}
+        resolved = ((key, _resolve_structure(item, variables, _UNRESOLVED)) for key, item in value.items())
+        return {key: item for key, item in resolved if item is not _UNRESOLVED}
     if isinstance(value, list):
         return [_resolve_structure(item, variables) for item in value]
-    return _resolve_binding(value, variables)
+    return _resolve_binding(value, variables, missing)
+
+
+def _resolve_http_body(body: Any, variables: dict) -> Any:
+    """Resolve an HTTP step's JSON body, including one written as JSON text.
+
+    An imported n8n ``jsonBody`` is JSON text such as ``{"id": "{{x}}"}``.
+    It is parsed first so a value is placed as JSON, not spliced into the
+    text; text that only parses once its references are filled in, such as
+    ``{"n": {{count}}}``, is rendered and then parsed.
+    """
+    if isinstance(body, str) and body.lstrip()[:1] in ("{", "[") and not _SINGLE_REF_RE.match(body):
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            rendered = _render_template(body, variables)
+            try:
+                return json.loads(rendered)
+            except ValueError:
+                return rendered
+        if isinstance(parsed, (dict, list)):
+            return _resolve_structure(parsed, variables)
+    return _resolve_structure(body, variables)
 
 
 FIELDS_FROM = "x-fields-from"
@@ -1044,6 +1286,17 @@ def _schema_fields_from(items: Any) -> dict[str, Any]:
             "x-ui": {"order": list(properties), "layout": "list"}}
 
 
+def _holds_unresolved_reference(value: Any) -> bool:
+    """Whether ``{{...}}`` text is left anywhere in a value, nested lists and objects included."""
+    if isinstance(value, str):
+        return bool(re.search(r"\{\{[^{}]+?\}\}", value))
+    if isinstance(value, dict):
+        return any(_holds_unresolved_reference(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_holds_unresolved_reference(item) for item in value)
+    return False
+
+
 def _bind_schema_defaults(schema: Any, variables: dict) -> Any:
     """Resolve ``default`` bindings so a paused input form opens with run values.
 
@@ -1061,7 +1314,7 @@ def _bind_schema_defaults(schema: Any, variables: dict) -> Any:
         bound.update(fields)
     if "default" in schema:
         value = _resolve_structure(schema["default"], variables)
-        if not (isinstance(value, str) and re.search(r"\{\{[^{}]+?\}\}", value)):
+        if not _holds_unresolved_reference(value):
             bound["default"] = value
     if isinstance(schema.get("properties"), dict):
         bound["properties"] = {
@@ -1110,6 +1363,490 @@ def _with_platform_failure(step: dict, result: Any, evidence_states: list[Any]) 
     if fault is None:
         return result
     return {**result, "platform_failure": workflow_platform_failure(fault, step=step)}
+
+
+def _ledger_meets_expectation(states: list[dict], expectation: Any) -> bool:
+    from packages.core.contracts.step_execution import StepExpectation
+
+    if expectation is StepExpectation.FILES:
+        return any(
+            isinstance(receipt, dict) and (receipt.get("document_id") or receipt.get("fs_path"))
+            for state in states for receipt in state.get("receipts") or ()
+        )
+    from packages.core.contracts.step_execution import OUTWARD_EFFECT_CATEGORIES
+
+    # Checking a status, listing integrations or computing in a sandbox is the
+    # step's own working; only a message sent or content published counts.
+    return any(
+        isinstance(effect, dict) and effect.get("category") in OUTWARD_EFFECT_CATEGORIES
+        for state in states for effect in state.get("effects") or ()
+    )
+
+
+#: File receipts that are not a file the step made or changed.
+_NOT_SAVED_FILE_OPERATIONS = frozenset({"archive", "uncertain_write"})
+
+
+def _with_saved_files(result: Any, evidence_states: list[Any]) -> Any:
+    """Record the files the host saw an Agent step save, in the order saved.
+
+    The receipt ledger, not the model's summary, says what the step made; the
+    run's reviews, outputs and files read it from ``saved_files``.
+    """
+    if not isinstance(result, dict) or result.get("status") != "completed":
+        return result
+    saved = _saved_files(evidence_states)
+    return {**result, "saved_files": saved[-20:]} if saved else result
+
+
+def _saved_files(evidence_states: list[Any]) -> list[dict[str, str]]:
+    saved: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for state in evidence_states:
+        for receipt in (state.get("receipts") or ()) if isinstance(state, dict) else ():
+            if (
+                not isinstance(receipt, dict) or receipt.get("kind") != "file"
+                or receipt.get("operation") in _NOT_SAVED_FILE_OPERATIONS
+            ):
+                continue
+            key = str(receipt.get("document_id") or receipt.get("fs_path") or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            saved.append({
+                field: str(receipt[field]) for field in ("document_id", "name", "fs_path") if receipt.get(field)
+            })
+    return saved
+
+
+def _with_unmet_expectations(step: dict, result: Any, evidence_states: list[Any]) -> Any:
+    """An Agent step that declared ``expects`` completes only when the host saw the output.
+
+    The receipt ledger decides, never the model's summary: an Agent that
+    explains why nothing was saved has not done the step. When a platform
+    fault stopped it, the step is marked transient so the shared step
+    resilience retries it before anyone is asked to look.
+    """
+    from packages.core.contracts.step_execution import STEP_EXPECTS_KEY, parse_step_expectations
+    from packages.core.services.workflow_step_resilience import TransientStepFailure
+
+    config = step.get("config") if isinstance(step.get("config"), dict) else {}
+    if STEP_EXPECTS_KEY not in config or not isinstance(result, dict) or result.get("status") != "completed":
+        return result
+    states = [state for state in evidence_states if isinstance(state, dict)]
+    if not states:
+        # A Skill node runs outside this ledger; it cannot be checked here.
+        return result
+    try:
+        expectations = parse_step_expectations(config[STEP_EXPECTS_KEY])
+    except ValueError:
+        return result
+    unmet = [item.value for item in expectations if not _ledger_meets_expectation(states, item)]
+    if not unmet:
+        return result
+    step_name = workflow_step_label(step) or "This step"
+    produced = {"files": "a saved file", "effects": "a completed action"}
+    failure = {
+        **result,
+        "status": "failed",
+        "code": "workflow_step_expectation_unmet",
+        "error": f"{step_name} finished without {' or '.join(produced[item] for item in unmet)}.",
+        "unmet_expectations": unmet,
+        "effect_state": str(states[-1].get("effect_state") or "none"),
+    }
+    if isinstance(result.get("platform_failure"), dict):
+        failure["transient_failure"] = TransientStepFailure.TOOL_UNAVAILABLE.value
+    return failure
+
+
+#: Fresh round budgets an Agent step gets when its round limit stopped it
+#: before the host saw its work done (see _agent_work_left_at_round_limit).
+_AGENT_ROUND_LIMIT_CONTINUATIONS = 2
+
+
+def _agent_work_left_at_round_limit(step: dict, result: Any, output_schema: Any, output_format: Any) -> list[str]:
+    """What an Agent step its round limit stopped has not done yet, from host evidence.
+
+    Empty unless the loop ran out of rounds (not an error, an approval or a
+    terminal stop). The receipt ledger says whether a declared ``expects`` is
+    met, and the step's output schema whether the reply carries what later
+    steps read; the reply's wording is not consulted.
+
+    A reply that matches the schema is not evidence the work is done. The loop
+    only reaches this stop while the model is still calling tools, so that
+    reply came from the forced tool-free call and can only report where the
+    limit caught it, and later nodes route on what it says. It owes a turn with
+    tools. A model with nothing left replies in one round; a step without an
+    output schema has no field to route on and keeps its reply.
+    """
+    from packages.core.contracts.step_execution import STEP_EXPECTS_KEY, parse_step_expectations
+
+    if (getattr(result, "stop_reason", None) != "max_rounds" or getattr(result, "error", None)
+            or _has_terminal_failure(result) or getattr(result, "run_state", None) is None):
+        return []
+    # A loop that stopped going in circles gets no fresh budget to circle in.
+    if (getattr(result, "error_detail", None) or {}).get("stop") == "no_progress":
+        return []
+    owed: list[str] = []
+    config = step.get("config") if isinstance(step.get("config"), dict) else {}
+    state = getattr(result, "tool_evidence", None)
+    if STEP_EXPECTS_KEY in config and isinstance(state, dict):
+        try:
+            expectations = parse_step_expectations(config[STEP_EXPECTS_KEY])
+        except ValueError:
+            expectations = ()
+        produced = {"files": "save the file this step makes", "effects": "complete the action this step takes"}
+        owed.extend(produced[item.value] for item in expectations if not _ledger_meets_expectation([state], item))
+    if output_schema is not None:
+        try:
+            reply = _parse_agent_output(getattr(result, "content", None), output_format)
+            unmatched = next(SchemaContractValidatorFactory.build(output_schema).iter_errors(reply), None)
+        except ValueError:
+            unmatched = True
+        if unmatched is not None:
+            owed.append("reply with the object the step's output schema describes")
+        elif not owed:
+            owed.append(
+                "do what your last reply, written with tools unavailable, left undone or unchecked, "
+                "and report only what you then actually did and confirmed"
+            )
+    return owed
+
+
+def _agent_round_limit_continuation(owed: list[str]) -> str:
+    return (
+        "The round limit stopped this workflow step before its work was done; tools are available again. "
+        f"Still to do: {'; '.join(owed)}. Continue from this transcript. Do not repeat tool work whose "
+        "successful result is already present. Finish the step, then reply as the step asks."
+    )
+
+
+_REFERENCE_RE = re.compile(r"\{\{([^{}]+?)\}\}")
+_OUTPUT_FIELD_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_NON_NULL_JSON_TYPES = ["string", "number", "integer", "boolean", "object", "array"]
+AGENT_OUTPUT_MISSING_CODE = "workflow_agent_output_missing"
+# Failures that mean one step never got a value another step owes it.
+_DEFINITION_GAP_CODES = frozenset({AGENT_OUTPUT_MISSING_CODE, UnresolvedWorkflowReference.code})
+
+
+def _config_strings(value: Any):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _config_strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _config_strings(item)
+
+
+_QUOTED_TEXT_RE = re.compile(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"")
+_EXPRESSION_REFERENCE_RE = re.compile(
+    r"(?<![\w.{])([A-Za-z_]\w*)\.([A-Za-z_]\w*)([\w.]*)(\s*(?:==|!=)\s*(?:true|false)\b)?", re.IGNORECASE,
+)
+
+
+def _expression_references(step: dict):
+    """References from the exact config paths this node evaluates as bare expressions.
+
+    An end's output, for example, can contain a literal field named condition.
+    """
+    config = step.get("config") if isinstance(step.get("config"), dict) else {}
+    kind = step.get("type")
+    if kind == "condition":
+        expressions = (config.get("expression"),)
+    elif kind == "switch":
+        if config.get("switch_mode") == "expression":
+            return
+        expressions = (case.get("expression") for case in config.get("cases") or [] if isinstance(case, dict))
+    elif kind == "filter":
+        if config.get("field") and str(config.get("operation") or "").lower() in {"after", "before"}:
+            return
+        expressions = (config.get("condition") or config.get("expression"),)
+    elif kind == "end":
+        expressions = (config.get("fail_when"),)
+    else:
+        return
+    for value in expressions:
+        if isinstance(value, str):
+            for match in _EXPRESSION_REFERENCE_RE.finditer(_QUOTED_TEXT_RE.sub('""', value)):
+                # ``step.review.verified == true`` does not make review a boolean.
+                yield match.group(1), match.group(2), bool(match.group(4)) and not match.group(3)
+
+
+def workflow_output_field_reads(steps: list[dict]) -> dict[str, dict[str, list[str]]]:
+    """The fields steps read from other steps' results, with who reads them.
+
+    ``{{edit.deliverable_document_id}}`` in step ``review_status`` gives
+    ``{"edit": {"deliverable_document_id": ["review_status"]}}``, and so does
+    ``edit.deliverable_document_id`` in a condition's ``expression`` (or a
+    switch case's, a filter's ``condition``, an end's ``fail_when``). A
+    reference is keyed by its first name, a step id or an ``output_var`` alias.
+    """
+    reads: dict[str, dict[str, list[str]]] = {}
+    for step in steps or []:
+        if not isinstance(step, dict):
+            continue
+        reader = str(step.get("id") or "")
+        found = []
+        for text in _config_strings(step.get("config")):
+            for match in _REFERENCE_RE.finditer(text):
+                root, _, rest = match.group(1).strip().partition(".")
+                found.append((root, rest.split(".")[0]))
+        found.extend((root, field) for root, field, _ in _expression_references(step))
+        for root, field in found:
+            if not root or root == reader or not _OUTPUT_FIELD_NAME_RE.match(field):
+                continue
+            readers = reads.setdefault(root, {}).setdefault(field, [])
+            if reader not in readers:
+                readers.append(reader)
+    return reads
+
+
+def workflow_output_field_types(steps: list[dict]) -> dict[str, dict[str, list[str]]]:
+    """The JSON types a project declares for the fields it keeps straight from a step's result.
+
+    A ``workflow_project`` step whose patch or state sets ``editor_notes`` to
+    exactly ``{{editor.editor_notes}}``, under a state_schema declaring it a
+    string, gives ``{"editor": {"editor_notes": ["string"]}}``: the project
+    rejects anything else, so the step is asked for that type. A field an
+    expression compares with ``true`` or ``false`` (``revise.verified ==
+    true``) is a boolean: the text ``"true"`` would not match. A field kept
+    under different types (or none) is left untyped.
+    """
+    found: dict[str, dict[str, set[str] | None]] = {}
+
+    def note(root: str, field: str, kinds: set[str] | None) -> None:
+        fields = found.setdefault(root, {})
+        fields[field] = kinds if field not in fields or fields[field] == kinds else None
+
+    def declared(schema: Any, path: tuple[str, ...]) -> set[str] | None:
+        for name in path:
+            properties = schema.get("properties") if isinstance(schema, dict) else None
+            schema = properties.get(name) if isinstance(properties, dict) else None
+        kind = schema.get("type") if isinstance(schema, dict) else None
+        kinds = {kind} if isinstance(kind, str) else set(kind) if isinstance(kind, list) else set()
+        return (kinds - {"null"}) or None
+
+    def kept(node: Any, path: tuple[str, ...], schema: Any):
+        for name, value in node.items():
+            if isinstance(value, dict):
+                yield from kept(value, (*path, str(name)), schema)
+                continue
+            match = _REFERENCE_RE.fullmatch(value) if isinstance(value, str) else None
+            if match:
+                root, _, field = match.group(1).strip().partition(".")
+                if root and _OUTPUT_FIELD_NAME_RE.fullmatch(field):
+                    yield root, field, declared(schema, (*path, str(name)))
+
+    for step in steps or []:
+        config = step.get("config") if isinstance(step, dict) and isinstance(step.get("config"), dict) else {}
+        for root, field, boolean in _expression_references(step):
+            if boolean:
+                note(root, field, {"boolean"})
+        if step.get("type") != "workflow_project" or not isinstance(config.get("state_schema"), dict):
+            continue
+        for key in ("state", "patch"):
+            if isinstance(config.get(key), dict):
+                for root, field, kinds in kept(config[key], (), config["state_schema"]):
+                    note(root, field, kinds)
+    return {root: {field: sorted(kinds) for field, kinds in fields.items() if kinds}
+            for root, fields in found.items()}
+
+
+# Studio article run 2026-11-01: the Edit step saved its Word file as an
+# "approval candidate" with source notes and "not approved for client
+# delivery" inside it. Nothing after the approval rewrites a file, so the
+# client would have received exactly that text.
+WORKFLOW_APPROVED_OUTPUT_IS_FINAL = (
+    "A person reviews what this step produces before the Workflow moves on, and what they approve is used "
+    "exactly as you leave it: delivered, sent, published or handed to the next stage as it is, with nothing "
+    "removed afterwards.\n"
+    "- Make each deliverable finished for its final reader. Keep out of its content and its file name anything "
+    "that is not part of the deliverable itself: review or approval status, delivery notes, notes to the "
+    "reviewer about edits, checks or sources, and labels such as draft or candidate.\n"
+    "- Put what only the reviewer needs in a separate file or in your reply."
+)
+
+
+def workflow_approval_reviewed_steps(steps: list[dict]) -> frozenset[str]:
+    """The Agent and llm steps whose result a person approves before the run moves on.
+
+    Walking back from each approval wait (not one where the person confirms
+    something they did themselves), the first Agent or llm step on every
+    route made the work under review; earlier stages handed theirs on to it,
+    and an earlier wait already had its own answer.
+    """
+    from packages.core.services.workflow_contracts import workflow_wait_is_confirmation
+
+    by_id = {str(step["id"]): step for step in steps or [] if isinstance(step, dict) and step.get("id")}
+    reverse: dict[str, list[str]] = {}
+    for source, targets in _workflow_step_edges(list(by_id.values())).items():
+        for target in targets:
+            reverse.setdefault(str(target), []).append(source)
+    reviewed: set[str] = set()
+    for wait_id, wait in by_id.items():
+        config = wait.get("config") if isinstance(wait.get("config"), dict) else {}
+        if (
+            wait.get("type") != "wait"
+            or str(config.get("wait_type") or "approval") != "approval"
+            or workflow_wait_is_confirmation(config)
+        ):
+            continue
+        seen = {wait_id}
+        pending = list(reverse.get(wait_id, []))
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            kind = str((by_id.get(current) or {}).get("type") or "")
+            if kind in {"agent", "llm"}:
+                reviewed.add(current)
+            elif kind != "wait":
+                pending.extend(reverse.get(current, []))
+    return frozenset(reviewed)
+
+
+def is_document_id_field(name: str) -> bool:
+    """A field named for a document id holds one: Agent steps must return one there."""
+    return name == "document_id" or name.endswith("_document_id")
+
+
+#: A Manor document id (a ULID). A reply's "NOT_SAVED" or "pending" is not one.
+_DOCUMENT_ID_PATTERN = "^[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{26}$"
+
+
+def _reported_document_id(value: Any, saved_ids: list[str]) -> bool:
+    """A document id field holds a file the step saved, or at least a document id."""
+    return isinstance(value, str) and (value in saved_ids or re.match(_DOCUMENT_ID_PATTERN, value) is not None)
+
+
+def _agent_output_contract(
+    step: dict, reads: dict[str, list[str]] | None, types: dict[str, list[str]] | None = None,
+) -> dict | None:
+    """The fields later steps read from this Agent step, as its output contract.
+
+    An Agent step's result is its reply text unless it declares a contract.
+    When a later step reads ``{{edit.deliverable_document_id}}``, the step is
+    asked for an object with each field read plus a ``summary`` of its work,
+    and the agent loop asks again in the same conversation when the reply does
+    not match. A field a project keeps as it is takes the type the project
+    declares (``types``, see :func:`workflow_output_field_types`). A step with
+    its own ``output_schema`` keeps it.
+    """
+    config = step.get("config") if isinstance(step.get("config"), dict) else {}
+    if not reads or config.get("output_schema") is not None or config.get("stat_assessment_keys"):
+        return None
+    properties: dict[str, dict] = {"summary": {
+        "type": "string", "description": "What this step did, in a few sentences, for the person following the run.",
+    }}
+    for field, readers in reads.items():
+        if is_document_id_field(field):
+            properties[field] = {
+                "type": "string", "pattern": _DOCUMENT_ID_PATTERN,
+                "description": "The document id of the file this names, exactly as its save result returned it.",
+            }
+        elif field != "summary":
+            kinds = (types or {}).get(field) or _NON_NULL_JSON_TYPES
+            properties[field] = {
+                "type": kinds[0] if len(kinds) == 1 else kinds,
+                "description": f"Read by the later step(s) {', '.join(readers)}."
+                               + (" Plain text, not an object or list." if kinds == ["string"] else ""),
+            }
+    return {"type": "object", "properties": properties, "required": list(properties)}
+
+
+def _as_text(value: Any) -> str:
+    """Readable text for a value an Agent gave as an object or list where text is kept."""
+    if isinstance(value, dict):
+        return "\n".join(f"{key}: {_as_text(item)}" for key, item in value.items())
+    if isinstance(value, list):
+        return "\n".join(f"- {_as_text(item)}" for item in value)
+    return str(value)
+
+
+def _text_fields_as_text(output: dict, contract: dict) -> tuple[dict, list[str]]:
+    """``output`` with each field its contract keeps as text written out as text, and those fields."""
+    rewritten = [field for field, spec in contract["properties"].items()
+                 if spec.get("type") == "string" and isinstance(output.get(field), (dict, list))]
+    return {**output, **{field: _as_text(output[field]) for field in rewritten}}, rewritten
+
+
+def _missed_output_contract(result: dict) -> bool:
+    return "output_schema_validation_failed" in {result.get("runtime_error"), result.get("code"), result.get("error")}
+
+
+def _with_output_contract(
+    step: dict, result: Any, contract: dict | None, reads: dict[str, list[str]] | None,
+    evidence_states: list[Any],
+) -> Any:
+    """Settle an Agent step that still owes later steps fields after the loop asked again.
+
+    The host fills what it saw itself: a document id from the one file the
+    step saved, and the summary from the reply. A document id field that holds
+    neither a file the step saved nor a document id ("NOT_SAVED") is missing,
+    whatever the reply's status. A field the host cannot fill fails the step,
+    naming the field and the steps that need it, so no later step stores or
+    sends a placeholder in its place. A field kept as text that still holds
+    an object or list is written out as text, so the project that keeps it
+    does not reject the whole step.
+    """
+    if contract is None or not isinstance(result, dict):
+        return result
+    document_ids = [saved["document_id"] for saved in _saved_files(evidence_states) if saved.get("document_id")]
+    reply = result.get("output")
+    if result.get("status") == "completed":
+        if not isinstance(reply, dict):
+            return result
+        if all(_reported_document_id(reply.get(field), document_ids)
+               for field in contract["required"] if is_document_id_field(field)):
+            output, rewritten = _text_fields_as_text(reply, contract)
+            if _schema_validation_failure(contract, output, code="output_schema_validation_failed") is None:
+                return {**result, "output": output, "output_text_from_structure": rewritten} if rewritten else result
+    elif result.get("status") != "failed" or not _missed_output_contract(result):
+        return result
+    output: dict = dict(reply) if isinstance(reply, dict) else {}
+    if isinstance(reply, str) and reply.strip():
+        try:
+            output = dict(_parse_agent_output(reply, "json"))
+        except ValueError:
+            output = {"summary": reply.strip()}
+    output, rewritten = _text_fields_as_text(output, contract)
+
+    def owed(field: str) -> bool:
+        if is_document_id_field(field):
+            return not _reported_document_id(output.get(field), document_ids)
+        return output.get(field) in (None, "") or not SchemaContractValidatorFactory.build(
+            contract["properties"][field],
+        ).is_valid(output.get(field))
+
+    filled = []
+    for field in contract["required"]:
+        if is_document_id_field(field) and owed(field) and len(document_ids) == 1:
+            output[field] = document_ids[0]
+            filled.append(field)
+    # The summary is for people; only a field a later step reads can be missing.
+    missing = [field for field in contract["required"] if owed(field) and field in (reads or {})]
+    if not missing:
+        settled = {key: value for key, value in result.items()
+                   if key not in {"error", "code", "stop_reason", "runtime_error", "provider_transient"}}
+        config = step.get("config") if isinstance(step.get("config"), dict) else {}
+        return {**settled, "status": "completed", "output": output, "output_var": config.get("output_var"),
+                **({"output_filled_from_receipts": filled} if filled else {}),
+                **({"output_text_from_structure": rewritten} if rewritten else {})}
+    readers = list(dict.fromkeys(reader for field in missing for reader in (reads or {}).get(field, ())))
+    step_name = workflow_step_label(step) or "This step"
+    return {
+        **result,
+        "status": "failed",
+        "code": AGENT_OUTPUT_MISSING_CODE,
+        "error": (
+            f"{step_name} finished without reporting {', '.join(missing)}, which "
+            f"{', '.join(readers) or 'a later step'} needs. Nothing was saved in its place."
+        ),
+        "missing_output_fields": missing,
+    }
 
 
 def _runtime_loop_failure_fields(result: Any) -> dict[str, Any]:
@@ -1222,6 +1959,11 @@ def _merge_project_state(base: dict[str, Any], patch: dict[str, Any]) -> dict[st
         else:
             merged[key] = deepcopy(value)
     return merged
+
+
+# A ``history_event`` is appended to the project's ``history`` list with these
+# values stamped on, besides the ones the step names.
+HISTORY_EVENT_STAMPS = ("timestamp", "step_id", "run_id", "attempt_number")
 
 
 def _project_state_list(state: dict[str, Any], path: str) -> list[Any]:
@@ -1382,6 +2124,13 @@ def _child_workflow_chat_origin(run: WorkflowRun) -> dict[str, Any] | None:
     child_origin["host_run_id"] = str(origin.get("host_run_id") or run.id)
     child_origin["nested"] = True
     return child_origin
+
+
+def _child_failure_details(child: WorkflowRun) -> str | None:
+    """The full text of the failure a child run's display error shortens, if any."""
+    result = (child.step_results or {}).get(child.current_step_id)
+    details = result.get("error_details") if isinstance(result, dict) else None
+    return details if isinstance(details, str) and details.strip() else None
 
 
 def _child_workflow_user_request(run: WorkflowRun) -> dict[str, Any]:
@@ -1582,13 +2331,47 @@ def _workflow_step_result_requires_reexecution(result: object) -> bool:
     )
 
 
+async def _workflow_project_folder(entity_id: str, runtime_context: dict[str, Any], db=None) -> str | None:
+    """The folder of the WorkflowProject this run works on, as its tools resolve it."""
+    from packages.core.services.generated_media_naming import resolve_workspace_artifact_base_dir
+    from packages.core.services.workspace_layout import project_production_root
+
+    if not (
+        runtime_context.get("workspace_id")
+        and runtime_context.get("workflow_run_id")
+        and project_production_root(runtime_context.get("workflow_project_root"))
+    ):
+        return None
+    if db is not None:
+        # The lookup takes its own transaction (admission is per transaction).
+        await release_read_transaction(db)
+    try:
+        return await resolve_workspace_artifact_base_dir(
+            entity_id=entity_id,
+            workspace_id=runtime_context["workspace_id"],
+            workflow_run_id=runtime_context["workflow_run_id"],
+            workflow_lineage_root_run_id=runtime_context.get("workflow_lineage_root_run_id"),
+            workflow_project_root=runtime_context["workflow_project_root"],
+        ) or None
+    except Exception:
+        # The tools resolve the same folder for every write; only the step's
+        # guidance goes without it.
+        logger.warning("Workflow project folder could not be resolved", exc_info=True)
+        return None
+
+
 def _workflow_agent_resume_prompt(
     previous_result: object,
     *,
     runtime_context: dict[str, Any],
     step_id: str,
+    recovery_tool: bool = False,
 ) -> str:
-    """Apply current recovery rules to both historical and new Agent steps."""
+    """Apply current recovery rules to both historical and new Agent steps.
+
+    ``recovery_tool`` says the step can read its complete evidence with
+    ``read_step_recovery``; the prompt then points there for what it cuts.
+    """
     if is_transient_retry_record(previous_result):
         # Re-run only because the attempt provably changed nothing: the
         # original instructions are the whole task, there is nothing to recover.
@@ -1598,7 +2381,11 @@ def _workflow_agent_resume_prompt(
         or previous_result.get("status") == "failed"
     ):
         return ""
-    from packages.core.services.workflow_agent_recovery import recovery_prompt_evidence
+    from packages.core.services.workflow_agent_recovery import (
+        STEP_RECOVERY_TOOL_NAME,
+        production_progress_index,
+        recovery_prompt_evidence,
+    )
 
     retrying = (
         previous_result.get("agent_retry_recovery") is True
@@ -1614,6 +2401,25 @@ def _workflow_agent_resume_prompt(
         "chrome_outcome": previous_result.get("chrome_outcome"),
         "agent_recovery": previous_result.get("agent_recovery"),
     }
+    progress_index = production_progress_index(previous_result.get("production_progress"))
+    units = ""
+    index_block = ""
+    if progress_index is not None:
+        units = (
+            "The production index lists the units earlier attempts already finished (units_made, each with "
+            "the Document ID of its clip) and the units still to make (units_to_make). Use each finished clip "
+            "by its Document ID as it is and make only units_to_make; never pay to make a finished unit again "
+            "unless the step's own check of that clip finds a concrete defect. "
+        )
+        # Clip identities are what a retry needs to avoid paying twice: they
+        # stay outside the bounded evidence so no budget split can cut them.
+        index_block = "\nProduction index (complete):\n" + json.dumps(
+            progress_index, ensure_ascii=False, sort_keys=True,
+        )
+    reader = (
+        f"Call {STEP_RECOVERY_TOOL_NAME} to read any truncated field in full before deciding on it. "
+        if recovery_tool else ""
+    )
     return (
         "\n\nWorkflow resume context:\n"
         "This Agent step is recovering prior work. First re-observe the target before any mutation. "
@@ -1623,6 +2429,7 @@ def _workflow_agent_resume_prompt(
         "If current evidence verifies the same target already meets that goal, return the "
         "schema-valid successful result without repeating the external action. "
         "If evidence proves the action did not execute, continue only the remaining work. "
+        + units +
         "If execution or the resulting state is uncertain, use read-only reconciliation; "
         "do not repeat the external effect or claim success without evidence. "
         "A successful tool call or an Agent's prior success claim is not proof of the business outcome. "
@@ -1631,9 +2438,53 @@ def _workflow_agent_resume_prompt(
         "Run-scoped receipts may include other steps; match the target before using them. "
         "Fields marked truncated are incomplete evidence: inspect the target or retrieve the "
         "original authorized run before making a decision that depends on omitted details. "
+        + reader +
         "Return through the normal step contract; do not directly change run or project status.\n"
         + json.dumps(recovery_prompt_evidence(context), ensure_ascii=False, sort_keys=True)
+        + index_block
     )
+
+
+def _new_items_in_listing(listing: Any, spec: dict, variables: dict) -> dict[str, Any]:
+    """What a tool that lists things answered and was not seen before, for a step that only asks when there is any.
+
+    ``spec`` names the listing's ``items`` field, each item's ``key``, the ``seen``
+    keys, and how many to keep (``limit``). It runs here, not as a code step, since
+    a look with nothing new would otherwise start a sandbox only to find that out.
+    """
+    def parsed(value: Any) -> dict:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                return {}
+        return value if isinstance(value, dict) else {}
+
+    answer = parsed(listing)
+    # With several accounts connected the call answers once for each.
+    answers = [answer]
+    if answer.get("integration_account_selection") == IntegrationAccountSelectionMode.ALL:
+        rows = answer.get("results")
+        answers = [
+            parsed(row.get("result")) if isinstance(row, dict) and row.get("ok") is True else {}
+            for row in rows
+        ] if isinstance(rows, list) else []
+    pages = [page for page in answers if isinstance(page.get(spec["items"]), list)]
+    seen = _resolve_binding(spec.get("seen", []), variables)
+    known = [str(key) for key in seen if key] if isinstance(seen, list) else []
+    kept, new, items = set(known), [], []
+    for page in pages:
+        for entry in page[spec["items"]]:
+            key = str(entry.get(spec.get("key", "id")) or "").strip() if isinstance(entry, dict) else ""
+            if key and key not in kept:
+                kept.add(key)
+                new.append(key)
+                item = {name: (value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str))[:500]
+                        for name, value in entry.items() if value is not None}
+                item[spec.get("key", "id")] = key
+                items.append(item)
+    return {"could_read": bool(pages), "has_new": bool(items), "items": items, "accounts_not_read": len(answers) - len(pages),
+            "seen": (new + known)[:int(spec.get("limit") or 500)]}
 
 
 def _continues_on_error(step: dict) -> bool:
@@ -1753,6 +2604,11 @@ def _continue_failed_result(
             payload.update(deepcopy(existing_output))
         error = result.get("error")
         payload["error"] = deepcopy(error) if isinstance(error, dict) else {"message": str(error or "Step failed")}
+        # A message shortened for display keeps its full text for the error route.
+        if isinstance(result.get("error_details"), str) and result["error_details"].strip():
+            payload["error"].setdefault("details", result["error_details"])
+        if result.get("cancelled") is True:
+            payload["error"]["cancelled"] = True
         result["output"] = payload
         error_next = config.get("error_next") or []
         result["next_override"] = list(error_next) if isinstance(error_next, list) else [error_next]
@@ -2042,14 +2898,18 @@ def _bind_inputs(config: dict, variables: dict) -> None:
     Each ``{key, value, type?}`` binds ``key`` to the resolved (and type-coerced)
     ``value`` so the step's own config (prompt / body / args) can reference it as
     ``{{key}}``. Mutates ``variables`` in place; later rows can read earlier ones.
+    An input whose reference has no value is left unbound (see :func:`_bound_value`).
     """
     for item in config.get("inputs") or []:
         if not isinstance(item, dict):
             continue
         key = str(item.get("key") or item.get("name") or "").strip()
         if key:
-            resolved = _resolve_structure(item.get("value", ""), variables)
-            variables[key] = _coerce_typed(resolved, item.get("type"))
+            resolved = _bound_value(item.get("value", ""), variables)
+            if resolved is _UNRESOLVED:
+                variables.pop(key, None)
+            else:
+                variables[key] = _coerce_typed(resolved, item.get("type"))
 
 
 def _resolve_value(raw: str, variables: dict) -> Any:
@@ -2105,6 +2965,102 @@ async def _commit_step_pointer_only(db, run) -> bool:
     await db.commit()
     return True
 
+
+async def _recover_failed_step_transaction(db, run) -> bool:
+    """Roll back a run session that a node left in a failed transaction.
+
+    A node whose flush failed (a unique key, a constraint) may catch the
+    error and report its own failure, but the run's session then refuses
+    every later read and write, so the runner could not record that failure
+    and the run stayed ``running``. Rolling back discards only the node's
+    unsaved work; the run's own unsaved changes are reapplied.
+    """
+    from sqlalchemy import inspect as sa_inspect
+
+    if db is None or getattr(db, "is_active", True):
+        return False
+    state = sa_inspect(run, raiseerr=False)
+    tracked = (
+        state is not None
+        and state.session is getattr(db, "sync_session", None)
+        and state.persistent
+    )
+    pending = (
+        {attr.key: attr.value for attr in state.attrs if attr.history.has_changes()}
+        if tracked else {}
+    )
+    await db.rollback()
+    if tracked:
+        await db.refresh(run)
+        for key, value in pending.items():
+            setattr(run, key, value)
+    return True
+
+
+async def _run_billed_workflow_loop(loop_kwargs: dict[str, Any], *, step: dict, runtime_context: dict[str, Any]) -> Any:
+    """Run one invocation of a workflow agent loop with durable per-call billing.
+
+    Each provider call reserves its credits before it runs and settles its usage
+    after, under a key unique to this invocation (a loop restarts its rounds, so
+    the key cannot be shared). The usage row is tied to the run. The suppressed
+    context stops the in-process billing from writing the same call again.
+    """
+    from packages.core.ai.runtime.billing import (
+        runtime_release_billing_context,
+        runtime_set_callback_settled_billing_context,
+    )
+    from packages.core.ai.runtime.harness import RUNTIME_WORKFLOW_AGENT_BILLING_SOURCE
+    from packages.core.models.base import generate_ulid
+    from packages.core.services.usage_service import build_durable_llm_billing_callbacks
+
+    run_id = str(runtime_context.get("workflow_run_id") or "").strip() or None
+    entity_id = loop_kwargs["entity_id"]
+    billing_scope = {
+        "user_id": loop_kwargs.get("user_id"),
+        "agent_id": loop_kwargs.get("agent_id"),
+        "workspace_id": loop_kwargs.get("workspace_id"),
+        "conversation_id": loop_kwargs.get("conversation_id"),
+    }
+    reserve_llm_call, settle_llm_call = build_durable_llm_billing_callbacks(
+        source_prefix=f"workflow:{run_id or 'run'}:{step.get('id')}:{generate_ulid()}",
+        entity_id=entity_id,
+        fallback_model=loop_kwargs.get("model"),
+        source=RUNTIME_WORKFLOW_AGENT_BILLING_SOURCE,
+        operation_id=run_id,
+        **billing_scope,
+    )
+    billing_handle = runtime_set_callback_settled_billing_context(
+        entity_id,
+        source=RUNTIME_WORKFLOW_AGENT_BILLING_SOURCE,
+        # A run started from a Task bills its agent steps to that Task.
+        task_id=str(runtime_context.get("task_id") or "").strip() or None,
+        **billing_scope,
+    )
+    try:
+        return await runtime_execute_workflow_agent_loop(
+            **loop_kwargs,
+            on_llm_call_before=reserve_llm_call,
+            on_llm_usage_settled=settle_llm_call,
+        )
+    finally:
+        runtime_release_billing_context(billing_handle)
+
+
+def _variable_limit_failure(step: dict, result: dict) -> str | None:
+    """Why a completed step's output may not be kept in the run's variables, or ``None``."""
+    output = result.get("output")
+    if output is None:
+        return None
+    names = {str(step["id"])}
+    if result.get("output_var"):
+        names.add(str(result["output_var"]))
+    for name in sorted(names):
+        error = variable_limit_error(name, output)
+        if error:
+            return error
+    return None
+
+
 class WorkflowRunner:
     """Execute a WorkflowRun through its step graph.
 
@@ -2126,6 +3082,42 @@ class WorkflowRunner:
         self._session_factory = session_factory or _default_workflow_session_factory()
         # Run id -> the collaborators behind it, resolved once per run.
         self._run_collaborators: dict[str, frozenset[str]] = {}
+        # Run id -> the fields its steps read from other steps' results.
+        self._run_output_field_reads: dict[str, dict[str, dict[str, list[str]]]] = {}
+        # Run id -> the types its projects declare for fields they keep from steps' results.
+        self._run_output_field_types: dict[str, dict[str, dict[str, list[str]]]] = {}
+        # Run id -> its steps whose result a person approves.
+        self._run_approval_reviewed: dict[str, frozenset[str]] = {}
+
+    def _output_field_reads_for(self, run: WorkflowRun, step: dict) -> dict[str, list[str]] | None:
+        """The fields later steps of ``run`` read from ``step``'s result, by id or ``output_var``."""
+        reads = self._run_output_field_reads.get(str(getattr(run, "id", "") or ""))
+        if not reads:
+            return None
+        merged: dict[str, list[str]] = {}
+        for name in (step.get("id"), (step.get("config") or {}).get("output_var")):
+            for field, readers in reads.get(str(name or ""), {}).items():
+                merged[field] = list(dict.fromkeys([*merged.get(field, []), *readers]))
+        return merged or None
+
+    def _learn_run_steps(self, run: WorkflowRun, steps: list[dict]) -> None:
+        """Read once per run what its steps owe each other and what a person approves."""
+        self._run_output_field_reads[str(run.id)] = workflow_output_field_reads(steps)
+        self._run_output_field_types[str(run.id)] = workflow_output_field_types(steps)
+        self._run_approval_reviewed[str(run.id)] = workflow_approval_reviewed_steps(steps)
+
+    def _output_field_types_for(self, run: WorkflowRun, step: dict) -> dict[str, list[str]] | None:
+        """The types ``run``'s projects declare for fields they keep from ``step``'s result."""
+        types = self._run_output_field_types.get(str(getattr(run, "id", "") or ""))
+        merged: dict[str, list[str]] = {}
+        for name in (step.get("id"), (step.get("config") or {}).get("output_var")):
+            merged.update((types or {}).get(str(name or ""), {}))
+        return merged or None
+
+    def _approval_reviewed(self, run: WorkflowRun, step: dict) -> bool:
+        """Whether a person approves ``step``'s result before ``run`` moves on."""
+        reviewed = getattr(self, "_run_approval_reviewed", {}).get(str(getattr(run, "id", "") or ""))
+        return bool(reviewed) and str(step.get("id") or "") in reviewed
 
     @staticmethod
     def prime_cache_from_results(step_results: dict | None) -> dict:
@@ -2245,6 +3237,29 @@ class WorkflowRunner:
                 workflow_run_id,
                 lost_claim_token=lost_claim_token,
             )
+        except Exception as exc:
+            if lost_claim_token is None:
+                raise
+            # The owner crashed without settling the run, and its clean exit
+            # released the lease, so the expired-lease sweep cannot see it.
+            # Settle it now the way a lost owner is settled: resume replay-safe
+            # work, otherwise fail with the interrupted step named.
+            logger.error(
+                "WorkflowRunner: run %s stopped without settling; recovering",
+                workflow_run_id,
+                exc_info=True,
+            )
+            try:
+                return await self._recover_and_report(
+                    workflow_run_id,
+                    lost_claim_token=lost_claim_token,
+                )
+            except Exception:
+                logger.exception(
+                    "WorkflowRunner: run %s recovery after a crash failed",
+                    workflow_run_id,
+                )
+                raise exc
         # Publish only after the claim context exited, as recovery does, so
         # the successor cannot race this owner's exit.
         await self._hand_off_to_next_worker(workflow_run_id, handoff_token)
@@ -2421,6 +3436,10 @@ class WorkflowRunner:
             except Exception as exc:
                 logger.error("WorkflowRunner: run %s failed: %s", workflow_run_id, exc, exc_info=True)
                 await db.rollback()
+                # Rollback expired the run; reading an expired attribute on an
+                # async session raises instead of loading, which used to abort
+                # this handler and leave the run ``running`` with no owner.
+                await db.refresh(run)
                 run.status = "failed"
                 run.error = str(exc)
                 run.completed_at = _utc_now()
@@ -2453,6 +3472,8 @@ class WorkflowRunner:
         await record_workflow_run_status(db, run)
         await db.commit()
         if run.status == WorkflowRunStatus.FAILED:
+            # Before error handlers: a handler must not find this run's lease still held.
+            await self._release_failed_run_leases(run, db)
             await self._dispatch_error_handlers(run, db)
         if run.status == WorkflowRunStatus.CANCELLED:
             from packages.core.services.media_job_control import stop_open_media_jobs_for_run
@@ -2464,6 +3485,26 @@ class WorkflowRunner:
             await self._propagate_subworkflow_result(run, db)
             run.terminal_effects_completed_at = _utc_now()
             run.terminal_effects_next_attempt_at = None
+            await db.commit()
+
+    @staticmethod
+    async def _release_failed_run_leases(run: WorkflowRun, db) -> None:
+        """Hand back the workflow-project leases a failed run holds, so they can be leased again."""
+        from packages.core.services.workflow_project_service import release_failed_run_project_leases
+
+        steps = (run.execution_snapshot or {}).get("steps") or []
+        lease_paths = {
+            str((step.get("config") or {}).get("lease_path") or "lease") for step in steps
+            if step.get("type") == "workflow_project"
+            and (step.get("config") or {}).get("operation") == "lease_due"
+        }
+        if not lease_paths or not run.workspace_id:
+            return
+        released = await release_failed_run_project_leases(
+            db, run_id=str(run.id), entity_id=run.entity_id, workspace_id=run.workspace_id,
+            lease_paths=lease_paths,
+        )
+        if released:
             await db.commit()
 
     @staticmethod
@@ -2776,10 +3817,14 @@ class WorkflowRunner:
                 if isinstance(cancel_ancestors, dict)
                 else ""
             )
+            # A step that handles its child's failure (``on_error``) also
+            # handles the person cancelling that child: the cancel stops at
+            # it, and the run goes on along the step's error route.
             cascades_chat_cancel = (
                 child.status == WorkflowRunStatus.CANCELLED
                 and host_run_id
                 and cancelled_by
+                and not _continues_on_error(step)
             )
             if cascades_chat_cancel:
                 from packages.core.services.workflow_chat_projection import (
@@ -2815,12 +3860,30 @@ class WorkflowRunner:
                 "error": child.error or f"subworkflow {child.status}",
                 "subrun_id": child.id,
                 "completed_at": completed_at,
+                "output": dict(child.variables or {}),
+                **({"error_details": details} if (details := _child_failure_details(child)) else {}),
             }
+            if child.status == WorkflowRunStatus.CANCELLED and _continues_on_error(step):
+                # The error route reads a cancelled child as one, not as a fault.
+                failed.update({"status": "failed", "cancelled": True})
             if any(
                 isinstance(result, dict) and result.get("retry_blocked") is True
                 for result in (child.step_results or {}).values()
             ):
                 failed["retry_blocked"] = True
+            if _continue_failed_result(step, failed, parent):
+                # The step handles its own failure (``on_error``), as it does
+                # when the child fails before ever pausing: record the error
+                # and continue the parent along its error route.
+                failed["output_var"] = (step.get("config") or {}).get("output_var")
+                self._record_step_result(step, failed, parent)
+                append_execution_trace(parent, node=step, status="failed", result=failed)
+                parent.status = "running"
+                parent.error = None
+                parent_run_id = parent.id
+                await db.commit()
+                await WorkflowRunner(cache_index=self._cache_index).run(parent_run_id)
+                return
             self._record_step_result(step, failed, parent)
             append_execution_trace(
                 parent,
@@ -3238,6 +4301,7 @@ class WorkflowRunner:
         projects_to_origin_chat = workflow_chat_context(run) is not None
 
         async def _emit(step, status, result=None):
+            nonlocal projects_to_origin_chat
             step_id = step["id"]
             if status == "running":
                 # The running trace and current-node pointer must cross the
@@ -3259,7 +4323,18 @@ class WorkflowRunner:
                 except Exception:  # noqa: BLE001 — progress is best-effort telemetry
                     pass
             if not projects_to_origin_chat:
-                return
+                if status != "paused":
+                    return
+                from packages.core.services.workflow_chat_projection import attach_workflow_chat_on_wait
+
+                try:
+                    attached = await attach_workflow_chat_on_wait(db, run=run, step=step, result=result)
+                except Exception:  # noqa: BLE001 — the card is best-effort, like every projection
+                    logger.warning("Scheduled Workflow wait could not reach chat", exc_info=True)
+                    attached = False
+                if not attached:
+                    return
+                projects_to_origin_chat = True
             try:
                 from packages.core.services.workflow_chat_projection import (
                     project_workflow_step,
@@ -3307,8 +4382,32 @@ class WorkflowRunner:
             await project_workflow_run_status(db, run=run)
             await _commit_terminal()
 
+        async def _finish_for_person(step_id: str, result: dict) -> None:
+            """Nothing later runs: no approval or delivery of work that was never done."""
+            run.current_step_id = step_id
+            if (run.trigger_data or {}).get("parent_run_id"):
+                # A parent reads a child's outcome from its status, so it stops here too.
+                run.status = "failed"
+                run.error = str((result.get("needs_person") or {}).get("missing") or "")
+            else:
+                run.status = "completed"
+                run.variables = {**(run.variables or {}), "__result": needs_input_run_result(result)}
+            run.completed_at = _utc_now()
+            from packages.core.services.workflow_chat_projection import (
+                project_workflow_run_status,
+            )
+
+            await project_workflow_run_status(db, run=run)
+            await _commit_terminal()
+
+        from packages.core.services.workflow_step_needs_person import (
+            needs_input_run_result,
+            step_stopped_for_person,
+        )
+
         steps = workflow.steps or []
         max_iterations = len(steps) * 3  # safety cap
+        self._learn_run_steps(run, steps)
 
         for _ in range(max_iterations):
             if await self._externally_paused_or_cancelled(
@@ -3320,6 +4419,10 @@ class WorkflowRunner:
             if apply_workflow_approval_revision(steps, run):
                 # Persist the rewind before the revised route starts running.
                 await db.commit()
+            stopped = step_stopped_for_person(run.step_results)
+            if stopped is not None:
+                await _finish_for_person(*stopped)
+                return
             runnable = self._find_runnable_steps(workflow, run)
             if not runnable:
                 # No more steps to run — check if we're done
@@ -3390,9 +4493,9 @@ class WorkflowRunner:
                         db,
                     )
                     batch.append((step, result))
-                    if result.get("code") == "runtime_approval_required":
-                        # A native approval parks the run at this exact call.
-                        # Later frontier siblings must not overtake its gate.
+                    if result.get("code") == "runtime_approval_required" or result.get("needs_person"):
+                        # A native approval or host stop parks this frontier.
+                        # Later siblings must not overtake its gate.
                         break
                 for step, result in batch:
                     _continue_failed_result(step, result, run)
@@ -3575,9 +4678,29 @@ class WorkflowRunner:
         return planned
 
     async def _settle_failure(self, step: dict, result: dict, run: WorkflowRun, db) -> dict:
-        """Give a failed step result the headline the platform owns."""
+        """Give a failed step result the headline the platform owns.
+
+        A step that failed because its integration is not connected waits for
+        that connection instead, and continues from here once it is.
+        """
         if not isinstance(result, dict) or result.get("status") != "failed":
             return result
+        from packages.core.services.workflow_connection_wait import connection_wait_for_failed_step
+
+        waiting = await connection_wait_for_failed_step(db, run=run, step=step, result=result)
+        if waiting is not None:
+            return waiting
+        if result.get("code") in _DEFINITION_GAP_CODES:
+            # A value one step owes another is a gap in the Workflow, not
+            # something the person running it can fix: operators are told.
+            from packages.core.services.platform_faults import report_platform_fault
+
+            await report_platform_fault(
+                target=f"workflow:{getattr(run, 'workflow_id', None)}", code=str(result["code"]),
+                summary=str(result.get("error") or ""),
+                context={"run_id": getattr(run, "id", None), "step_id": step.get("id"),
+                         "entity_id": getattr(run, "entity_id", None), "workspace_id": getattr(run, "workspace_id", None)},
+            )
         locale = await self._failure_locale(run, db)
         return settle_workflow_failure(step, result, step_results=run.step_results, locale=locale)
 
@@ -3602,6 +4725,14 @@ class WorkflowRunner:
         """Execute a step with timeout and error handling."""
         step_id = step["id"]
         run.current_step_id = step_id
+        from packages.core.services.workflow_connection_wait import recheck_connection_wait
+
+        # A step waiting for a connection runs again only once it is connected.
+        still_waiting = await recheck_connection_wait(
+            db, run=run, step=step, previous=(run.step_results or {}).get(step_id),
+        )
+        if still_waiting is not None:
+            return still_waiting
         config = step.get("config", {})
         execution_variables = _step_variable_scope(step, run)
         resolved_inputs = dict(execution_variables)
@@ -3770,7 +4901,14 @@ class WorkflowRunner:
                 ):
                     # No call reached an effectful handler during this attempt.
                     result.setdefault("effect_state", "none")
-            if result.get("status") == "completed":
+            if await _recover_failed_step_transaction(db, run) and result.get("status") != "failed":
+                # Whatever the node reported, none of its database work was kept.
+                result = {
+                    "status": "failed",
+                    "code": "step_changes_not_saved",
+                    "error": f"Step {step_id} could not save its changes; nothing it wrote was kept",
+                }
+            if result.get("status") == "completed" and not result.get("needs_person"):
                 if config.get("always_output_data") and result.get("output") in (None, [], ()):
                     result["output"] = [{}]
                 output_failure = _schema_validation_failure(
@@ -3863,7 +5001,11 @@ class WorkflowRunner:
         config = step.get("config") or {}
         # Explicit named inputs: bind config.inputs into the scope so the step's
         # own config can reference them by {{name}} (data-flow mapping).
-        _bind_inputs(config, variables)
+        try:
+            with _references_must_resolve() if step_type in _STRICT_REFERENCE_STEP_TYPES else nullcontext():
+                _bind_inputs(config, variables)
+        except UnresolvedWorkflowReference as exc:
+            return exc.step_failure()
         if config.get("execute_once"):
             # n8n Execute Once exposes only the first item on every main input.
             # Manor represents those item streams as lists in named bindings and
@@ -3897,6 +5039,8 @@ class WorkflowRunner:
             runtime_context["workflow_execution_node_id"] = execution_node_id
         if (refusal := await self._collaborator_step_refusal(step_type, step, variables, run, db)) is not None:
             return refusal
+        if (refusal := await self._production_storage_refusal(step, variables, run, db)) is not None:
+            return refusal
 
         if step_type == "stage":
             return await self._execute_stage_step(step, run, db)
@@ -3919,6 +5063,10 @@ class WorkflowRunner:
                 runtime_context,
                 db,
                 previous_result=previous_result,
+                output_field_reads=self._output_field_reads_for(run, step),
+                output_field_types=self._output_field_types_for(run, step),
+                approval_reviewed=self._approval_reviewed(run, step),
+                may_stop_for_person=True,
             )
         elif step_type == "tool":
             previous_result = (run.step_results or {}).get(step.get("id"))
@@ -3946,16 +5094,22 @@ class WorkflowRunner:
             return await self._execute_parallel_step(step, variables, entity_id, run, db)
         elif step_type == "transform":
             return self._execute_transform_step(step, variables, run)
-        elif step_type == "workflow_project":
-            return await self._execute_workflow_project_step(step, variables, run, db)
-        elif step_type == "workflow_action_grant":
-            return await self._execute_workflow_action_grant_step(step, variables, run, db)
-        elif step_type == "workflow_effect_deadline":
-            return self._execute_workflow_effect_deadline_step(step, variables, run)
-        elif step_type == "browser_effect":
-            return await self._execute_browser_effect_step(step, variables)
-        elif step_type == "publication_receipt":
-            return self._execute_publication_receipt_step(step, variables)
+        elif step_type in _RECORD_STEP_TYPES:
+            # Everything these steps render is stored, so none of it may keep
+            # a ``{{...}}`` placeholder in place of a value.
+            try:
+                with _references_must_resolve():
+                    if step_type == "workflow_project":
+                        return await self._execute_workflow_project_step(step, variables, run, db)
+                    if step_type == "workflow_action_grant":
+                        return await self._execute_workflow_action_grant_step(step, variables, run, db)
+                    if step_type == "workflow_effect_deadline":
+                        return self._execute_workflow_effect_deadline_step(step, variables, run)
+                    if step_type == "browser_effect":
+                        return await self._execute_browser_effect_step(step, variables)
+                    return self._execute_publication_receipt_step(step, variables)
+            except UnresolvedWorkflowReference as exc:
+                return exc.step_failure()
         elif step_type == "notify":
             return await self._execute_notify_step(
                 step,
@@ -3982,6 +5136,10 @@ class WorkflowRunner:
                 user_id,
                 runtime_context,
                 db,
+                # A classifier's reply is the label its routes match.
+                output_field_reads=self._output_field_reads_for(run, step) if step_type == "llm" else None,
+                output_field_types=self._output_field_types_for(run, step) if step_type == "llm" else None,
+                approval_reviewed=self._approval_reviewed(run, step),
             )
         elif step_type == "connector":
             # A connector node is a single tool/MCP call — reuse the tool path.
@@ -4106,6 +5264,12 @@ class WorkflowRunner:
                 "status": "completed",
                 "output": output,
             }
+            # What reaching this end means for the business, said to the person
+            # instead of a bare "completed" (e.g. "kept out of the queue, not
+            # published", or "scheduled" for a plan whose work runs later).
+            completion_message = str(end_config.get("completion_message") or "").strip()
+            if completion_message:
+                completed["completion_message"] = _render_template(completion_message, variables)
             # An end that reports a needs_input outcome can say where to resume
             # once the person supplies what was missing, and which inputs to edit.
             retry_state = _resolve_structure(end_config.get("retry_state"), variables)
@@ -4188,6 +5352,37 @@ class WorkflowRunner:
                 self._run_collaborators = {}
             self._run_collaborators[str(run.id)] = collaborators
         return collaborators
+
+    @staticmethod
+    async def _production_storage_refusal(step: dict, variables: dict, run: WorkflowRun, db) -> dict | None:
+        """Refuse to start a step that makes the production's units when the plan has no room for them.
+
+        Checked when the step starts or is retried, not when it resumes work
+        already under way: a Personal plan learns it is full before dozens of
+        shots are paid for, not when they are saved.
+        """
+        from packages.core.services.document_service import StorageLimitExceeded
+        from packages.core.services.storage_capacity import ensure_storage_capacity
+        from packages.core.services.workflow_production import production_storage_bytes
+
+        step_id = str(step.get("id") or "")
+        previous = (getattr(run, "step_results", None) or {}).get(step_id)
+        if isinstance(previous, dict) and previous.get("status") != "failed":
+            return None
+        snapshot = getattr(run, "execution_snapshot", None)
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        estimate = production_storage_bytes(snapshot.get("steps"), variables, step_id, previous)
+        if not estimate:
+            return None
+        try:
+            await ensure_storage_capacity(db, run.entity_id, estimate, what="This production")
+        except StorageLimitExceeded as exc:
+            return {
+                "status": "failed", "code": "knowledge_storage_limit", "error": str(exc),
+                "plan": exc.plan, "limit": exc.limit, "current": exc.current,
+                "estimated_bytes": estimate, "effect_state": "none",
+            }
+        return None
 
     async def _collaborator_step_refusal(
         self,
@@ -4272,6 +5467,12 @@ class WorkflowRunner:
 
         all_stage_state = deepcopy((run.variables or {}).get("__stage_execution") or {})
         state = deepcopy(all_stage_state.get(stage_id) or {})
+        stopped = state.get("stopped_for_person")
+        if (isinstance(stopped, dict) and stopped.get("run_id") == str(run.id)
+                and isinstance(stopped.get("result"), dict)):
+            return deepcopy(stopped["result"])
+        # A new retry keeps completed operations, then reruns the stopped one.
+        state.pop("stopped_for_person", None)
         operation_results = {
             str(operation_id): _stage_operation_checkpoint(result)
             for operation_id, result in (state.get("operation_results") or {}).items()
@@ -4373,6 +5574,21 @@ class WorkflowRunner:
                     status="skipped" if result.get("skipped") else result.get("status", "unknown"),
                     result=result,
                 )
+
+                if result.get("needs_person"):
+                    stopped_result = {
+                        **result, "stage_id": stage_id,
+                        "retry_state": {**result["retry_state"], "retry_from_step_id": stage_id, "step_id": stage_id},
+                    }
+                    checkpoint(
+                        status="failed", current_operation_id=operation_id,
+                        pending_operation_ids=[operation_id], failed_operation_id=operation_id,
+                        paused_operation_id=None,
+                        stopped_for_person={"run_id": str(run.id), "result": stopped_result},
+                    )
+                    if db is not None:
+                        await db.commit()
+                    return stopped_result
 
                 if result.get("status") == "paused":
                     operation_config = operation.get("config") if isinstance(operation.get("config"), dict) else {}
@@ -4564,12 +5780,58 @@ class WorkflowRunner:
         except Exception:
             raise WorkflowRuntimeApprovalError("The exact approval continuation could not be loaded. Do not replay this step.") from None
 
-    async def _execute_agent_step(self, step: dict, *args: Any, **kwargs: Any) -> dict:
+    @staticmethod
+    def _step_needs_person_outcome(step: dict, request: dict[str, str], loop_result: Any) -> dict:
+        """End the step asking the person, unless it already acted outward.
+
+        Retry runs a stopped step again, which could repeat what it sent or
+        published, so that case fails without replay for someone to look at.
+        """
+        from packages.core.contracts.step_execution import StepExpectation
+        from packages.core.services.workflow_step_needs_person import step_needs_person_result
+
+        evidence = getattr(loop_result, "tool_evidence", None)
+        control = getattr(loop_result, "control", None)
+        control = control if isinstance(control, dict) else {}
+        effect_state = (evidence.get("effect_state") if isinstance(evidence, dict) else None) or control.get("effect_state")
+        fields = {
+            "usage": getattr(loop_result, "usage", None),
+            "tools_used": getattr(loop_result, "tool_calls_made", None),
+            "rounds": getattr(loop_result, "rounds", None),
+        }
+        if (effect_state == "unconfirmed" or control.get("do_not_replay") is True
+                or (isinstance(evidence, dict) and _ledger_meets_expectation([evidence], StepExpectation.EFFECTS))):
+            return {
+                **fields,
+                "status": "failed",
+                "error": request["missing"],
+                "do_not_replay": True,
+                "retry_blocked": True,
+                "effect_state": str(effect_state or "unknown"),
+            }
+        return step_needs_person_result(str(step.get("id") or ""), request, **fields)
+
+    async def _execute_agent_step(
+        self, step: dict, *args: Any, output_field_reads: dict[str, list[str]] | None = None,
+        output_field_types: dict[str, list[str]] | None = None,
+        approval_reviewed: bool = False, **kwargs: Any,
+    ) -> dict:
         """Run an agent step inside its ``tool_operation_denylist`` scope.
 
         The Runtime refuses a denied ``tool(operation=...)`` call as a pre-I/O
         preflight result, including inside nested prompt-Skill loops.
+
+        ``output_field_reads`` are the fields later steps read from this
+        step's result (see :func:`_agent_output_contract`).
+        ``approval_reviewed`` says a person approves this result as it is
+        (see :func:`workflow_approval_reviewed_steps`).
         """
+        if approval_reviewed:
+            config = dict(step.get("config") or {})
+            for key in [key for key in ("prompt", "input") if config.get(key)] or ["prompt"]:
+                task = config.get(key) or step.get("name") or "Execute this step."
+                config[key] = f"{task}\n\n{WORKFLOW_APPROVED_OUTPUT_IS_FINAL}"
+            step = {**step, "config": config}
         from packages.core.contracts.step_execution import (
             TOOL_OPERATION_DENYLIST_KEY, parse_tool_operation_denylist, tool_operation_denylist_scope,
         )
@@ -4581,11 +5843,18 @@ class WorkflowRunner:
             except ValueError as exc:
                 return {"status": "failed", "error": f"Invalid config.{TOOL_OPERATION_DENYLIST_KEY}: {exc}"}
         evidence_states: list[Any] = []
+        contract = _agent_output_contract(step, output_field_reads, output_field_types)
         with tool_operation_denylist_scope(denylist):
             result = await self._execute_agent_step_in_scope(
-                step, *args, evidence_states=evidence_states, **kwargs,
+                step, *args, evidence_states=evidence_states, output_contract=contract, **kwargs,
             )
-        return _with_platform_failure(step, result, evidence_states)
+        if isinstance(result, dict) and result.get("needs_person"):
+            # Nothing later runs, so no output contract or ``expects`` is owed.
+            return _with_saved_files(result, evidence_states)
+        result = _with_output_contract(step, result, contract, output_field_reads, evidence_states)
+        return _with_saved_files(_with_unmet_expectations(
+            step, _with_platform_failure(step, result, evidence_states), evidence_states,
+        ), evidence_states)
 
     async def _execute_agent_step_in_scope(
         self,
@@ -4598,18 +5867,27 @@ class WorkflowRunner:
         previous_result: dict[str, Any] | None = None,
         *,
         evidence_states: list[Any] | None = None,
+        output_contract: dict | None = None,
+        may_stop_for_person: bool = False,
     ) -> dict:
         """Run agentic loop for an agent-type step.
 
         ``evidence_states`` receives the run's tool evidence ledger, so the
         caller can tell a platform fault from what the model wrote.
+        ``output_contract`` is the object a step with no ``output_schema``
+        returns because later steps read its fields.
+        ``may_stop_for_person`` offers the step ``stop_step_needs_person``.
 
         Config keys:
           - skill: skill ID or slug to invoke via Runtime skill boundary
           - prompt / input: text prompt (supports {{var}} templates)
           - system_prompt: override system prompt for the agentic loop
           - tools: list of tool names to make available
-          - max_rounds: max agentic loop iterations (default 20)
+          - max_rounds: agentic loop iterations per budget (default 20); a step
+            the limit stops before its expected output exists, or whose output
+            schema would be filled by the forced final reply, gets up to
+            ``_AGENT_ROUND_LIMIT_CONTINUATIONS`` more budgets
+            (see :func:`_agent_work_left_at_round_limit`)
           - temperature: LLM temperature (default 0.7)
           - model: LLM model override
         """
@@ -4672,6 +5950,10 @@ class WorkflowRunner:
         if config.get("stat_assessment_keys") and (skill_ref or config.get("output_schema")):
             return {"status": "failed", "error": "assessment steps must use the evidence receipt contract, not skill delegation or an output schema"}
         output_schema = _resolve_structure(config.get("output_schema"), variables)
+        # The contract's reply is the object later steps read fields from.
+        output_format = "json" if output_contract is not None else config.get("output_format")
+        if output_schema is None:
+            output_schema = output_contract
         if output_schema is not None:
             try:
                 SchemaContractValidatorFactory.build(output_schema)
@@ -4935,10 +6217,7 @@ class WorkflowRunner:
                     failure,
                     runtime_envelope,
                 )
-            output = _parse_agent_output(
-                skill_result.get("content", ""),
-                config.get("output_format"),
-            )
+            output = _parse_agent_output(skill_result.get("content", ""), output_format)
             # Store output in variables if output_var specified
             output_var = config.get("output_var")
             completed = {
@@ -4982,18 +6261,28 @@ class WorkflowRunner:
             # instructions carried on the node (see standalone_tools below).
             default_system = str(config["standalone_system_prompt"])
         system_prompt = _render_template(config.get("system_prompt", default_system), variables)
+        from packages.core.services.workflow_agent_recovery import step_recovery_evidence
+
+        can_act = str(step.get("type") or "agent").lower() == "agent"
+        # A retried Agent step reads its complete stored evidence on demand
+        # instead of trusting whatever survived the prompt budget.
+        recovery_evidence = step_recovery_evidence(previous_result) if can_act else {}
+        resume_prompt = _workflow_agent_resume_prompt(
+            previous_result,
+            runtime_context=runtime_context,
+            step_id=str(step.get("id") or ""),
+            recovery_tool=bool(recovery_evidence),
+        )
+        if not resume_prompt:
+            recovery_evidence = {}
         user_message = runtime_prompt_with_output_schema(
             runtime_prompt_with_completion_rules(
                 _render_template(
                     config.get("prompt", config.get("input", step.get("name", "Execute this step."))),
                     variables,
-                ) + _workflow_agent_resume_prompt(
-                    previous_result,
-                    runtime_context=runtime_context,
-                    step_id=str(step.get("id") or ""),
-                ),
+                ) + resume_prompt,
                 # An llm step has no tools; an agent step acts with its tools or its agent's.
-                can_act=str(step.get("type") or "agent").lower() == "agent",
+                can_act=can_act,
             ),
             output_schema,
         )
@@ -5046,6 +6335,11 @@ class WorkflowRunner:
             tool_names = [
                 str(name) for name in (config.get("standalone_tools") or []) if str(name or "").strip()
             ]
+        project_folder = await _workflow_project_folder(entity_id, runtime_context, db)
+        # In a run that works on a WorkflowProject, what the step makes belongs
+        # in the project's folder: a code project only when the step lists
+        # code_project in its own tools, never from the Agent's general ones.
+        blocked_tool_names = ("code_project",) if project_folder and tool_names is None else None
         runtime_request = runtime_request_for_surface_turn(
             surface=ChatSurface.WORKFLOW_AGENT_STEP,
             entity_id=entity_id,
@@ -5056,6 +6350,7 @@ class WorkflowRunner:
             task_id=runtime_context.get("task_id"),
             message=user_message,
             legacy_path="ai.workflow_runner.agent_step",
+            metadata={WORKFLOW_PROJECT_FOLDER_METADATA_KEY: project_folder} if project_folder else None,
         )
         try:
             if db is not None:
@@ -5077,6 +6372,7 @@ class WorkflowRunner:
                     mcp_scope_unrestricted=mcp_scope_unrestricted,
                     active_user_message=user_message,
                     configured_tool_names=tool_names,
+                    blocked_tool_names=blocked_tool_names,
                 )
                 if prompt_db is not None:
                     await prompt_db.commit()
@@ -5090,7 +6386,10 @@ class WorkflowRunner:
                 runtime_surface_result = runtime_prepare_agent_tool_surface_for_turn(
                     runtime_request,
                     agent_id=agent_id or None,
-                    bound_tool_names=bound_tool_names,
+                    bound_tool_names=(
+                        bound_tool_names - set(blocked_tool_names or ())
+                        if bound_tool_names is not None else None
+                    ),
                     is_master=is_master,
                     mcp_allowed_names=mcp_allowed_names,
                     mcp_provider_scopes=mcp_provider_scopes,
@@ -5104,6 +6403,51 @@ class WorkflowRunner:
             tool_schemas = runtime_surface_result.tool_schemas
             allowed_tool_names = runtime_surface_result.allowed_tool_names
             runtime_envelope = runtime_surface_result.envelope
+
+        recovery_handlers: dict[str, Any] = {}
+        if recovery_evidence:
+            # Reading its own evidence is part of retrying, even for a step
+            # whose node grants no other tool; the prompt already points here.
+            from packages.core.services.workflow_agent_recovery import (
+                STEP_RECOVERY_TOOL,
+                STEP_RECOVERY_TOOL_NAME,
+                step_recovery_page,
+            )
+
+            async def read_step_recovery(args: dict) -> str:
+                return step_recovery_page(recovery_evidence, args)
+
+            tool_schemas = [*tool_schemas, STEP_RECOVERY_TOOL]
+            if allowed_tool_names is not None:
+                allowed_tool_names = {*allowed_tool_names, STEP_RECOVERY_TOOL_NAME}
+            recovery_handlers[STEP_RECOVERY_TOOL_NAME] = read_step_recovery
+
+        # What the Agent asked for, recorded by the host: the reply's wording is not consulted.
+        person_requests: list[dict[str, str]] = []
+        needs_person_kwargs: dict[str, Any] = {}
+        # A step with no tools only writes text: it stays on the plain model call.
+        if may_stop_for_person and tool_schemas:
+            from packages.core.services.workflow_step_needs_person import (
+                STEP_NEEDS_PERSON_GUIDANCE,
+                STEP_NEEDS_PERSON_TERMINAL_POLICY,
+                STEP_NEEDS_PERSON_TOOL,
+                STEP_NEEDS_PERSON_TOOL_NAME,
+                step_needs_person_request,
+            )
+
+            async def stop_step_needs_person(args: dict) -> str:
+                request = step_needs_person_request(args)
+                if request is None:
+                    return json.dumps({"error": "Say what is missing and what the person should do."})
+                person_requests.append(request)
+                return json.dumps({"ok": True, "status": "stopped"})
+
+            tool_schemas = [*tool_schemas, STEP_NEEDS_PERSON_TOOL]
+            if allowed_tool_names is not None:
+                allowed_tool_names = {*allowed_tool_names, STEP_NEEDS_PERSON_TOOL_NAME}
+            recovery_handlers[STEP_NEEDS_PERSON_TOOL_NAME] = stop_step_needs_person
+            system_prompt = f"{system_prompt}\n\n{STEP_NEEDS_PERSON_GUIDANCE}"
+            needs_person_kwargs["terminal_tool_result_policy"] = STEP_NEEDS_PERSON_TERMINAL_POLICY
 
         assessment_contract = None
         if config.get("stat_assessment_keys"):
@@ -5121,7 +6465,7 @@ class WorkflowRunner:
 
         if db is not None:
             await release_read_transaction(db)
-        result = await runtime_execute_workflow_agent_loop(
+        loop_kwargs = dict(
             runtime_envelope=runtime_envelope,
             system_prompt=system_prompt,
             user_message=user_message,
@@ -5139,15 +6483,39 @@ class WorkflowRunner:
             max_tokens=agent_config.max_tokens or node_config.max_tokens,
             model=agent_config.model or node_config.model,
             runtime_tool_context=runtime_workflow_tool_context_args(runtime_context),
+            # Every model call of this step is written against its run.
+            billing_operation_id=runtime_context.get("workflow_run_id") or None,
             output_schema=output_schema,
             # The checkpoint already owns the original forced-call prefix.
             forced_tool_calls=None if approval_resume else forced_tool_calls,
             **({"final_response_contract": assessment_contract} if assessment_contract is not None else {}),
+            **({"dynamic_tool_handlers": recovery_handlers} if recovery_handlers else {}),
+            **needs_person_kwargs,
             hitl_resume_checkpoint=True,
             runtime_checkpoint=approval_resume["checkpoint"] if approval_resume else None,
         )
+        result = await _run_billed_workflow_loop(loop_kwargs, step=step, runtime_context=runtime_context)
+        for _ in range(_AGENT_ROUND_LIMIT_CONTINUATIONS):
+            # Running out of rounds mid-work is the platform's budget, not the
+            # step's failure: the same conversation continues with a fresh
+            # budget, its transcript, receipts, loaded tools and sandbox kept.
+            owed = _agent_work_left_at_round_limit(step, result, output_schema, output_format)
+            if not owed:
+                break
+            logger.info("Workflow agent step %s ran out of rounds before: %s; continuing", step.get("id"), owed)
+            result = await _run_billed_workflow_loop({
+                **loop_kwargs,
+                "run_state": result.run_state,
+                "user_message": _agent_round_limit_continuation(owed),
+                "max_rounds": result.run_state.rounds + max_rounds,
+                "forced_tool_calls": None,
+                "runtime_checkpoint": None,
+            }, step=step, runtime_context=runtime_context)
         if evidence_states is not None:
             evidence_states.append(getattr(result, "tool_evidence", None))
+
+        if person_requests:
+            return self._step_needs_person_outcome(step, person_requests[-1], result)
 
         if (getattr(result, "stop_reason", None) == "hitl_required"
             and (getattr(result, "control", None) or {}).get("kind") == "approval_required"):
@@ -5190,7 +6558,23 @@ class WorkflowRunner:
             )
 
         output_var = config.get("output_var")
-        output = _parse_agent_output(result.content, config.get("output_format"))
+        try:
+            output = _parse_agent_output(result.content, output_format)
+        except ValueError:
+            if output_contract is None:
+                raise
+            # The round limit's tool-free reply is not schema-checked by the
+            # loop; the host settles the contract (see _with_output_contract).
+            return await runtime_attach_and_persist_workflow_runner_result({
+                "status": "failed",
+                "output": result.content,
+                "error": _LOOP_ERROR_MESSAGES["output_schema_validation_failed"],
+                "runtime_error": "output_schema_validation_failed",
+                "stop_reason": result.stop_reason,
+                "usage": result.usage,
+                "tools_used": result.tool_calls_made,
+                "rounds": result.rounds,
+            }, runtime_envelope)
         completed = {
             "status": "completed",
             "output": output,
@@ -5265,10 +6649,21 @@ class WorkflowRunner:
 
         raw_args = config.get("args", {})
         approval_resume = await self._native_approval_resume(previous_result, runtime_context, entity_id, user_id)
-        rendered_args = (approval_resume["call"]["arguments"] if approval_resume
-                         else _resolve_structure(raw_args, variables))
+        try:
+            with _references_must_resolve():
+                rendered_args = (approval_resume["call"]["arguments"] if approval_resume
+                                 else _resolve_structure(raw_args, variables))
+        except UnresolvedWorkflowReference as exc:
+            return exc.step_failure()
         if not isinstance(rendered_args, dict):
             return {"status": "failed", "error": "Tool arguments must be an object"}
+        lists_new_items = isinstance(config.get("new_items"), dict)
+        if lists_new_items:
+            from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
+            from packages.core.ai.runtime.tool_effect_classification import RuntimeToolEffect
+
+            if classify_runtime_tool(tool_name, rendered_args).effect is not RuntimeToolEffect.READ_ONLY:
+                return {"status": "failed", "error": "Tool step new_items requires a read-only tool"}
         previous_fanout = (
             previous_result.get("output")
             if _workflow_step_result_requires_reexecution(previous_result)
@@ -5292,13 +6687,29 @@ class WorkflowRunner:
             message=str(config.get("prompt") or config.get("input") or step.get("name") or ""),
             legacy_path="ai.workflow_runner.tool_step",
         )
-        tool_step_result = await runtime_execute_workflow_tool_step(
-            request=runtime_request,
-            tool_name=tool_name,
-            arguments=rendered_args,
-            active_user_message=str(config.get("prompt") or config.get("input") or step.get("name") or ""),
-            workflow_context=runtime_context,
-        )
+        # A tool step runs outside any agent loop, so it binds its own billing
+        # context: media and model calls the tool makes are tied to this run
+        # and to the Task that started it, and are gated and recorded like
+        # calls in an agent step.
+        from packages.core.ai.runtime.billing import runtime_llm_billing_context
+        from packages.core.ai.runtime.harness import RUNTIME_WORKFLOW_AGENT_BILLING_SOURCE
+
+        async with runtime_llm_billing_context(
+            entity_id,
+            user_id=user_id or None,
+            workspace_id=runtime_context.get("workspace_id"),
+            conversation_id=runtime_context.get("conversation_id"),
+            source=RUNTIME_WORKFLOW_AGENT_BILLING_SOURCE,
+            operation_id=str(runtime_context.get("workflow_run_id") or "").strip() or None,
+            task_id=str(runtime_context.get("task_id") or "").strip() or None,
+        ):
+            tool_step_result = await runtime_execute_workflow_tool_step(
+                request=runtime_request,
+                tool_name=tool_name,
+                arguments=rendered_args,
+                active_user_message=str(config.get("prompt") or config.get("input") or step.get("name") or ""),
+                workflow_context=runtime_context,
+            )
 
         from packages.core.ai.runtime.human_gate import runtime_detect_blocking_human_gate
         control = runtime_detect_blocking_human_gate(tool_name, rendered_args, tool_step_result.output)
@@ -5341,8 +6752,13 @@ class WorkflowRunner:
                 fanout_status = None
         if fanout_status is not None:
             output = parsed_object
-        if fanout_status is IntegrationAccountFanoutStatus.PARTIAL:
-            can_resume = IntegrationAccountFanoutResultFactory.continuation_account_id(parsed_object) is not None
+        can_resume = (
+            fanout_status is IntegrationAccountFanoutStatus.PARTIAL
+            and IntegrationAccountFanoutResultFactory.continuation_account_id(parsed_object) is not None
+        )
+        # An account that cannot be read does not hold up what the others answered: it is
+        # listed again on the next look, and nothing of it was marked as seen.
+        if fanout_status is IntegrationAccountFanoutStatus.PARTIAL and (can_resume or not lists_new_items):
             if not can_resume:
                 return await runtime_attach_and_persist_workflow_runner_result(
                     {
@@ -5421,6 +6837,8 @@ class WorkflowRunner:
                             },
                             tool_step_result.envelope,
                         )
+        if lists_new_items:
+            output = _new_items_in_listing(output, config["new_items"], variables)
         completed = {
             "status": "completed",
             "output": output,
@@ -5739,15 +7157,19 @@ class WorkflowRunner:
                 "output_var": config.get("output_var"),
             }
 
-        url = _render_template(str(config.get("url", "")), variables)
+        try:
+            with _references_must_resolve():
+                url = _render_template(str(config.get("url", "")), variables)
+                headers = {k: _render_template(str(v), variables) for k, v in (config.get("headers") or {}).items()}
+                query = {k: _render_template(str(v), variables) for k, v in (config.get("query") or {}).items()}
+                payload = _resolve_http_body(config.get("json", config.get("body")), variables)
+        except UnresolvedWorkflowReference as exc:
+            return exc.step_failure()
         if not url:
             return {"status": "failed", "error": "No url specified in http step config"}
 
         method = str(config.get("method", "GET")).upper()
-        headers = {k: _render_template(str(v), variables) for k, v in (config.get("headers") or {}).items()}
-        query = {k: _render_template(str(v), variables) for k, v in (config.get("query") or {}).items()}
         timeout = resolve_workflow_http_request_timeout(config)
-        payload = config.get("json", config.get("body"))
 
         try:
             current_url = _validate_workflow_http_url(url)
@@ -5941,6 +7363,7 @@ class WorkflowRunner:
     ) -> dict:
         from packages.core.services.workflow_project_service import (
             WorkflowProjectConflict,
+            WorkflowProjectKeyTaken,
             claim_workflow_project,
             create_workflow_project,
             get_workflow_project,
@@ -5975,9 +7398,16 @@ class WorkflowRunner:
                     "code": "workflow_project_state_validation_failed",
                     "error": "Workflow project state must be an object",
                 }
+            display_failure = project_display_failure(state)
+            if display_failure:
+                return {"status": "failed", "code": "workflow_project_state_validation_failed",
+                        "error": f"Workflow project state is invalid: {display_failure}"}
+            # ``display`` is the platform's own contract: a schema that does not
+            # declare it is checked against the rest of the state.
+            declares_display = isinstance(state_schema, dict) and PROJECT_DISPLAY_KEY in (state_schema.get("properties") or {})
             failure = _schema_validation_failure(
                 state_schema,
-                state,
+                state if declares_display else {key: value for key, value in state.items() if key != PROJECT_DISPLAY_KEY},
                 code="workflow_project_state_validation_failed",
             )
             return failure or state
@@ -6197,22 +7627,22 @@ class WorkflowRunner:
                     event = _resolve_structure(history_event, variables)
                     if not isinstance(event, dict):
                         raise ValueError("Workflow project history_event must be an object")
-                    event.setdefault("run_id", run.id)
-                    event.setdefault(
-                        "attempt_number",
-                        run.effective_attempt_number,
-                    )
-                    event.setdefault("step_id", str(step.get("id") or ""))
-                    event.setdefault("timestamp", _utc_now().isoformat())
+                    stamps = {"run_id": run.id, "attempt_number": run.effective_attempt_number,
+                              "step_id": str(step.get("id") or ""), "timestamp": _utc_now().isoformat()}
+                    for name in HISTORY_EVENT_STAMPS:
+                        event.setdefault(name, stamps[name])
                     _project_state_list(state, "history").append(event)
 
                 checked = validated_state(state)
                 if checked.get("code") == "workflow_project_state_validation_failed":
                     return checked
                 current_stage_value = config.get("current_stage")
+                # A stage that resolves to nothing (an answer left the field out)
+                # keeps the record's stage instead of blanking it.
+                current_stage = _bound_value(current_stage_value, variables) if current_stage_value is not None else None
                 current_stage = (
-                    str(_resolve_binding(current_stage_value, variables) or "").strip()
-                    if current_stage_value is not None
+                    str(current_stage).strip() or None
+                    if current_stage is not None and current_stage is not _UNRESOLVED
                     else None
                 )
                 allowed_stages = {str(value) for value in (config.get("allowed_stages") or [])}
@@ -6228,6 +7658,32 @@ class WorkflowRunner:
                     current_stage=current_stage,
                     last_run_id=run.id,
                 )
+            elif operation == "delete":
+                if not project_id or not project_type:
+                    raise ValueError("Workflow project delete requires project_id and project_type")
+                children = []
+                for child in config.get("children") or []:
+                    if not isinstance(child, dict) or not child.get("project_type") or not child.get("parent_state_key"):
+                        raise ValueError("Workflow project delete children need project_type and parent_state_key")
+                    children.append((str(child["project_type"]), str(child["parent_state_key"])))
+                from packages.core.services.workflow_project_service import (
+                    WorkflowProjectInUse,
+                    delete_workflow_project,
+                )
+
+                expected = _resolve_structure(config.get("expected_children"), variables)
+                expected_child_ids = None if expected is None else [str(item) for item in expected]
+                try:
+                    deleted = await delete_workflow_project(
+                        db, project_id=project_id, entity_id=run.entity_id, workspace_id=run.workspace_id,
+                        project_type=project_type, children=children, run_id=run.id,
+                        expected_child_ids=expected_child_ids,
+                    )
+                except WorkflowProjectInUse as exc:
+                    return {"status": "failed", "error": str(exc), "code": "workflow_project_in_use"}
+                return {"status": "completed", "output_var": output_var, "output": {
+                    "project_id": project_id, "deleted_ids": deleted, "deleted_count": len(deleted),
+                }}
             else:
                 raise ValueError(f"Unsupported Workflow project operation: {operation}")
             state = project.state if isinstance(project.state, dict) else {}
@@ -6341,6 +7797,17 @@ class WorkflowRunner:
                 "error": str(exc),
                 "project_id": project_id,
             }
+        except WorkflowProjectKeyTaken as exc:
+            # ``create`` means a new project; adopting the existing one would
+            # let this run overwrite another run's work. ``claim`` reuses it.
+            return {
+                "status": "failed",
+                "code": "workflow_project_key_taken",
+                "error": str(exc),
+                "existing_project_id": exc.existing.id,
+            }
+        except UnresolvedWorkflowReference:
+            raise
         except Exception as exc:  # noqa: BLE001
             return {
                 "status": "failed",
@@ -6530,6 +7997,8 @@ class WorkflowRunner:
                 },
                 "output_var": output_var,
             }
+        except UnresolvedWorkflowReference:
+            raise
         except Exception as exc:  # noqa: BLE001
             return {
                 "status": "failed",
@@ -6576,6 +8045,8 @@ class WorkflowRunner:
                 },
                 "output_var": config.get("output_var"),
             }
+        except UnresolvedWorkflowReference:
+            raise
         except Exception as exc:  # noqa: BLE001
             return {
                 "status": "failed",
@@ -6639,6 +8110,19 @@ class WorkflowRunner:
         )
 
         if wait_type == "approval":
+            trigger_decision = preapproved_wait_decision(config, step_id=str(step.get("id") or ""), variables=variables)
+            if trigger_decision is not None:
+                response_variable = str(config.get("response_variable") or f"{step.get('id')}_response")
+                return {
+                    "status": "completed",
+                    "output": {"choice": trigger_decision["decision"], "preapproved": True},
+                    "output_var": response_variable,
+                    "wait_type": wait_type,
+                    "decision": trigger_decision["decision"],
+                    "approved": True,
+                    "approved_by": trigger_decision["approved_by"],
+                    "approved_at": trigger_decision["approved_at"],
+                }
             delegated = await delegated_parent_workflow_approval(db, run=run, config=config)
             if delegated is not None:
                 response_variable = str(config.get("response_variable") or f"{step.get('id')}_response")
@@ -6832,6 +8316,13 @@ class WorkflowRunner:
             from packages.core.services.workflow_review_files import attach_review_document_ids
 
             await attach_review_document_ids(db, entity_id=run.entity_id, reviews=[result["review"]])
+        elif wait_type == "approval":
+            # An approval that names nothing to review shows what the run made for it.
+            from packages.core.services.workflow_review_files import workflow_wait_review_files
+
+            files = await workflow_wait_review_files(db, run, step_id=str(step.get("id") or ""))
+            if files:
+                result["review"] = {"files": files}
         if config.get("review_title") is not None:
             result["review_title"] = _resolve_binding(config["review_title"], variables)
         return result
@@ -6851,13 +8342,42 @@ class WorkflowRunner:
         Config keys:
           - channel: optional channel name (e.g. "slack", "email"); omit to use
             the recipient's routing preferences (always includes the in-app bell).
+            "workspace_chat" posts into the Workspace's chat, where its people
+            read it, and also tells whoever started the run.
           - message: notification body (templated)
         """
         config = step.get("config", {})
         message = _render_template(str(config.get("message") or ""), variables)
-        title = step.get("name") or "Workflow notification"
+        title = workflow_step_label(step) or "Workflow notification"
         channel = config.get("channel")
+        chat_message, message = await _name_documents_in_message(message, entity_id)
+        if channel == "workspace_chat":
+            workspace_id = runtime_context.get("workspace_id")
+            if not workspace_id:
+                return {"status": "failed", "error": f"{title} posts to a Workspace chat, but this run has no Workspace."}
+            try:
+                from packages.core.database import create_worker_session
+                from packages.core.workspace_chat import service as workspace_chat_service
+
+                async with create_worker_session()() as db:
+                    posted = await workspace_chat_service.post_message(
+                        db, entity_id=entity_id, workspace_id=workspace_id, body=chat_message or title,
+                        message_kind="text", author_kind="agent", publish_event=False,
+                    )
+                    await db.commit()
+                    await workspace_chat_service.publish_workspace_chat_message_event(
+                        entity_id, workspace_id=workspace_id, message=posted,
+                    )
+            except Exception as exc:  # noqa: BLE001 — the person was not told; do not report that they were
+                logger.warning("notify step could not post to Workspace chat: %s", exc)
+                return {"status": "failed", "error": f"{title} could not post to the Workspace chat."}
+            channel = None
+            posted_output = {"message_id": posted.id, "channel": "workspace_chat"}
+        else:
+            posted_output = None
         if not user_id:
+            if posted_output:
+                return {"status": "completed", "output": posted_output}
             # No triggering user to target the in-app bell — degrade gracefully.
             return {"status": "completed", "output": "Notify skipped (no recipient)"}
 
@@ -6875,8 +8395,8 @@ class WorkflowRunner:
             )
         except Exception as exc:  # noqa: BLE001 — a failed notify must not fail the run
             logger.warning("notify step failed: %s", exc)
-            return {"status": "completed", "output": f"Notify failed: {exc}"}
-        return {"status": "completed", "output": f"Notified via {channel or 'default channels'}"}
+            return {"status": "completed", "output": posted_output or f"Notify failed: {exc}"}
+        return {"status": "completed", "output": posted_output or f"Notified via {channel or 'default channels'}"}
 
     # ── Parallel step ────────────────────────────────────────────────────
 
@@ -7006,10 +8526,13 @@ class WorkflowRunner:
                     mapped_item.update(raw_output)
                 else:
                     for key, value in transforms.items():
+                        resolved = _bound_value(value, item_scope)
+                        if resolved is _UNRESOLVED:
+                            continue
                         _set_nested_field(
                             mapped_item,
                             str(key),
-                            _resolve_structure(value, item_scope),
+                            resolved,
                             dot_notation=bool(config.get("dot_notation")),
                         )
                 mapped.append(mapped_item)
@@ -7021,7 +8544,11 @@ class WorkflowRunner:
             }
         updated_vars = dict(run.variables or {})
         for key, value in transforms.items():
-            updated_vars[key] = _resolve_structure(value, variables)
+            resolved = _bound_value(value, variables)
+            if resolved is _UNRESOLVED:
+                updated_vars.pop(key, None)
+            else:
+                updated_vars[key] = resolved
         run.variables = updated_vars
         return {"status": "completed", "output": updated_vars}
 
@@ -7621,14 +9148,27 @@ class WorkflowRunner:
     # ── Date & Time (n8n) — produce / format / shift a datetime ──────────
 
     def _execute_datetime_step(self, step, variables) -> dict:
-        """config: {operation, value?, format?, amount?, unit?}.
+        """config: {operation, value?, format?, amount?, unit?, timezone?}.
         operation: now | format | add | subtract. ``value`` (templated) defaults
-        to now; ``format`` is a strftime pattern (ISO if omitted)."""
+        to now; ``format`` is a strftime pattern (ISO if omitted). ``timezone``
+        (templated IANA name) expresses the result in that zone, so a local
+        calendar date does not follow UTC."""
         config = step.get("config", {})
         op = str(config.get("operation") or "now").lower()
         fmt = config.get("format")
         value = _render_template(str(config.get("value") or ""), variables)
         base = _parse_dt(value) or _utc_now()
+        zone_name = _render_template(str(config.get("timezone") or ""), variables).strip()
+        if zone_name:
+            try:
+                zone = ZoneInfo(zone_name)
+            except (ZoneInfoNotFoundError, ValueError):
+                return {
+                    "status": "failed",
+                    "code": "datetime_timezone_invalid",
+                    "error": f"Unknown timezone: {zone_name}",
+                }
+            base = (base if base.tzinfo else base.replace(tzinfo=timezone.utc)).astimezone(zone)
         if op in ("add", "subtract"):
             raw_amount = _resolve_binding(config["amount"], variables) if "amount" in config else 0
             try:
@@ -8061,7 +9601,13 @@ class WorkflowRunner:
             WorkflowRunStatus.FAILED,
             WorkflowRunStatus.CANCELLED,
         }:
-            return {"status": "failed", "error": sub_run.error or "subworkflow failed", "subrun_id": sub_id}
+            return {
+                "status": "failed", "error": sub_run.error or "subworkflow failed", "subrun_id": sub_id,
+                # What the child got done before it stopped, as a finished child
+                # hands over; a step that continues on error reads it there.
+                "output": dict(sub_run.variables or {}),
+                **({"error_details": details} if (details := _child_failure_details(sub_run)) else {}),
+            }
         if sub_run.status in {
             WorkflowRunStatus.PENDING,
             WorkflowRunStatus.RUNNING,
@@ -8343,6 +9889,7 @@ class WorkflowRunner:
                     fingerprint=target_fingerprint,
                 )
                 child_run_id = generate_ulid()
+                child_chat_origin = _child_workflow_chat_origin(run)
                 child_run = WorkflowRun(
                     id=child_run_id,
                     workflow_id=target.id,
@@ -8371,6 +9918,13 @@ class WorkflowRunner:
                         "_workflow_runtime_context": _child_workflow_context(
                             run,
                             seed,
+                        ),
+                        # Each item's reviews reach the person in the parent's
+                        # chat, as a plain subworkflow's do.
+                        **(
+                            {"_workflow_chat_origin": child_chat_origin}
+                            if child_chat_origin is not None
+                            else {}
                         ),
                     },
                     started_by=run.started_by,
@@ -8575,6 +10129,10 @@ class WorkflowRunner:
                     op_fn = _OPS[op_str]
                     return bool(op_fn(left_val, right_val))
 
+        # A bare boolean literal (``fail_when: "true"``) is its own value, not
+        # the name of a variable that is never set.
+        if expression.lower() in {"true", "false"}:
+            return expression.lower() == "true"
         # Bare variable name — truthy check
         val = _lookup_reference(expression, variables, missing=False)
         return bool(val)
@@ -8774,8 +10332,9 @@ class WorkflowRunner:
                 if not key or key in variables:
                     continue
                 raw = item.get("value")
-                resolved = output if raw in (None, "") else _resolve_structure(raw, variables)
-                variables[key] = _coerce_typed(resolved, item.get("type"))
+                resolved = output if raw in (None, "") else _bound_value(raw, variables)
+                if resolved is not _UNRESOLVED:
+                    variables[key] = _coerce_typed(resolved, item.get("type"))
         return variables
 
     def _selected_next(
@@ -8901,6 +10460,11 @@ class WorkflowRunner:
     ) -> None:
         """Store step result and update run variables."""
         step_id = step["id"]
+        # A value the run cannot keep fails this step with the reason, instead of being stored.
+        if result.get("status") == "completed" or result.get("continued") is True:
+            limit_error = _variable_limit_failure(step, result)
+            if limit_error:
+                result = {**result, "status": "failed", "error": limit_error, "output": None}
 
         # Update step_results
         step_results = dict(run.step_results or {})
@@ -8927,7 +10491,8 @@ class WorkflowRunner:
             # Explicit named outputs (config.outputs): expose specific fields of
             # this step's result under chosen names. A blank value defaults to
             # the whole result; an expression (e.g. {{id.field}}) is resolved
-            # against the scope that already includes the step's auto var.
+            # against the scope that already includes the step's auto var. An
+            # optional run input nobody gave leaves its name without a value.
             for item in (step.get("config") or {}).get("outputs") or []:
                 if not isinstance(item, dict):
                     continue
@@ -8935,8 +10500,11 @@ class WorkflowRunner:
                 if not key:
                     continue
                 raw = item.get("value")
-                resolved = output if raw in (None, "") else _resolve_structure(raw, updated_vars)
-                updated_vars[key] = _coerce_typed(resolved, item.get("type"))
+                resolved = output if raw in (None, "") else _bound_value(raw, updated_vars)
+                if resolved is _UNRESOLVED:
+                    updated_vars.pop(key, None)
+                else:
+                    updated_vars[key] = _coerce_typed(resolved, item.get("type"))
             if updated_vars != (run.variables or {}):
                 run.variables = updated_vars
         elif result.get("status") == "paused":
@@ -9102,15 +10670,73 @@ class WorkflowRunner:
                     return "continuation_required"
                 approval_metadata: dict[str, Any] = {}
                 if is_approval:
+                    from packages.core.services.workflow_chat_approvals import (
+                        _review_variable,
+                        workflow_review_is_revision_choice,
+                        workflow_review_matches_original,
+                        workflow_review_revision_field,
+                        workflow_review_revision_note,
+                    )
+
                     actor_id = str(resumed_by or "").strip()
                     if not actor_id or actor_id != str(run.started_by or "").strip():
                         return "invalid_approval"
                     response_variable = str(current_config.get("response_variable") or "decision").strip()
+                    submitted_variables = dict(variables or {})
+                    if (
+                        isinstance(current_config.get("review_editable_fields"), list)
+                        and set(submitted_variables) != {response_variable}
+                    ):
+                        return "invalid_approval"
                     response_value = (variables or {}).get(response_variable)
                     decision_value = response_value.get("choice") if isinstance(response_value, dict) else response_value
                     decision = str(decision_value or "").strip()
                     if not decision:
                         return "invalid_approval"
+                    revising = workflow_review_is_revision_choice(decision)
+                    if isinstance(response_value, dict) and "review" in response_value:
+                        review_variable = _review_variable(current_config)
+                        submitted_review = response_value["review"]
+                        original_review = (run.variables or {}).get(review_variable) if review_variable else None
+                        if (
+                            not review_variable
+                            or not workflow_review_matches_original(
+                                original_review, submitted_review, current_config,
+                            )
+                        ):
+                            return "invalid_approval"
+                        variables = {
+                            **dict(variables or {}),
+                            review_variable: submitted_review,
+                        }
+                        if revising:
+                            revision_note = workflow_review_revision_note(
+                                current_config, submitted_review,
+                            )
+                            if revision_note:
+                                response_value = {**response_value, "note": revision_note}
+                                variables = {
+                                    **dict(variables or {}),
+                                    response_variable: response_value,
+                                }
+                    if revising:
+                        if workflow_review_revision_field(current_config) and not (
+                            isinstance(response_value, dict)
+                            and str(response_value.get("note") or "").strip()
+                        ):
+                            return "invalid_approval"
+                    if decision == "approve":
+                        submitted_review = (
+                            response_value.get("review")
+                            if isinstance(response_value, dict)
+                            else None
+                        )
+                        review_variable = _review_variable(current_config)
+                        review_for_approval = submitted_review if submitted_review is not None else (
+                            (run.variables or {}).get(review_variable) if review_variable else None
+                        )
+                        if workflow_review_revision_note(current_config, review_for_approval):
+                            return "invalid_approval"
                     try:
                         approval_metadata = workflow_approval_decision_metadata(
                             current_config,
@@ -9127,6 +10753,16 @@ class WorkflowRunner:
                             current_config, variables, context=run.variables,
                         )
                     except ValueError:
+                        return "invalid_input"
+                    from packages.core.services.workflow_project_select import (
+                        input_wait_project_selection_errors,
+                    )
+
+                    # Picked Workspace records must exist, as on a run's own inputs.
+                    if await input_wait_project_selection_errors(
+                        db, _input_schema, input_value,
+                        entity_id=run.entity_id, workspace_id=run.workspace_id,
+                    ):
                         return "invalid_input"
 
                 updated_vars = dict(run.variables or {})

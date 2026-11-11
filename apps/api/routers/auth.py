@@ -520,6 +520,9 @@ async def verify_email_endpoint(
     from packages.core.services.email_service import send_welcome_email
     await send_welcome_email(req.email, user.display_name or req.email.split("@")[0])
 
+    from packages.core.services.workspace_recommendations import schedule_workspace_recommendations
+    schedule_workspace_recommendations(user.id)
+
     token = create_access_token(
         user.id, user.entity_id, user.role, token_version=user.token_version,
     )
@@ -1585,13 +1588,34 @@ def _provider_probe_error_detail(response: httpx.Response) -> str:
     return str(data.get("message") or data.get("msg") or data.get("detail") or detail)
 
 
+def _listed_model_ids(data: object) -> set[str]:
+    """Model ids from a provider's model listing (bare list, data or models)."""
+    items = data if isinstance(data, list) else []
+    if isinstance(data, dict):
+        items = data.get("data") or data.get("models") or []
+    if not isinstance(items, list):
+        return set()
+    ids: set[str] = set()
+    for item in items:
+        if isinstance(item, str):
+            ids.add(item)
+        elif isinstance(item, dict):
+            for field in ("id", "model", "modelId", "name"):
+                if isinstance(item.get(field), str):
+                    ids.add(item[field])
+    return ids
+
+
 async def _probe_media_role_key(
     role: str,
     api_key: str,
     model: str,
     base_url: str,
-) -> None:
-    """Live-test a catalog media model without creating a billable asset."""
+) -> str | None:
+    """Live-test a media model without creating a billable asset.
+
+    Returns a note when the provider can only confirm the key, not the model.
+    """
     from packages.core.services.model_resolver import (
         normalize_llm_model_for_provider,
         resolve_llm_provider_base_url,
@@ -1843,9 +1867,25 @@ async def _probe_media_role_key(
             status_code=400,
             detail=f"Kling rejected this API key or model access: {_provider_probe_error_detail(response)}",
         )
+    if role == "video" and not _is_catalog_model(role, model):
+        from packages.core.tasks.video_adapters import native_video_model
+
+        if provider == "atlascloud":
+            if native_video_model(model) not in _listed_model_ids(data):
+                raise HTTPException(status_code=400, detail=f"{label} could not find model {model}.")
+        elif provider in {"bytedance", "kwaivgi"}:
+            # Seedance and Kling publish no model lookup; a wrong id is
+            # refused, unbilled, on the first generation.
+            return (
+                f"{label} accepted this key. {label} has no model lookup, so the "
+                "model id is checked when the first video is generated."
+            )
+    return None
 
 
-async def _probe_custom_model(role: str, model: str, api_key: str, base_url: str | None) -> tuple[str | None, int | None]:
+async def _probe_custom_model(
+    role: str, model: str, api_key: str, base_url: str | None,
+) -> tuple[str | None, int | None, str | None]:
     from packages.core.services.model_resolver import (
         adapt_llm_chat_payload_for_provider,
         detect_llm_provider_from_key,
@@ -1891,8 +1931,8 @@ async def _probe_custom_model(role: str, model: str, api_key: str, base_url: str
     if role in {"image", "video", "voice", "audio", "sfx", "stt"}:
         provider = _catalog_model_provider(model)
         _validate_role_api_key_for_model(role, api_key, model)
-        await _probe_media_role_key(role, api_key, model, base_url or "")
-        return provider, int((time.perf_counter() - started) * 1000)
+        note = await _probe_media_role_key(role, api_key, model, base_url or "")
+        return provider, int((time.perf_counter() - started) * 1000), note
 
     resolved_base = resolve_llm_provider_base_url(model, api_key, base_url).rstrip("/")
     provider = (
@@ -2029,7 +2069,7 @@ async def _probe_custom_model(role: str, model: str, api_key: str, base_url: str
         )
 
     latency_ms = int((time.perf_counter() - started) * 1000)
-    return provider, latency_ms
+    return provider, latency_ms, None
 
 
 # The provider prefix of a media model ID selects its API format at runtime.
@@ -2312,7 +2352,8 @@ async def save_catalog_model_settings(
     model = str(req.model or "").strip()
     if not role or not model:
         raise HTTPException(status_code=400, detail="Role and model are required.")
-    catalog = effective_catalog(await get_model_settings_cached(db))
+    # Saved with the user's own key: BYOK may use a model the platform cannot bill.
+    catalog = effective_catalog(await get_model_settings_cached(db), billable_only=False)
     catalog_entries = {
         str(item.get("id")): item
         for item in catalog.get(role, [])
@@ -2465,10 +2506,10 @@ async def test_custom_model(
     effective_settings = await _effective_entity_settings(db, entity)
     role, model, key, base_url = _validate_custom_model_request(req, effective_settings)
     _custom_model_limits(req, role)
-    provider, latency_ms = await _probe_custom_model(role, model, key, base_url)
+    provider, latency_ms, note = await _probe_custom_model(role, model, key, base_url)
     return {
         "ok": True,
-        "detail": "Model test passed",
+        "detail": note or "Model test passed",
         "provider": provider,
         "latency_ms": latency_ms,
         "test_token": _create_model_test_token(

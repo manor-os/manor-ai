@@ -7,8 +7,12 @@ read the contract, and ran out of rounds before writing the script.
 from __future__ import annotations
 
 from pathlib import Path
+import json
+
+import pytest
 
 from packages.core.ai import agentic_loop
+from packages.core.ai.runtime.control import RuntimeAgentCheckpoint
 
 
 def test_handoff_guarantees_a_minimum_remaining_budget():
@@ -103,3 +107,74 @@ async def test_a_turn_keeps_its_handed_off_sandbox_alive_until_it_ends(monkeypat
 def test_both_handoff_paths_register_the_turn_sandbox():
     source = Path("packages/core/ai/agentic_loop.py").read_text(encoding="utf-8")
     assert source.count("_note_turn_sandbox(tool_result)") == 2
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("failure_reason", ["sandbox_allocation_failed", "sandbox_queue_timeout", "sandbox_capacity_timeout", "sandbox_runner_unavailable", "sandbox_allocation_rejected"])
+@pytest.mark.parametrize("cancel_summary", [False, True])
+async def test_exhausted_allocation_gets_one_billed_model_summary_without_replaying_tools(monkeypatch, cancel_summary, failure_reason):
+    calls = [
+        {"id": "pdf", "name": "generate_file", "arguments": {"format": "pdf"}},
+        {"id": "send", "name": "send_email", "arguments": {}},
+    ]
+    checkpoint = RuntimeAgentCheckpoint(
+        messages=[
+            {"role": "system", "content": "Help with the user's files."},
+            {"role": "user", "content": "Fill the rental PDF using the details I supplied."},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": call["id"], "type": "function", "function": {
+                    "name": call["name"], "arguments": json.dumps(call["arguments"]),
+                }} for call in calls
+            ]},
+        ],
+        rounds=2, usage={}, tool_calls_made=["read_file", "request_input"],
+        pending_tool_call=calls[0], remaining_tool_calls=calls[1:],
+        pending_tool_result={"id": "pdf", "content": json.dumps({
+            "status": "error", "message": "Dependencies could not be installed.",
+            "error": failure_reason, "allocation_attempts": 5,
+        }), "terminal_failure": failure_reason},
+    )
+    events = []
+    cancelled = [False]
+    summary = "I have your details, but the PDF could not be prepared because the file tools could not start."
+
+    async def no_execution(*_args, **_kwargs):
+        pytest.fail("A failed allocation must not retry tools or execute the queued suffix")
+
+    async def final(messages, **kwargs):
+        events.append("model")
+        assert "tools" not in kwargs
+        assert any("details I supplied" in str(m.get("content")) for m in messages)
+        assert [m["tool_call_id"] for m in messages if m.get("role") == "tool"] == ["pdf"]
+        assert [c["id"] for m in messages for c in m.get("tool_calls", [])] == ["pdf"]
+        assert any("Dependencies could not be installed" in str(m.get("content")) for m in messages)
+        return summary, {"input_tokens": 10, "output_tokens": 12}
+
+    async def reserve(*_args):
+        events.append("reserve")
+
+    async def settle(*_args):
+        events.append("settle")
+
+    def on_tool_end(*_args):
+        cancelled[0] = cancel_summary
+
+    monkeypatch.setattr(agentic_loop, "runtime_execute_agentic_round_tool_completion", no_execution)
+    monkeypatch.setattr(agentic_loop, "runtime_execute_agentic_final_completion", final)
+    result = await agentic_loop.agentic_loop(
+        system_prompt="Help with files", user_message="continue", tools=[],
+        tool_executor=no_execution, resume_checkpoint=checkpoint.to_dict(),
+        forced_tool_calls=[calls[1]], on_llm_call_before=reserve, on_llm_usage_settled=settle,
+        on_tool_end=on_tool_end, is_cancelled=lambda: cancelled[0],
+    )
+    if cancel_summary:
+        assert events == []
+        assert result.stop_reason == "cancelled"
+        return
+    assert events == ["reserve", "model", "settle"]
+    assert result.content == summary
+    assert result.error == failure_reason
+    assert result.stop_reason == "error"
+    from packages.core.ai.runtime.output_policy import runtime_assistant_result_meta, runtime_public_assistant_message_content
+
+    assert runtime_public_assistant_message_content(result.content, runtime_assistant_result_meta(result)) == summary

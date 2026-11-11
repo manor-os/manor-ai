@@ -1925,6 +1925,7 @@ async def _bill_embedding(
                 conversation_id=billing.conversation_id,
                 source=billing.source or "embedding",
                 byok=billing.byok or bool(cfg.get("byok")),
+                prompt_tokens=total_tokens,
             )
             await db.commit()
     except Exception:
