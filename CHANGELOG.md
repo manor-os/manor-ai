@@ -7,6 +7,23 @@ are published from GitHub tags after the OSS export and docs checks pass.
 
 ## Unreleased
 
+## [0.2.0]
+
+- Workspaces are the main building surface: Blueprint export, install,
+  upgrade and promotion, Workflows, Skills, Knowledge, and the Workspace app
+  pages all go through the same REST routes.
+- Workspace approval rules: a Workspace's "Needs approval" page sets the
+  approval mode and rules that pause sensitive actions for a person.
+- A hosted MCP endpoint and a Claude Code / Codex plugin let external coding
+  agents build Workspaces through the same routes.
+- Blueprint update notices and upgrades check reviewed configuration before the
+  first write.
+- Chat rooms, workspace memory layers, calendar publishing, and app field
+  formats for percent, duration, date range, people, tags, and media.
+- The public edition excludes Cloud-only product packages and their assets,
+  the Stripe connector, and the platform admin routes. The build and export
+  checks fail if they reappear.
+
 ## [0.1.1]
 
 - Enforced Entity-owned BYOK for the OpenAI-compatible LLM gateway, voice,

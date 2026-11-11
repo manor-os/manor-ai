@@ -164,7 +164,7 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 
             response = await call_next(request)
             response.headers["X-Request-ID"] = rid
-            response.headers["X-API-Version"] = "0.1.1"
+            response.headers["X-API-Version"] = "0.2.0"
             return response
         finally:
             database_request_id.reset(token)
