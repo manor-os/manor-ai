@@ -159,7 +159,7 @@ async def test_system_info(client):
     data = resp.json()
     assert "system" in data
     system = data["system"]
-    assert system["version"] == "0.2.0"
+    assert system["version"] == "0.2.1"
     assert "uptime_seconds" in system
     assert isinstance(system["uptime_seconds"], int)
     assert system["uptime_seconds"] >= 0

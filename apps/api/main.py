@@ -556,7 +556,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Manor AI",
         description="The AI operating system for autonomous enterprise management",
-        version="0.2.0",
+        version="0.2.1",
         docs_url=None if cloud_mode else "/api/docs",
         redoc_url=None if cloud_mode else "/api/redoc",
         openapi_url=None if cloud_mode else "/api/openapi.json",

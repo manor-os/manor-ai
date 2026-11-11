@@ -201,7 +201,7 @@ async def deep_health():
     # System info
     uptime_seconds = time.time() - _STARTUP_TIME
     system = {
-        "version": "0.2.0",
+        "version": "0.2.1",
         "python": platform.python_version(),
         "platform": platform.platform(),
         "uptime_seconds": round(uptime_seconds),

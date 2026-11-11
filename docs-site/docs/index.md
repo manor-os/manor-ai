@@ -12,7 +12,7 @@ the seeded workspace, and confirm that governed actions pause for human review.
 
 <img
   src="img/manor-ai-runtime.png"
-  alt="Manor AI workspace runtime showing a running workspace dashboard"
+  alt="Manor AI Tasks board with work items created in a workspace"
 />
 
 ## What this is, briefly
@@ -93,9 +93,8 @@ deployment.
 
 ### 4. Inspect the workspace
 
-Open the workspace view and check the operating score, goals, tasks, documents,
-and agent mappings. The workspace should look like a running system, not an
-empty SDK sample.
+Open Tasks and check the work items your workspace created. Then open Goals to
+see how those tasks connect to the workspace's objectives.
 
 <img
   src="img/manor-ai-goals.png"
@@ -110,7 +109,7 @@ tool runs.
 
 <img
   src="img/manor-ai-governance.png"
-  alt="Manor AI governance rules requiring approval for external messages and blocking destructive actions"
+  alt="Manor AI workspace Needs approval page with rules that ask before sending messages and block deletes"
 />
 
 ## What you'll see at the end

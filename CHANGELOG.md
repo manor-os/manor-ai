@@ -7,6 +7,15 @@ are published from GitHub tags after the OSS export and docs checks pass.
 
 ## Unreleased
 
+## [0.2.1]
+
+- The README and social card now describe Manor AI as a self-hosted AI
+  workspace for governed agents. The screenshots show the Tasks board and the
+  approval rules page, and the Simplified Chinese home page is in sync.
+- Release fixes: the public web build, version checks and the public export
+  boundary pass together. Cloud-only Stripe, Stickman and product-package code
+  stays out of the public tree.
+
 ## [0.2.0]
 
 - Workspaces are the main building surface: Blueprint export, install,

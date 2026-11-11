@@ -12,7 +12,7 @@ description: 从克隆仓库到跑起一个 Manor AI 工作区的最短路径。
 
 <img
   src="img/manor-ai-runtime.png"
-  alt="Manor AI 工作区运行时,展示运行中的工作区仪表盘"
+  alt="Manor AI 任务看板，展示工作区创建的任务"
 />
 
 ## 这是什么(简述)
@@ -90,8 +90,7 @@ demo@manor.local / manor-demo
 
 ### 4. 查看工作区
 
-打开工作区视图,查看运行评分、目标、任务、文档和 Agent 映射。工作区看起来
-应该像一个正在运转的系统,而不是空空如也的 SDK 示例。
+打开「任务」查看工作区创建的任务，再打开「目标」查看这些任务如何关联到工作区目标。
 
 <img
   src="img/manor-ai-goals.png"
@@ -105,7 +104,7 @@ demo@manor.local / manor-demo
 
 <img
   src="img/manor-ai-governance.png"
-  alt="Manor AI 治理规则:外部消息需审批,破坏性操作被拦截"
+  alt="Manor AI 工作区的审批设置，展示发送消息前需确认和禁止删除的规则"
 />
 
 ## 完成后你将拥有

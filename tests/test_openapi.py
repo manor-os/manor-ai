@@ -17,7 +17,7 @@ async def test_openapi_schema_accessible(client: AsyncClient):
     assert response.status_code == 200
     schema = response.json()
     assert schema["info"]["title"] == "Manor AI"
-    assert schema["info"]["version"] == "0.2.0"
+    assert schema["info"]["version"] == "0.2.1"
     assert "paths" in schema
 
 
